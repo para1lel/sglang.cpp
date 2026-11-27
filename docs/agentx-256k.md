@@ -1,4 +1,4 @@
-# AgentX 256k benchmark protocol
+# AgentX 256k benchmark
 
 Compare native serving with LMCache against pinned vLLM with Simple KV Offload on NVIDIA B200. Use the [AgentX methodology][methodology] for replay and the [InferenceX DeepSeek V4.1 Flash page][leaderboard] as a reporting reference. This campaign uses a local Qwen checkpoint and a 30-minute profiling window.
 
@@ -7,6 +7,8 @@ Compare native serving with LMCache against pinned vLLM with Simple KV Offload o
 | Input | Identity |
 | --- | --- |
 | Initial native baseline | `3813c20f53a27f31dadb5698ef3d319af25f4b99` on `bench/agentx-256k-tp1-tp2`. This build was used for the aborted TP2 warmup and operator diagnosis. |
+| Measured native source | `fad939383840a545e03ae2d2fe17277b52403cf3`, tree `7bcc82a5f0f05956baf2e7e9d658ce039065d006`. Both runs used the same Release binary, SHA-256 `c6f750ecb4205a49ab6c6a29643ab1df9f597606bf43a85acbc4ea3ae8e11ca8`. The build receipt is under `artifacts/agentx-256k/native-preflight/committed-release-fad939383840.uE4Olan4/`. |
+| Native LMCache | Wheel `0.5.8`, SHA-256 `4ec775bda3a8c5f1f5b1ef0bbc441b666db86b57c3c2a7bcba47a4f6550b07cd`. Each width used one private daemon. [Daemon setup](serving/lmcache.md#start-the-daemon) |
 | vLLM source | `vllm-project/vllm` at `81a8cb063e6247fe254d7caf7e98a6691d71022a`. Use `/data1/shared/dongwu.chen/environments/vllm-81a8cb063e62`. Both runs use `0.34.0rc1.dev787+g81a8cb063`, wheel SHA-256 `25358fa092260117176d78f4efeabfd06a0e49731d29bbcffd717dfedc498ad9`. [Baseline agreement](performance.md#implementations-and-controls) |
 | Model and tokenizer | `/data0/shared/Qwen3.8-27B-FP8` for both engines and the replay tokenizer. The checkpoint matches Qwen revision `c3a462cc3d38cf351f3b26cbd763469eeb74ef81` and supports 262,144 tokens. [Checkpoint record](research/checkpoint.md) |
 | Trace | `semianalysisai/cc-traces-weka-062126-256k`, revision `8fecd2fc56694469f758f0afbbb6335ad3043740`, file `traces.jsonl`. SHA-256 `e39cd2ff3eba21d4a3664be51da743ac3d2149a1933898cafc7bfeac8147eeef`. The corpus has 393 trajectories and 68,266 recorded requests. The largest recorded request has 255,999 combined input and output tokens. [Pinned trace][trace] · [Corpus description][corpus] |
@@ -14,7 +16,7 @@ Compare native serving with LMCache against pinned vLLM with Simple KV Offload o
 
 ## Run matrix
 
-TP1 and TP2 can run in parallel on separate NUMA nodes. At each width, run the two engines in sequence on the same ordered GPU UUIDs. Record the execution order with the results.
+At each width, the two engines ran in sequence on the same ordered GPU UUIDs, with vLLM first. The native TP1 and TP2 runs overlapped on separate NUMA nodes.
 
 | TP | Engine | CPU cache capacity | Physical GPUs in rank order | Live agent clients | Profile |
 | ---: | --- | ---: | --- | ---: | ---: |
@@ -23,7 +25,7 @@ TP1 and TP2 can run in parallel on separate NUMA nodes. At each width, run the t
 | 2 | Native + LMCache 0.5.8 | 128 GiB | B200 1, 2 | 16 | 1,800 s |
 | 2 | vLLM + Simple KV Offload | 128 GiB | B200 1, 2 | 16 | 1,800 s |
 
-TP1 uses B200 6 (`GPU-d4d87d81-ea84-5dd0-7167-3e1c48fde29b`) on NUMA node 1. TP2 uses NUMA node 0. Its rank 0 is B200 1 (`GPU-9a94015a-6a0d-1ae1-82db-b6736b77562e`). Its rank 1 is B200 2 (`GPU-7e25f95a-29b7-9f94-ce9a-2a2871cf7c0c`). Pin the TP2 server to CPUs `12-21,24-33` and its client to `22-23,34-35`. Confirm the UUIDs, rank placement, and availability at startup.
+TP1 uses B200 6 (`GPU-d4d87d81-ea84-5dd0-7167-3e1c48fde29b`) on NUMA node 1. Pin its server to CPUs `72-81` and its client to `82-83`. TP2 uses NUMA node 0. Its rank 0 is B200 1 (`GPU-9a94015a-6a0d-1ae1-82db-b6736b77562e`). Its rank 1 is B200 2 (`GPU-7e25f95a-29b7-9f94-ce9a-2a2871cf7c0c`). Pin the TP2 server to CPUs `12-21,24-33` and its client to `22-23,34-35`. Pin the LMCache daemon to the client CPUs. Confirm UUIDs, rank placement, and availability at startup.
 
 ## Execution
 
@@ -31,7 +33,7 @@ TP1 uses B200 6 (`GPU-d4d87d81-ea84-5dd0-7167-3e1c48fde29b`) on NUMA node 1. TP2
 2. Start a fresh engine for each arm. For native, start a private [LMCache daemon](serving/lmcache.md#start-the-daemon) with the matrix capacity and UUIDs. Pass its socket to `sglang-server` with `--lmcache-socket`. Use one daemon and the same ordered UUIDs for both [TP2 ranks](serving/tp2.md#prerequisites-and-command).
 3. For vLLM, set `VLLM_USE_SIMPLE_KV_OFFLOAD=1` and `--kv-offloading-backend native`. Set `--kv-offloading-size` to the matrix capacity across all ranks. Enable prefix caching and `--enable-prompt-tokens-details`. Verify that the worker selects `SimpleCPUOffloadConnector`. [Connector selection][offload] · [Capacity option][capacity]
 4. Confirm each engine serves streaming `/v1/chat/completions` with the local tokenizer and context capacity. Check the terminal usage for prompt, completion, and cached prompt tokens. Preserve the readiness receipt. Restart with a fresh cache if the readiness requests populated it.
-5. Verify the pinned trace bytes before invoking AgentX. Use the seeded 25–75% trajectory start range, cache busting per replay, and ten warmup requests per lane. Retain the trace timing and subagent dependencies. Use one live agent client per lane, with eight lanes per GPU. Subagent fan-out can create more simultaneous HTTP requests than live clients. [Replay methodology][methodology]
+5. Verify the pinned trace bytes before invoking AgentX. Verify the preset resolves seed `42`, a 25–75% trajectory start range, and cache busting per replay. Use ten warmup requests per lane. Retain the trace timing and subagent dependencies. Use one live agent client per lane, with eight lanes per GPU. Subagent fan-out can create more simultaneous HTTP requests than live clients. [Replay methodology][methodology]
 6. Verify the resolved plan before starting. Dispatch profiling requests for 1,800 seconds after the warmup barrier. Allow 30 seconds for outstanding requests after dispatch closes. Include valid profiling responses received during that grace period. Exclude primers and warmup requests. Record the phase times and drain deadline.
 
 Run the pinned client in its locked environment. Set `SERVER_URL` and `SERVED_MODEL` to match the active server. Set `CONC` from the matrix and `RUN_DIR` to a fresh output path. Run from the staged working directory with the verified file at `semianalysisai/cc-traces-weka-062126-256k/traces.jsonl`. The official loader resolves this local dataset directory. Use the proxy at `http://127.0.0.1:7890` to fetch dependencies and the pinned corpus. Run the replay offline and send loopback requests directly.
@@ -61,7 +63,7 @@ Score profiling turns that have successful transport, a finish choice, and `[DON
 | Actual KV cache hit rate | % | Divide the sum of server-reported `usage.prompt_tokens_details.cached_tokens` by the sum of `usage.prompt_tokens` over the same turns. Count logical tokens once at TP2. Report usage coverage and use engine counters to corroborate reuse. [Native final stream usage](../apps/server/text_completion.cpp#L591)<!-- prefix: "void TextRes" --> |
 | Theoretical KV cache hit rate | % | Divide the replay's hit blocks by its total 64-token blocks over the same finalized turns. Keep the harness aggregate `theoretical_prefix_cache_hit` as a cross-check. Report any difference in the scoring cohorts. [InferenceX metric][scorer] |
 
-For the revenue estimate, let `I`, `C`, and `O` be the retained input, cached input, and output token totals. Use the Singapore International list tariff accessed on 2026-11-27. The rates per million tokens are `3.646` CNY uncached input, `0.729` CNY implicit cache read, and `21.875` CNY output. Multiply `(3.646 × (I − C) + 0.729 × C + 21.875 × O) / 1,000,000` by `3,600 / (observation seconds × chips)`. [Singapore tariff][pricing]
+For the revenue estimate, let `I`, `C`, and `O` be the retained input, cached input, and output token totals. Use the Singapore International list tariff accessed on 2026-11-27. The rates per million tokens are `3.646` CNY uncached input, `0.729` CNY implicit cache read, and `21.875` CNY output. Multiply `(3.646 × (I − C) + 0.729 × C + 21.875 × O) / 1,000,000` by `3,600 / (observation seconds × chips)`. The result is a list-price estimate for finalized responses. This benchmark collects no realized receipts. [Singapore tariff][pricing]
 
 Keep one evidence directory per run under `artifacts/agentx-256k/`. Record its path and a SHA-256 manifest with the results. Preserve the following material:
 
@@ -101,22 +103,50 @@ The final archive passed six production-route cases, four direct split cases, an
 
 ## Timed AgentX results
 
+All four runs used seed `42` and a 1,800-second dispatch window after warmup. Closed-loop replay submits dependent turns as predecessors finish, so the engines can complete different numbers and mixes of requests. Each row uses its own finalized profiling cohort and response observation span.
+
 | TP | Engine | P90 E2E normalized interactivity (output tokens/s/user) | Input tokens/s/chip | Output tokens/s/chip | Estimated CNY/chip/hour | Actual KV hit (%) | Theoretical KV hit (%) |
 | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | Native + LMCache | 13.47 | 26,509.24 | 242.53 | 135.79 | 83.07 | 95.82 |
 | 1 | vLLM + Simple KV Offload | 53.66 | 39,992.77 | 365.52 | 157.95 | 94.24 | 95.94 |
+| 2 | Native + LMCache | 11.06 | 20,884.43 | 179.15 | 103.53 | 84.22 | 95.65 |
 | 2 | vLLM + Simple KV Offload | 53.05 | 36,530.15 | 331.35 | 141.80 | 94.83 | 96.32 |
+
+At TP1, native delivered 33.7% lower input and 33.6% lower output throughput per chip than vLLM. At TP2 the gaps were 42.8% and 45.9%. Native P90 normalized interactivity was 74.9% lower at TP1 and 79.2% lower at TP2. The estimated revenue gaps were 14.0% and 27.0%, respectively. Native actual KV hits were 11.16 and 10.61 percentage points lower, while theoretical rates differed by 0.12 and 0.67 points.
+
+### Effective server and cache settings
+
+Native used 8 and 16 running-request slots at TP1 and TP2, respectively, with the 32,768-token batch limit and 262,144-token context. Both widths used MTP4 with INT8 head verification and online GQA, Tensor Core FP8 prefill, and MXFP8 GQA KV. The server reported `batch_cuda_graphs=true` at TP1 and `false` at TP2.
+
+Native served active KV on the GPUs and persisted reusable prefixes in LMCache CPU L1. Before-to-after counters cover warmup, profiling, and drain. LMCache restored coherent target prefixes of 45,228,032 tokens at TP1 and 76,547,687 at TP2. It acknowledged 1,612 and 2,612 stores, respectively, with zero I/O errors. GQA coverage was 49,421,056 and 82,739,303 tokens, respectively. GQA coverage includes the coherent span and can extend past it. The TP2 profiling-to-drain interval recorded 716 transfers from CPU L1 and 1,952 stores per rank. Read bytes sum over ranks, while logical token spans count once. [Cache accounting](prefix-cache.md#checkpoint-compatibility-and-resume) · [Ranked restores](serving/lmcache.md#ranked-tp2-transport)
 
 Both vLLM runs resolved 32,768 batched and scheduled tokens, with eight sequences at TP1 and 16 at TP2. Both used the 262,144-token context, four-token Qwen MTP, FlashInfer attention, and FP8 E4M3 KV. The scored TP1 restart used 112 GiB of GPU KV after the 128 GiB attempt exhausted memory during warmup. TP2 used 128 GiB of GPU KV per rank. The engine reported 3,038,820 logical GPU KV token slots at TP1 and 6,947,548 at TP2.
 
 Both runs selected `SimpleCPUOffloadConnector` in eager mode. Host capacity was 64 GiB total at TP1 and 128 GiB total at TP2. The before-to-after counters include primers, warmup, and profiling. GPU-local prefix hits were 74,409,088 tokens at TP1 and 138,632,832 at TP2. External lookups covered 5,607,899 and 10,097,443 tokens, respectively, with zero external hits in both runs. The connector recorded 1,899 and 2,979 `stored` outcomes, respectively. All cache reuse in the scored vLLM runs was GPU-local.
 
-The vLLM TP1 scorer retained 837 profiling turns and all 837 final usage records. It recorded zero errors, skips, or cancellations. The 1,819.132-second span includes responses received during the drain. It counted 72,752,129 input tokens, 68,558,464 of them cached, and 664,926 output tokens. The theoretical tally was 1,086,537 hits out of 1,132,567 blocks and matched the harness aggregate.
+### Observation and coverage
 
-The vLLM TP1 evidence directory is `artifacts/agentx-256k/runs/vllm-tp1/`. Its `score.json` SHA-256 is `5633e6b6cce333d3311e1ea4874a15115aa0f8626b1985255428f45d853ff5cb`. Its `run.sha256` SHA-256 is `86be678c2a3c44f9d6278f143bd5897bba09298d46c382e173ee79043e37ecaa`.
+Every finalized profiling request had timestamps, trace blocks, final token and cache usage, and a positive-latency P90 sample. The theoretical block totals matched the harness in all four rows. All four runs reported zero request errors and zero context-overflow skips.
 
-The vLLM TP2 scorer retained 1,260 profiling turns with complete final usage and cache details. It recorded zero errors, skips, or cancellations. The observation span was 1,804.877 seconds, including the drain. It counted 131,864,832 input tokens, 125,046,272 of them cached, and 1,196,076 output tokens. The theoretical tally was 1,978,892 hits out of 2,054,481 blocks and matched the harness aggregate.
+| TP | Engine | Finalized / sent | Observation (s) | Chip-seconds | Input tokens | Cached input tokens | Output tokens | Theoretical hit / total blocks |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | Native | 602 / 602 | 1,811.559007976 | 1,811.559007976 | 48,023,046 | 39,895,040 | 439,361 | 716,082 / 747,320 |
+| 1 | vLLM | 837 / 837 | 1,819.132212561 | 1,819.132212561 | 72,752,129 | 68,558,464 | 664,926 | 1,086,537 / 1,132,567 |
+| 2 | Native | 774 / 775 | 1,826.998717913 | 3,653.997435826 | 76,311,656 | 64,267,879 | 654,628 | 1,136,963 / 1,188,620 |
+| 2 | vLLM | 1,260 / 1,260 | 1,804.876589299 | 3,609.753178598 | 131,864,832 | 125,046,272 | 1,196,076 | 1,978,892 / 2,054,481 |
 
-The vLLM TP2 evidence directory is `artifacts/agentx-256k/runs/vllm-tp2/`. Its `score.json` SHA-256 is `c79f6d33492c2f1408559f817b5f1020a98c9f5131f78a582082df49fce38e2b`. Its `run.sha256` SHA-256 is `a37ddc962e4d830e236f29e397aa5621c47a8c51706eb803094e2397a8431424`.
+The native TP1 profiling-start scrape included 37,641 prompt tokens and 13 generated tokens from the first profiling request. The drained whole-replay deltas reconcile with the finalized warmup and profiling records. Native TP2 canceled one request at the 30-second grace deadline. Its drained engine counters exceeded finalized warmup and profiling SSE by 84,580 input and 4,310 output tokens. The excess input included 81,920 cached tokens. The headline metrics and tariff estimate use finalized SSE, so they exclude unfinished work counted by the engine.
+
+### Run receipts
+
+Run files are under `artifacts/agentx-256k/runs/`. The independent native reconciliations are `artifacts/agentx-256k/scoring/native-tp1-reconciliation.json` and `native-tp2-reconciliation.json`. Both reconciled all six metrics against the canonical scores.
+
+| Run directory | `score.json` SHA-256 | `run.sha256` SHA-256 |
+| --- | --- | --- |
+| `native-tp1/` | `930cf7baa9261f12e28da1ce34d92561373935c61c23b0fc8cadb2289b992f94` | `aeb5dd51bce05483b9a7f5aed5cdfbb528fe87db82b75d0575c2412f932d31ce` |
+| `vllm-tp1/` | `5633e6b6cce333d3311e1ea4874a15115aa0f8626b1985255428f45d853ff5cb` | `86be678c2a3c44f9d6278f143bd5897bba09298d46c382e173ee79043e37ecaa` |
+| `native-tp2/` | `3fa866530cb00c248d032f3265dab31af3b21995a15c0d9db28cc5a5d807ac8f` | `eed33a3a6235593d2abed377663ccca5c02a74f94edb4ca881e1798a74987d13` |
+| `vllm-tp2/` | `c79f6d33492c2f1408559f817b5f1020a98c9f5131f78a582082df49fce38e2b` | `a37ddc962e4d830e236f29e397aa5621c47a8c51706eb803094e2397a8431424` |
 
 [methodology]: https://inferencex.semianalysis.com/agentx/methodology
 [leaderboard]: https://inferencex.semianalysis.com/zh/infx/inference/deepseek-v41-flash

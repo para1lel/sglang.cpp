@@ -129,11 +129,21 @@ Retain the run manifest, commands, environment, fixture hashes, raw samples, and
 
 ## Matched K4 evidence
 
-The archived TP1 release `c701d294b3823c655c6adc38bbd87d077147bbcc` passed all five rows with direct GPU LMCache 0.5.8. W5 took 38.396171943 s native and 35.940895116 s pinned vLLM (1.068314293×). [Frozen TP1 results and SSE replay](https://github.com/para1lel/sglang.cpp/blob/a5974ba4eb99bd8e8f890c2e7262a27dbc3aace1/docs/performance.md#matched-k4-evidence)
+Native release `739413015202541bdb4bdabcc1580aceb381e86b` passed the 1.10× gate independently on all five rows at both TP widths. Each native arm used one LMCache daemon with a 64 GiB CPU L1 at TP1 and 128 GiB at TP2. [PR #3 campaign evidence](https://github.com/para1lel/sglang.cpp/pull/3)
+
+| Row | TP1 native (ns) | TP1 vLLM (ns) | TP1 ratio | TP2 native (ns) | TP2 vLLM (ns) | TP2 ratio |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| W1 | 565,244,798 | 644,300,564 | 0.87730× | 495,706,506 | 563,151,345 | 0.88024× |
+| W2 | 1,288,408,231 | 1,779,069,188 | 0.72420× | 1,235,557,398 | 2,017,694,876 | 0.61236× |
+| W3 | 3,950,017,357 | 4,442,892,822 | 0.88906× | 3,877,101,752 | 3,868,120,684 | 1.00232× |
+| W4 | 26,478,343,436 | 27,963,477,695 | 0.94689× | 27,371,598,131 | 25,600,380,451 | 1.06919× |
+| W5 | 38,757,275,298 | 36,979,270,671 | 1.04808× | 41,606,364,017 | 40,096,070,795 | 1.03767× |
+
+The scored TP1 W4 pair excludes an earlier pair with external GPU PID 833580 during measured vLLM requests. The independent replay receipt `consolidated.json` has SHA-256 `53fd6f8b86df28787269dbf0a48d30f2183122e2922ecf70fb7aee72cdf0b181`.
 
 <a id="traced-one-output-prefill-diagnostic"></a>
 <a id="current-single-round-v5"></a>
 <a id="archived-single-round-v5"></a>
 <a id="archived-multi-cohort-v4"></a>
 
-[Archived v4, v5, and one-output diagnostics](https://github.com/para1lel/sglang.cpp/blob/5ee79416d3e30cd178abab69598d047c4393793d/docs/performance.md#matched-k4-evidence) · [TP2 campaign record](serving/tp2.md#campaign-record)
+[Archived TP1 `c701d294` results and SSE replay](https://github.com/para1lel/sglang.cpp/blob/a5974ba4eb99bd8e8f890c2e7262a27dbc3aace1/docs/performance.md#matched-k4-evidence) · [Archived v4, v5, and one-output diagnostics](https://github.com/para1lel/sglang.cpp/blob/5ee79416d3e30cd178abab69598d047c4393793d/docs/performance.md#matched-k4-evidence) · [TP2 campaign record](serving/tp2.md#campaign-record)

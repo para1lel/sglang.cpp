@@ -1,6 +1,6 @@
-"""Check the current K4 budget, graph evidence, and W4-first qualification."""
-
 import json
+import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -103,3 +103,47 @@ def test_v4_rejects_graph_overrides_from_flags_or_environment():
             [*args, "--max-cudagraph-capture-size", "40"], environment)
     with pytest.raises(ValueError, match="graph launch or environment override"):
         defaults.verify_vllm_graph_launch(args, environment | {"VLLM_USE_BREAKABLE_CUDAGRAPH": "0"})
+
+
+@pytest.mark.parametrize("proxy", ["", "http://127.0.0.1:7890"])
+def test_v4_comparator_proxy_is_explicit_and_recorded(tmp_path, monkeypatch, proxy):
+    monkeypatch.setenv("PAIRED_VLLM_HTTP_PROXY", proxy)
+    monkeypatch.setenv("HTTP_PROXY", "http://inherited.invalid:9999")
+    monkeypatch.setenv("VLLM_USE_BREAKABLE_CUDAGRAPH", "1")
+    common = Path(__file__).with_name("common.sh")
+    script = r'''
+set -euo pipefail
+source "$1"
+seed_cache=$2/seed
+mkdir "$seed_cache"
+native_defaults=true cache_on=true context=2560 kv_bytes=10737418240 max_seqs=8
+client=(true) uv=/usr/bin/env python=/usr/bin/python3
+export CUDA_VISIBLE_DEVICES=0 CUDA_DEVICE_ORDER=PCI_BUS_ID
+start_group() {
+    local run=$1
+    shift
+    local environment=()
+    while [[ $1 != "$python" ]]; do
+        environment+=("$1")
+        shift
+    done
+    "${environment[@]}" /usr/bin/env -0 >"$run/live-environment.bin"
+}
+start_vllm "$2"
+'''
+    subprocess.run(["bash", "-c", script, "bash", str(common), str(tmp_path)],
+                   check=True, timeout=15)
+    live = dict(item.split(b"=", 1) for item in
+                (tmp_path / "live-environment.bin").read_bytes().split(b"\0") if item)
+    receipt = dict(line.split(b"=", 1) for line in
+                   (tmp_path / "effective-environment.txt").read_bytes().splitlines())
+    assert live == receipt
+    assert b"PAIRED_VLLM_HTTP_PROXY" not in live
+    assert b"VLLM_USE_BREAKABLE_CUDAGRAPH" not in live
+    keys = (b"http_proxy", b"https_proxy", b"all_proxy",
+            b"HTTP_PROXY", b"HTTPS_PROXY", b"ALL_PROXY")
+    if proxy:
+        assert all(live[key] == proxy.encode() for key in keys)
+        assert live[b"no_proxy"] == live[b"NO_PROXY"] == b"localhost,127.0.0.1,::1"
+    else:
+        assert all(key not in live for key in (*keys, b"no_proxy", b"NO_PROXY"))

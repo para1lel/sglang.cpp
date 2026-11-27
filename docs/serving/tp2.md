@@ -1,6 +1,6 @@
 # TP2 serving status and acceptance target
 
-`--tp` accepts 1 or 2 and defaults to 1. TP2 defaults to [eligible verification replay](../batch-graphs.md#tp2-target-verification-graph). `--eager` disables it. Ordinary TP2 decode is eager. Use `benchmarks/tp2/run.sh` for two-B200 campaigns. [TP option](../../apps/sglang-server.cpp#L168)<!-- prefix: "} else if (o" --> · [Graph policy](../../apps/sglang-server.cpp#L354)<!-- prefix: "arguments.ma" --> · [TP1 topology](../../include/sglang/runtime/server/batch_session.h#L15)<!-- prefix: "inline const" --> · [Launcher limit](../../benchmarks/paired/README.md#L71)<!-- prefix: "the number o" -->
+`--tp` accepts 1 or 2 and defaults to 1. TP2 defaults to [eligible verification replay](../batch-graphs.md#tp2-target-verification-graph). `--eager` disables it. Ordinary TP2 decode is eager. Use `benchmarks/tp2/run.sh` for two-B200 campaigns. [TP option](../../apps/sglang-server.cpp#L168)<!-- prefix: "} else if (o" --> · [Graph policy](../../apps/sglang-server.cpp#L354)<!-- prefix: "arguments.ma" --> · [TP1 topology](../../include/sglang/runtime/server/batch_session.h#L15)<!-- prefix: "inline const" --> · [Launcher limit](../../benchmarks/paired/README.md#L72)<!-- prefix: "the number o" -->
 
 TP2 with LMCache requires rank device receipts. The server derives one endpoint per rank from the base socket path. Each rank uses a private namespace and daemon. [Rank endpoints](../../include/sglang/runtime/cache/lmcache_client.h#L58)<!-- prefix: "std::string " --> · [Ranked transport](lmcache.md#ranked-tp2-transport)
 

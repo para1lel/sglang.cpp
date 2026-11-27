@@ -36,6 +36,7 @@ checks the fixture and request bytes. Both arms record resolved settings before 
 | `PAIRED_WARMUPS` / `PAIRED_MEASURED` | `1` / `1` for new depth-zero captures. |
 | `PAIRED_MAX_NUM_BATCHED_TOKENS` | `8192`. Any other explicit cap is exploratory or historical. The native range is 1–32768. With 32 sequences vLLM requires 32–32768. |
 | `PAIRED_VLLM_SEED_CACHE` | `$PAIRED_HOST_ROOT/cache/vllm-81a8cb063e62`, copied into each vLLM group's private cache. |
+| `PAIRED_VLLM_HTTP_PROXY` | Unset. Set to `http://127.0.0.1:7890` for comparator cubin downloads in matched K4 TP1 and TP2 runs. Local requests bypass the proxy. |
 | `PAIRED_VLLM_RESULTS` | Unset. Set the saved vLLM evidence root to request a verified same-device comparison. |
 | `PAIRED_COMPARISON_MODE` | `matched` when saved results are supplied. Use `frozen` with W3–W6 and no saved results for the published GPU2 reference. |
 | `PAIRED_CHECKPOINT_MANIFEST` | The saved `checkpoint.sha256` or `meta/checkpoint.sha256` in matched mode. Supply the published manifest explicitly in frozen mode. |

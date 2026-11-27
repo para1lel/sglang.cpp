@@ -35,7 +35,7 @@ curl --fail-with-body -N -X PUT http://127.0.0.1:17384/generate \
 
 The scalar request shapes above also accept prompt arrays. For indexed batches, supply `text: ["A", "B"]` or `input_ids: [[220], [32, 220]]`. Broadcast one `sampling_params` object or supply one per prompt, and optionally supply per-prompt `cache_salt` and `rid`. [Copyable batch JSON and SSE examples](https://github.com/para1lel/sglang.cpp/blob/6debe50edccdeda34ff307235ed38e74b6b8f2ee/docs/native-generate.md#runtime-path)
 
-The reader reserves IDs after queue admission. The worker validates and encodes all items before decoder admission. A batch shares one HTTP worker and [decoder scheduler](http-server.md#decode-scheduling). Multi-item batches submit in input order from lane zero, waiting at `--max-active`. One-item requests wait for their worker's lane. An item decoding alone can use [score-backed singleton attention](singleton-gqa-decode.md). [Lane selection](../apps/server/batch_service.cpp#L486)<!-- prefix: "void BatchSe" -->
+The worker validates and encodes every item before decoder admission. Multi-item batches submit in input order from lane zero, waiting at `--max-active`. The [shared scheduler](http-server.md#http-admission-and-shutdown) handles request IDs and lane selection. A lone decoding item can use [score-backed attention](singleton-gqa-decode.md). [Lane selection](../apps/server/batch_service.cpp#L486)<!-- prefix: "void BatchSe" -->
 
 ### Parallel sampling
 
@@ -47,9 +47,7 @@ Results are prompt-major. SSE uses `index = prompt_position * n + sample_positio
 
 ### JSON and SSE
 
-HTTP 200 JSON returns one object for scalar `n: 1` and an ordered array for indexed requests, including one-item batches.
-SSE opens [chunked HTTP 200](http-server.md#completion-streams) after admission or if all items were aborted while waiting. Indexed events can interleave and carry their zero-based result positions. Scalar `n: 1` omits `index`.
-[Indexed result](../apps/server/native_generate.cpp#L232)<!-- prefix: "std::string " --> · [Batch admission and polling](../apps/server/batch_service.cpp#L628)<!-- prefix: "bool BatchSe" -->
+JSON 200 returns an object for scalar `n: 1` and an ordered array for every indexed request. [SSE admission](http-server.md#completion-streams) opens a chunked HTTP 200. Indexed events can interleave and carry zero-based result positions; scalar `n: 1` omits `index`. [Indexed result](../apps/server/native_generate.cpp#L232)<!-- prefix: "std::string " --> · [Batch admission and polling](../apps/server/batch_service.cpp#L628)<!-- prefix: "bool BatchSe" -->
 
 | Field | Meaning |
 | --- | --- |
@@ -62,7 +60,7 @@ SSE opens [chunked HTTP 200](http-server.md#completion-streams) after admission 
 | `meta_info.finish_reason` | `null` on intermediate events. The final value records `length`, `stop` with a string or integer `matched`, or an [abort result](native-abort.md#runtime-path). |
 | `meta_info.cached_tokens` | Number of reused prompt IDs. Present on every batch result event and in every final object. Single-prompt intermediate events omit it. |
 
-Replace each item's text and IDs per event. Text can stay unchanged as IDs grow and cumulative events can use quadratic bytes. An item ends with one terminal object. A budget finish is `{"type":"length","length":N}`, including empty output at zero. A token-ID stop returns `{"type":"stop","matched":ID}` and counts the ID in `completion_tokens`, hiding its text by default. Successful streams send one `[DONE]`. Measure TTFT at the first output-ID event for each item. Zero-budget items have no sample. Any item frame resets the [keepalive timer](http-server.md#completion-streams). The writer runs outside the scheduler mutex, allowing other completions to advance. Eligible unindexed streams can use [bounded decode output](http-server.md#bounded-decode-output). [Batch result delivery](../apps/server/batch_service.cpp#L573)<!-- prefix: "bool BatchSe" -->
+Replace each item's text and IDs on every event. Text can stay fixed as IDs grow, and cumulative frames can use quadratic bytes. Each item has one terminal object. Budget finish is `{"type":"length","length":N}`, including zero. A token-ID stop returns `{"type":"stop","matched":ID}`, counts that ID, and hides its text by default. Use the shared [end marker, keepalive and TTFT rules](http-server.md#completion-streams). The writer runs outside the scheduler mutex. [Batch result delivery](../apps/server/batch_service.cpp#L573)<!-- prefix: "bool BatchSe" -->
 
 ### Text stops
 
@@ -70,7 +68,7 @@ Text stops inspect generated pieces including specials, regardless of `skip_spec
 
 The final finish is `{"type":"stop","matched":"…"}`. Rendered text trims at its first occurrence by default, or through it with `no_stop_trim: true`. If hiding specials removed the match, keep rendered text through the matching token. `skip_special_tokens: false` exposes those pieces. `no_stop_trim: true` also retains a matched ID’s text if its piece is visible. Prompt IDs never enter matching. Token logprob text decodes independently. Partial UTF-8 waits for its last byte, and invalid or flushed incomplete pieces become U+FFFD. Hold partial stop prefixes until safe so cumulative text never retracts, then release them at an unmatched finish. [UTF-8 assembly](../src/utf8.cpp#L77)<!-- prefix: "std::string " --> · [UTF-8 flush](../src/utf8.cpp#L110)<!-- prefix: "std::string " --> · [Text release](../apps/server/detail/text_stop.cpp#L102)<!-- prefix: "std::string " -->
 
-Unscored unconstrained scalar `n: 1` without text stops uses per-token callbacks. Indexed prompts and scalar text stops, scores, or constraints use step delivery, which can emit multiple MTP IDs. Positive-MTP buffering requires per-token delivery. K0 can also buffer eligible step streams. Indexed requests use ordinary readiness. [Dispatch](../apps/server/native_generate.cpp#L408)<!-- prefix: "} else if (!" --> · [Bounded delivery](http-server.md#bounded-decode-output)
+Unscored, unconstrained scalar `n: 1` without text stops uses per-token callbacks. Indexed requests or scalar text stops, scores, and constraints use steps, which can emit multiple MTP IDs. See [output buffering and K0 exceptions](http-server.md#bounded-decode-output). [Dispatch](../apps/server/native_generate.cpp#L408)<!-- prefix: "} else if (!" -->
 
 ### Token logprobs
 
@@ -91,9 +89,7 @@ Input scores use raw target distributions and can restore a [matching checkpoint
 
 ## Constraints and failure behavior
 
-Send HTTP/1.1 with `Content-Length` and `Content-Type: application/json`. The media type accepts case variation and requires an exact value without parameters.
-The shared reader enforces the [header and body limits](http-server.md#http-admission-and-shutdown).
-Send one JSON object. The parser rejects duplicate keys, nesting beyond 32 containers, and floating-point range errors.
+Use [HTTP/1.1 JSON framing and input limits](http-server.md#request-targets-and-redirects). Framing returns 411 for missing length or 415 for missing or unsupported media type. Send one object under the [shared JSON validation rules](text-serving.md#send-a-request).
 
 | Request field | Accepted values |
 | --- | --- |
@@ -136,33 +132,17 @@ Client compatibility fields accept only disabled values.
 Use `false` or null for `return_routed_experts`, and null for `lora_path`.
 Other fields return HTTP 400, including `model`, `messages`, and top-level sampling fields.
 
-| Result | Behavior |
-| --- | --- |
-| Invalid headers, JSON, request options, or duplicate live IDs | HTTP 400. |
-| Missing length or media type | HTTP 411 for missing `Content-Length`. HTTP 415 for missing or unsupported `Content-Type`. |
-| Oversized request | HTTP 413 for an oversized body. HTTP 431 for oversized headers. |
-| Decoder capacity failure | HTTP 413 if the request exceeds total [resident capacity](batch-graphs.md#resident-memory-admission). HTTP 503 if capacity is temporarily unavailable. |
-| Queue overload | HTTP 503. |
-| Unexpected failure before response headers | HTTP 500. This includes a tokenizer that cannot load. |
-
-Before response headers, an error returns the mapped HTTP status and one JSON body with `error.message`. A nonstreaming batch failure returns this error in place of the result array.
-After SSE opens, HTTP stays at 200. The worker attempts one SSE error event with `error.message: "Native decoder failed"`, `error.type: "server_error"`, `error.code: 500`, and `error.retryable: false`.
-The error event applies to the stream and has no item index. Previously delivered events remain visible, and the response closes without `[DONE]`.
-On a generation failure, disconnect, or failed write, the worker discards unsubmitted items, cancels the active jobs still owned by the batch, and waits for their retirement before releasing the slot.
-Cache checkpoints the daemon already acknowledged can remain available.
-The [cache reset exclusion](prefix-cache.md#native-http-controls) covers the whole claimed completion.
-[Batch cancellation](../apps/server/batch_service.cpp#L463)<!-- prefix: "void BatchSe" --> · [HTTP error mapping](../apps/server/prefix_controls.cpp#L178)<!-- prefix: "void handle_" --> · [SSE error writer](../apps/server/native_generate.cpp#L243)<!-- prefix: "void write_s" -->
+Use the [shared status and SSE rules](http-server.md#completion-streams). A pre-header failure substitutes JSON with `error.message` for the entire result. A tokenizer load failure returns 500. A post-header failure attempts one stream-wide error with no index, `error.message: "Native decoder failed"`, `error.type: "server_error"`, `error.code: 500`, and `error.retryable: false`. Already sent events remain visible. Generation failure, disconnect, or write failure drops unsubmitted items and cancels owned jobs through retirement. Acknowledged cache checkpoints can survive. The [reset exclusion](prefix-cache.md#native-http-controls) covers the complete HTTP claim. [Batch cancellation](../apps/server/batch_service.cpp#L463)<!-- prefix: "void BatchSe" --> · [HTTP error mapping](../apps/server/prefix_controls.cpp#L178)<!-- prefix: "void handle_" --> · [SSE error writer](../apps/server/native_generate.cpp#L243)<!-- prefix: "void write_s" -->
 
 The route matches the decoded `/generate` path and ignores its query. `/generate/` follows the [shared redirect rules](http-server.md#request-targets-and-redirects). After HTTP parsing, methods other than `POST` and `PUT` return HTTP 405 with `Allow: POST, PUT` and `{"detail":"Method Not Allowed"}`. For `HEAD`, the server sends only the headers. [Native route matcher](../apps/server/http.cpp#L388)<!-- prefix: "GenerateRout" --> · [Method response](../apps/server/http.cpp#L562)<!-- prefix: "void write_m" -->
 
-A disconnected client can cancel queued or active work through the [shared transport](http-server.md#http-admission-and-shutdown).
-Send [`POST /abort_request`](native-abort.md) from a second connection to cancel by ID.
+Cancel queued or active work with a disconnect or [`POST /abort_request`](native-abort.md) from a second connection.
 
 ## Verification
 
-On a reserved B200, compare both methods and JSON/SSE at one and two lanes. Check indexed and one-item shapes, stable IDs, cumulative output and usage, matching text and finishes, one terminal per item and one `[DONE]`. Test zero budget and an explicit first-ID stop. Reject malformed JSON, both prompt fields, wrong sampling-array length and invalid later items before headers. Check PUT 411/415 and HEAD 405 with `Allow: POST, PUT`.
+On a reserved B200, verify POST and PUT with JSON/SSE at one and two lanes. Check indexed and singleton shape, stable IDs, cumulative fields, matching text, finishes and usage, one terminal per item, and one successful `[DONE]`. Include zero budget, first-ID stop, malformed JSON, both prompt fields, wrong option array length and invalid later items before headers. Check PUT 411/415 and HEAD 405 with `Allow: POST, PUT`. Apply the [stream end and failure checks](http-server.md#verification).
 
-Compare generated scores at K0 and positive depth for top zero/three, both text settings, prompt offsets, mixed lanes, empty output and stop IDs. Reject invalid offsets, requested-ID scoring, and active sampling. Run the independent full-vocabulary comparison in managed Pixi.
+Compare scores at K0 and positive MTP for top zero/three, both text settings, prompt offsets, mixed lanes, empty output and stop IDs. Reject invalid offsets, requested-ID scoring, and active sampling. Run the full-vocabulary oracle in managed Pixi.
 
 ```bash
 checkpoint=/data0/shared/Qwen3.8-27B-FP8
@@ -183,6 +163,6 @@ CUDA_VISIBLE_DEVICES='' python3 -B tests/text/test_native_text_stops_cpu.py \
     --binary "$out/server" --checkpoint "$checkpoint" --output "$out/text-stop-evidence"
 ```
 
-The score fixture also checks token text, mixed opt-in, abort, and greedy `top_k: 1` at positive temperature. For text stops, cover single tokens, token boundaries, and UTF-8 pieces. Reverse competing matches in one step, and check hidden partials, incomplete UTF-8 at length, discarded speculative IDs and usage, indexed stops, broadcast with `ignore_eos: true`, and lane reuse. Reject nested stop arrays. Check [transport admission, keepalives, and cancellation](http-server.md#verification). Require the mapped JSON error for pre-admission failure. After an item event, require HTTP 200, one SSE error, and closure without `[DONE]`. Disconnect with an unsubmitted item and confirm cancellation, retirement, and reuse.
+The CPU score fixture also covers token text, mixed opt-in, abort, and greedy `top_k: 1` at positive temperature. The stop fixture must cover token and UTF-8 boundaries, reversed matches, hidden partials and incomplete UTF-8 at length, speculative cutoff with exact usage, indexed and broadcast matching with `ignore_eos: true`, nested-list rejection and lane reuse. Check [transport admission and errors](http-server.md#verification). After an item, require HTTP 200, one native stream error and closure without `[DONE]`. Disconnect with an unsubmitted item and require cancellation, retirement and reuse.
 
 [Full verification appendix](https://github.com/para1lel/sglang.cpp/blob/572627c81b89b1c75c7bcda1c2e9c23a4c8e95f6/docs/native-generate.md#verification)

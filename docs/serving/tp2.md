@@ -49,6 +49,8 @@ One host thread enqueues both ranks in order. Each rank reserves 536,870,912 byt
 
 [Frozen NCCL and two-shot replay](https://github.com/para1lel/sglang.cpp/blob/a5974ba4eb99bd8e8f890c2e7262a27dbc3aace1/docs/serving/tp2.md#two-rank-allreduce-transport)
 
+[Archived eager W1 verifier](https://github.com/para1lel/sglang.cpp/blob/a5974ba4eb99bd8e8f890c2e7262a27dbc3aace1/benchmarks/tp2/verify_transport.py#L194)<!-- prefix: "if __name__ " --> compares one-shot MNNVL with forced NCCL using the original run, fixtures, trace, and executable and daemon receipts.
+
 ### Verification reduction fusion
 
 TP2 fuses one-shot MNNVL, RMSNorm, and quantization for ten packed verification rows or [eligible eager singletons](../batch-graphs.md#eager-tp2-singleton-verification). Both ranks need aligned 5,120-wide operands and ten resident blocks per GPU. Clean declines use ordinary collectives and local preparation. Eligible [M10 graph replay](../batch-graphs.md#tp2-target-verification-graph) retains fusion. Ordinary joined capture used MNNVL at ten rows and NCCL at 52. [Selection](../../src/runtime/execution/decoder_forward_tp.cpp#L52)<!-- prefix: "struct TpRed" --> · [Capture](../../src/runtime/backend/tensor_parallel.cpp#L490)<!-- prefix: "bool TensorP" --> · [Preflight](../../src/runtime/backend/mnnvl_ar.cu#L861)<!-- prefix: "bool MnnvlAl" -->

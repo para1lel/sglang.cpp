@@ -25,7 +25,7 @@ Verification preserves BF16 rounding, E4M3 activations and FP32 scales. Compact 
 | Four-lane packets | Pack 6–20 rows. Through 20 rows use 8/16/32 MMA columns. |
 | [wide K4 verification](mtp.md#target-round) | With adequate scratch, M40/M80/M160 use 48/80/160 columns and 4/4/3 slots. M40 gate/up uses 64 columns; M40 can fall back to 64 columns. Split epilogues sum K groups and ranks in FP32 order and round once to BF16. [Compact arithmetic](../src/text/decode_proj_fp8.cu#L94)<!-- prefix: "template \u003cbo" --> |
 
-Wide fallback tries 40, 20, then ≤5 rows. Pending/recorded CUDA errors propagate, except optional setup reporting no status with only recorded `cudaErrorNotSupported`. [Wide dispatch](../src/text/decode_proj_fp8.cu#L616)<!-- prefix: "if (count ==" -->
+Wide fallback tries 40, 20, then ≤5 rows. Pending/recorded CUDA errors propagate, except optional setup reporting no status with only recorded `cudaErrorNotSupported`. [Wide dispatch](../src/text/decode_proj_fp8.cu#L618)<!-- prefix: "if (count ==" -->
 
 Stream-owned scratch is 87,040 B/lane (up to 2,785,280 B). Eight TP2 lanes reserve 696,320 B with 409,600 live for depth scoring. Setup failure leaves ordinary draft packets. Resident shortage or allocation OOM reduces width and replans against the 2 GiB shared reserve. Other CUDA errors propagate. [Scratch reserve](../src/decoder_batch.cpp#L478)<!-- prefix: "bool Decoder" --> · [Width downgrade](../src/decoder_batch.cpp#L508)<!-- prefix: "WideMtpGroup" -->
 

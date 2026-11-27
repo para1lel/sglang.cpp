@@ -179,12 +179,11 @@ std::optional<cudaError_t> prefill_bf16_gdn_gates_sm100(
     if (*prepared != cudaSuccess) return take_launch_status(*prepared);
     constexpr int shared_bytes = copy_stages * stage_bytes<columns>;
     int shared_limit = 0;
-    constexpr int smem_slot = Channels == text_gdn_value_heads ? 19 : 18;
     const void* kernel = reinterpret_cast<const void*>(project_gdn_gate_partials<Channels>);
-    const auto configured = configure(kernel, smem_slot, target.device, shared_limit);
+    const auto configured = configure(kernel, target.device, shared_limit);
     if (configured != cudaSuccess) return take_launch_status(configured);
     if (shared_limit < shared_bytes) return std::nullopt;
-    alignas(64) CUtensorMap maps[3];
+    CUtensorMap maps[3];
     auto encoded = encode_gate_map(target, maps[0], weight_b, Channels, tile_rows / 2);
     if (encoded == CUDA_SUCCESS) {
         encoded = encode_gate_map(target, maps[1], weight_a, Channels, tile_rows / 2);

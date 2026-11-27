@@ -160,9 +160,8 @@ SplitPlan compute_plan(const void* kernel, const LaunchTarget& target, int row_b
 
 }
 
-cudaError_t plan_splits(const void* kernel, int slot, const LaunchTarget& target,
-                        int row_blocks, int k_blocks, int fixed_bytes, int bytes_per_block,
-                        SplitPlan& plan) {
+cudaError_t plan_splits(const void* kernel, const LaunchTarget& target, int row_blocks,
+                        int k_blocks, int fixed_bytes, int bytes_per_block, SplitPlan& plan) {
     std::lock_guard lock(plan_mutex);
     for (const auto& entry : plan_cache) {
         if (entry.kernel == kernel && entry.device == target.device &&
@@ -172,7 +171,7 @@ cudaError_t plan_splits(const void* kernel, int slot, const LaunchTarget& target
         }
     }
     int limit = 0;
-    const auto status = configure(kernel, slot, target.device, limit);
+    const auto status = configure(kernel, target.device, limit);
     if (status != cudaSuccess) {
         return status;
     }
@@ -184,27 +183,33 @@ cudaError_t plan_splits(const void* kernel, int slot, const LaunchTarget& target
 std::optional<cudaError_t> prepare_gate_cluster(const void* kernel, const LaunchTarget& target,
                                                 int clusters, int shared_bytes) {
     static std::mutex mutex;
-    static int resident[max_devices]{};
+    struct Residency {
+        const void* kernel;
+        int shared_bytes;
+        int active_ctas;
+    };
+    static Residency resident[max_devices]{};
     if (static_cast<unsigned>(target.device) >= max_devices) return cudaErrorInvalidDevice;
     std::lock_guard lock(mutex);
-    auto& active_ctas = resident[target.device];
-    if (active_ctas == 0) {
+    auto& entry = resident[target.device];
+    if (entry.kernel != kernel || entry.shared_bytes != shared_bytes) {
         int cluster_launch = 0;
         auto status = cudaDeviceGetAttribute(&cluster_launch, cudaDevAttrClusterLaunch,
                                              target.device);
         if (status != cudaSuccess) return status;
         if (!cluster_launch) {
-            active_ctas = -1;
+            entry = {kernel, shared_bytes, -1};
             return std::nullopt;
         }
         int limit = 0;
-        status = configure(kernel, 20, target.device, limit);
+        status = configure(kernel, target.device, limit);
         if (status != cudaSuccess) return status;
-        active_ctas = shared_bytes <= limit
-            ? resident_ctas(kernel, 2, shared_bytes, target.sm_count) : 0;
-        if (active_ctas == 0) active_ctas = -1;
+        const int active_ctas =
+            shared_bytes <= limit ? resident_ctas(kernel, 2, shared_bytes, target.sm_count) : 0;
+        entry = {kernel, shared_bytes, active_ctas};
     }
-    if (active_ctas < 2 * clusters) return std::nullopt;
+    if (entry.active_ctas < 2 * clusters)
+        return std::nullopt;
     return cudaSuccess;
 }
 
@@ -246,16 +251,21 @@ cudaError_t launch_split(const void* kernel, dim3 grid, int shared_bytes, void**
     return cudaLaunchKernelExC(&config, kernel, args);
 }
 
-cudaError_t configure(const void* kernel, int slot, int device, int& limit) {
+cudaError_t configure(const void* kernel, int device, int& limit) {
+    struct KernelLimit {
+        const void* kernel;
+        int bytes;
+    };
     static std::mutex mutex;
-    constexpr unsigned slot_count = 23;
-    static int limits[max_devices][slot_count] = {};
-    if (static_cast<unsigned>(slot) >= slot_count) return cudaErrorInvalidValue;
+    static std::vector<KernelLimit> limits[max_devices];
     if (static_cast<unsigned>(device) >= max_devices) return cudaErrorInvalidDevice;
     std::lock_guard lock(mutex);
-    if (limits[device][slot] > 0) {
-        limit = limits[device][slot];
-        return cudaSuccess;
+    auto& entries = limits[device];
+    for (const auto& entry : entries) {
+        if (entry.kernel == kernel) {
+            limit = entry.bytes;
+            return cudaSuccess;
+        }
     }
     int optin = 0;
     auto status = cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
@@ -268,11 +278,10 @@ cudaError_t configure(const void* kernel, int slot, int device, int& limit) {
         status = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, limit);
     }
     if (status == cudaSuccess) {
-        limits[device][slot] = limit;
+        entries.push_back({kernel, limit});
     }
     return status;
 }
-
 }
 
 }

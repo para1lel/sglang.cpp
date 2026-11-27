@@ -1,6 +1,6 @@
 # TP2 serving status and acceptance target
 
-`--tp` accepts 1 or 2 and defaults to 1. TP2 defaults to [eligible verification replay](../batch-graphs.md#tp2-target-verification-graph). `--eager` disables it. Ordinary TP2 decode is eager. Use `benchmarks/tp2/run.sh` for two-B200 campaigns. [TP option](../../apps/sglang-server.cpp#L168)<!-- prefix: "} else if (o" --> · [Graph policy](../../apps/sglang-server.cpp#L354)<!-- prefix: "arguments.ma" --> · [TP1 topology](../../include/sglang/runtime/server/batch_session.h#L15)<!-- prefix: "inline const" --> · [Launcher limit](../../benchmarks/paired/README.md#L72)<!-- prefix: "the number o" -->
+`--tp` accepts 1 or 2 and defaults to 1. TP2 defaults to [eligible verification replay](../batch-graphs.md#tp2-target-verification-graph). `--eager` disables it. Ordinary TP2 decode is eager. Use `benchmarks/tp2/run.sh` for two-B200 campaigns. [TP option](../../apps/sglang-server.cpp#L168)<!-- prefix: "} else if (o" --> · [Graph policy](../../apps/sglang-server.cpp#L354)<!-- prefix: "arguments.ma" --> · [TP1 topology](../../include/sglang/runtime/server/batch_session.h#L15)<!-- prefix: "inline const" --> · [TP1 launcher limit](../../benchmarks/paired/run_k4.sh#L75-L78)<!-- prefix: "if [[ ! $ind" -->
 
 TP2 uses one node-local LMCache daemon, socket and namespace across both ranks. Each rank still needs independent device and transfer receipts. [Ranked transport](lmcache.md#ranked-tp2-transport)
 
@@ -8,7 +8,7 @@ Both ranks own target workers and store 16,896 target KV bytes per token per ran
 
 ## Campaign record
 
-The archived `e912b39b` campaign (`6f7754f4-b4f7-4e0b-acb1-ea2f8df74e73`) passed W1–W3 at 1.0474×, 1.0117×, and 1.0639×. W4 took 29.046274476 s native and 25.335314580 s vLLM (1.146473804×), so the campaign stopped before W5. Both arms completed all sixteen W4 requests. Native stored eighty checkpoints per rank for W4, with zero restores or I/O errors. [Frozen results, identities, and receipts](https://github.com/para1lel/sglang.cpp/blob/a5974ba4eb99bd8e8f890c2e7262a27dbc3aace1/docs/serving/tp2.md#campaign-record)
+On `7394130`, all five TP2 rows passed. Native/vLLM makespan ratios for W1–W5 were 0.88024×, 0.61236×, 1.00232×, 1.06919×, and 1.03767×. Native used one LMCache daemon with a 128 GiB CPU L1. Measured W4 and W5 stored 80 and 136 checkpoints per rank, respectively. The campaign `comparison.json` has SHA-256 `0fca3af708b54d7bfd37629853c993edb86d7e67b410cafd9149e3df6d9733fa`. [PR #3 campaign evidence](https://github.com/para1lel/sglang.cpp/pull/3) · [Archived `e912b39b` campaign](https://github.com/para1lel/sglang.cpp/blob/a5974ba4eb99bd8e8f890c2e7262a27dbc3aace1/docs/serving/tp2.md#campaign-record)
 
 <a id="w4-wide-verification-release"></a>
 <a id="w1-diagnostic-profile"></a>

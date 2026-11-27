@@ -1,5 +1,4 @@
 import copy
-import gzip
 import json
 import statistics
 import threading
@@ -13,9 +12,7 @@ from benchmarks.concurrent import client
 from benchmarks.concurrent.client import (
     capture_cohort, gate, summarize, thresholds, validate_cohort,
 )
-from benchmarks.concurrent.profile import GDN_DECODE, GDN_PREFILL_PREFIX, inspect_events
 from benchmarks.concurrent.reference import ROWS, digest, goldens, lane_manifest, reference
-from benchmarks.concurrent.replay import replay_cohort
 from benchmarks.streaming.client import json_bytes, request_body
 
 
@@ -99,8 +96,8 @@ def captured():
     return raw, lanes, [[1, 2, 3]] * 2, policy
 
 
-def test_overlapping_streams_and_round_replay(captured, tmp_path):
-    raw, lanes, expected, policy = captured
+def test_overlapping_streams_and_timing(captured):
+    raw, lanes, _, policy = captured
     report = validate_cohort(raw, lanes, policy)
     assert report["submission_span_ms"] < 50
     assert report["all_streams_overlap_ms"] > 0
@@ -112,17 +109,6 @@ def test_overlapping_streams_and_round_replay(captured, tmp_path):
     for record in records:
         assert [count for _, count in record["token_chunks"]] == [2, 1]
         assert record["metrics"]["tpot_ms"] == (record["last_ns"] - record["first_ns"]) / 2e6
-    (tmp_path / "W3").mkdir()
-    path = "W3/measured-01.json.gz"
-    compressed = gzip.compress(json_bytes(raw), mtime=0)
-    (tmp_path / path).write_bytes(compressed)
-    _, replay = replay_cohort(tmp_path, {path: digest(compressed)}, "W3", "measured-01",
-                              lanes, expected, policy)
-    assert replay == report
-    (tmp_path / path).write_bytes(compressed[:-1])
-    with pytest.raises(ValueError, match="evidence digest"):
-        replay_cohort(tmp_path, {path: digest(compressed)}, "W3", "measured-01",
-                      lanes, expected, policy)
 
 
 def test_prefix_cohort_replays_one_token_and_checks_cache_range():
@@ -184,20 +170,15 @@ def test_rejects_missing_done_and_submission_skew(captured):
         validate_cohort(raw, lanes, policy | {"max_submission_span_ms": -1})
 
 
-def test_cross_engine_wire_accepts_different_ids_and_vllm_replay_rejects(captured, tmp_path):
+def test_cross_engine_wire_accepts_different_ids_but_same_engine_rejects(captured):
     raw, lanes, expected, policy = captured
     original = validate_cohort(raw, lanes, policy)
     first = raw["requests"][0]
     mutate_payload(first, 1, "token_ids", [1, 99])
     first["output_ids"][1] = 99
     assert validate_cohort(raw, lanes, policy) == original
-    (tmp_path / "W3").mkdir()
-    path = "W3/measured-01.json.gz"
-    compressed = gzip.compress(json_bytes(raw), mtime=0)
-    (tmp_path / path).write_bytes(compressed)
-    with pytest.raises(ValueError, match="greedy mismatch at output index 1"):
-        replay_cohort(tmp_path, {path: digest(compressed)}, "W3", "measured-01",
-                      lanes, expected, policy)
+    with pytest.raises(ValueError, match="output 1 differs from warmup"):
+        client.verify_round_ids(raw, expected)
 
 
 def test_wire_accepts_optional_openai_envelope(captured):
@@ -236,37 +217,6 @@ def test_rate_margin_and_independent_latency_budgets():
     assert gate(stats, limits) == {
         "throughput": False, "latency": {"ttft_ms": True, "tpot_ms": True, "e2e_ms": True},
     }
-
-
-def trace_event(category, name):
-    return {"ph": "X", "cat": category, "name": name}
-
-
-@pytest.mark.parametrize("phase", ["prefill", "decode"])
-def test_profile_route_and_negative_controls(phase):
-    trt = "fmhaSm100aKernel_QBfloat16KvE4m3OBfloat16H256PagedKvCausalP64ForGen"
-    fa2 = ("void flashinfer::BatchPrefillWithPagedKVCacheKernel<1, __nv_bfloat16,"
-           " __nv_fp8_e4m3, __nv_bfloat16, float, int, 2>")
-    prefill = phase == "prefill"
-    label = "execute_context_1(8192)_generation_0(0)" if prefill else (
-        "execute_context_0(0)_generation_4(4)"
-    )
-    attention, gdn = (fa2, GDN_PREFILL_PREFIX + ">") if prefill else (trt, GDN_DECODE)
-    events = ([trace_event("user_annotation", label)] * 4
-              + [trace_event("cuda_runtime", "cudaGraphLaunch")] * 4
-              + [trace_event("kernel", attention)] * 64 + [trace_event("kernel", gdn)] * 192)
-    assert inspect_events(events, phase, 4, 8192)["graph_launches"] == 4
-    wrong = attention.replace("__nv_fp8_e4m3", "__nv_bfloat16").replace("KvE4m3", "KvBF16")
-    with pytest.raises(ValueError, match="Unrecognized attention"):
-        inspect_events(events + [trace_event("kernel", wrong)], phase, 4, 8192)
-    with pytest.raises(ValueError, match="CUDA graph activity"):
-        inspect_events([event for event in events if event["cat"] != "cuda_runtime"],
-                       phase, 4, 8192)
-    with pytest.raises(ValueError, match="kernel counts"):
-        inspect_events(events[:-1], phase, 4, 8192)
-    if not prefill:
-        with pytest.raises(ValueError, match="full batch"):
-            inspect_events(events, phase, 16, 8192)
 
 
 def test_portable_goldens_and_condition_identity():

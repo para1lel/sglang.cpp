@@ -94,15 +94,12 @@ retains the original files and output under `artifacts/workload-baselines/run.un
 
 ## Run
 
-Use the pinned environment created by `benchmarks/vllm/setup.sh`. In the
-checkout run `GPU=3 bash benchmarks/streaming/run_vllm.sh`. Keep the selected
-UUID available for later native timing. The launcher uses a UUID lock in that
-environment, copies its inputs, checks the checkpoint and wheel identities,
-and keeps the server bound to loopback. It uses the normal vLLM graph policy,
-an explicit FlashInfer BF16 query policy, E4M3 KV, and BF16/FP32 GDN state.
-The RPC reads live tensor metadata and scales before warmup. The wrapper also
-collects one untimed dispatch profile per workload. Use `--probe W1` or
-`--probe W2` to run a direct client probe against an already running endpoint.
+Use the [archived GPU3 capture procedure](https://github.com/para1lel/sglang.cpp/blob/acbf95b0de14108b37c37bdc3dc40daaf2db2099/benchmarks/streaming/README.md#run) for the original launcher and its W1 and W2 probes.
+That procedure uses the pinned vLLM environment, a UUID lock, checkpoint
+and wheel identity checks, and a loopback server. It enables the normal
+vLLM graph policy, FlashInfer BF16 queries, E4M3 KV, and BF16/FP32 GDN state.
+It reads live tensor metadata and scales before warmup and collects one
+untimed dispatch profile per workload.
 
 For a native server with the wire contract, run
 the checkout client under the same device and host controls. The compact

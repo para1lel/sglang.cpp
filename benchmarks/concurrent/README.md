@@ -136,11 +136,8 @@ original launcher used `concurrent_observer.py` and seeded its cache from the ea
 W1/W2 run. Repeating that setup requires the original launcher and observer from a
 separate copy of the capture sources and the W1/W2 seed cache.
 
-```sh
-mkdir -p "$EXTRACTED"
-tar -xzf "$BUNDLE" -C "$EXTRACTED"
-python -B -m benchmarks.concurrent.replay "$EXTRACTED"
-```
+Extract and verify the bundle using the [archived offline replay procedure](https://github.com/para1lel/sglang.cpp/blob/acbf95b0de14108b37c37bdc3dc40daaf2db2099/benchmarks/concurrent/README.md#provenance-and-offline-replay).
+Run the checker from that revision and pass it the extracted bundle directory.
 
 Replay checks raw cohort and trace digests, exact requests and outputs, overlap,
 latencies, full-precision gate arithmetic, and scheduler and kernel dispatch. The

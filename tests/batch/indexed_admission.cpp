@@ -311,15 +311,6 @@ void check_singleton_owner(const Decoder& decoder) {
 
 namespace sglang {
 
-struct Decoder::Model {};
-#define SGLANG_TEST_TP_HEADER "sglang/runtime/execution/decoder_tp.h"
-#if __has_include(SGLANG_TEST_TP_HEADER)
-struct Decoder::TpRuntime {};
-const decoder::TpRuntimeInfo* Decoder::tensor_parallel_info() const { return nullptr; }
-#endif
-Decoder::Decoder(const std::filesystem::path&, int, bool) {}
-Decoder::~Decoder() = default;
-
 std::string_view Tokenizer::piece(TokenId, bool) const { std::abort(); }
 
 struct DecoderBatch::State {
@@ -346,11 +337,7 @@ int DecoderBatch::admit_multimodal(int, std::vector<int>, const DecoderOptions&,
 
 void DecoderBatch::cancel(int) {}
 bool DecoderBatch::available() const { return true; }
-std::size_t DecoderBatch::request_device_allocation_bytes() const { return 0; }
-DecoderPrefixCacheStats DecoderBatch::prefix_cache_stats() const { return {}; }
-DecoderBatchPrefixUpdate DecoderBatch::poll_prefix(int) { std::abort(); }
 void DecoderBatch::reset_prefix_cache() {}
-void DecoderBatch::release_retired_allocations() {}
 
 std::array<DecoderBatchStep, decoder_batch_max_lanes>
 DecoderBatch::advance_chunked(const std::array<bool, decoder_batch_max_lanes>& selected,

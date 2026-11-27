@@ -216,15 +216,6 @@ extern "C" int __wrap_pthread_cond_timedwait(pthread_cond_t* condition, pthread_
 
 namespace sglang {
 
-struct Decoder::Model {};
-#define SGLANG_TEST_TP_HEADER "sglang/runtime/execution/decoder_tp.h"
-#if __has_include(SGLANG_TEST_TP_HEADER)
-struct Decoder::TpRuntime {};
-const decoder::TpRuntimeInfo* Decoder::tensor_parallel_info() const { return nullptr; }
-#endif
-Decoder::Decoder(const std::filesystem::path&, int, bool) {}
-Decoder::~Decoder() = default;
-
 struct DecoderBatch::State {
     std::array<int, width> emitted{};
 };
@@ -252,16 +243,10 @@ int DecoderBatch::admit_multimodal(int, std::vector<int>, const DecoderOptions&,
 
 void DecoderBatch::cancel(int) { std::abort(); }
 bool DecoderBatch::available() const { return true; }
-std::size_t DecoderBatch::request_device_allocation_bytes() const { return 0; }
-DecoderPrefixCacheStats DecoderBatch::prefix_cache_stats() const { return {}; }
-DecoderBatchPrefixUpdate DecoderBatch::poll_prefix(int) { std::abort(); }
-
 void DecoderBatch::reset_prefix_cache() {
     std::lock_guard lock(fixture.mutex);
     ++fixture.resets;
 }
-
-void DecoderBatch::release_retired_allocations() {}
 
 Steps DecoderBatch::advance_chunked(const Selection& selected, DecoderBatchStepStats*) {
     Mask selection = 0;

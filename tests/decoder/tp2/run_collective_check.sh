@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if (( $# < 3 || $# > 4 )) || [[ $1 == "$2" || ( $# == 4 && $4 != --require-mnnvl ) ]]; then
-    echo "Usage: bash $0 GPU_UUID GPU_UUID TP2_COLLECTIVE_CHECK [--require-mnnvl]" >&2
+mode=${4:-}
+if (( $# < 3 || $# > 4 )) || [[ $1 == "$2" ||
+    ( $# == 4 && $mode != --require-mnnvl && $mode != --require-nccl ) ]]; then
+    echo "Usage: bash $0 GPU_UUID GPU_UUID TP2_COLLECTIVE_CHECK" \
+        "[--require-mnnvl|--require-nccl]" >&2
     exit 2
 fi
 first=$1

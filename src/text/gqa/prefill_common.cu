@@ -143,6 +143,7 @@ template <typename Real, bool recover_scores>
 __device__ __inline_hint__ int ordered_attention(OrderedTile<Real>& shared, Attention request,
                                                   int row_index, int query_head, int invalid) {
     const int channel = threadIdx.x;
+    const bool active = channel < channels;
     const int warp = channel / mxfp8_group_size;
     const int lane = channel % mxfp8_group_size;
     const int kv_head = query_head / ratio;
@@ -150,12 +151,14 @@ __device__ __inline_hint__ int ordered_attention(OrderedTile<Real>& shared, Atte
     const int last = request.position + row_index;
     const auto cache = request.cache;
     float query[ordered_heads][mxfp8_groups];
+    if (active) {
     #pragma unroll
-    for (int head = 0; head < ordered_heads; ++head) {
-        #pragma unroll
-        for (int group = 0; group < mxfp8_groups; ++group) {
-            const auto offset = row + head * channels + group * mxfp8_group_size + lane;
-            query[head][group] = __bfloat162float(request.queries[offset]);
+        for (int head = 0; head < ordered_heads; ++head) {
+    #pragma unroll
+            for (int group = 0; group < mxfp8_groups; ++group) {
+                const int query_channel = (head * channels) + (group * mxfp8_group_size) + lane;
+                query[head][group] = __bfloat162float(request.queries[row + query_channel]);
+            }
         }
     }
     Real maximum = -CUDART_INF_F;
@@ -170,7 +173,7 @@ __device__ __inline_hint__ int ordered_attention(OrderedTile<Real>& shared, Atte
         const auto scale = scale_offset(cache.kv_heads, page, token, kv_head);
         const int payload_stride = cache.kv_heads * channels;
         constexpr int scale_stride = (mxfp8_page_size / mxfp8_group_size) * mxfp8_groups;
-        for (int index = warp; index < count; index += channels / mxfp8_group_size) {
+        for (int index = warp; active && index < count; index += channels / mxfp8_group_size) {
             Real dot[ordered_heads]{};
             #pragma unroll
             for (int group = 0; group < mxfp8_groups; ++group) {
@@ -198,16 +201,19 @@ __device__ __inline_hint__ int ordered_attention(OrderedTile<Real>& shared, Atte
             ordered_weights<recover_scores>(shared, warp, lane, count, maximum, invalid_score);
         }
         __syncthreads();
-        #pragma unroll 4
-        for (int index = 0; index < count; ++index) {
-            const Real value = ordered_decode(
-                cache.value_payload[payload + index * payload_stride + channel],
-                cache.value_scales[scale + index * scale_stride + warp]);
-            #pragma unroll
-            for (int head = 0; head < ordered_heads; ++head) {
-                weighted_value[head] =
-                    fma(shared.token_weight[head][index], value,
-                        shared.history_weight[head][index] * weighted_value[head]);
+        if (active) {
+    #pragma unroll 4
+            for (int index = 0; index < count; ++index) {
+                const int value_index = (index * payload_stride) + channel;
+                const int scale_index = (index * scale_stride) + warp;
+                const Real value = ordered_decode(cache.value_payload[payload + value_index],
+                                                  cache.value_scales[scale + scale_index]);
+    #pragma unroll
+                for (int head = 0; head < ordered_heads; ++head) {
+                    weighted_value[head] =
+                        fma(shared.token_weight[head][index], value,
+                            shared.history_weight[head][index] * weighted_value[head]);
+                }
             }
         }
         if (warp < ordered_heads && lane == 0) {
@@ -222,7 +228,9 @@ __device__ __inline_hint__ int ordered_attention(OrderedTile<Real>& shared, Atte
             break;
         }
     }
-    int failed = store_ordered(request, row, channel, weighted_value, shared.denominator, invalid);
+    int failed =
+        active ? store_ordered(request, row, channel, weighted_value, shared.denominator, invalid)
+               : 0;
     if constexpr (recover_scores) {
         failed |= score_recovery_mask<ordered_heads>(warp, lane, invalid_score);
     }

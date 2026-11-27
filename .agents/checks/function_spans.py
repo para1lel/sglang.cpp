@@ -9,6 +9,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from native_tokens import normalize_include_predicates
 from tool_process import invoke
 from tree_sitter import Language, Parser, Query, QueryCursor
 
@@ -29,6 +30,10 @@ SPAN_QUERIES = {
     "cpp": "[(function_definition) (lambda_expression)] @function",
     "cuda": "[(function_definition) (lambda_expression)] @function",
     "lua": "[(function_definition) (function_declaration)] @function",
+}
+DECLARATION_CLAUSES = {
+    "delete_method_clause": ["=", "delete", ";"],
+    "pure_virtual_clause": ["=", ";"],
 }
 HEADER_QUERY = """
     [(function_definition) (lambda_expression)] @definition
@@ -123,11 +128,11 @@ def present_tokens(node):
     return [token.type for token in node.children if not token.is_extra and not token.is_missing]
 
 
-def deleted_method(node: Node) -> bool:
+def declaration_clause(node: Node) -> bool:
     return any(
-        child.type == "delete_method_clause"
+        child.type in DECLARATION_CLAUSES
         and not child.has_error
-        and present_tokens(child) == ["=", "delete", ";"]
+        and present_tokens(child) == DECLARATION_CLAUSES[child.type]
         for child in node.named_children
     )
 
@@ -136,7 +141,7 @@ def header_findings(
     parser: Parser, root: Node
 ) -> tuple[dict[str, list[Node]], list[Node], int | None]:
     matches = captures(parser, root, HEADER_QUERY)
-    definitions = [node for node in matches.get("definition", ()) if not deleted_method(node)]
+    definitions = [node for node in matches.get("definition", ()) if not declaration_clause(node)]
     valid_deletes = set()
     for declaration in matches.get("initialized", ()):
         value = declaration.child_by_field_name("value")
@@ -322,9 +327,19 @@ def expand_macros(path: Path, repository: Path, source: bytes) -> tuple[bytes, l
     return b"".join(lines), original_rows
 
 
+def parse_include_predicates(parser: Parser, root: Node, grammar: str) -> Node:
+    if not root.has_error or grammar not in {"c", "cpp", "cuda"}:
+        return root
+    source = root.text
+    normalized = normalize_include_predicates(source, "c23" if grammar == "c" else "c++23")
+    return parser.parse(normalized).root_node if normalized != source else root
+
+
 def scan_header(path, parser, repository=None):
     repository = Path.cwd() if repository is None else repository.resolve()
-    root = parse_source(path, parser, repository)
+    preprocessor_source = parse_source(path, parser, repository)
+    grammar = GRAMMARS[path.suffix.lower()]
+    root = parse_include_predicates(parser, preprocessor_source, grammar)
     matches, direct, error = header_findings(parser, root)
     definitions = [function_span(node)["start"] for node in direct]
     for value in matches.get("replacement", ()):
@@ -334,11 +349,10 @@ def scan_header(path, parser, repository=None):
         or error is not None
         or any(included_header(node, path, repository) for node in matches.get("include", ()))
     ):
-        expanded, rows = expand_macros(path, repository, root.text)
+        expanded, rows = expand_macros(path, repository, preprocessor_source.text)
         if expanded:
             _, indirect, _ = header_findings(parser, parser.parse(expanded).root_node)
             definitions.extend(rows[function_span(node)["start"] - 1] for node in indirect)
-    grammar = GRAMMARS[path.suffix.lower()]
     measured = [function_span(node) for node in function_nodes(root, parser, grammar)]
     return definitions, measured, error
 
@@ -352,6 +366,7 @@ def spans(path):
             return measured
     else:
         root = parse_source(path, parser, Path.cwd())
+        root = parse_include_predicates(parser, root, grammar)
         if not root.has_error:
             return [function_span(node) for node in function_nodes(root, parser, grammar)]
     raise ValueError(f"{path}: invalid {grammar} syntax or unsupported grammar construct")

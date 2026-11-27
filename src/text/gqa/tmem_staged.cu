@@ -452,6 +452,7 @@ std::optional<cudaError_t> launch_staged_requests(const decoder::PagedPrefillSeq
                                                  cudaStream_t stream,
                                                  decoder::PairedPrefillScratch scratch) {
     const int position = sequences[0].position;
+    const int kv_heads = sequences[0].cache.kv_heads;
     constexpr int min_partial_rows = LongPage ? decoder::staged_serial_min_rows : 256;
     constexpr int max_partial_visible = LongPage ? decoder::staged_serial_max_tokens : 32768;
     if (!StagedRange(scratch.keys, scratch.key_bytes, 1).valid() ||
@@ -466,6 +467,8 @@ std::optional<cudaError_t> launch_staged_requests(const decoder::PagedPrefillSeq
     int total_pages = 0;
     for (int lane = 0; lane < Count; ++lane) {
         const auto& sequence = sequences[lane];
+        if (sequence.cache.kv_heads != kv_heads)
+            return std::nullopt;
         const int rows = sequence.rows;
         if constexpr (Partial) {
             if (rows < min_partial_rows || rows > flash_chunk || sequence.position < 0 ||
@@ -495,7 +498,7 @@ std::optional<cudaError_t> launch_staged_requests(const decoder::PagedPrefillSeq
     if (const auto pending = cudaPeekAtLastError(); pending != cudaSuccess) {
         return pending;
     }
-    const auto page_heads = static_cast<std::size_t>(total_pages) * sequences[0].cache.kv_heads;
+    const auto page_heads = static_cast<std::size_t>(total_pages) * kv_heads;
     const auto elements = page_heads * staged_head_elements;
     const auto decoded_bytes = elements * sizeof(std::uint16_t);
     const auto value_bytes = decoded_bytes + page_heads * sizeof(int);

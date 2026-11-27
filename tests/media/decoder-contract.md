@@ -10,6 +10,9 @@ compute-sanitizer --tool memcheck --leak-check full --error-exitcode 71 \
     /tmp/media-contract "$checkpoint" --embedding-only
 ```
 
+Outside Pixi, set `CUDA_TOOLKIT_ROOT` and `NCCL_ROOT` to the toolkit and NCCL package directories
+used to build Release. The NCCL package directory contains `lib/libnccl.so.2`.
+
 The test uses two rectangular images and a two-plane video with unequal timestamp lengths.
 Distinct synthetic BF16 rows check substitution for every channel, untouched text rows and
 guard rows. Two image spans cross prefill tile boundaries. The wrapper traces arguments to the

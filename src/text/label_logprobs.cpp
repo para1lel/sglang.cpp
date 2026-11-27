@@ -2,14 +2,14 @@
 
 #include <algorithm>
 #include <cmath>
-#include <cuda_bf16.h>
 #include <limits>
 
 namespace sglang::decoder {
+namespace {
 
 template <class Logit>
-std::vector<double> label_logprobs(const std::vector<Logit>& logits,
-                                   const std::vector<int>& labels) {
+std::vector<double> label_logprobs_impl(const std::vector<Logit>& logits,
+                                        const std::vector<int>& labels) {
     double maximum = -std::numeric_limits<double>::infinity();
     for (const auto logit : logits) {
         const float value = static_cast<float>(logit);
@@ -36,24 +36,36 @@ std::vector<double> label_logprobs(const std::vector<Logit>& logits,
 }
 
 template <class Logit>
-void collect_label_score(const std::vector<Logit>& logits, const std::vector<int>& labels,
-                         DecoderBatchStep& step) {
+void collect_label_score_impl(const std::vector<Logit>& logits, const std::vector<int>& labels,
+                              DecoderBatchStep& step) {
     try {
-        step.label_logprobs = std::make_shared<const std::vector<double>>(
-            label_logprobs(logits, labels));
+        step.label_logprobs =
+            std::make_shared<const std::vector<double>>(label_logprobs_impl(logits, labels));
         step.finish_reason = DecoderFinishReason::length;
     } catch (const DecoderSamplingError&) {
         step.sampling_failed = true;
     }
 }
 
-template std::vector<double> label_logprobs<float>(const std::vector<float>&,
-                                                   const std::vector<int>&);
-template std::vector<double> label_logprobs<__nv_bfloat16>(
-    const std::vector<__nv_bfloat16>&, const std::vector<int>&);
-template void collect_label_score<float>(const std::vector<float>&, const std::vector<int>&,
-                                         DecoderBatchStep&);
-template void collect_label_score<__nv_bfloat16>(const std::vector<__nv_bfloat16>&,
-                                                  const std::vector<int>&, DecoderBatchStep&);
+}
 
+std::vector<double> label_logprobs(const std::vector<float>& logits,
+                                   const std::vector<int>& labels) {
+    return label_logprobs_impl(logits, labels);
+}
+
+std::vector<double> label_logprobs(const std::vector<__nv_bfloat16>& logits,
+                                   const std::vector<int>& labels) {
+    return label_logprobs_impl(logits, labels);
+}
+
+void collect_label_score(const std::vector<float>& logits, const std::vector<int>& labels,
+                         DecoderBatchStep& step) {
+    collect_label_score_impl(logits, labels, step);
+}
+
+void collect_label_score(const std::vector<__nv_bfloat16>& logits, const std::vector<int>& labels,
+                         DecoderBatchStep& step) {
+    collect_label_score_impl(logits, labels, step);
+}
 }

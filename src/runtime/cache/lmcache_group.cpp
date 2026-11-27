@@ -32,6 +32,10 @@ bool LmCacheGroup::ready() const {
     return client_.ready();
 }
 
+bool LmCacheGroup::ready(const std::vector<std::array<std::uint8_t, 16>>& devices) const {
+    return client_.ready(devices);
+}
+
 PrefixCacheRead LmCacheGroup::lookup_prefix(const std::vector<const PrefixCacheKeys*>& keys,
                                             int max_restore, bool draft) const {
     const auto world = static_cast<std::size_t>(world_size());

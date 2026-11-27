@@ -582,6 +582,7 @@ if has_config("tp2-collective-check") and os.isfile("tests/decoder/tp2/collectiv
         add_sysincludedirs(path.join(nccl_wheel, "include"))
         add_deps("sglang_decoder")
         add_rpathdirs(path.join(prefix, "lib"), path.join(toolkit, "lib"))
+        add_ldflags("-Wl,--wrap=cuMulticastGetGranularity", {force = true})
         add_files("tests/decoder/tp2/collective_check.cpp")
     target_end()
 end

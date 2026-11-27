@@ -1,10 +1,15 @@
+#include "mxfp8_gqa_checks.h"
+
 #include "sglang/decoder_cuda.cuh"
+#include "sglang/text/prefill_attn_sm100.h"
 
 #include <algorithm>
 #include <array>
+#include <cstddef>
 #include <cstdio>
 #include <cstdint>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -112,6 +117,57 @@ void check_draft_replay(Mxfp8KvCache cache, Mxfp8PageTable pages, const Bf16* qu
     }
 }
 
+void check_mixed_staged_heads(cudaStream_t stream) {
+    constexpr int rows = 1024;
+    constexpr int pages = (position + rows) / mxfp8_page_size;
+    constexpr auto page_heads = std::size_t{2} * pages * mxfp8_kv_heads;
+    constexpr auto key_bytes = page_heads * mxfp8_page_size * mxfp8_head_dim * sizeof(Bf16);
+    constexpr auto value_bytes = key_bytes + (page_heads * sizeof(int));
+    constexpr auto elements = std::ptrdiff_t{rows} * channels;
+    const DeviceBuffer<std::uint8_t> payload(pages * mxfp8_payload_bytes_per_page);
+    const DeviceBuffer<std::uint8_t> scales(pages * mxfp8_scale_bytes_per_page);
+    const DeviceBuffer<std::int32_t> mapping(pages);
+    const DeviceBuffer<Bf16> queries(elements);
+    std::array<std::int32_t, pages> page_table{};
+    for (int page = 0; page < pages; ++page)
+        page_table[page] = page;
+    check(cudaMemcpyAsync(mapping.data, page_table.data(), sizeof(page_table),
+                          cudaMemcpyHostToDevice, stream));
+    check(cudaMemsetAsync(payload.data, 0, pages * mxfp8_payload_bytes_per_page, stream));
+    check(cudaMemsetAsync(scales.data, 127, pages * mxfp8_scale_bytes_per_page, stream));
+    check(cudaMemsetAsync(queries.data, 0, elements * sizeof(Bf16), stream));
+    const DeviceBuffer<Bf16> output(2 * elements);
+    const DeviceBuffer<std::byte> keys(key_bytes);
+    const DeviceBuffer<std::byte> values(value_bytes);
+    const decoder::PairedPrefillScratch scratch{keys.data, key_bytes, values.data, value_bytes};
+    const Mxfp8KvCache cache{payload.data, payload.data, scales.data, scales.data, pages};
+    auto rank_cache = cache;
+    rank_cache.kv_heads = gqa_rank_geometry.kv_heads;
+    const decoder::PagedPrefillSequence full{
+        cache, {mapping.data, pages}, position, rows, queries.data, output.data,
+    };
+    const decoder::PagedPrefillSequence rank{
+        rank_cache, {mapping.data, pages}, position, rows, queries.data, output.data + elements,
+    };
+    std::array lanes{full, rank};
+    for (int order = 0; order < 2; ++order) {
+        auto control = lanes;
+        control[1].cache.kv_heads = control[0].cache.kv_heads;
+        const auto pending = cudaLaunchKernel(nullptr, dim3(1), dim3(1), nullptr, 0, stream);
+        if (pending == cudaSuccess || cudaPeekAtLastError() != pending) {
+            throw std::runtime_error("Missing pending error to prevent staged test submission");
+        }
+        const auto matched =
+            decoder::try_long_staged_paged_prefill(control.data(), control.size(), stream, scratch);
+        const auto mixed =
+            decoder::try_long_staged_paged_prefill(lanes.data(), lanes.size(), stream, scratch);
+        if (cudaGetLastError() != pending || matched != pending || mixed.has_value()) {
+            throw std::runtime_error("Long staged prefill admitted mixed KV head counts");
+        }
+        std::swap(lanes[0], lanes[1]);
+    }
+    std::puts("MXFP8 long staged prefill rejects mixed KV heads in both lane orders");
+}
 }
 
 namespace gqa_test {
@@ -166,4 +222,88 @@ void check_short_prefill_replay(cudaStream_t stream) {
     check_draft_replay(unaligned_scales, pages, query.data, output.data, scores.data, stream);
 }
 
+void check_mixed_grouped_prefill(cudaStream_t stream) {
+    check_mixed_staged_heads(stream);
+    constexpr int lanes = decoder::staged_prefill_batch_size;
+    constexpr int rows = 256;
+    constexpr int pages = (position + rows) / mxfp8_page_size;
+    constexpr auto elements = std::ptrdiff_t{rows} * channels;
+    DeviceBuffer<std::uint8_t> keys(pages * mxfp8_payload_bytes_per_page);
+    DeviceBuffer<std::uint8_t> values(pages * mxfp8_payload_bytes_per_page);
+    DeviceBuffer<std::uint8_t> scales(pages * mxfp8_scale_bytes_per_page);
+    DeviceBuffer<std::int32_t> mapping(pages);
+    DeviceBuffer<Bf16> query(elements);
+    DeviceBuffer<Bf16> output(lanes * elements);
+    std::array<std::int32_t, pages> page_table{};
+    for (int page = 0; page < pages; ++page)
+        page_table[page] = page;
+    check(cudaMemcpyAsync(mapping.data, page_table.data(), sizeof(page_table),
+                          cudaMemcpyHostToDevice, stream));
+    check(cudaMemsetAsync(keys.data, 0, pages * mxfp8_payload_bytes_per_page, stream));
+    check(cudaMemsetAsync(values.data, 0x38, pages * mxfp8_payload_bytes_per_page, stream));
+    check(cudaMemsetAsync(scales.data, 127, pages * mxfp8_scale_bytes_per_page, stream));
+    check(cudaMemsetAsync(query.data, 0, elements * sizeof(Bf16), stream));
+    std::vector<Bf16> actual(lanes * elements);
+    for (const int start : {0, position}) {
+        std::array<decoder::PagedPrefillSequence, lanes> batch{};
+        for (int lane = 0; lane < lanes; ++lane) {
+            batch[lane] = {
+                {keys.data, values.data, scales.data, scales.data, pages},
+                {mapping.data, pages},
+                start,
+                rows,
+                query.data,
+                output.data + (lane * elements),
+            };
+        }
+        const auto launch = [start, stream](const auto& requests) {
+            return start == 0 ? decoder::try_batched_paged_prefill(requests.data(), 2, stream)
+                              : decoder::try_batched_partial_paged_prefill(requests.data(),
+                                                                           requests.size(), stream);
+        };
+        const auto capture = [&](const auto& requests, bool admitted) {
+            check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+            const auto status = launch(requests);
+            cudaGraph_t graph = nullptr;
+            check(cudaStreamEndCapture(stream, &graph));
+            std::size_t nodes = 0;
+            const auto counted = cudaGraphGetNodes(graph, nullptr, &nodes);
+            check(cudaGraphDestroy(graph));
+            check(counted);
+            if (status.has_value() != admitted || (status && *status != cudaSuccess) ||
+                nodes != static_cast<std::size_t>(admitted)) {
+                throw std::runtime_error("Grouped prefill admission disagrees with KV heads");
+            }
+        };
+        capture(batch, true);
+        auto rank_batch = batch;
+        for (auto& request : rank_batch)
+            request.cache.kv_heads = gqa_rank_geometry.kv_heads;
+        capture(rank_batch, true);
+        batch[1].cache.kv_heads = gqa_rank_geometry.kv_heads;
+        capture(batch, false);
+        std::swap(batch[0], batch[1]);
+        capture(batch, false);
+        check(cudaMemsetAsync(output.data, 0xff, actual.size() * sizeof(Bf16), stream));
+        for (const auto& request : batch) {
+            check(decoder::tensor_core_model_prefill_gqa(request.cache, request.pages,
+                                                         request.position, request.rows,
+                                                         request.queries, request.output, stream));
+        }
+        check(cudaMemcpyAsync(actual.data(), output.data, actual.size() * sizeof(Bf16),
+                              cudaMemcpyDeviceToHost, stream));
+        check(cudaStreamSynchronize(stream));
+        for (const auto& request : batch) {
+            const auto begin = actual.begin() + (request.output - output.data);
+            const auto active = elements * request.cache.kv_heads / mxfp8_kv_heads;
+            if (!std::all_of(begin, begin + active,
+                             [](Bf16 value) { return __bfloat162float(value) == 1.0F; }) ||
+                !std::all_of(begin + active, begin + elements,
+                             [](Bf16 value) { return __bfloat16_as_ushort(value) == 0xffff; })) {
+                throw std::runtime_error("Per-request prefill fallback differs from known output");
+            }
+        }
+    }
+    std::puts("MXFP8 raw grouped prefill rejects mixed heads and per-request fallback matches");
+}
 }

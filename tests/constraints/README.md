@@ -46,6 +46,6 @@ python "$tests/integration.py" "$server" "$checkpoint" "$evidence/prefix" \
 
 The native probe matches serial and batched IDs with depth zero. Counters cover full, partial, and zero acceptance, replay, terminal drafts, and mixed-depth lanes.
 
-HTTP requires `jsonschema` 4.26.0. Each cache-off positive-depth run matches token IDs and finish reasons with a depth-zero server. Check draft and verifier activity on both routes for finite-choice EBNF, regex, and JSON Schema. At width four, check joint verification and retirement after mixed requests.
+HTTP requires `jsonschema` 4.26.0. `http_contract.py --width 4 --graph --mtp 1` checks JSON, SSE, and verifier activity on one service. Each cache-off positive-depth `schema_integration.py` run matches token IDs and finish reasons with a depth-zero server. The schema runs check draft and verifier activity on both routes for finite-choice EBNF, regex, and JSON Schema. At width four, they also check joint verification and retirement after mixed requests.
 
 For media rejection and recovery, append `--media-body "$media_request" --media-sha256 "$media_hash"` to a capacity-one command. The body must be a valid unconstrained chat request and must succeed before and after the rejected constrained media request.

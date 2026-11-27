@@ -3,6 +3,7 @@ import json
 import statistics
 import threading
 from contextlib import contextmanager
+from http.client import HTTPResponse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
@@ -10,7 +11,11 @@ import pytest
 
 from benchmarks.concurrent import client
 from benchmarks.concurrent.client import (
-    capture_cohort, gate, summarize, thresholds, validate_cohort,
+    capture_cohort,
+    gate,
+    summarize,
+    thresholds,
+    validate_cohort,
 )
 from benchmarks.concurrent.reference import ROWS, digest, goldens, lane_manifest, reference
 from benchmarks.streaming.client import json_bytes, request_body
@@ -111,19 +116,39 @@ def test_overlapping_streams_and_timing(captured):
         assert record["metrics"]["tpot_ms"] == (record["last_ns"] - record["first_ns"]) / 2e6
 
 
-def test_prefix_cohort_replays_one_token_and_checks_cache_range():
+@pytest.fixture
+def coalesced_reads(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(HTTPResponse, "read1", HTTPResponse.read)
+
+
+@pytest.mark.usefixtures("coalesced_reads")
+def test_prefix_cohort_replays_one_token_and_checks_cache_range() -> None:
     identity, body, case = wire_fixture(output_tokens=1)[0]
     lanes = [(identity, body, case | {"cached_token_range": (1, 2)})]
     policy = reference()["policy"]
     with loopback(lanes, cached_tokens=2) as (url, _):
         raw = capture_cohort(url, "W3", lanes, "prime", policy)
+    assert {event["read"] for event in raw["requests"][0]["events"]} == {1}
     report, records = client.replay_cohort(raw, lanes, policy)
     record, = records
     assert record["output_ids"] == [1]
     assert record["usage"]["prompt_tokens_details"]["cached_tokens"] == 2
     assert report["request_latencies"][0]["tpot_ms"] is None
+    assert report["all_generating_overlap_ms"] == 0
     with pytest.raises(ValueError, match="Unexpected cached prompt rows"):
         validate_cohort(raw, [(identity, body, case | {"cached_token_range": (0, 0)})], policy)
+
+
+@pytest.mark.usefixtures("coalesced_reads")
+def test_coalesced_reads_do_not_satisfy_multi_lane_overlap() -> None:
+    lanes, policy = wire_fixture(output_tokens=1), reference()["policy"]
+    with loopback(lanes) as (url, _):
+        raw = capture_cohort(url, "W3", lanes, "measured-01", policy)
+    for record, lane in zip(raw["requests"], lanes, strict=True):
+        assert {event["read"] for event in record["events"]} == {1}
+        client.replay_lane(record, lane)
+    with pytest.raises(ValueError, match="overlap bounds"):
+        validate_cohort(raw, lanes, policy)
 
 
 def test_oom_records_failed_and_successful_requests():

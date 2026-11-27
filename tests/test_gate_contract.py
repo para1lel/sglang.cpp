@@ -618,7 +618,7 @@ def test_tool_configuration_is_read_from_selected_index(style_repository: Path) 
     assert_passed(selected_hook(root, index))
 
 
-def test_real_hook_discovers_pinned_tools_from_system_path(style_repository: Path) -> None:
+def test_real_hook_bootstraps_from_system_only_path(style_repository: Path) -> None:
     stage_files(style_repository, ROOT_SOURCES)
     assert_passed(selected_hook(style_repository, path="/usr/bin:/bin"))
 

@@ -501,7 +501,14 @@ def main():
                 configuration["function_adapters"] = json.loads(
                     arguments.adapters.read_text(encoding="utf-8")
                 )
-            result = gate_config.measure(root, repository_files(root), CODE_SUFFIXES, configuration)
+            header_adapter = ["{python}", function_spans.__file__, "{file}"]
+            result = gate_config.measure(
+                root,
+                repository_files(root),
+                CODE_SUFFIXES,
+                configuration,
+                default_adapters=dict.fromkeys(function_spans.HEADER_SUFFIXES, header_adapter),
+            )
             print(json.dumps(result, indent=2))
             return 0
         if arguments.command == "package":

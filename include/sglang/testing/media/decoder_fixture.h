@@ -3,6 +3,7 @@
 #include "sglang/decoder_media.h"
 
 #include <array>
+#include <cstdint>
 #include <utility>
 
 #include <cuda_runtime_api.h>

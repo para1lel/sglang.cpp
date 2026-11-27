@@ -20,7 +20,7 @@ CPU patch preparation expands prompt IDs before submission to the [multimodal de
 
 ### Read JSON and SSE
 
-JSON uses `object: "chat.completion"` and puts assistant messages in `choices`. SSE uses `object: "chat.completion.chunk"`. Both include `id`, `model`, and `created` in Unix seconds. Each choice keeps its own `chatcmpl-` ID. Without parsers, generated reasoning and tool markup stay in `content`, while supplied tools and history still affect the prompt.
+JSON uses `object: "chat.completion"` and puts assistant messages in `choices`. One top-level `chatcmpl-` ID identifies the response. Each choice is identified by its `index` alone. SSE uses `object: "chat.completion.chunk"` and a distinct top-level `chatcmpl-` ID for each index. Both formats include `model` and `created` in Unix seconds. Without parsers, generated reasoning and tool markup stay in `content`, while supplied tools and history still affect the prompt.
 
 Each SSE index starts with `delta.role: "assistant"` and a null finish reason. Join `delta.content` by index. The terminal choice has `delta: {}`. Follow the [shared stop, usage, and end marker rules](text-serving.md#read-the-response), with a separate `tool_calls` finish. JSON always includes usage. Media usage counts expanded prompt IDs.
 

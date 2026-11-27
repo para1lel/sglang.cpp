@@ -151,6 +151,7 @@ class LogprobProjection(unittest.TestCase):
                         ]
                     )
                 self.assertEqual(blocking["text"], VISIBLE)
+                self.assertEqual(blocking["output_ids"], list(SAMPLED))
                 self.assertEqual([len(frame["output_ids"]) for frame in frames], [1, 2, 3, 4])
                 for response in [*frames, blocking]:
                     count = len(response["output_ids"])

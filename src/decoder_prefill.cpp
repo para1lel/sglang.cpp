@@ -363,8 +363,7 @@ void finish_prefill_group_tp(const DecoderModel& model, const Chunk& chunk,
             throw std::runtime_error("Prefill workspace too small for the MTP draft seed scratch");
         }
         seed_memory =
-            layout.take<Bf16>(seed_scratch_bytes(seed_tile_rows, seed_kv_rows) /
-                              sizeof(Bf16));
+            layout.take_bf16(seed_scratch_bytes(seed_tile_rows, seed_kv_rows) / sizeof(Bf16));
     }
     int offset = 0;
     for (int index = 0; index < count; ++index) {
@@ -736,7 +735,7 @@ void prefill_chunk_tp(const DecoderModel& model, const DecoderModel& peer,
             throw std::runtime_error("Prefill workspace too small for the MTP draft seed scratch");
         }
         const auto scratch = make_seed_scratch(
-            layout.take<Bf16>(seed_scratch_bytes(concat_rows, seed_rows) / sizeof(Bf16)),
+            layout.take_bf16(seed_scratch_bytes(concat_rows, seed_rows) / sizeof(Bf16)),
             concat_rows, seed_rows);
         chunk.seed_draft(*grant.draft, grant.tokens + 1, seed_rows, model.final_norm, wmma,
                          nullptr, &scratch);

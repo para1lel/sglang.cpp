@@ -424,9 +424,6 @@ __device__ __inline_hint__ void pair_repair(Tile& tile, Attention request,
         bad_key >= position + flash_rows) {
         return;
     }
-    if (threadIdx.x >= channels) {
-        return;
-    }
     for (int offset = 0; offset < flash_rows; ++offset) {
         if (position + offset >= bad_key || tile.bad_query[offset * ordered_heads] ||
             tile.bad_query[offset * ordered_heads + 1]) {
@@ -480,9 +477,6 @@ __device__ __inline_hint__ void tmem_repair_ordered(const Tile& tile, Attention 
     const int position = request.position + row;
     if (!__syncthreads_or(threadIdx.x < members && tile.bad_query[threadIdx.x]) &&
         tile.bad_key >= position + rows) {
-        return;
-    }
-    if (threadIdx.x >= channels) {
         return;
     }
     for (int offset = 0; offset < rows; ++offset) {

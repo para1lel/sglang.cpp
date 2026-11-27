@@ -649,8 +649,7 @@ class Handler(socketserver.BaseRequestHandler):
             if namespace != self.server.namespace:
                 raise ValueError("wrong LMCache namespace")
             if request.op == 1:
-                request.end()
-                request.reply(0, WIRE_VERSION.encode("ascii"))
+                self.ready(request)
                 return
             if request.op == 8:
                 self.server.lease_status(request)
@@ -669,6 +668,20 @@ class Handler(socketserver.BaseRequestHandler):
                     return
                 self.request.settimeout(left)
                 self.request.sendall(HEADER.pack(MAGIC, 2, len(detail)) + detail)
+
+    def ready(self, request: Request) -> None:
+        uuid_bytes = 16
+        if request.remaining % uuid_bytes:
+            raise ValueError("invalid readiness GPU UUID list")
+        uuids = request.read(request.remaining)
+        copies = self.server.device_copies
+        if any(
+            copies is None or bytes(uuids[index : index + uuid_bytes]) not in copies.devices
+            for index in range(0, len(uuids), uuid_bytes)
+        ):
+            request.reply(3)
+        else:
+            request.reply(0, WIRE_VERSION.encode("ascii"))
 
     def dispatch(self, request, namespace):
         records = self.server.records

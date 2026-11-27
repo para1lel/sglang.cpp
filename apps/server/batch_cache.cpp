@@ -317,7 +317,20 @@ struct BatchCache::State {
         rank_restores = std::vector<std::atomic_uint64_t>(devices.size());
         rank_read_bytes = std::vector<std::array<std::atomic_uint64_t, 3>>(devices.size());
         rank_written_bytes = std::vector<std::array<std::atomic_uint64_t, 3>>(devices.size());
-        try { available = group->ready(); } catch (const std::exception&) {}
+        try {
+            available = group->ready(devices);
+        } catch (const std::exception&) {
+            available = false;
+        }
+    }
+
+    bool ready_for_lookup() {
+        if (devices.empty() || available)
+            return true;
+        const bool ready = group->ready(devices);
+        if (ready)
+            available = true;
+        return ready;
     }
 
     int rank_of(const PrefixDeviceTransfer& view) const {
@@ -330,7 +343,8 @@ struct BatchCache::State {
     }
 
     bool record(LmCacheStatus status, const LmCacheReceipt& receipt, bool restore) {
-        available = true;
+        if (devices.empty())
+            available = true;
         if (status != LmCacheStatus::complete) {
             misses += restore && status == LmCacheStatus::miss;
             declined += !restore;
@@ -382,8 +396,12 @@ void BatchCache::lookup(Keys keys, int score_start, bool draft, Cancel cancelled
         BatchCacheRead result;
         const auto start = Clock::now();
         try {
-            result.keys = keys(state->identity);
-            if (*cancelled || result.keys.empty()) return;
+            if (*cancelled)
+                return;
+            if (state->ready_for_lookup())
+                result.keys = keys(state->identity);
+            if (*cancelled)
+                return;
             if (result.keys.size() != static_cast<std::size_t>(state->group->world_size())) {
                 result.keys.clear();
             } else {
@@ -398,7 +416,8 @@ void BatchCache::lookup(Keys keys, int score_start, bool draft, Cancel cancelled
                 }
                 if (!result.keys.empty()) {
                     result.match = state->group->lookup_prefix(rank_keys, score_start, draft);
-                    state->available = true;
+                    if (state->devices.empty())
+                        state->available = true;
                     state->misses += !*cancelled && result.keys.front()->cacheable_tokens() &&
                                      !result.match.usable_gdn;
                 }
@@ -579,7 +598,8 @@ void BatchCache::reset() {
     state_->stores_queue.drain();
     try {
         state_->group->reset();
-        state_->available = true;
+        if (state_->devices.empty())
+            state_->available = true;
     } catch (...) {
         ++state_->errors;
         state_->available = false;

@@ -441,9 +441,18 @@ LmCacheClient::LmCacheClient(LmCacheConfig config) : config_(std::move(config)) 
 }
 
 bool LmCacheClient::ready() const {
+    return ready({});
+}
+
+bool LmCacheClient::ready(const std::vector<std::array<std::uint8_t, 16>>& devices) const {
     const Connection connection(config_);
-    connection.request(Operation::ready, request_prefix(config_));
+    auto metadata = request_prefix(config_);
+    for (const auto& device : devices)
+        append_bytes(metadata, device);
+    connection.request(Operation::ready, metadata);
     const auto [status, size] = connection.response_header();
+    if (!devices.empty() && status == 3 && size == 0)
+        return false;
     if (status != 0 || size != daemon_version.size()) transport_error("unsupported daemon version");
     std::string version(daemon_version.size(), '\0');
     connection.read_all(version.data(), version.size());

@@ -1,3 +1,4 @@
+#include "mxfp8_gqa_checks.h"
 #include "sglang/decoder_cuda.cuh"
 #include "sglang/mxfp8_gqa.h"
 
@@ -7,6 +8,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <iostream>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -16,9 +18,7 @@ namespace gqa_test {
 std::vector<__nv_bfloat16> make_queries(int start_token, int count);
 double decode_value(std::uint8_t code, std::uint8_t scale);
 void check_bound_gdn(cudaStream_t stream);
-void check_flash_prefill(cudaStream_t stream);
 void check_tiled_prefill_scales(cudaStream_t stream);
-void check_short_prefill_replay(cudaStream_t stream);
 void check_raw_attention(cudaStream_t stream);
 void verify_ordered_prefill(const char* phase, sglang::Mxfp8KvCache cache,
                             sglang::Mxfp8PageTable pages, int first, int rows,
@@ -947,7 +947,6 @@ void check_ordered_prefill_masked_score_overflow(cudaStream_t stream) {
     std::fill_n(values.begin() + kv_elements_per_token, head_width, __float2bfloat16_rn(3.0f));
     const KvSequence input(std::move(keys), std::move(values));
     check_append("masked score overflow KV", cache, pages, input, 0, rows, stream);
-
     const std::vector<BFloat> host_queries(rows * query_elements, __float2bfloat16_rn(0x1p120f));
     const DeviceBuffer<BFloat> queries(host_queries.size());
     const DeviceBuffer<BFloat> output(host_queries.size() + 2 * prefill_guard);
@@ -976,25 +975,26 @@ void check_ordered_prefill_masked_score_overflow(cudaStream_t stream) {
     }
     std::puts("Masked score overflow recovers in paired rows and odd tail");
 }
-
 }
-int main() {
-    try {
-        const Stream stream;
-        run_check(stream);
-        check_bound_cache(stream.get());
-        gqa_test::check_bound_gdn(stream.get());
-        gqa_test::check_tiled_prefill_scales(stream.get());
-        check_ordered_multirow_prefill(stream.get());
-        gqa_test::check_raw_attention(stream.get());
-        check_finite_range_decode(stream.get());
-        check_ordered_prefill_masked_score_overflow(stream.get());
-        gqa_test::check_short_prefill_replay(stream.get());
-        gqa_test::check_flash_prefill(stream.get());
-        std::puts("MXFP8 GQA check passed");
+int main(int argc, char** argv) try {
+    const Stream stream;
+    if (argc == 2 && std::strcmp(argv[1], "--tmem-repair") == 0) {
+        gqa_test::check_flash_prefill(stream.get(), true);
         return 0;
-    } catch (const std::exception& error) {
-        std::fprintf(stderr, "MXFP8 GQA check failed. %s\n", error.what());
-        return 1;
     }
+    run_check(stream);
+    check_bound_cache(stream.get());
+    gqa_test::check_bound_gdn(stream.get());
+    gqa_test::check_tiled_prefill_scales(stream.get());
+    check_ordered_multirow_prefill(stream.get());
+    gqa_test::check_raw_attention(stream.get());
+    check_finite_range_decode(stream.get());
+    check_ordered_prefill_masked_score_overflow(stream.get());
+    gqa_test::check_short_prefill_replay(stream.get());
+    gqa_test::check_flash_prefill(stream.get());
+    std::puts("MXFP8 GQA check passed");
+    return 0;
+} catch (const std::exception& error) {
+    std::cerr << "MXFP8 GQA check failed. " << error.what() << '\n';
+    return 1;
 }

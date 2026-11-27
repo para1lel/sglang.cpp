@@ -1,17 +1,21 @@
 """Exercise ranked BatchCache workers through the Unix daemon with controlled CPU receipts."""
 
-from contextlib import contextmanager, ExitStack
-from pathlib import Path
 import select
 import subprocess
 import sys
+from collections.abc import Generator
+from contextlib import ExitStack, contextmanager
+from pathlib import Path
 from tempfile import TemporaryDirectory
 from threading import Event, Thread
+from types import SimpleNamespace
 
 from lmcache_relay import RECEIPT
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tools/lmcache"))
 from sglang_lmcache import GdnEndpoints, SocketServer
+
+RANK_DEVICES = (bytes([1]) + bytes(15), bytes([2]) + bytes(15))
 
 
 class ControlledRecords:
@@ -35,7 +39,7 @@ class ControlledRecords:
             raise ValueError("injected shared reset error")
 
     def transfer(self, request, view, store):
-        rank = {b"\x01" + bytes(15): 0, b"\x02" + bytes(15): 1}[bytes(view.device)]
+        rank = RANK_DEVICES.index(bytes(view.device))
         assert len(view.records) == 1 and view.records[0].size == 4
         self.entered[rank].set()
         if rank == 1:
@@ -57,15 +61,29 @@ class ControlledRecords:
         return self.transfer(request, view, False)
 
 
-def exercise(binary, work, action, mode):
-    with ExitStack() as stack:
-        records = ControlledRecords(mode)
-        endpoint = work / "service.sock"
-        server = SocketServer(str(endpoint), "service", records)
-        worker = Thread(target=server.serve_forever, kwargs={"poll_interval": 0.02})
-        worker.start()
-        stack.callback(worker.join)
-        stack.callback(server.close)
+@contextmanager
+def daemon(
+    endpoint: Path, mode: str, devices: tuple[bytes, ...]
+) -> Generator[ControlledRecords, None, None]:
+    records = ControlledRecords(mode)
+    copies = SimpleNamespace(devices=dict.fromkeys(devices), device_for=devices.index)
+    server = SocketServer(str(endpoint), "service", records, copies)
+    worker = Thread(target=server.serve_forever, kwargs={"poll_interval": 0.02})
+    worker.start()
+    try:
+        yield records
+    finally:
+        records.release.set()
+        server.close()
+        worker.join()
+
+
+def exercise(
+    binary: str, work: Path, action: str, mode: str, devices: tuple[bytes, ...] = RANK_DEVICES[::-1]
+) -> None:
+    endpoint = work / "service.sock"
+    with ExitStack() as startup:
+        records = startup.enter_context(daemon(endpoint, mode, devices))
         args = [binary, endpoint]
         if action != "lookup":
             args.extend([action, mode])
@@ -79,6 +97,15 @@ def exercise(binary, work, action, mode):
                     assert select.select([child.stdout], [], [], 3)[0], (action, mode)
                     assert child.stdout.readline() == "release\n", (action, mode)
                     records.release.set()
+                if action == "readiness":
+                    assert select.select([child.stdout], [], [], 3)[0], "readiness timeout"
+                    assert child.stdout.readline() == "restart\n"
+                    assert records.resets == 1
+                    assert not records.digests
+                    startup.close()
+                    records = startup.enter_context(daemon(endpoint, mode, RANK_DEVICES[::-1]))
+                    child.stdin.write("held\n")
+                    child.stdin.flush()
                 assert child.wait(4) == 0, (action, mode)
             finally:
                 records.release.set()
@@ -86,9 +113,11 @@ def exercise(binary, work, action, mode):
                     child.kill()
         if action in ("register", "restore", "reset"):
             assert records.resets == 1, (action, mode)
-        if action == "lookup":
-            assert len(records.digests) == len(records.entered), records.digests
-            assert len(set(records.digests)) == len(records.entered), records.digests
+        if action == "lookup" and len(devices) == 1:
+            assert not records.digests, records.digests
+        elif action in ("lookup", "readiness"):
+            assert len(records.digests) == len(RANK_DEVICES), records.digests
+            assert len(set(records.digests)) == len(RANK_DEVICES), records.digests
 
 
 if __name__ == "__main__":
@@ -98,6 +127,11 @@ if __name__ == "__main__":
     with TemporaryDirectory(prefix="sglang-service-") as directory:
         exercise(sys.argv[2], Path(directory), "lookup", "cold")
         print("public service ranked key factory and cold generation: passed", flush=True)
+        exercise(sys.argv[2], Path(directory), "lookup", "cold", RANK_DEVICES[:1])
+        print("public service one-device daemon cold fallback: passed", flush=True)
+        wrong_inventory = (RANK_DEVICES[0], RANK_DEVICES[1][::-1])
+        exercise(sys.argv[1], Path(directory), "readiness", "ready", wrong_inventory)
+        print("ranked cache wrong UUID, successful reset, and daemon recovery: passed", flush=True)
         for action, mode in cases:
             exercise(sys.argv[1], Path(directory), action, mode)
             print(f"{action} {mode}: passed", flush=True)

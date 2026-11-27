@@ -221,11 +221,13 @@ def replay_cohort(raw, lanes, policy):
     latest_headers = max(item["headers_ns"] for item in records)
     earliest_first = min(item["first_ns"] for item in records)
     latest_first = max(item["first_ns"] for item in records)
-    if (type(raw["barrier_ns"]) is not int
-            or not max(item["connect_ns"] for item in records) <= raw["barrier_ns"] <= earliest
-            or not max(item["sent_ns"] for item in records) < earliest_first
-            or max(latest_headers, latest_first) >= earliest_done
-            or span > policy["max_submission_span_ms"]):
+    if (
+        type(raw["barrier_ns"]) is not int
+        or not max(item["connect_ns"] for item in records) <= raw["barrier_ns"] <= earliest
+        or not max(item["sent_ns"] for item in records) < earliest_first
+        or (len(records) > 1 and max(latest_headers, latest_first) >= earliest_done)
+        or span > policy["max_submission_span_ms"]
+    ):
         raise ValueError("Cohort submissions or open streams failed overlap bounds")
     duration = (latest_done - earliest) / 1e9
     prompt = sum(record["usage"]["prompt_tokens"] for record in records)

@@ -17,6 +17,7 @@ public:
   int world_size() const;
 
   bool ready() const;
+  bool ready(const std::vector<std::array<std::uint8_t, 16>>& devices) const;
 
   PrefixCacheRead lookup_prefix(const std::vector<const PrefixCacheKeys*>& keys, int max_restore,
                                 bool draft) const;

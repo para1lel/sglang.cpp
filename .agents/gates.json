@@ -60,7 +60,8 @@
       "paths": [".agents/*", ".githooks/*", "tests/*"],
       "command": [
         "{python}", "-IB", "-m", "pytest", "-q", "-p", "no:cacheprovider",
-        "tests/test_gate_contract.py", "--junitxml=.gate-results/contracts.xml"
+        "tests/test_gate_contract.py", "tests/test_gate_regressions.py",
+        "--junitxml=.gate-results/contracts.xml"
       ],
       "report": ".gate-results/contracts.xml",
       "timeout": 90

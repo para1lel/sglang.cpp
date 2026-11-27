@@ -12,7 +12,7 @@ from threading import Thread
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, call, patch
 
-from lmcache_relay import DRAFT, PREFIX_DETAIL, RANK_GET, RANK_PUT, RECEIPT, Relay
+from lmcache_relay import DRAFT, PREFIX_DETAIL, RANK_GET, RANK_PUT, READY, RECEIPT, Relay, control
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tools/lmcache"))
 gpu_transfer = import_module("sglang_gpu_transfer")
@@ -52,6 +52,23 @@ class DeviceStartupTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "GPU UUID is not visible"):
             copies.device_for(bytes(16))
         assert self.cuda.mock_calls == expected
+
+    def test_ready_checks_visible_uuids(self) -> None:
+        copies = gpu_transfer.DeviceCopies()
+        with TemporaryDirectory(prefix="sglang-ready-") as work, ExitStack() as stack:
+            endpoint = Path(work) / "ready.sock"
+            server = lmcache.SocketServer(str(endpoint), "sglang", HostRecords(2), copies)
+            worker = Thread(target=server.serve_forever, kwargs={"poll_interval": 0.02})
+            worker.start()
+            stack.callback(worker.join)
+            stack.callback(server.close)
+            success = (0, b"0.5.8+native-v3")
+            first, second = self.uuids
+            for payload in (b"", first, second, first + second, second + first):
+                with self.subTest(payload=payload.hex()):
+                    self.assertEqual(control(endpoint, "sglang", READY, payload), success)
+            self.assertEqual(control(endpoint, "sglang", READY, second + bytes(16)), (3, b""))
+            self.assertEqual(control(endpoint, "sglang", READY, first + b"\x00")[0], 2)
 
     def test_rank_mode_validates_before_streams(self) -> None:
         for count in (0, len(self.uuids)):
@@ -178,14 +195,22 @@ def exercise(binary, runtime, world):
     records = HostRecords(world)
     endpoint = runtime / "sglang-lmcache.sock"
     upstream = runtime / "daemon.sock"
+    copies = SimpleNamespace(
+        devices=dict.fromkeys(reversed(records.devices)), device_for=records.devices.index
+    )
     with ExitStack() as stack:
-        server = lmcache.SocketServer(str(upstream), "sglang", records)
+        server = lmcache.SocketServer(str(upstream), "sglang", records, copies)
         thread = Thread(target=server.serve_forever, kwargs={"poll_interval": 0.02})
         thread.start()
         stack.callback(thread.join)
         stack.callback(server.close)
         relay = stack.enter_context(Relay(endpoint, upstream))
         call("ready")
+        (readiness,) = relay.since()
+        assert readiness["opcode"] == READY
+        assert readiness["devices"] == (
+            [device.hex() for device in records.devices] if world > 1 else []
+        )
         assert call("lookup") == "0 0 0 0 0"
         call("store", 65)
         if world == 1:

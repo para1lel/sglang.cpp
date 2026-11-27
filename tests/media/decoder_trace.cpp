@@ -104,18 +104,37 @@ extern "C" cudaError_t __wrap_cudaStreamBeginCapture(cudaStream_t stream,
 }
 
 using Bf16 = __nv_bfloat16;
-template <class Position>
-using Rotate = cudaError_t(Position, int, const Bf16*, const Bf16*, const Bf16*, const Bf16*,
-                           Bf16*, Bf16*, cudaStream_t);
+template <class Position, class... Args>
+using Rotate = cudaError_t(Position, int, const Bf16*, const Bf16*, const Bf16*, const Bf16*, Bf16*,
+                           Bf16*, cudaStream_t, Args...);
 
 extern "C" Rotate<const MropePosition*> real_mrope;
 extern "C" Rotate<const MropePosition*> traced_mrope;
-extern "C" Rotate<int> real_rope;
-extern "C" Rotate<int> traced_rope;
+extern "C" Rotate<const MropePosition*, GqaGeometry> real_mrope_model;
+extern "C" Rotate<const MropePosition*, GqaGeometry> traced_mrope_model;
+extern "C" Rotate<int, GqaGeometry> real_rope;
+extern "C" Rotate<int, GqaGeometry> traced_rope;
 
 cudaError_t traced_mrope(const MropePosition* positions, int rows, const Bf16* query,
                          const Bf16* keys, const Bf16* qnorm, const Bf16* knorm,
                          Bf16* rotated_query, Bf16* rotated_keys, cudaStream_t stream) {
+    if (mtp_prompt_rows != 0 && seed_key_rows == mtp_prompt_rows - 1 && rows == 1) {
+        MropePosition actual;
+        media_test::cuda(
+            cudaMemcpyAsync(&actual, positions, sizeof(actual), cudaMemcpyDeviceToHost, stream));
+        media_test::cuda(cudaStreamSynchronize(stream));
+        media_test::require(media_test::equal(actual, media_test::axes(mtp_prompt_rows - 1)),
+                            "First MTP proposal did not rotate the final prompt row");
+        ++draft_first_queries;
+    }
+    return real_mrope(positions, rows, query, keys, qnorm, knorm, rotated_query, rotated_keys,
+                      stream);
+}
+
+cudaError_t traced_mrope_model(const MropePosition* positions, int rows, const Bf16* query,
+                               const Bf16* keys, const Bf16* qnorm, const Bf16* knorm,
+                               Bf16* rotated_query, Bf16* rotated_keys, cudaStream_t stream,
+                               GqaGeometry heads) {
     if (tracing) {
         const auto [start, count] = geometry(rotary_calls++);
         media_test::require(rows == count && start + rows <= media_test::physical,
@@ -128,56 +147,50 @@ cudaError_t traced_mrope(const MropePosition* positions, int rows, const Bf16* q
             media_test::require(media_test::equal(actual[row], media_test::axes(start + row)),
                                 "Wrong rotary axis or tile offset");
         }
-    } else if (mtp_prompt_rows != 0 && seed_key_rows == mtp_prompt_rows - 1 && rows == 1) {
-        MropePosition actual;
-        media_test::cuda(cudaMemcpyAsync(&actual, positions, sizeof(actual),
-                                         cudaMemcpyDeviceToHost, stream));
-        media_test::cuda(cudaStreamSynchronize(stream));
-        media_test::require(media_test::equal(actual, media_test::axes(mtp_prompt_rows - 1)),
-                            "First MTP proposal did not rotate the final prompt row");
-        ++draft_first_queries;
     }
-    return real_mrope(positions, rows, query, keys, qnorm, knorm, rotated_query, rotated_keys,
-                      stream);
+    return real_mrope_model(positions, rows, query, keys, qnorm, knorm, rotated_query, rotated_keys,
+                            stream, heads);
 }
 
 cudaError_t traced_rope(int position, int rows, const Bf16* query, const Bf16* keys,
                         const Bf16* qnorm, const Bf16* knorm, Bf16* rotated_query,
-                        Bf16* rotated_keys, cudaStream_t stream) {
+                        Bf16* rotated_keys, cudaStream_t stream, GqaGeometry heads) {
     if (tracing) {
         const auto [start, count] = geometry(rotary_calls++);
         media_test::require(start >= media_test::physical && rows == count &&
                                 position == media_test::rotary + start - media_test::physical,
                             "Decode rotary position did not use the multimodal delta");
     }
-    return real_rope(position, rows, query, keys, qnorm, knorm, rotated_query, rotated_keys,
-                     stream);
+    return real_rope(position, rows, query, keys, qnorm, knorm, rotated_query, rotated_keys, stream,
+                     heads);
 }
 
 using Append = cudaError_t(Mxfp8KvCache, Mxfp8PageTable, int, int, const Bf16*, const Bf16*,
-                           cudaStream_t);
+                           cudaStream_t, GqaGeometry);
 extern "C" Append real_append;
 extern "C" Append traced_append;
 
 cudaError_t traced_append(Mxfp8KvCache cache, Mxfp8PageTable pages, int position, int rows,
-                          const Bf16* keys, const Bf16* values, cudaStream_t stream) {
+                          const Bf16* keys, const Bf16* values, cudaStream_t stream,
+                          GqaGeometry heads) {
     if (tracing) {
         const auto [start, count] = geometry(append_calls++);
         media_test::require(position == start && rows == count && pages.page_count == 3,
                             "Cache append used the rotary index or the wrong physical tile");
     }
-    return real_append(cache, pages, position, rows, keys, values, stream);
+    return real_append(cache, pages, position, rows, keys, values, stream, heads);
 }
 
 using Attend = cudaError_t(Mxfp8KvCache, Mxfp8PageTable, int, int, int, const Bf16*, Bf16*,
-                           cudaStream_t);
+                           cudaStream_t, GqaGeometry);
 extern "C" Attend real_attend;
 extern "C" Attend traced_attend;
 
 cudaError_t traced_attend(Mxfp8KvCache cache, Mxfp8PageTable pages, int valid, int position,
-                          int rows, const Bf16* query, Bf16* output, cudaStream_t stream) {
+                          int rows, const Bf16* query, Bf16* output, cudaStream_t stream,
+                          GqaGeometry heads) {
     if (tracing) observe_prefill(position, rows, valid);
-    return real_attend(cache, pages, valid, position, rows, query, output, stream);
+    return real_attend(cache, pages, valid, position, rows, query, output, stream, heads);
 }
 
 using AttendTensor = cudaError_t(Mxfp8KvCache, Mxfp8PageTable, int, int, const Bf16*, Bf16*,

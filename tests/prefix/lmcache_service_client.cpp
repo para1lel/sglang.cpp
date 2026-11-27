@@ -2,6 +2,7 @@
 #include "sglang/runtime/server/batch_cache.h"
 
 #include <chrono>
+#include <future>
 #include <iostream>
 #include <string>
 #include <thread>
@@ -31,6 +32,31 @@ PrefixDeviceTransfer view(int rank) {
 void synchronize_delayed_daemon() {
     std::string command;
     require(bool(std::getline(std::cin, command)) && command == "held", "missing daemon gate");
+}
+
+BatchCacheRead lookup(BatchCache& cache, const Keys& keys) {
+    const auto done = std::make_shared<std::promise<BatchCacheRead>>();
+    auto result = done->get_future();
+    cache.lookup([keys](std::string_view) { return keys; }, 1, false,
+                 std::make_shared<std::atomic_bool>(false),
+                 [done](BatchCacheRead read) { done->set_value(std::move(read)); });
+    require(result.wait_for(1s) == std::future_status::ready, "prefix lookup stuck");
+    return result.get();
+}
+
+void readiness_case(BatchCache& cache, const Keys& keys) {
+    require(!cache.metrics().available, "startup accepted a daemon missing a configured UUID");
+    const auto cold = lookup(cache, keys);
+    require(cold.keys.empty() && cold.match.usable_gdn == 0 && !cache.metrics().available,
+            "missing GPU UUID enabled ranked cache lookup");
+    cache.reset();
+    require(!cache.metrics().available, "namespace reset bypassed ranked readiness");
+
+    std::cout << "restart\n" << std::flush;
+    synchronize_delayed_daemon();
+    const auto recovered = lookup(cache, keys);
+    require(recovered.keys == keys && recovered.match.usable_gdn == 0 && cache.metrics().available,
+            "ranked lookup did not recover after daemon restart");
 }
 
 void registration_cases(BatchCache& cache, const Keys& keys) {
@@ -123,6 +149,7 @@ void store_case(BatchCache& cache, const Keys& keys, const std::string& mode) {
     require(stats.gqa_written_tokens == (success ? 3u : 0u), "logical token credit");
     require(stats.declined_stores == (mode == "decline") && stats.io_errors == (mode == "error"),
             "incorrect failure accounting");
+    require(stats.available == (mode != "error"), "store availability after rank failure");
 }
 
 void restore_case(BatchCache& cache, const Keys& keys, const std::string& mode) {
@@ -146,6 +173,9 @@ void restore_case(BatchCache& cache, const Keys& keys, const std::string& mode) 
     require(stats.rank_read_bytes[0][1] == 4 * success && stats.rank_read_bytes[1][1] == success,
             "restore must use actual per-rank receipts");
     require(stats.gdn_read_bytes == 5 * success, "joint restore receipt");
+    if (mode == "error") {
+        require(!stats.available, "restore failure left ranked cache available");
+    }
     cache.reset();
 }
 
@@ -157,7 +187,6 @@ int main(int argc, char** argv) {
     devices[0][0] = 1;
     devices[1][0] = 2;
     BatchCache cache({argv[1], "service", 2000}, devices, "service", 1);
-    require(cache.metrics().available, "shared daemon unavailable");
     Keys keys;
     for (int r = 0; r < 2; ++r) {
         const auto layout = tp2_prefix_cache_layout(r);
@@ -165,6 +194,11 @@ int main(int argc, char** argv) {
                                                          &layout));
     }
     const std::string action = argv[2];
+    if (action == "readiness") {
+        readiness_case(cache, keys);
+        return 0;
+    }
+    require(cache.metrics().available, "shared daemon unavailable");
     if (action == "register") registration_cases(cache, keys);
     else if (action == "reset") {
         bool failed = false;

@@ -880,11 +880,13 @@ std::optional<cudaError_t> decoder::launch_batched_ragged_tmem(
     }
     TmemAttentionBatch batch{};
     batch.tiles.count = count;
+    const auto& first_cache = sequences[0].cache;
     int tiles = 0;
     for (int index = 0; index < count; ++index) {
         const auto& sequence = sequences[index];
         constexpr int max_physical_pages = INT_MAX / mxfp8_page_size + 1;
-        if (sequence.cache.page_count > max_physical_pages) {
+        if (sequence.cache.kv_heads != first_cache.kv_heads ||
+            sequence.cache.page_count > max_physical_pages) {
             return std::nullopt;
         }
         const auto encoded = encode_flash_maps(sequence.cache, batch.key_maps[index],
@@ -899,8 +901,8 @@ std::optional<cudaError_t> decoder::launch_batched_ragged_tmem(
         batch.tiles.tile_end[index] = tiles;
     }
     void* args[] = {&batch};
-    return cudaLaunchKernel(kernel, dim3(tiles, gqa_head_pairs(sequences[0].cache)),
-                            tmem_threads, args, dynamic_shared, stream);
+    return cudaLaunchKernel(kernel, dim3(tiles, gqa_head_pairs(first_cache)), tmem_threads, args,
+                            dynamic_shared, stream);
 }
 
 }

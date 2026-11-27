@@ -32,8 +32,7 @@ struct ScratchLayout {
     std::byte* data = nullptr;
     std::size_t bytes = 0;
 
-    template <typename Element, std::size_t alignment = 16>
-    Element* take(std::size_t count);
+    Bf16* take_bf16(std::size_t count);
 };
 
 struct PrefillDims {

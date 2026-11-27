@@ -37,6 +37,14 @@ K and V use four 256-channel E4M3 heads and one E8M0 scale per 32 contiguous cha
 
 Each 128-token page holds 131,072 payload bytes and 4,096 scale bytes per tensor. The device table maps logical pages to distinct physical pages. [Cache layout](../include/sglang/mxfp8_gqa.h#L28)<!-- prefix: "struct Mxfp8" --> · [Page table](../include/sglang/mxfp8_gqa.h#L37)<!-- prefix: "struct Mxfp8" -->
 
+`gqa_geometry_valid` and `gqa_geometry_matches` are runtime predicates. For compile-time checks, use the fields of a `constexpr GqaGeometry` directly. Check geometry against the live cache with `gqa_geometry_matches` at runtime. [Geometry constants](../include/sglang/mxfp8_gqa.h#L23)<!-- prefix: "inline const" --> · [Runtime predicates](../src/text/gqa/geometry.cpp#L9)<!-- prefix: "bool gqa_geo" -->
+
+```cpp
+constexpr auto geometry = sglang::gqa_rank_geometry;
+static_assert(geometry.kv_heads == sglang::mxfp8_kv_heads / 2);
+static_assert(geometry.query_heads == sglang::mxfp8_queries_per_kv_head * geometry.kv_heads);
+```
+
 Link `sglang_cuda`. Apply RoPE to Q and K. Append contiguous BF16 K and V `[tokens, 4, 256]`. Pass the ready prefix length and first query position to `mxfp8_gqa_attention`. BF16 Q and output are `[queries, 24, 256]`. Row `r` sees through `first_query_position + r` inclusive. Check launch status. Retain storage through stream completion. [Library](../xmake.lua#L136)<!-- prefix: "target(\"sgla" --> · [Append](../include/sglang/mxfp8_gqa.h#L45)<!-- prefix: "cudaError_t " --> · [Attention](../include/sglang/mxfp8_gqa.h#L50)<!-- prefix: "cudaError_t " -->
 
 For group maximum magnitude `amax`, clamp `ceil(log2(max(amax, 1e-30) / 448)) + 127` to `[0, 254]`. See the [scratch-free reader](singleton-gqa-decode.md#scratch-free-ordered-attention) for direct attention. [Scale calculation](../src/text/gqa/kv_append.cu#L15)<!-- prefix: "__device__ i" -->
@@ -80,7 +88,7 @@ The [checkpoint loader](../include/sglang/checkpoint.h#L24)<!-- prefix: "class C
 
 ### Runtime path
 
-The shared layer loop uses the model layout to select each layer's KV or GDN bank. Tile and row adapters supply buffers and operator dispatch. The outer paths own embedding, draft seeding, and scoring. [Layer mapping](../src/runtime/model/qwen_text_model.cpp#L13)<!-- prefix: "QwenTextMode" --> · [Execution bank selection](../src/decoder_prefill.cpp#L32)<!-- prefix: "const auto r" --> · [Tile adapter](../src/decoder_prefill.cpp#L625)<!-- prefix: "run_layers(l" --> · [Row adapter](../src/decoder_forward.cpp#L75)<!-- prefix: "void Decoder" -->
+The shared layer loop uses the model layout to select each layer's KV or GDN bank. Tile and row adapters supply buffers and operator dispatch. The outer paths own embedding, draft seeding, and scoring. [Layer mapping](../src/runtime/model/qwen_text_model.cpp#L13)<!-- prefix: "QwenTextMode" --> · [Execution bank selection](../src/decoder_prefill.cpp#L32)<!-- prefix: "const auto r" --> · [Tile adapter](../src/decoder_prefill.cpp#L624)<!-- prefix: "run_layers(l" --> · [Row adapter](../src/decoder_forward.cpp#L75)<!-- prefix: "void Decoder" -->
 
 Serial K0 reuses its stream and grows storage on demand. Prefill rebuilds [MXFP8 pages](#p2-gqa-cache-contract) with an identity page table. Reset clears BF16 convolution history and FP32 recurrent state across the GDN layers. The final prompt row supplies the initial logits. Overlapping calls use private eager storage. [Generation loop](../src/decoder.cpp#L721)<!-- prefix: "void Decoder" --> · [State reset](../src/runtime/model/qwen_request.cpp#L321)<!-- prefix: "void Request" -->
 
@@ -136,6 +144,8 @@ Use `--max-active` for the 1–32 HTTP lane limit and `--max-num-batched-tokens`
 Startup injects the Qwen serving profile and a batch executor into `BatchService`. The worker owns the batch and topology. Startup waits for the first cache snapshot. Shutdown closes the queue and wakes the worker before joining. [Composition](../apps/sglang-server.cpp#L355)<!-- prefix: "auto executo" --> · [Executor lifecycle](../src/runtime/server/single_device_batch_executor.cpp#L81)<!-- prefix: "void SingleD" --> · [Startup handshake](../apps/server/batch_service.cpp#L47)<!-- prefix: "void BatchSe" -->
 
 The scheduler uses the session for admission, cancellation, and whole batch steps. The [batch planner](batch-graphs.md#runtime-path) allocates rows. Operator dispatch runs within each planned step. Lanes share device weights and own request KV, GDN state, and output. The [resident-memory limit](batch-graphs.md#resident-memory-admission) applies separately from row and lane limits. [Scheduler loop](../apps/server/batch_service.cpp#L333)<!-- prefix: "void BatchSe" -->
+
+Call `BatchSession` operations on the worker thread that owns the session. `admit()` returns the number of prompt positions restored. After an admission exception, the scheduler checks `available()` to see whether the session can continue. If it can, the scheduler ends the affected request. Otherwise, the scheduler rethrows the exception. [Worker session](../src/runtime/server/single_device_batch_executor.cpp#L81)<!-- prefix: "void SingleD" --> · [Admission and failure](../apps/server/batch_service.cpp#L230)<!-- prefix: "job->cached_" -->
 
 Use the serving contracts for [native generation](native-generate.md), [text](text-serving.md), [chat](chat-serving.md), [benchmark token-ID streams](../benchmarks/streaming/README.md#wire-contract), and [launch migration](native-model-info.md#migrate-old-launch-commands).
 

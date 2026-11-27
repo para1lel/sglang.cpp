@@ -6,7 +6,7 @@ import shutil
 import subprocess
 import tarfile
 import tempfile
-from collections import defaultdict, deque
+from collections import defaultdict
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -110,20 +110,18 @@ def include_parents(root: Path) -> IncludeParents:
     return parents
 
 
-def consumers(header: str, parents: IncludeParents) -> list[str]:
-    closer = deque([(header, 0)])
-    seen = {header}
-    units = []
-    while closer:
-        name, distance = closer.popleft()
-        for parent in parents[name] - seen:
+def consumers(headers: set[str], parents: IncludeParents) -> set[str]:
+    pending = list(headers)
+    seen = set(headers)
+    units = set()
+    while pending:
+        for parent in parents[pending.pop()] - seen:
             seen.add(parent)
             if Path(parent).suffix.lower() in SOURCE_SUFFIXES:
-                mismatch = header.lower().endswith(".cuh") and not parent.lower().endswith(".cu")
-                units.append((mismatch, distance, parent))
+                units.add(parent)
             else:
-                closer.append((parent, distance + 1))
-    return [name for _, _, name in sorted(units)]
+                pending.append(parent)
+    return units
 
 
 def toolchain_flags(prefix: Path) -> list[str]:
@@ -407,23 +405,6 @@ def selected(item: Finding, files: LineSelection) -> bool:
     return ranges is None or any(start <= item.line <= end for start, end in ranges)
 
 
-def inspect_headers(engine: ClangTidy, pending: set[str], units: set[str]) -> None:
-    parents = include_parents(engine.root)
-    for header in sorted(pending):
-        if header not in pending:
-            continue
-        for name in consumers(header, parents):
-            if name not in units:
-                pending -= engine.inspect(name, trace=True)
-                units.add(name)
-            if header not in pending:
-                break
-        if header in pending:
-            pending -= engine.inspect(header, trace=True)
-            if header in pending:
-                raise RuntimeError(f"clang-tidy could not confirm analysis of {header}.")
-
-
 def inspect_selected(engine: ClangTidy) -> None:
     root, baseline, files = engine.root, engine.baseline, engine.files
     headers = {name for name in files if Path(name).suffix.lower() in HEADER_SUFFIXES}
@@ -431,19 +412,22 @@ def inspect_selected(engine: ClangTidy) -> None:
     if not files:
         units.update(name for name in PROBES if (root / name).is_file())
     missing = {name for name in headers if not (root / name).is_file()}
+    uncovered = headers - missing
+    if uncovered:
+        units.update(consumers(uncovered, include_parents(root)))
     if missing and baseline is not None:
-        before = include_parents(baseline)
         units.update(
             name
-            for header in missing
-            for name in consumers(header, before)
+            for name in consumers(missing, include_parents(baseline))
             if (root / name).is_file()
         )
-    pending = headers - missing
     for name in sorted(units):
-        pending -= engine.inspect(name, trace=bool(pending))
-    if pending:
-        inspect_headers(engine, pending, units)
+        uncovered -= engine.inspect(name, trace=bool(uncovered))
+    for header in sorted(uncovered):
+        if header in uncovered:
+            uncovered -= engine.inspect(header, trace=True)
+            if header in uncovered:
+                raise RuntimeError(f"clang-tidy could not confirm analysis of {header}.")
 
 
 def run(root: Path, files: LineSelection, *, baseline: Path | None = None) -> bool:

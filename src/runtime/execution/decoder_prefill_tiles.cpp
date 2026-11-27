@@ -10,11 +10,19 @@
 
 namespace sglang::decoder::prefill_detail {
 
-template <typename Element, std::size_t alignment>
-Element* ScratchLayout::take(std::size_t count) {
-    const auto offset = (bytes + alignment - 1) / alignment * alignment;
-    bytes = offset + count * sizeof(Element);
-    return data ? reinterpret_cast<Element*>(data + offset) : nullptr;
+namespace {
+
+template <typename Element, std::size_t alignment = 16>
+Element* take(ScratchLayout& layout, std::size_t count) {
+    const auto offset = (layout.bytes + alignment - 1) / alignment * alignment;
+    layout.bytes = offset + (count * sizeof(Element));
+    return layout.data ? reinterpret_cast<Element*>(layout.data + offset) : nullptr;
+}
+
+}
+
+Bf16* ScratchLayout::take_bf16(std::size_t count) {
+    return take<Bf16>(*this, count);
 }
 
 PrefillDims PrefillDims::from_layers(const std::array<Layer, layer_count>& layers) {
@@ -73,27 +81,29 @@ SeedScratch make_seed_scratch(Bf16* memory, int concat_rows, int kv_rows) {
 }
 
 TileBuffers::TileBuffers(ScratchLayout& layout, int rows, const PrefillDims& tile_dims)
-    : dims(tile_dims),
-      hidden(layout.take<Bf16>(rows * hidden_size)),
-      normalized(layout.take<Bf16>(rows * hidden_size)),
-      residual(layout.take<Bf16>(rows * hidden_size)),
-      projected_attention(layout.take<Bf16>(rows * hidden_size)),
-      attention(layout.take<Bf16>(rows * dims.attention_width())),
-      mlp_gate(layout.take<Bf16, 32>(rows * dims.intermediate)),
-      mlp_up(layout.take<Bf16>(rows * dims.intermediate)),
-      q_gate(layout.take<Bf16>(rows * dims.q_gate_width)),
-      keys(layout.take<Bf16>(rows * dims.kv_width)),
-      values(layout.take<Bf16>(rows * dims.kv_width)),
-      rope_queries(layout.take<Bf16>(rows * dims.q_width)),
-      rope_keys(layout.take<Bf16>(rows * dims.kv_width)),
-      gdn_qkv(layout.take<Bf16>(rows * dims.gdn_qkv_width)),
-      gdn_z(layout.take<Bf16>(rows * dims.gdn_value_width)),
-      gdn_b(layout.take<Bf16>(rows * dims.gdn_heads)),
-      gdn_a(layout.take<Bf16>(rows * dims.gdn_heads)),
-      gdn_scratch(layout.take<Bf16>(dims.gdn_workspace_bytes(rows) / sizeof(Bf16))),
+    : dims(tile_dims), hidden(take<Bf16>(layout, static_cast<std::size_t>(rows) * hidden_size)),
+      normalized(take<Bf16>(layout, static_cast<std::size_t>(rows) * hidden_size)),
+      residual(take<Bf16>(layout, static_cast<std::size_t>(rows) * hidden_size)),
+      projected_attention(take<Bf16>(layout, static_cast<std::size_t>(rows) * hidden_size)),
+      attention(take<Bf16>(layout, static_cast<std::size_t>(rows) * dims.attention_width())),
+      mlp_gate(take<Bf16, 32>(layout, static_cast<std::size_t>(rows) * dims.intermediate)),
+      mlp_up(take<Bf16>(layout, static_cast<std::size_t>(rows) * dims.intermediate)),
+      q_gate(take<Bf16>(layout, static_cast<std::size_t>(rows) * dims.q_gate_width)),
+      keys(take<Bf16>(layout, static_cast<std::size_t>(rows) * dims.kv_width)),
+      values(take<Bf16>(layout, static_cast<std::size_t>(rows) * dims.kv_width)),
+      rope_queries(take<Bf16>(layout, static_cast<std::size_t>(rows) * dims.q_width)),
+      rope_keys(take<Bf16>(layout, static_cast<std::size_t>(rows) * dims.kv_width)),
+      gdn_qkv(take<Bf16>(layout, static_cast<std::size_t>(rows) * dims.gdn_qkv_width)),
+      gdn_z(take<Bf16>(layout, static_cast<std::size_t>(rows) * dims.gdn_value_width)),
+      gdn_b(take<Bf16>(layout, static_cast<std::size_t>(rows) * dims.gdn_heads)),
+      gdn_a(take<Bf16>(layout, static_cast<std::size_t>(rows) * dims.gdn_heads)),
+      gdn_scratch(take<Bf16>(layout, dims.gdn_workspace_bytes(rows) / sizeof(Bf16))),
       activation{
-          layout.take<std::uint8_t>(rows * dims.intermediate),
-          layout.take<float>(rows * text_fp8_group_count(dims.intermediate))} {}
+          take<std::uint8_t>(layout, static_cast<std::size_t>(rows) * dims.intermediate),
+          take<float>(layout,
+                      static_cast<std::size_t>(rows) * text_fp8_group_count(dims.intermediate)),
+      } {
+}
 
 PairedPrefillScratch TileBuffers::gqa_scratch() const {
     const auto mlp_begin = reinterpret_cast<std::uintptr_t>(mlp_gate);
@@ -457,8 +467,6 @@ Chunk prefill_attention_segment(const Chunk& chunk, const PrefillGrant& grant, i
         grant.position, grant.media ? grant.media->positions + grant.position : nullptr,
         grant.request->cached_gqa_tokens, chunk.long_staging};
 }
-
-template Bf16* ScratchLayout::take<Bf16, 16>(std::size_t);
 
 }
 

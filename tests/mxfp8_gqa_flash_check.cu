@@ -1,3 +1,5 @@
+#include "mxfp8_gqa_checks.h"
+
 #include "sglang/mxfp8_gqa.h"
 #include "sglang/text/prefill_attn_sm100.h"
 
@@ -7,6 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <iostream>
 #include <limits>
 #include <numeric>
 #include <random>
@@ -875,9 +878,54 @@ void check_tail_recovery(cudaStream_t stream, int position, int count, Dispatch 
                 last_offset, nonfinite);
 }
 
+void check_exceptional_repair(const char* label, int position, Dispatch dispatch,
+                              cudaStream_t stream, int count = rows) {
+    Input input(position + count, count);
+    std::fill(input.keys.begin(), input.keys.end(), 0);
+    std::fill(input.values.begin(), input.values.end(), 0x38);
+    std::fill(input.value_scales.begin(), input.value_scales.end(), 127);
+    std::fill(input.queries.begin(), input.queries.end(), __float2bfloat16_rn(0.0F));
+    const int key_row = count - 2;
+    input.keys[input.payload_offset(position + key_row, 0)] = 0x7f;
+    const int query = ((count - 1) * row_width) + (queries_per_kv * channels);
+    input.queries[query] = __ushort_as_bfloat16(0x7fc0);
+    DeviceInput device(input);
+    const auto repaired =
+        device.run(label, input, position, dispatch, {}, stream, {.count = count});
+    for (int row = 0; row < count; ++row) {
+        for (int head = 0; head < mxfp8_query_heads; ++head) {
+            const bool bad_key = row >= key_row && head < queries_per_kv;
+            const bool bad_query = row == count - 1 && head == queries_per_kv;
+            const auto offset = (row * row_width) + (head * channels);
+            const auto first = repaired.begin() + guard + offset;
+            const auto correct = [bad = bad_query || bad_key](BFloat value) {
+                return bad ? std::isnan(__bfloat162float(value)) &&
+                                 __bfloat16_as_ushort(value) != 0xffff
+                           : __bfloat162float(value) == 1.0F;
+            };
+            if (!std::all_of(first, first + channels, correct)) {
+                throw std::runtime_error(std::string(label) + ": exceptional repair mismatch at " +
+                                         std::to_string(row) + "/" + std::to_string(head));
+            }
+        }
+    }
+    std::cout << "MXFP8 prefill " << label << " repaired exceptional query and key\n";
 }
 
-void check_flash_prefill(cudaStream_t stream) {
+void check_tmem_repair(cudaStream_t stream) {
+    constexpr int pipeline_rows = 144;
+    constexpr Dispatch pipeline{"tmem_pipeline_attention", 5, head_blocks, 1, 416};
+    check_mixed_grouped_prefill(stream);
+    check_exceptional_repair("paired exceptional repair", 4096, tmem_paired, stream);
+    check_exceptional_repair("pipeline exceptional repair", 8192, pipeline, stream, pipeline_rows);
+    check_exceptional_repair("wide Flash exceptional repair", 1025, flash, stream);
+}
+}
+
+void check_flash_prefill(cudaStream_t stream, bool repair_only) {
+    check_tmem_repair(stream);
+    if (repair_only)
+        return;
     check_dispatch_errors(stream);
     check_paired_lower_edge(stream);
     check_unaligned_paired_prefill(stream);
@@ -915,5 +963,4 @@ void check_flash_prefill(cudaStream_t stream) {
     }
     check_long_flash(stream);
 }
-
 }

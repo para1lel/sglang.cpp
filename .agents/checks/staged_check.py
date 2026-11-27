@@ -49,6 +49,8 @@ def freeze(root, temporary):
         environment["GIT_INDEX_FILE"] = str(selected if selected.is_absolute() else root / selected)
     environment["GIT_OPTIONAL_LOCKS"] = "0"
     environment["GIT_NO_REPLACE_OBJECTS"] = "1"
+    head = git(root, ["rev-parse", "--verify", "HEAD"], environment, required=False)
+    head = head.strip().decode("ascii")
     value = git(root, ["rev-parse", "--git-path", "index"], environment)
     path = Path(os.fsdecode(value).rstrip("\n"))
     index = path if path.is_absolute() else root / path
@@ -68,11 +70,19 @@ def freeze(root, temporary):
     environment["GIT_OBJECT_DIRECTORY"] = str(objects)
     tree = git(root, ["write-tree"], environment).strip()
     entries = read_tree(root, tree.decode("ascii"), environment)
+    base = head or git(
+        root,
+        ["hash-object", "-t", "tree", "-w", "--stdin"],
+        environment,
+        input_data=b"",
+    ).strip().decode("ascii")
     changed = git(
-        root, ["diff", "--cached", "--name-only", "--no-renames", "-z"], environment,
+        root,
+        ["diff", "--cached", "--name-only", "--no-renames", "-z", base, "--"],
+        environment,
     )
     changed = [os.fsdecode(name) for name in changed.split(b"\0") if name]
-    return entries, changed, environment, index, original
+    return entries, changed, environment, index, original, head
 
 
 def read_blob(reader, destination, size, expected):
@@ -176,8 +186,8 @@ def snapshot_repository(root, snapshot, entries, environment, head):
         for name, (mode, _, identity) in entries.items()
     )
     git(snapshot, ["update-index", "-z", "--index-info"], clean, input_data=listing)
-    if head.strip():
-        git(snapshot, ["update-ref", "HEAD", head.strip().decode("ascii")], clean)
+    if head:
+        git(snapshot, ["update-ref", "HEAD", head], clean)
 
 
 def prepare_checker(root: Path, snapshot: Path, temporary: Path) -> Path:
@@ -186,6 +196,7 @@ def prepare_checker(root: Path, snapshot: Path, temporary: Path) -> Path:
         ("check_rules.py", "the rule checker"),
         ("function_spans.py", "function_spans.py"),
         ("comment_rules.py", "the comment rules"),
+        ("native_tokens.py", "native_tokens.py"),
         ("tool_process.py", "tool_process.py"),
         ("gate_config.py", "the gate's helper"),
     )
@@ -206,14 +217,20 @@ def run(root):
         temporary = Path(directory).resolve()
         if not temporary.is_relative_to(Path(tempfile.gettempdir()).resolve()):
             raise ValueError("The temporary snapshot leaves its selected directory.")
-        entries, changed, environment, index, original = freeze(root, temporary)
-        head = git(root, ["rev-parse", "--verify", "HEAD"], environment, required=False)
+        entries, changed, environment, index, original, head = freeze(root, temporary)
         snapshot = temporary / "source"
         snapshot.mkdir()
         materialize(root, snapshot, entries, environment)
         gate_config = selected_helpers(root, snapshot)
         configuration = gate_config.load(snapshot)
-        gate_config.baseline_unchanged(root, configuration, environment)
+        if head:
+            previous = git(
+                root,
+                ["show", f"{head}:{gate_config.CONFIG_PATH}"],
+                environment,
+                required=False,
+            )
+            gate_config.baseline_unchanged(configuration, previous)
         clean_environment = snapshot_environment()
         snapshot_repository(root, snapshot, entries, environment, head)
         selected_checker = prepare_checker(root, snapshot, temporary)
@@ -247,7 +264,8 @@ def run(root):
         current = index.read_bytes() if index.exists() else None
         if current != original:
             raise ValueError("The caller's index changed during verification.")
-        if git(root, ["rev-parse", "--verify", "HEAD"], environment, required=False) != head:
+        current_head = git(root, ["rev-parse", "--verify", "HEAD"], environment, required=False)
+        if current_head.strip().decode("ascii") != head:
             raise ValueError("HEAD changed during verification.")
         return result.returncode
 

@@ -1,9 +1,6 @@
 import io
-import os
 import re
-import tempfile
 import tokenize
-from pathlib import Path
 
 import tree_sitter_bash
 import tree_sitter_go
@@ -16,7 +13,7 @@ import tree_sitter_toml
 import tree_sitter_typescript
 import tree_sitter_yaml
 from function_spans import HEADER_SUFFIXES
-from tool_process import invoke
+from native_tokens import inspect_tokens
 from tree_sitter import Language, Parser, Query, QueryCursor
 
 C_KINDS = ({".c", ".c++", ".cc", ".cpp", ".cxx"} | HEADER_SUFFIXES) - {".cuh"}
@@ -70,24 +67,6 @@ UNSUPPORTED = (
 )
 COMMENT_FOUND = "Line {line} contains a comment. Remove it or express it as data."
 NOT_UTF8 = "The staged content is not valid UTF-8, so its comments cannot be examined."
-SPLICE = rb"\\[ \t]*\n"
-COMMENT_START = re.compile(rb"(?:" + SPLICE + rb")*(/)(?:" + SPLICE + rb")*[/*]")
-DIRECTIVE_SPACE = rb"(?:[ \t\v\f]|" + SPLICE + rb"|/\*.*?\*/)*"
-HEADER_NAME = re.compile(
-    rb"(?:#|%:)"
-    + DIRECTIVE_SPACE
-    + rb"(?P<directive>[a-z_]+(?:"
-    + SPLICE
-    + rb"[a-z_]+)*)"
-    + DIRECTIVE_SPACE
-    + rb"<(?P<name>(?:"
-    + SPLICE
-    + rb"|[^>\n])*)>",
-    re.DOTALL,
-)
-HEADER_CHARACTER = re.compile(rb"(" + SPLICE + rb")|[^\n]")
-HEADER_QUOTING = re.compile(rb"[\"']|//|/\*")
-HEADER_DIRECTIVES = {b"include", b"include_next", b"import", b"embed"}
 
 
 def classify(path, prefix):
@@ -132,63 +111,11 @@ def is_shebang(node):
     )
 
 
-def raw_token_starts(source: bytes, standard: str) -> list[tuple[int, int]]:
-    with tempfile.NamedTemporaryFile() as handle:
-        handle.write(source)
-        handle.flush()
-        language = "c" if standard == "c23" else "c++"
-        result = invoke(
-            [
-                "clang++",
-                "-cc1",
-                "-x",
-                language,
-                "-std=" + standard,
-                "-dump-raw-tokens",
-                handle.name,
-            ],
-            Path.cwd(),
-        )
-        result.check_returncode()
-        location = rb"Loc=<" + re.escape(os.fsencode(handle.name)) + rb":(\d+):(\d+)>"
-    starts = [0, *(match.end() for match in re.finditer(rb"\n", source))]
-    return [
-        (int(row), starts[int(row) - 1] + int(column) - 1)
-        for row, column in re.findall(location, result.stderr)
-    ]
-
-
 def c_comment_lines(source: bytes, standard: str) -> set[int]:
     if b"/" not in source:
         return set()
-    while True:
-        tokens = raw_token_starts(source, standard)
-        normalized = bytearray(source)
-        lines = set()
-        at_start = True
-        for index, (row, offset) in enumerate(tokens):
-            end = tokens[index + 1][1] if index + 1 < len(tokens) else len(source)
-            token = source[offset:end]
-            comment = COMMENT_START.match(token)
-            if comment:
-                lines.add(row + token[: comment.start(1)].count(b"\n"))
-                continue
-            if at_start and (header := HEADER_NAME.match(source, offset)):
-                directive = re.sub(SPLICE, b"", header["directive"])
-                name = re.sub(SPLICE, b"", header["name"])
-                if directive in HEADER_DIRECTIVES and HEADER_QUOTING.search(name):
-                    start, stop = header.span("name")
-                    normalized[start:stop] = HEADER_CHARACTER.sub(
-                        lambda character: character[1] or b" ",
-                        header["name"],
-                    )
-            if not token.strip() or token.startswith(b"\\"):
-                at_start = at_start or b"\n" in re.sub(SPLICE, b"", token)
-            else:
-                at_start = False
-        if normalized == source:
-            return lines
-        source = bytes(normalized)
+    lines, _ = inspect_tokens(source, standard)
+    return lines
 
 
 def comment_lines(kind: str, text: str, standard: str = "c++23") -> set[int]:

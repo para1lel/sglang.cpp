@@ -111,6 +111,8 @@ def frame_metadata(opcode, payload):
                 size += number(8)
             records.append({"bytes": size, "tokens": 0, "endpoint": endpoint})
         entry["records"] = records
+    elif opcode == READY:
+        entry["devices"] = [read(16).hex() for _ in range((len(payload) - view.tell()) // 16)]
     elif opcode in (PREFIX, PREFIX_DETAIL):
         count, limit, draft = struct.unpack("!IIB", read(9))
         read(64 * count)

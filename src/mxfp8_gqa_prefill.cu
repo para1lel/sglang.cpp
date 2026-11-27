@@ -383,11 +383,6 @@ __device__ __forceinline__ void flash_attention_tile(Attention request, int rows
     }
     if (__syncthreads_or(threadIdx.x < Rows * ordered_heads && tile.bad_query[threadIdx.x]) ||
         tile.bad_key < last) {
-        if constexpr (Rows > flash_rows) {
-            if (threadIdx.x >= channels) {
-                return;
-            }
-        }
         for (int offset = 0; offset < active_rows; ++offset) {
             if (position + offset >= tile.bad_key ||
                 tile.bad_query[offset * ordered_heads] ||
@@ -574,7 +569,8 @@ std::optional<cudaError_t> decoder::try_batched_paged_prefill(
     bool below_ragged_floor = false;
     for (int index = 0; index < count; ++index) {
         const auto& sequence = sequences[index];
-        if (!valid_paged_prefill_sequence(sequence, min_flash_rows, max_multirow_visible_tokens)) {
+        if (sequence.cache.kv_heads != first.cache.kv_heads ||
+            !valid_paged_prefill_sequence(sequence, min_flash_rows, max_multirow_visible_tokens)) {
             return std::nullopt;
         }
         early_ragged = early_ragged && sequence.rows == 256 &&

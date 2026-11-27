@@ -65,7 +65,13 @@ def is_code(path, suffixes, configuration, root):
     )
 
 
-def function_spans(path, text, configuration):
+def function_spans(
+    path: Path,
+    text: str,
+    configuration: dict,
+    *,
+    default_adapter: list[str] | None = None,
+) -> list[tuple[str, int, int]]:
     if not function_source(path):
         return []
     if path.suffix in PYTHON_SUFFIXES:
@@ -80,7 +86,7 @@ def function_spans(path, text, configuration):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
         ]
     suffix = ".sh" if path.parent.name == ".githooks" else path.suffix
-    command = configuration.get("function_adapters", {}).get(suffix)
+    command = configuration.get("function_adapters", {}).get(suffix, default_adapter)
     if (
         not isinstance(command, list) or not command or "{file}" not in command
         or not all(isinstance(part, str) and part for part in command)
@@ -113,7 +119,14 @@ def function_spans(path, text, configuration):
     return [(span["name"], span["start"], span["end"]) for span in spans]
 
 
-def measure(root, paths, code_suffixes, configuration):
+def measure(
+    root: Path,
+    paths: list[Path],
+    code_suffixes: set[str],
+    configuration: dict,
+    *,
+    default_adapters: dict[str, list[str]],
+) -> dict:
     configuration = {**configuration, "_root": str(root)}
     maximum = dict.fromkeys(DEFAULT_LIMITS, 0)
     children = {}
@@ -127,11 +140,17 @@ def measure(root, paths, code_suffixes, configuration):
         contents = path.read_bytes()
         identity.update(relative.as_posix().encode("utf-8") + b"\0")
         identity.update(hashlib.sha256(contents).digest())
-        if not is_code(path, code_suffixes, configuration, root):
+        default_adapter = default_adapters.get(path.suffix.lower())
+        if not is_code(path, code_suffixes, configuration, root) and default_adapter is None:
             continue
         text = contents.decode("utf-8")
         maximum["code_file_lines"] = max(maximum["code_file_lines"], len(text.splitlines()))
-        for _, start, end in function_spans(path, text, configuration):
+        for _, start, end in function_spans(
+            path,
+            text,
+            configuration,
+            default_adapter=default_adapter,
+        ):
             maximum["function_lines"] = max(maximum["function_lines"], end - start + 1)
     maximum["directory_entries"] = max((len(value) for value in children.values()), default=0)
     result = subprocess.run(
@@ -160,16 +179,12 @@ def matches(name, patterns):
     return any(fnmatch.fnmatchcase(name, pattern) for pattern in patterns)
 
 
-def baseline_unchanged(root, configuration, environment):
-    result = subprocess.run(
-        ["git", "--no-replace-objects", "-C", str(root), "show", "HEAD:" + CONFIG_PATH],
-        env=environment, capture_output=True, text=True, check=False,
-    )
-    if result.returncode:
+def baseline_unchanged(configuration: dict, old_configuration: bytes) -> None:
+    if not old_configuration:
         return
     if not configuration:
         raise ValueError("A normal commit cannot remove the frozen gate configuration.")
-    previous = json.loads(result.stdout)
+    previous = json.loads(old_configuration)
     for name in ("baseline", "limits"):
         if previous.get(name) != configuration.get(name):
             raise ValueError(

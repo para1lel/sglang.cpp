@@ -28,6 +28,12 @@ The streaming recurrence uses four warps per CTA, with 16 value rows per CTA and
 
 FlashInfer v0.7.4's single-token FP32 pretranspose kernel provides a source comparison for SM100. For `V = K = 128`, it also assigns 16 value rows per CTA and eight CTAs per request and value head. It stages FP32 `[V,K]` state in shared memory with cache-global 128-bit `cp.async`, moving four contiguous K elements per lane. It then updates the state in registers, uses warp butterfly reductions, and writes to the destination pool slot. [FlashInfer launch](https://github.com/flashinfer-ai/flashinfer/blob/77039051b0be921788dc2784ec41423b558878ec/flashinfer/gdn_kernels/gdn_decode_pretranspose.py#L725-L793) · [FlashInfer recurrence](https://github.com/flashinfer-ai/flashinfer/blob/77039051b0be921788dc2784ec41423b558878ec/flashinfer/gdn_kernels/gdn_decode_pretranspose.py#L280-L367)
 
+### TP2 80-row target verification
+
+On B200 TP2, eager verification uses the wide GDN recurrence for 16 complete five-row K4 lanes with packed activations, target Tensor Cores, and rank-local state. Each rank has 24 value heads of 128 channels. Eight warps process four value channels each. Each block covers 32 channels, so each lane needs 96 blocks instead of 192. Scalar streaming FP32 state accesses preserve alignment requirements and per-channel arithmetic. Ordinary verification, fixed verifier replay, 32 local lanes, and full-model GDN retain their kernels. [Caller](../include/sglang/runtime/execution/decoder_forward_layers.h#L424)<!-- prefix: "inline bool " --> · [Geometry](../src/text/gdn_verify.cu#L149)<!-- prefix: "__global__ v" --> · [Rank-local dispatch](../src/text/gdn_verify.cu#L377)<!-- prefix: "if constexpr" -->
+
+Each verification writes tentative history and recurrent state. A full commit swaps in the tentative tail. A partial commit replays the accepted prefix from the initial state and saved inputs before swapping. A zero-row commit keeps the initial state. Submission errors propagate through the existing cleanup path. [Commit](../src/decoder_verify.cpp#L512)<!-- prefix: "void TargetV" --> · [Launch status](../src/text/gdn_verify.cu#L351)<!-- prefix: "cudaError_t " -->
+
 ## Constraints and failure behavior
 
 Each live row updates its bound request's FP32 `[V,K]` state and three BF16 history taps in place. The checkpoint uses 16 Q/K heads, 48 value heads, and head dimension 128. Each kernel checks the current active count before it accesses state or writes outputs. Padding can carry null bindings and leaves recurrent state, history, and outputs untouched, including when the active count is zero. [Checkpoint dimensions](../include/sglang/text_attention.h#L10)<!-- prefix: "inline const" -->
@@ -37,6 +43,13 @@ FlashInfer uses input and output pool indices. A negative input index skips the 
 A wide-path execution failure after convolution can leave history advanced. A target-only execution error outside graph fallback or prefix recovery disables the batch. See the [packed batch failure contract](batch-graphs.md#constraints-and-failure-behavior).
 
 ## Verification
+
+### TP2 80-row caller replay
+
+On two B200s, 18 paired samples reused three live W4 packets at positions 32,768, 32,773, and 32,778. Median verifier time fell from 13.347 to 13.152 ms, with a 0.193833 ms paired median saving. The fenced interval included the full target verifier through scoring and readbacks on both ranks. Proposal generation, acceptance, and commit ran outside it. Wire latency remains unmeasured. See `artifacts/tp2-resume/w4-gdn-verify/production/e912b39/receipt.txt` and `artifacts/tp2-resume/w4-gdn-verify/pair-0-6-arm0.T6jnFwjV/live.log`.
+
+All live lanes accepted four proposals. Separate one- to four-row prefix replays matched both ranks and detected a mutated carry byte. Independent B200 tests matched seven guarded output and state buffers byte for byte. They covered scalar-only alignment, wider and full-model controls, and direct operator capture. See `artifacts/tp2-resume/gdn-verify-m80-review/receipt.txt`.
+
 
 Use the focused replay bundle on a B200 with the default Pixi CUDA 13.4 environment and CUDA compatibility library. The wrapper requires both shared GPU4 reservations. From a copy of the bundle, verify the executable and input hashes against the frozen checkpoint identity. Use fresh run tags.
 

@@ -30,7 +30,7 @@ B200 Tensor Core prefill can prefer TMA and `tcgen05` for draft seed FC on promp
 
 TMA requires 4-byte-aligned output, a matching image and tensor-map encoder, and enough shared memory. Unaligned output or unsupported preflight selects the 32×64 WMMA tile. CUDA errors, including stream/device mismatch and launch failure, propagate without retry. SIMT accumulation can change draft KV and proposals. [TMA preflight](../src/text/draft_seed_fc_sm100.cu#L195)<!-- prefix: "std::optiona" --> · [Submission](../src/text/draft_seed_fc_sm100.cu#L241)<!-- prefix: "return submi" --> · [WMMA tile](../src/text/draft_seed_fc.cu#L24)<!-- prefix: "constexpr in" -->
 
-Tiled and row-wise seeding normalize and concatenate both inputs before the draft input and KV projections. Both normalize and rotate keys and write MXFP8 KV at the target positions. Both skip query projection, draft attention, MLP, and scoring. [Draft seed](../src/decoder_mtp.cpp#L667)<!-- prefix: "void MtpDraf" -->
+Tiled and row-wise seeding normalize and concatenate both inputs before the draft input and KV projections. Both normalize and rotate keys and write MXFP8 KV at the target positions. Both skip query projection, draft attention, MLP, and scoring. [Draft seed](../src/decoder_mtp.cpp#L686)<!-- prefix: "void MtpDraf" -->
 
 For a multi-row seed tile on B200, each request prepares FP8 activations in
 slices of up to 128 rows on the prefill stream. One exact FP8 kernel projects
@@ -38,7 +38,7 @@ K and V in separate grid banks for the tile. One key normalization and RoPE
 launch and one MXFP8 append follow. Grouped prefill seeds each request
 separately. Single-row tiles and other devices project and append each slice
 Seed scratch comes from the [existing prefill workspace](native-prefill-workspace.md#seed-scratch).
-[Slice preparation](../src/decoder_mtp.cpp#L711)<!-- prefix: "for (int off" --> ·
+[Slice preparation](../src/decoder_mtp.cpp#L730)<!-- prefix: "for (int off" --> ·
 [Paired projection](../src/text_ops.cu#L748)<!-- prefix: "cudaError_t " --> ·
 [Grid banks](../include/sglang/text/prefill_fp8_exact.cuh#L209)<!-- prefix: "__global__ v" --> ·
 [Grouped seed](../src/decoder_prefill.cpp#L75)<!-- prefix: "seed.seed_dr" -->
@@ -49,9 +49,9 @@ Eligible B200 draft lanes select [grouped online attention](native-model-info.md
 
 ### Draft winner readback
 
-On B200, if every lane has mapped pinned host storage, two to four unconstrained draft lanes share two argmax launches. The first launch reduces tiles within each lane. The second writes each lane's winning ID and score directly to that request's host record. The selection rules match the per-lane path, including lowest-ID ties and invalidation for nonfinite INT8 scores. [Dispatch](../src/decoder_mtp.cpp#L289)<!-- prefix: "void MtpDraf" --> · [Launcher](../src/text_ops.cu#L821)<!-- prefix: "cudaError_t " --> · [Selection](../src/text_ops.cu#L377)<!-- prefix: "__device__ T" -->
+On B200, two to four unconstrained lanes with mapped pinned storage share two argmax launches. The first reduces tiles. The second writes each winner directly to the mapped record. Both follow per-lane tie and nonfinite rules. [Dispatch](../src/decoder_mtp.cpp#L289)<!-- prefix: "void MtpDraf" --> · [Launcher](../src/text_ops.cu#L821)<!-- prefix: "cudaError_t " --> · [Selection](../src/text_ops.cu#L377)<!-- prefix: "__device__ T" -->
 
-Each request can reuse its mapping during stream capture. Outside capture, a request can allocate mapped storage on demand. Singleton, constrained, and other-device lanes use per-lane selection and copy the winning ID. If capture prevents allocation or pinned allocation fails on any lane, the group uses per-lane selection. Other CUDA errors propagate. [Mapping](../src/decoder_mtp.cpp#L269)<!-- prefix: "bool MtpDraf" --> · [Allocation](../src/decoder_verify.cpp#L559)<!-- prefix: "std::shared_" --> · [Per-lane selection](../src/decoder_mtp.cpp#L289)<!-- prefix: "void MtpDraf" -->
+Capture can reuse mappings. Eager requests can allocate them on demand. Singletons, constrained lanes, and other devices use per-lane selection and copy. If any mapping allocation fails or capture prevents it, the group uses per-lane selection. Other CUDA errors propagate. [Mapping](../src/decoder_mtp.cpp#L269)<!-- prefix: "bool MtpDraf" --> · [Allocation](../src/decoder_verify.cpp#L559)<!-- prefix: "std::shared_" --> · [Per-lane selection](../src/decoder_mtp.cpp#L289)<!-- prefix: "void MtpDraf" -->
 
 ### Target round
 
@@ -102,9 +102,9 @@ fails in a later slice, the paired path attempts to append the prepared prefix
 before reporting the error. A draft preparation, projection, or append error
 marks the draft failed. A target final-normalization error leaves the draft's
 failure flag clear if the prepared prefix flush succeeds.
-[Append](../src/decoder_mtp.cpp#L690)<!-- prefix: "check(mxfp8_" --> ·
-[Target normalization failure](../src/decoder_mtp.cpp#L723)<!-- prefix: "append_prepa" --> ·
-[Draft preparation failure](../src/decoder_mtp.cpp#L748)<!-- prefix: "append_prepa" -->
+[Append](../src/decoder_mtp.cpp#L709)<!-- prefix: "check(mxfp8_" --> ·
+[Target normalization failure](../src/decoder_mtp.cpp#L742)<!-- prefix: "append_prepa" --> ·
+[Draft preparation failure](../src/decoder_mtp.cpp#L767)<!-- prefix: "append_prepa" -->
 
 For recoverable TP1 verifier setup failures, eager fallback requires ended capture, a drained stream, and successful handle cleanup. This disables only the verifier executable. A binding upload failure follows speculative step recovery without replaying the failed round. A verification launch error or unconfirmed capture cleanup disables the batch without reevaluating the target. Resources stay live until safe cleanup. [Graph recovery](../src/runtime/backend/cuda_resources.cpp#L568)<!-- prefix: "const auto f" --> · [Launch](../src/runtime/backend/cuda_resources.cpp#L645)<!-- prefix: "const auto l" -->
 
@@ -114,7 +114,7 @@ If a constrained draft row has no valid winner, drafting stops and the target ca
 
 Run the [MTP acceptance procedure](../tests/mtp/README.md) with both release binaries, the pinned checkpoint, and a reserved B200. Require exit status zero. Match target dispatch and prompt tiles for the K0 control. Compare default generation with explicit K4. Check IDs, finish reasons, usage, and SSE at wider capacities. For seed parity, pass a row-wise seed generator with the same target verifier to `--reference-generate`. [Runner](../tests/mtp/run_native.py#L1)<!-- prefix: "\"\"\"Opt-in re" -->
 
-Compare complete BF16 draft vocabulary rows bitwise with per-lane scoring. Compare winner IDs and scores exactly in waves of two, three, and four. Include cross-tile ties and nonfinite inputs. Test eager launches and graph replay with mapped storage. Trace both grouped argmax launches and require zero explicit winner copies. Check per-lane fallback and the BF16 retry after an invalid INT8 winner.
+Compare full BF16 rows bitwise and winner IDs and scores exactly against per-lane scoring in waves of two, three, and four. Cover ties across tiles and nonfinite inputs. Trace both grouped argmax launches in eager and graph modes. Require mapped winner writes without copies, working per-lane fallback, and BF16 retry.
 
 Compare paired RMSNorm and key-only preprocessing with the single-row operations. At matched compute boundaries, compare full logits, final-normalized rows, target state, and draft KV where arithmetic agrees. Check subsequent draft and verifier logits. Exercise 1, 127, 128, 129, and 257 positions and a longer multi-tile prompt. Cover cold and restored prompts, media, and scored generation. Keep the K0 graph control. Disconnect during prefill and verify queued-request parity after retirement. [Paired RMSNorm](../src/text_normalization.cu#L479)<!-- prefix: "cudaError_t " --> · [Key preprocessing](../src/text_attention_gqa.cu#L278)<!-- prefix: "cudaError_t " -->
 
@@ -166,3 +166,5 @@ Follow the [positive-depth constraint checks](output-constraints.md#positive-dep
 ### Measured trade-offs
 
 Layer-major verification, tiled prefill seeding, and speculative depth each changed the best choice by prompt and workload. Early rejection can leave already computed rows unused and require GDN replay. Measure the intended prompt mix, depth, verifier, and seeding against K0 before changing a default.
+
+A bounded B200 TP2 HTTP replay reduced the combined time for four [learned draft heads](native-model-info.md#int8-draft-head) from 0.991 to 0.796 ms. Paired direct replay saved a median 0.204 ms per steady decode step. A separate fixed-schedule ranked fixture matched all 80 terminal payloads byte for byte, along with output IDs and acceptance. Formal W4 makespan for the fusion remains unmeasured. See `artifacts/tp2-resume/round-cost/w4-scheduling/m16-head/production-dd9e1be0/report.txt`.

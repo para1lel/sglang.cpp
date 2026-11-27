@@ -64,7 +64,7 @@ public:
                         const Bf16* feature = nullptr);
     static void enqueue_wave(MtpDraftInput* rows, int count, bool score, cudaStream_t stream);
     static bool prepare_depth(MtpDraftRequest& lane, DraftDepthScratch& scratch,
-                              std::uint8_t* activation, cudaStream_t stream);
+                              std::uint8_t* activation, bool tensor_parallel, cudaStream_t stream);
     static void enqueue_depth(MtpDraftInput* rows, int count, const DraftDepthScratch& scratch,
                               cudaStream_t stream);
     static void repair_wave(const DraftRepairs* repairs, int count, Bf16* packed,

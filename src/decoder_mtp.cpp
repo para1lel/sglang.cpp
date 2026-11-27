@@ -541,16 +541,18 @@ void MtpDraftRequest::enqueue_wave_impl(MtpDraftInput* rows, int count, bool sco
 }
 
 bool MtpDraftRequest::prepare_depth(MtpDraftRequest& lane, DraftDepthScratch& scratch,
-                                    std::uint8_t* activation, cudaStream_t stream) {
+                                    std::uint8_t* activation, bool tensor_parallel,
+                                    cudaStream_t stream) {
     const auto& model = *lane.state_->weights->state_;
     if (!model.quantized_head || !activation) return false;
     if (scratch.activation == activation) return scratch.ready;
     static_assert(wide_mtp_rows * intermediate_size >=
-                  decoder_batch_max_lanes * (hidden_size + sizeof(float)));
+                  decoder_batch_max_lanes * (hidden_size + sizeof(float)) +
+                      draft_depth_winner_bytes);
     static_assert((decoder_batch_max_lanes * hidden_size) % alignof(float) == 0);
     scratch.activation = activation;
     scratch.maxima = reinterpret_cast<float*>(activation + decoder_batch_max_lanes * hidden_size);
-    const auto status = prepare_draft_depth(scratch, model.quantized_head, stream);
+    const auto status = prepare_draft_depth(scratch, model.quantized_head, tensor_parallel, stream);
     if (status && *status != cudaSuccess) {
         scratch.activation = nullptr;
         check(*status, "Prepare depth-major INT8 MTP vocabulary projection");
@@ -613,6 +615,23 @@ void MtpDraftRequest::enqueue_depth(MtpDraftInput* rows, int count,
                 rows[slots[index]].hidden = packet[index].hidden;
             }
             first += draft_wave_rows;
+        }
+        constexpr int winner_rows = draft_depth_winner_rows;
+        if (count == winner_rows && active_count == winner_rows && scratch.fused_winner &&
+            weights->state_->capabilities.grouped_argmax &&
+            std::all_of(active.begin(), active.begin() + winner_rows, [stream](State* row) {
+                return row->prepare_mapped_score(stream);
+            })) {
+            std::array<TextLogitCandidate*, winner_rows> winners;
+            for (int row = 0; row < winner_rows; ++row) winners[row] = active[row]->device_score;
+            check(score_draft_depth16(scratch, weights->state_->quantized_head_maxima, vocab,
+                                      winners.data(), stream), "Score fused M16 draft vocabulary");
+            for (int row = 0; row < winner_rows; ++row) {
+                auto& state = *active[row];
+                state.mapped_score = state.scored = state.int8_score = true;
+                state.constrained_score = state.retried_score = false;
+            }
+            return;
         }
         check(project_draft_depth(scratch, weights->state_->quantized_head_maxima, vocab,
                                   active_count, stream),

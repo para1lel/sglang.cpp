@@ -631,7 +631,7 @@ void DecoderBatch::State::speculate_group(const PrefillRows& verification_rows, 
     const bool score_together = count >= draft_projection_rows ||
         (count == wide_mtp_lanes && wide_mtp_activation != nullptr);
     const bool depth_scoring = score_together && !output && MtpDraftRequest::prepare_depth(
-        *rounds.front().draft, draft_depth, wide_mtp_activation, stream);
+        *rounds.front().draft, draft_depth, wide_mtp_activation, tp, stream);
     if (depth_scoring) {
         MtpRound::propose_depth(rounds.data(), count, draft_depth, stream);
     } else if (!MtpRound::propose_packets(rounds.data(), count, constraint_workspace, stream,

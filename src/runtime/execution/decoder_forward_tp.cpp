@@ -88,10 +88,10 @@ struct TpReduceNorm {
     }
 };
 
-struct TpReduceNorm40 {
+template <int Width> struct TpWideReduceNorm {
     TensorParallel& group;
-    cudaStream_t streams[2];
-    MnnvlRmsQuantizeRows40 rows[2];
+    cudaStream_t streams[2]{};
+    MnnvlWideRmsQuantizeRows<Width> rows[2];
     bool fused = true;
     int fused_calls = 0;
     int ordinary_calls = 0;
@@ -105,26 +105,30 @@ struct TpReduceNorm40 {
     bool operator()(Bf16* const buffers[], const Bf16* gain, const Bf16* peer_gain) {
         if (fused && gain) {
             const Bf16* gains[] = {gain, peer_gain};
-            fused = group.try_allreduce_rms_quantize_m40(buffers, streams, rows, gains);
+            fused = group.try_allreduce_rms_quantize_wide(buffers, streams, rows, gains);
             if (fused) {
                 ++fused_calls;
                 return true;
             }
         }
-        const auto route = group.allreduce_bf16(buffers, streams,
-                                                MnnvlRmsQuantizeRows40::size * hidden_size);
-        ordinary_calls += route == TpAllReduceRoute::mnnvl_one_shot;
+        const auto route = group.allreduce_bf16(buffers, streams, std::size_t{Width} * hidden_size);
+        constexpr auto ordinary = Width == wide_mtp_rows ? TpAllReduceRoute::mnnvl_one_shot
+                                                         : TpAllReduceRoute::mnnvl_two_shot;
+        ordinary_calls += static_cast<int>(route == ordinary);
         return false;
     }
 };
 
-template <typename Run>
-[[gnu::noinline]] bool tp_run_m40(TensorParallel& group,
-                                  const LayerBatch<VerificationRow>& primary,
-                                  const LayerBatch<VerificationRow>& peer, const Run& run) {
-    TpReduceNorm40 reduce{group, {primary.stream, peer.stream},
-        {tp_mnnvl_rms_rows<MnnvlRmsQuantizeRows40>(primary),
-         tp_mnnvl_rms_rows<MnnvlRmsQuantizeRows40>(peer)}};
+template <int Width, typename Run>
+[[gnu::noinline]] bool tp_run_wide(TensorParallel& group,
+                                   const LayerBatch<VerificationRow>& primary,
+                                   const LayerBatch<VerificationRow>& peer, const Run& run) {
+    using Rows = MnnvlWideRmsQuantizeRows<Width>;
+    TpWideReduceNorm<Width> reduce{
+        group,
+        {primary.stream, peer.stream},
+        {tp_mnnvl_rms_rows<Rows>(primary), tp_mnnvl_rms_rows<Rows>(peer)},
+    };
     run(reduce);
     return reduce.replicated();
 }
@@ -133,11 +137,15 @@ template <typename Lane, typename Run>
 bool tp_run_reductions(TensorParallel& group, const LayerBatch<Lane>& primary,
                        const LayerBatch<Lane>& peer, const Run& run) {
     if constexpr (std::is_same_v<Lane, VerificationRow>) {
-        static_assert(MnnvlRmsQuantizeRows40::size == wide_mtp_rows);
-        if (primary.count == wide_mtp_rows && primary.packed_activation &&
-            peer.packed_activation && primary.packs_projection_activation(hidden_size) &&
+        if (primary.packed_activation && peer.packed_activation &&
+            primary.packs_projection_activation(hidden_size) &&
             peer.packs_projection_activation(hidden_size)) {
-            return tp_run_m40(group, primary, peer, run);
+            if (primary.count == wide_mtp_rows) {
+                return tp_run_wide<wide_mtp_rows>(group, primary, peer, run);
+            }
+            if (primary.count == 2 * wide_mtp_rows) {
+                return tp_run_wide<2 * wide_mtp_rows>(group, primary, peer, run);
+            }
         }
     }
     TpReduceNorm reduce{group, {primary.stream, peer.stream},

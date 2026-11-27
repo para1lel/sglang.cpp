@@ -13,7 +13,7 @@
 namespace sglang::decoder {
 
 struct MnnvlRmsQuantizeRows;
-struct MnnvlRmsQuantizeRows40;
+template <int Width> struct MnnvlWideRmsQuantizeRows;
 
 enum class TpAllReduceRoute { nccl, mnnvl_one_shot, mnnvl_two_shot };
 
@@ -35,9 +35,11 @@ public:
     bool try_allreduce_rms_quantize(
         __nv_bfloat16* const buffers[], const cudaStream_t streams[],
         const MnnvlRmsQuantizeRows rows[], const __nv_bfloat16* const gains[]);
-    bool try_allreduce_rms_quantize_m40(
-        __nv_bfloat16* const buffers[], const cudaStream_t streams[],
-        const MnnvlRmsQuantizeRows40 rows[], const __nv_bfloat16* const gains[]);
+    template <int Width>
+    bool try_allreduce_rms_quantize_wide(__nv_bfloat16* const buffers[],
+                                         const cudaStream_t streams[],
+                                         const MnnvlWideRmsQuantizeRows<Width> rows[],
+                                         const __nv_bfloat16* const gains[]);
 
     void broadcast_int32(std::int32_t* const buffers[], const cudaStream_t streams[],
                          std::size_t count, int root);

@@ -19,8 +19,9 @@ struct MnnvlRmsQuantizeRows {
     Row entries[size];
 };
 
-struct MnnvlRmsQuantizeRows40 {
-    static constexpr int size = 40;
+template <int Width> struct MnnvlWideRmsQuantizeRows {
+    static_assert(Width == 40 || Width == 80);
+    static constexpr int size = Width;
 
     MnnvlRmsQuantizeRows::Row entries[size];
 };

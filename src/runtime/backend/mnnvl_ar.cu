@@ -310,15 +310,14 @@ struct ReduceNorm {
 
 using PairAtomic = cuda::atomic_ref<std::uint64_t, cuda::thread_scope_system>;
 
-template <>
-struct ReduceNorm<MnnvlRmsQuantizeRows40> {
-    ReduceNormArgs<MnnvlRmsQuantizeRows40> args;
+template <int Width> struct ReduceNorm<MnnvlWideRmsQuantizeRows<Width>> {
+    ReduceNormArgs<MnnvlWideRmsQuantizeRows<Width>> args;
     std::uint64_t* rejected;
     std::uint64_t epoch;
 };
 
-__device__ bool poll_m40_rank0(const uint4* address, PackedBf16& remote,
-                               std::uint64_t* rejected, std::uint64_t epoch) {
+__device__ bool poll_wide_rank0(const uint4* address, PackedBf16& remote, std::uint64_t* rejected,
+                                std::uint64_t epoch) {
     unsigned misses = 0;
     while (!poll_pack(address, remote)) {
         if ((++misses & 255) == 0 &&
@@ -330,7 +329,7 @@ __device__ bool poll_m40_rank0(const uint4* address, PackedBf16& remote,
 template <int Rank, typename Rows>
 __global__ __launch_bounds__(block_threads) void reduce_norm_rows(
     const __grid_constant__ ReduceNorm<Rows> params) {
-    constexpr bool can_cancel = Rank == 0 && std::is_same_v<Rows, MnnvlRmsQuantizeRows40>;
+    constexpr bool can_cancel = Rank == 0 && !std::is_same_v<Rows, MnnvlRmsQuantizeRows>;
     const auto& args = params.args;
     const int row = blockIdx.x;
     const auto& output = args.rows.entries[row];
@@ -367,8 +366,8 @@ __global__ __launch_bounds__(block_threads) void reduce_norm_rows(
         if (packed < packs_per_row) {
             PackedBf16 remote;
             if constexpr (can_cancel) {
-                if (cancelled || !poll_m40_rank0(peer + packed, remote, params.rejected,
-                                                 params.epoch)) {
+                if (cancelled ||
+                    !poll_wide_rank0(peer + packed, remote, params.rejected, params.epoch)) {
                     cancelled = true;
                     continue;
                 }
@@ -420,9 +419,10 @@ struct MnnvlAllReduce::State {
     bool twoshot_supported = false;
     bool reduce_norm_supported = true;
     bool reduce_norm_m40_supported = true;
-    std::uint64_t* m40_rejected = nullptr;
-    std::uint64_t* m40_device_word = nullptr;
-    std::uint64_t m40_epoch = 0;
+    bool reduce_norm_m80_supported = true;
+    std::uint64_t* wide_rejected = nullptr;
+    std::uint64_t* wide_device_word = nullptr;
+    std::uint64_t wide_epoch = 0;
 
     CUmemGenericAllocationHandle physical[kRanks]{};
     CUmemGenericAllocationHandle multicast{};
@@ -444,7 +444,7 @@ struct MnnvlAllReduce::State {
     bool reserved_mc = false;
     bool mapped_mc = false;
 
-    bool map_m40_submission();
+    bool map_wide_submission();
     ~State();
 
     void release();
@@ -477,24 +477,24 @@ MnnvlAllReduce::State::~State() {
     release();
 }
 
-bool MnnvlAllReduce::State::map_m40_submission() {
+bool MnnvlAllReduce::State::map_wide_submission() {
     void* memory = nullptr;
     constexpr unsigned flags = cudaHostAllocMapped | cudaHostAllocPortable;
     if (cudaHostAlloc(&memory, sizeof(std::uint64_t), flags) != cudaSuccess) {
         (void)cudaGetLastError();
         return false;
     }
-    m40_rejected = new (memory) std::uint64_t{0};
+    wide_rejected = new (memory) std::uint64_t{0};
     CallerDevice device_scope;
     void* device_word = nullptr;
     if (cudaSetDevice(devices[0]) != cudaSuccess ||
         cudaHostGetDevicePointer(&device_word, memory, 0) != cudaSuccess) {
         (void)cudaGetLastError();
         (void)cudaFreeHost(memory);
-        m40_rejected = nullptr;
+        wide_rejected = nullptr;
         return false;
     }
-    m40_device_word = static_cast<std::uint64_t*>(device_word);
+    wide_device_word = static_cast<std::uint64_t*>(device_word);
     return true;
 }
 
@@ -507,9 +507,9 @@ void MnnvlAllReduce::State::release() {
             flags[r] = nullptr;
         }
     }
-    if (m40_rejected) {
-        (void)cudaFreeHost(m40_rejected);
-        m40_rejected = nullptr;
+    if (wide_rejected != nullptr) {
+        (void)cudaFreeHost(wide_rejected);
+        wide_rejected = nullptr;
     }
     if (mapped_mc) {
         (void)cuMemUnmap(mc_va, allocation_size);
@@ -710,10 +710,14 @@ void MnnvlAllReduce::init_lamport(State& state) {
         state.twoshot_supported &= twoshot_grid_fits(state.multiprocessors[r]);
         state.reduce_norm_supported &= reduce_norm_ready<MnnvlRmsQuantizeRows>(state.devices[r], r);
         state.reduce_norm_m40_supported &=
-            reduce_norm_ready<MnnvlRmsQuantizeRows40>(state.devices[r], r);
+            reduce_norm_ready<MnnvlWideRmsQuantizeRows<40>>(state.devices[r], r);
+        state.reduce_norm_m80_supported &=
+            reduce_norm_ready<MnnvlWideRmsQuantizeRows<80>>(state.devices[r], r);
     }
-    if (state.reduce_norm_m40_supported) {
-        state.reduce_norm_m40_supported = state.map_m40_submission();
+    if ((state.reduce_norm_m40_supported || state.reduce_norm_m80_supported) &&
+        !state.map_wide_submission()) {
+        state.reduce_norm_m40_supported = false;
+        state.reduce_norm_m80_supported = false;
     }
 }
 
@@ -866,20 +870,34 @@ bool MnnvlAllReduce::try_allreduce_rms_quantize(
     return try_reduce_norm(buffers, streams, rows, gains, width);
 }
 
-bool MnnvlAllReduce::try_allreduce_rms_quantize_m40(
-    Bf16* const buffers[], const cudaStream_t streams[],
-    const MnnvlRmsQuantizeRows40 rows[], const Bf16* const gains[]) {
-    return try_reduce_norm(buffers, streams, rows, gains, MnnvlRmsQuantizeRows40::size);
+template <int Width>
+bool MnnvlAllReduce::try_allreduce_rms_quantize_wide(Bf16* const buffers[],
+                                                     const cudaStream_t streams[],
+                                                     const MnnvlWideRmsQuantizeRows<Width> rows[],
+                                                     const Bf16* const gains[]) {
+    return try_reduce_norm(buffers, streams, rows, gains, Width);
 }
+
+template bool MnnvlAllReduce::try_allreduce_rms_quantize_wide<40>(
+    Bf16* const[], const cudaStream_t[], const MnnvlWideRmsQuantizeRows<40>[], const Bf16* const[]);
+template bool MnnvlAllReduce::try_allreduce_rms_quantize_wide<80>(
+    Bf16* const[], const cudaStream_t[], const MnnvlWideRmsQuantizeRows<80>[], const Bf16* const[]);
 
 template <typename Rows>
 bool MnnvlAllReduce::try_reduce_norm(Bf16* const buffers[], const cudaStream_t streams[],
                                     const Rows rows[], const Bf16* const gains[], int width) {
     constexpr bool narrow = std::is_same_v<Rows, MnnvlRmsQuantizeRows>;
-    const std::size_t count = width * kTokenDim;
-    const bool supported = narrow ? state_->reduce_norm_supported
-                                  : state_->reduce_norm_m40_supported;
-    if (!supported || count > state_->max_elements) return false;
+    if constexpr (Rows::size == kTwoshotRows) {
+        if (!state_->reduce_norm_m80_supported || state_->buffer_size_bytes < kTwoshotBufferBytes) {
+            return false;
+        }
+    } else {
+        const bool supported =
+            narrow ? state_->reduce_norm_supported : state_->reduce_norm_m40_supported;
+        if (!supported || static_cast<std::size_t>(width) * kTokenDim > state_->max_elements) {
+            return false;
+        }
+    }
     for (int rank = 0; rank < kRanks; ++rank) {
         if (!buffers[rank] || !streams[rank] || !gains[rank] ||
             !aligned(buffers[rank], sizeof(float4)) || !aligned(gains[rank], sizeof(float4))) {
@@ -904,8 +922,9 @@ bool MnnvlAllReduce::try_reduce_norm(Bf16* const buffers[], const cudaStream_t s
     }
     std::uint64_t epoch = 0;
     if constexpr (!narrow) {
-        if (state_->m40_epoch == UINT64_MAX) return false;
-        epoch = ++state_->m40_epoch;
+        if (state_->wide_epoch == UINT64_MAX)
+            return false;
+        epoch = ++state_->wide_epoch;
     }
 
     ReduceNorm<Rows> launch[kRanks];
@@ -915,7 +934,7 @@ bool MnnvlAllReduce::try_reduce_norm(Bf16* const buffers[], const cudaStream_t s
                              reinterpret_cast<void*>(state_->mc_va), state_->flags[rank],
                              rows[rank]};
         if constexpr (!narrow) {
-            launch[rank].rejected = state_->m40_device_word;
+            launch[rank].rejected = state_->wide_device_word;
             launch[rank].epoch = epoch;
         }
     }
@@ -932,7 +951,7 @@ bool MnnvlAllReduce::try_reduce_norm(Bf16* const buffers[], const cudaStream_t s
             state_->failed = true;
             if constexpr (!narrow) {
                 if (rank > 0) {
-                    PairAtomic(*state_->m40_rejected).store(epoch, cuda::memory_order_release);
+                    PairAtomic(*state_->wide_rejected).store(epoch, cuda::memory_order_release);
                     for (int peer = 0; peer < kRanks; ++peer) {
                         (void)cudaStreamSynchronize(streams[peer]);
                     }

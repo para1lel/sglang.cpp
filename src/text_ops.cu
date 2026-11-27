@@ -466,9 +466,7 @@ cudaError_t text_quantize_fp8_rows(const __nv_bfloat16* input, int width, int ro
         return cudaErrorInvalidValue;
     }
     const __nv_bfloat16* up = nullptr;
-    if (rows == 1024 &&
-        (width == text_gqa_q_width || width == text_gqa_q_width / 2) &&
-        aligned(input, alignof(__nv_bfloat162)) &&
+    if (width % text_fp8_group_size == 0 && aligned(input, alignof(__nv_bfloat162)) &&
         aligned(output.values, alignof(__nv_fp8x4_storage_t))) {
         const dim3 grid(divide_up(width / text_fp8_group_size, block_warps), rows);
         void* warp_args[] = {&input, &up, &width, &output};
@@ -484,7 +482,9 @@ cudaError_t decoder::tensor_core_prefill_swiglu_quantize(
     const __nv_bfloat16* gate, const __nv_bfloat16* up, int width, int rows,
     TextFp8Activation activation, cudaStream_t stream) {
     void* args[] = {&gate, &width, &activation, &up};
-    if (rows >= 256 && width % text_fp8_group_size == 0 &&
+    constexpr std::int64_t packed_swiglu_min_groups = 4096;
+    const auto groups = static_cast<std::int64_t>(rows) * (width / text_fp8_group_size);
+    if ((rows >= 256 || groups >= packed_swiglu_min_groups) && width % text_fp8_group_size == 0 &&
         aligned(gate, alignof(__nv_bfloat162)) && aligned(up, alignof(__nv_bfloat162)) &&
         aligned(activation.values, alignof(__nv_fp8x4_storage_t))) {
         const dim3 grid(divide_up(width / text_fp8_group_size, block_warps), rows);

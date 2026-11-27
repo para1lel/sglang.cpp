@@ -69,10 +69,17 @@ void run(const std::vector<Input>& inputs, const std::vector<Dispatch>& expected
     DeviceScope device(0);
     DecoderBatchStepStats stats{};
     std::vector<Dispatch> observed;
-    const bool scheduled = execute_partial_projection_groups(
-        grants[0].data(), int(inputs.size()), cudaStreamPerThread, stats,
-        [&](int source, int offset, const PrefillGrant* tiles, PrefillGroup group,
-            PrefillWorkspace&, PrefillAttentionMode mode, int) {
+    struct ScheduleState {
+        const std::vector<Input>& inputs;
+        const decltype(grants)& rank_grants;
+        std::vector<Dispatch>& observed;
+    };
+    const ScheduleState state{inputs, grants, observed};
+    const PartialProjectionSchedule schedule{
+        &state,
+        [](const void* context, int source, int offset, const PrefillGrant* tiles,
+           PrefillGroup group, PrefillWorkspace&, PrefillAttentionMode mode, int) {
+            const auto& [inputs, grants, observed] = *static_cast<const ScheduleState*>(context);
             const bool causal = mode == PrefillAttentionMode::causal_segments;
             need(causal || mode == PrefillAttentionMode::serial_segments, "Unexpected mode");
             std::array<PrefillGrant, causal_full_group.grants> peer;
@@ -87,10 +94,15 @@ void run(const std::vector<Input>& inputs, const std::vector<Dispatch>& expected
             }
             observed.push_back({causal ? 'C' : 'S', source, offset, group.rows, group.grants});
         },
-        [&](int source, const PrefillGrant* grant, PrefillWorkspace&, int, int offset) {
-            need(grant == &grants[0].at(source), "Tail owner mismatch");
-            observed.push_back({'T', source, offset, grant->rows - offset, 1});
-        }, min_rows);
+        [](const void* context, int source, const PrefillGrant* grant, PrefillWorkspace&, int,
+           int offset) {
+            const auto& state = *static_cast<const ScheduleState*>(context);
+            need(grant == &state.rank_grants[0].at(source), "Tail owner mismatch");
+            state.observed.push_back({'T', source, offset, grant->rows - offset, 1});
+        },
+    };
+    const bool scheduled = execute_partial_projection_groups(
+        grants[0].data(), int(inputs.size()), cudaStreamPerThread, stats, schedule, min_rows);
     need(scheduled == !expected.empty() && observed == expected, "Unexpected dispatch sequence");
     int rows = 0, groups = 0;
     for (const auto& step : expected) {

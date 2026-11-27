@@ -98,19 +98,31 @@ def test_staged_ruff_diagnostics_ignore_output_file(
     assert_rejected(selected_hook(root), name, "F821")
 
 
-def test_staged_header_checks_consumers_with_different_macros(tmp_path: Path) -> None:
+@pytest.mark.parametrize("include_style", ["literal", "macro", "via_header"])
+def test_staged_header_checks_consumers_with_different_macros(
+    tmp_path: Path, include_style: str
+) -> None:
     name = "probe.hpp"
     header = (
         "#pragma once\n\n"
         "inline constexpr int value = 0;\n\n"
         "#ifdef VARIABLE_VALUE\n"
-        "#define PROBE_POINTER nullptr\n"
+        "    #define PROBE_POINTER nullptr\n"
         "#else\n"
-        "#define PROBE_POINTER &value\n"
+        "    #define PROBE_POINTER &value\n"
         "#endif\n"
     )
+    macro_include = '#define PROBE_HEADER "probe.hpp"\n#include PROBE_HEADER\n'
+    includes = {
+        "literal": '#include "probe.hpp"\n',
+        "macro": macro_include,
+        "via_header": '#include "bridge.hpp"\n',
+    }
+    fixture = {}
+    if include_style == "via_header":
+        fixture["bridge.hpp"] = f"#pragma once\n\n{macro_include}"
     source = (
-        '#include "probe.hpp"\n\n'
+        f"{includes[include_style]}\n"
         "int read_probe() {\n"
         "    const int* pointer = PROBE_POINTER;\n"
         "    return *pointer;\n"
@@ -119,6 +131,7 @@ def test_staged_header_checks_consumers_with_different_macros(tmp_path: Path) ->
     root = seed_repository(
         tmp_path,
         {
+            **fixture,
             name: header.replace("nullptr", "&value"),
             "a.cpp": source,
             "b.cpp": "#define VARIABLE_VALUE\n" + source,
@@ -129,7 +142,26 @@ def test_staged_header_checks_consumers_with_different_macros(tmp_path: Path) ->
     assert_passed(selected_hook(root))
 
     stage_files(root, {name: header})
-    assert_rejected(selected_hook(root), "b.cpp:", "clang-analyzer-core.NullDereference")
+    assert_rejected(
+        selected_hook(root),
+        "b.cpp:",
+        "Dereference of null pointer",
+        "clang-analyzer-core.NullDereference",
+    )
+
+
+def test_staged_header_deletion_checks_macro_include_consumers(tmp_path: Path) -> None:
+    name = "probe.hpp"
+    root = seed_repository(
+        tmp_path,
+        {
+            name: "#pragma once\n",
+            "probe.cpp": '#define PROBE_HEADER "probe.hpp"\n#include PROBE_HEADER\n',
+        },
+        style=True,
+    )
+    git_fixture(root, "rm", "--", name)
+    assert_rejected(selected_hook(root), "probe.cpp:2:", "'probe.hpp' file not found")
 
 
 def test_staged_hook_rejects_head_advance_during_change_selection(tmp_path: Path) -> None:

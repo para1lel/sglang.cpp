@@ -7,11 +7,13 @@ import subprocess
 import tarfile
 import tempfile
 from collections import defaultdict
+from collections.abc import Iterator
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from pathlib import Path
 
 from function_spans import HEADER_SUFFIXES
+from native_tokens import DIRECTIVE_IDENTIFIER, SPLICE
 from tool_process import invoke as invoke_tool
 
 SOURCE_SUFFIXES = {".c", ".cc", ".cpp", ".cxx", ".cu"}
@@ -45,7 +47,25 @@ GQA_DEVICE_SOURCES = {
 }
 MEDIA_SOURCES = {"apps/server/media_mp4.cpp", "apps/server/media_png.cpp"}
 PROBES = ("tools/toolchain-probe.cpp", "tools/toolchain-probe.cu")
-INCLUDE = re.compile(rb'(?m)^[ \t]*#[ \t]*include[ \t]*(["<])([^"<>\n]+)[">]')
+BLOCK_COMMENT = rb"/\*[^*]*\*+(?:[^/*][^*]*\*+)*/"
+INCLUDE_SPACE = rb"(?:[ \t\v\f]|" + BLOCK_COMMENT + rb")*"
+INCLUDE_TOKEN = re.compile(
+    rb"^"
+    + INCLUDE_SPACE
+    + rb"(?:#|%:)"
+    + INCLUDE_SPACE
+    + rb"include(?!"
+    + DIRECTIVE_IDENTIFIER
+    + rb")"
+    + INCLUDE_SPACE
+    + rb"""(?:"(?P<quoted>[^"\r\n]+)"|<(?P<angled>[^>\r\n]+)>|(?P<macro>[^/"<\s]))"""
+    + rb'|R"(?P<delimiter>[^ ()\\\t\v\f\r\n]{0,16})\(.*?\)(?P=delimiter)"'
+    + rb"|"
+    + BLOCK_COMMENT
+    + rb"|//[^\r\n]*"
+    + rb"""|"(?:\\[^\r\n]|[^"\\\r\n])*"|'(?:\\[^\r\n]|[^'\\\r\n])*'""",
+    re.MULTILINE | re.DOTALL,
+)
 TRACE = re.compile(r"(?m)^\.+ (.+)$\n?")
 DIAGNOSTIC = re.compile(
     r"(?m)^(.+?):(\d+):(\d+): (?:warning|(?:fatal )?error): (.*?)"
@@ -93,34 +113,49 @@ def tool_output(arguments: list[str], root: Path) -> tuple[int, str]:
     return result.returncode, result.stdout.decode(errors="replace")
 
 
-def include_parents(root: Path) -> IncludeParents:
+def include_directives(source: bytes) -> Iterator[tuple[bytes, bytes]]:
+    source = re.sub(SPLICE, b"", source.removeprefix(b"\xef\xbb\xbf"))
+    for match in INCLUDE_TOKEN.finditer(source):
+        if match["quoted"] is not None:
+            yield b'"', match["quoted"]
+        elif match["angled"] is not None:
+            yield b"<", match["angled"]
+        elif match["macro"] is not None:
+            yield b"", b""
+
+
+def include_parents(root: Path) -> tuple[IncludeParents, set[str]]:
     parents: IncludeParents = defaultdict(set)
+    macro_owners = set()
     for owner in root.rglob("*"):
         if owner.suffix.lower() not in SOURCE_SUFFIXES | HEADER_SUFFIXES or not owner.is_file():
             continue
         relative = owner.relative_to(root).as_posix()
-        source = owner.read_bytes().replace(b"\\\r\n", b"").replace(b"\\\n", b"")
-        for quote, name in INCLUDE.findall(source):
+        for quote, name in include_directives(owner.read_bytes()):
+            if not quote:
+                macro_owners.add(relative)
+                continue
             directories = (owner.parent, root / "include") if quote == b'"' else (root / "include",)
             for directory in directories:
                 candidate = (directory / os.fsdecode(name)).resolve()
                 if candidate.is_relative_to(root) and candidate.is_file():
                     parents[candidate.relative_to(root).as_posix()].add(relative)
                     break
-    return parents
+    return parents, macro_owners
 
 
-def consumers(headers: set[str], parents: IncludeParents) -> set[str]:
-    pending = list(headers)
-    seen = set(headers)
+def consumers(root: Path, headers: set[str]) -> set[str]:
+    parents, macro_owners = include_parents(root)
+    seen = headers | macro_owners
+    pending = list(seen)
     units = set()
     while pending:
-        for parent in parents[pending.pop()] - seen:
+        name = pending.pop()
+        if Path(name).suffix.lower() in SOURCE_SUFFIXES:
+            units.add(name)
+        for parent in parents[name] - seen:
             seen.add(parent)
-            if Path(parent).suffix.lower() in SOURCE_SUFFIXES:
-                units.add(parent)
-            else:
-                pending.append(parent)
+            pending.append(parent)
     return units
 
 
@@ -306,7 +341,7 @@ class ClangTidy:
             tidy.append("--checks=-misc-const-correctness")
         needs_cutlass = any(
             include.startswith((b"cutlass/", b"cute/"))
-            for _, include in INCLUDE.findall(path.read_bytes())
+            for _, include in include_directives(path.read_bytes())
         )
         if path.suffix.lower() in HEADER_SUFFIXES:
             self.wrapper.write_text(
@@ -411,16 +446,13 @@ def inspect_selected(engine: ClangTidy) -> None:
     units = {name for name in files if name not in headers and (root / name).is_file()}
     if not files:
         units.update(name for name in PROBES if (root / name).is_file())
-    missing = {name for name in headers if not (root / name).is_file()}
-    uncovered = headers - missing
+    uncovered = {name for name in headers if (root / name).is_file()}
     if uncovered:
-        units.update(consumers(uncovered, include_parents(root)))
-    if missing and baseline is not None:
-        units.update(
-            name
-            for name in consumers(missing, include_parents(baseline))
-            if (root / name).is_file()
-        )
+        units.update(consumers(root, uncovered))
+    if baseline is not None:
+        previous = {name for name in headers if (baseline / name).is_file()}
+        if previous:
+            units.update(name for name in consumers(baseline, previous) if (root / name).is_file())
     for name in sorted(units):
         uncovered -= engine.inspect(name, trace=bool(uncovered))
     for header in sorted(uncovered):

@@ -3,17 +3,91 @@
 import os
 import subprocess
 import sys
+import unittest
 from contextlib import ExitStack, contextmanager
 from importlib import import_module
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from threading import Thread
+from types import SimpleNamespace
+from unittest.mock import MagicMock, Mock, call, patch
 
 from lmcache_relay import DRAFT, PREFIX_DETAIL, RANK_GET, RANK_PUT, RECEIPT, Relay
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tools/lmcache"))
-NativeMxfp8 = import_module("sglang_gpu_transfer").NativeMxfp8
+gpu_transfer = import_module("sglang_gpu_transfer")
+NativeMxfp8 = gpu_transfer.NativeMxfp8
 lmcache = import_module("sglang_lmcache")
+
+
+class DeviceStartupTest(unittest.TestCase):
+    uuids = (bytes([2]) + bytes(15), bytes([1]) + bytes(15))
+
+    def setUp(self) -> None:
+        patches = ExitStack()
+        self.addCleanup(patches.close)
+        self.cuda = patches.enter_context(patch.object(gpu_transfer.torch, "cuda", MagicMock()))
+        self.cuda.device_count.return_value = len(self.uuids)
+        self.uuid = patches.enter_context(patch.object(gpu_transfer.driver, "cuDeviceGetUuid"))
+        self.uuid.side_effect = lambda ordinal: (0, SimpleNamespace(bytes=self.uuids[ordinal]))
+        ops = Mock(spec=["BatchStep", "batch_memcpy_supported"])
+        patches.enter_context(patch.object(gpu_transfer, "device_ops", ops))
+
+    def test_visible_order_and_unknown_uuid(self) -> None:
+        copies = gpu_transfer.DeviceCopies()
+        devices = [gpu_transfer.torch.device("cuda", ordinal) for ordinal in range(len(self.uuids))]
+        assert self.uuid.call_args_list == [call(ordinal) for ordinal in range(len(self.uuids))]
+        expected = [call.device_count(), call.init()]
+        for device in devices:
+            expected.extend(
+                [
+                    call.device(device),
+                    call.device().__enter__(),
+                    call.Stream(device=device),
+                    call.device().__exit__(None, None, None),
+                ]
+            )
+        assert self.cuda.mock_calls == expected
+        assert [copies.device_for(uuid) for uuid in self.uuids] == devices
+        with self.assertRaisesRegex(ValueError, "GPU UUID is not visible"):
+            copies.device_for(bytes(16))
+        assert self.cuda.mock_calls == expected
+
+    def test_rank_mode_validates_before_streams(self) -> None:
+        for count in (0, len(self.uuids)):
+            with self.subTest(count=count):
+                self.cuda.device_count.return_value = count
+                with self.assertRaisesRegex(RuntimeError, "requires exactly one"):
+                    gpu_transfer.DeviceCopies(single_device=True)
+        self.cuda.Stream.assert_not_called()
+        self.cuda.init.assert_not_called()
+        self.uuid.assert_not_called()
+        self.cuda.device_count.return_value = 1
+        copies = gpu_transfer.DeviceCopies(single_device=True)
+        self.cuda.Stream.assert_called_once_with(device=copies.device_for(self.uuids[0]))
+
+    def test_duplicate_uuid_fails_before_streams(self) -> None:
+        self.uuid.side_effect = None
+        self.uuid.return_value = (0, SimpleNamespace(bytes=self.uuids[0]))
+        with self.assertRaisesRegex(RuntimeError, "distinct visible CUDA device UUIDs"):
+            gpu_transfer.DeviceCopies()
+        self.cuda.Stream.assert_not_called()
+
+    def test_second_device_failure_prevents_listener(self) -> None:
+        self.cuda.Stream.side_effect = [Mock(), RuntimeError("second CUDA device failed")]
+        manager = Mock(spec=lmcache.DramL1Manager, _registered_listeners=[])
+        storage = Mock(l1_managers=Mock(return_value=[manager]), l2_adapters=Mock(return_value=[]))
+        with (
+            patch.object(
+                lmcache, "SocketServer", side_effect=AssertionError("listener opened")
+            ) as listener,
+            self.assertRaisesRegex(RuntimeError, "second CUDA device failed"),
+        ):
+            lmcache.SglangSnapshotModule(
+                SimpleNamespace(storage_manager=storage), "/unused", "sglang"
+            )
+        listener.assert_not_called()
+        assert self.cuda.Stream.call_count == len(self.uuids)
 
 
 class HostRecords:
@@ -165,6 +239,9 @@ def exercise(binary, runtime, world):
 
 
 if __name__ == "__main__":
+    suite = unittest.defaultTestLoader.loadTestsFromTestCase(DeviceStartupTest)
+    if not unittest.TextTestRunner().run(suite).wasSuccessful():
+        raise SystemExit(1)
     check_scales()
     for world_size in (1, 2):
         with TemporaryDirectory(prefix="sglang-ranks-") as work:

@@ -271,6 +271,9 @@ class DeviceCopies:
             self.devices[bytes(uuid.bytes)] = torch.device("cuda", ordinal)
         if len(self.devices) != count:
             raise RuntimeError("sglang LMCache requires distinct visible CUDA device UUIDs")
+        for device in self.devices.values():
+            with torch.cuda.device(device):
+                torch.cuda.Stream(device=device)
 
     def device_for(self, uuid: bytes) -> torch.device:
         device = self.devices.get(uuid)

@@ -49,10 +49,7 @@ void append_logprob(std::string& output, int id, std::optional<float> value,
     }
     output += ',' + std::to_string(id) + ',';
     if (tokenizer) {
-        Utf8Stream utf8;
-        auto text = utf8.push(tokenizer->piece(id, false));
-        text += utf8.finish();
-        json::append_quoted(output, text);
+        json::append_quoted(output, repair_utf8(tokenizer->piece(id, false)));
     } else {
         output += "null";
     }

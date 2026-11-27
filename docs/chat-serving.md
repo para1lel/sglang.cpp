@@ -86,7 +86,7 @@ Rendered prompts require 1–1,048,576 UTF-8 bytes. The prompt and budget share 
 
 First render loads the pinned `tokenizer_config.json` and `chat_template.jinja` from the checkpoint. Unreadable, missing, or mismatched assets return 500 before output. Later chat requests retry. [Tokenizer loading](text-serving.md#send-a-request) stays independent.
 
-Use shared [resident admission](batch-graphs.md#resident-memory-admission), [graph eligibility](batch-graphs.md#runtime-path), [MTP policy](mtp.md#runtime-path), and [stream failure handling](http-server.md#completion-streams). Failed writes and resets also discard pending UTF-8, buffered reasoning, and incomplete tool calls. [Request lifecycle](../apps/server/text_completion.cpp#L727)<!-- prefix: "void complet" -->
+Use shared [resident admission](batch-graphs.md#resident-memory-admission), [graph eligibility](batch-graphs.md#runtime-path), [MTP policy](mtp.md#runtime-path), and [stream failure handling](http-server.md#completion-streams). Failed writes and resets also discard pending UTF-8, buffered reasoning, and incomplete tool calls. [Request lifecycle](../apps/server/text_completion.cpp#L725)<!-- prefix: "void complet" -->
 
 ### Sampling defaults and output budget
 

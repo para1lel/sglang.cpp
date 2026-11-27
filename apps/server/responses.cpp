@@ -813,10 +813,7 @@ struct OutputScore {
 };
 
 OutputScore output_score(const Tokenizer& tokenizer, const DecoderLogprob& score) {
-    Utf8Stream utf8;
-    auto token = utf8.push(tokenizer.piece(score.token_id, false));
-    token += utf8.finish();
-    return {std::move(token), score.value};
+    return {repair_utf8(tokenizer.piece(score.token_id, false)), score.value};
 }
 
 OrderedObject score_fields(OutputScore score) {

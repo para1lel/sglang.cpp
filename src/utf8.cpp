@@ -115,4 +115,10 @@ std::string Utf8Stream::finish() {
     return std::string(replacement);
 }
 
+std::string repair_utf8(std::string_view bytes) {
+    Utf8Stream stream;
+    auto text = stream.push(bytes);
+    text += stream.finish();
+    return text;
+}
 }

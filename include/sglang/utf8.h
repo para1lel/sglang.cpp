@@ -17,6 +17,7 @@ Utf8Lead utf8_lead(unsigned byte);
 
 std::u32string read_utf8(std::string_view bytes);
 bool valid_utf8(std::string_view bytes);
+std::string repair_utf8(std::string_view bytes);
 void append_utf8(std::string& output, char32_t scalar);
 
 class Utf8Stream {

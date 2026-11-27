@@ -28,11 +28,13 @@ The choice's `logprobs.content` contains one object per committed token. Each ob
 
 ## Streaming and stops
 
-SSE delivers each score once. A scored event can have empty visible text while the writer holds incomplete UTF-8 or a possible stop prefix. In a scored stream, choices with no new scores, including terminal choices, carry `logprobs: null`. Usage events carry no choices. A committed token that matches a text stop or stop ID retains its score and contributes to usage. The visible text follows the ordinary stop trimming rules. [Delta projection](../../apps/server/text_completion.cpp#L581)<!-- prefix: "bool TextRes" --> · [Score alignment](../../apps/server/text_completion.cpp#L679)<!-- prefix: "bool consume" -->
+SSE delivers each score once. A scored event can have empty visible text while the writer holds incomplete UTF-8 or a possible stop prefix. In a scored stream, choices with no new scores, including terminal choices, carry `logprobs: null`. Usage events carry no choices. A committed token that matches a text stop or stop ID retains its score and contributes to usage. The visible text follows the ordinary stop trimming rules. [Delta projection](../../apps/server/text_completion.cpp#L579)<!-- prefix: "bool TextRes" --> · [Score alignment](../../apps/server/text_completion.cpp#L677)<!-- prefix: "bool consume" -->
 
 ## Verification
 
 Compare JSON with concatenated SSE scores for greedy requests at K0 and the configured positive depth. Check selected-only and top-20 scores, indexed choices, zero budgets, and stops across token boundaries. Repeat on eager and eligible graph decode. Require HTTP 400 before SSE for active sampling or output constraints. Run the [native score checks](../native-generate.md#verification) and [mixed media checks](../../tests/media/http-contract.md).
+
+A CPU probe of the pinned SGLang projection functions matched native projection for invalid single-byte fragments 226 and 227. Chat exposed both alternatives with their original bytes. Responses encoded both as U+FFFD (`[239, 191, 189]`) and kept the last score for the shared display string. [Chat projection](https://github.com/sgl-project/sglang/blob/f04d886bf79aa3d6237cbb12a3311838eb9f9bd8/python/sglang/srt/entrypoints/openai/serving_chat.py#L3109-L3183) · [Responses projection](https://github.com/sgl-project/sglang/blob/f04d886bf79aa3d6237cbb12a3311838eb9f9bd8/python/sglang/srt/entrypoints/openai/serving_responses.py#L129-L158) · [Display-key aggregation](https://github.com/sgl-project/sglang/blob/f04d886bf79aa3d6237cbb12a3311838eb9f9bd8/python/sglang/srt/entrypoints/openai/utils.py#L153-L160)
 
 Build the [CPU fixture](../../tests/text/README.md#native-generate-on-cpu), then run the OpenAI wire suite from the repository root in the managed Pixi environment.
 

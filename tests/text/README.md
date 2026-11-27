@@ -154,7 +154,7 @@ The direct parser probe uses the same tokenizer and JSON libraries. Check whole 
 
 ```bash
 "${CXX:-c++}" -std=c++17 -O2 -pthread -Iinclude \
-    tests/text/chat_output_chunks.cpp apps/server/qwen/qwen_chat_output.cpp \
+    tests/text/chat_output_chunks.cpp apps/server/qwen/{qwen_chat_output,qwen_tool_syntax}.cpp \
     "$build/lib/libsglang_tokenizer.a" "$build/lib/libsglang_json.a" \
     -o "$out/chat-output-chunks"
 "$out/chat-output-chunks" "$checkpoint/tokenizer.json"

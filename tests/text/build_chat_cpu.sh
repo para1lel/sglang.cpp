@@ -41,6 +41,9 @@ fi
 qwen="$source/apps/server/qwen"
 sources+=("$qwen"/{qwen_chat_template,qwen_chat_output,qwen_tool_constraints}.cpp
           "$qwen"/{qwen_serving_profile,qwen_tool_output}.cpp)
+if [[ -f "$qwen/qwen_tool_syntax.cpp" ]]; then
+    sources+=("$qwen/qwen_tool_syntax.cpp")
+fi
 
 if [[ -f "$source/apps/server/chat_media.cpp" ]]; then
     sources+=("$source/src/media_preprocess.cpp" "$source/src/media_resize.cpp"

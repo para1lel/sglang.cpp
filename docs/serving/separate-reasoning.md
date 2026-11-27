@@ -8,7 +8,7 @@ Send `POST /separate_reasoning` with text that already contains model output. Th
 | --- | --- | --- |
 | HTTP reader | Match the path, check the media type, and dispatch the request. | [Path match](../../apps/server/prefix_controls.cpp#L660)<!-- prefix: "if (const au" --> · [Media types](../../apps/server/http.cpp#L117)<!-- prefix: "bool json_me" --> · [Dispatch](../../apps/server/prefix_controls.cpp#L662)<!-- prefix: "if (request." --> |
 | Request and response | Validate the input, select the parser, and serialize the result. | [Request validation](../../apps/server/prefix_controls.cpp#L96)<!-- prefix: "void separat" --> · [Response writer](../../apps/server/prefix_controls.cpp#L70)<!-- prefix: "void write_s" --> |
-| Qwen3 parser | Split the supplied text at literal reasoning and tool markers. | [Text split](../../apps/server/qwen/qwen_chat_output.cpp#L762)<!-- prefix: "std::optiona" --> · [Pinned SGLang Qwen3 detector](https://github.com/sgl-project/sglang/blob/f04d886bf79aa3d6237cbb12a3311838eb9f9bd8/python/sglang/srt/parser/reasoning_parser.py#L447)<!-- prefix: "class Qwen3D" --> |
+| Qwen3 parser | Split the supplied text at literal reasoning and tool markers. | [Text split](../../apps/server/qwen/qwen_chat_output.cpp#L707)<!-- prefix: "std::optiona" --> · [Pinned SGLang Qwen3 detector](https://github.com/sgl-project/sglang/blob/f04d886bf79aa3d6237cbb12a3311838eb9f9bd8/python/sglang/srt/parser/reasoning_parser.py#L447)<!-- prefix: "class Qwen3D" --> |
 
 ## Runtime path
 

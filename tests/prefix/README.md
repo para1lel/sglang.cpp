@@ -15,7 +15,7 @@ mkdir -p "$out"
     apps/server/{parse_function_call,native_sessions,responses,native_generate,ollama_generate}.cpp \
     apps/server/{text_request,text_completion,tokenization_validation,tool_literal,tool_union}.cpp \
     apps/server/detail/{batch_state,text_stop}.cpp \
-    apps/server/qwen/{qwen_chat_output,qwen_tool_output,qwen_chat_template}.cpp \
+    apps/server/qwen/{qwen_chat_output,qwen_tool_output,qwen_tool_syntax,qwen_chat_template}.cpp \
     src/runtime/server/batch_executor.cpp src/runtime/execution/decoder_options.cpp \
     src/tokenizer/*.cpp src/{json,utf8}.cpp \
     -Wl,--gc-sections \

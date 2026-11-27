@@ -1,6 +1,8 @@
 #include "sglang/server/serving/qwen_parser.h"
 #include "sglang/server/serving/qwen_serving_profile.h"
 
+#include "qwen_tool_syntax.h"
+
 #include "sglang/server/tool_literal.h"
 #include "sglang/server/tool_union.h"
 
@@ -16,13 +18,10 @@
 namespace sglang::model {
 namespace {
 
-constexpr std::string_view tool_open = "<tool_call>";
-constexpr std::string_view tool_close = "</tool_call>";
-constexpr std::string_view function_open = "<function=";
-constexpr std::string_view function_close = "</function>";
-constexpr std::string_view parameter_open = "<parameter=";
-constexpr std::string_view parameter_close = "</parameter>";
+using namespace server::qwen_tool_syntax;
+
 constexpr std::array schema_branches{"anyOf", "oneOf", "allOf"};
+constexpr std::string_view whitespace = " \t\r\n\f\v";
 
 const json::Value* field(const json::Value& value, std::string_view key) {
     const auto* object = value.ordered_object();
@@ -35,19 +34,6 @@ std::string_view string_or(const json::Value* value, std::string_view fallback) 
 
 bool starts_with(std::string_view text, std::string_view prefix) {
     return text.substr(0, prefix.size()) == prefix;
-}
-
-bool ends_with_newline(std::string_view text) {
-    return !text.empty() && text.back() == '\n';
-}
-
-std::string_view trim(std::string_view text) {
-    constexpr std::string_view whitespace = " \t\r\n\f\v";
-    const auto first = text.find_first_not_of(whitespace);
-    if (first == text.npos) {
-        return {};
-    }
-    return text.substr(first, text.find_last_not_of(whitespace) - first + 1);
 }
 
 std::string lowercase(std::string_view text) {
@@ -221,7 +207,7 @@ std::string_view inferred_type(const json::Value& schema) {
 }
 
 Conversion conversion_for(const json::Value& schema) {
-    const auto type = lowercase(trim(inferred_type(schema)));
+    const auto type = lowercase(trim(inferred_type(schema), whitespace));
     if (type == "boolean" || type == "bool" || type == "binary") {
         return Conversion::boolean;
     }
@@ -243,14 +229,6 @@ Conversion conversion_for(const json::Value& schema) {
     return Conversion::string;
 }
 
-std::string_view float_spelling(double value, char (&buffer)[64]) {
-    const auto magnitude = std::abs(value);
-    const auto format = (magnitude == 0 || (magnitude >= 1e-4 && magnitude < 1e16))
-        ? std::chars_format::fixed : std::chars_format::scientific;
-    const auto result = std::to_chars(buffer, buffer + sizeof(buffer), value, format);
-    return {buffer, static_cast<std::size_t>(result.ptr - buffer)};
-}
-
 void append_float(std::string& output, double value) {
     if (std::isnan(value)) {
         output += "NaN";
@@ -260,12 +238,13 @@ void append_float(std::string& output, double value) {
         output += value < 0 ? "-Infinity" : "Infinity";
         return;
     }
+    const auto magnitude = std::abs(value);
+    const auto format = magnitude == 0 || (magnitude >= 1e-4 && magnitude < 1e16)
+                            ? std::chars_format::fixed
+                            : std::chars_format::scientific;
     char buffer[64];
-    const auto digits = float_spelling(value, buffer);
-    output += digits;
-    if (digits.find_first_of(".e") == digits.npos) {
-        output += ".0";
-    }
+    const auto result = std::to_chars(buffer, buffer + sizeof(buffer), value, format);
+    append_float_spelling(output, {buffer, static_cast<std::size_t>(result.ptr - buffer)});
 }
 
 void append_json(std::string& output, const json::Value& value) {
@@ -306,56 +285,33 @@ bool digit(char character) {
     return character >= '0' && character <= '9';
 }
 
-std::string numeric_text(std::string_view raw) {
-    const auto text = trim(raw);
-    std::string result;
+std::string_view numeric_text(std::string_view text, std::string& normalized) {
+    if (text.find('_') == std::string_view::npos) {
+        return text;
+    }
+    normalized.reserve(text.size());
     for (std::size_t index = 0; index < text.size(); ++index) {
         if (text[index] != '_') {
-            result += text[index];
+            normalized += text[index];
         } else if (index == 0 || index + 1 == text.size() ||
                    !digit(text[index - 1]) || !digit(text[index + 1])) {
             return {};
         }
     }
-    return result;
-}
-
-bool append_integer(std::string& output, std::string_view text) {
-    const bool negative = !text.empty() && text.front() == '-';
-    if (negative || (!text.empty() && text.front() == '+')) {
-        text.remove_prefix(1);
-    }
-    if (text.empty() || text.size() > 4300 || !std::all_of(text.begin(), text.end(), digit)) {
-        return false;
-    }
-    const auto first = text.find_first_not_of('0');
-    if (first == text.npos) {
-        output += '0';
-    } else {
-        if (negative) output += '-';
-        output += text.substr(first);
-    }
-    return true;
+    return normalized;
 }
 
 bool append_number(std::string& output, std::string_view text) {
-    if (!text.empty() && text.front() == '+') {
-        text.remove_prefix(1);
-        if (!text.empty() && text.front() == '-') return false;
-    }
-    if (text.empty()) return false;
     double number = 0;
-    const auto* end = text.data() + text.size();
-    const auto parsed = std::from_chars(text.data(), end, number);
-    if (parsed.ptr != end) return false;
-    if (parsed.ec == std::errc::result_out_of_range) {
+    const auto status = parse_float(text, number);
+    if (status == std::errc::result_out_of_range) {
         std::istringstream stream{std::string(text)};
         stream.imbue(std::locale::classic());
         stream >> number;
         if (stream.fail()) {
             number = std::copysign(std::numeric_limits<double>::infinity(), number);
         }
-    } else if (parsed.ec != std::errc{}) {
+    } else if (status != std::errc{}) {
         return false;
     }
     if (std::isnan(number) && text.find('(') != text.npos) {
@@ -400,33 +356,42 @@ bool append_structured(std::string& output, std::string_view raw,
     }
 }
 
-std::string convert(std::string_view raw, Parameter* parameter) {
-    std::string output;
-    if (raw.size() == 4 && lowercase(raw) == "null") return "null";
+void append_parameter(std::string& output, std::string_view raw, Parameter* parameter) {
+    if (equals_folded(raw, "null")) {
+        output += "null";
+        return;
+    }
     if (parameter && !parameter->conversion) {
         parameter->conversion = conversion_for(*parameter->schema);
     }
     const auto conversion = parameter ? *parameter->conversion : Conversion::string;
     switch (conversion) {
     case Conversion::boolean:
-        return raw.size() == 4 && lowercase(raw) == "true" ? "true" : "false";
+        output += equals_folded(raw, "true") ? "true" : "false";
+        return;
     case Conversion::integer:
-        if (append_integer(output, numeric_text(raw))) return output;
+    case Conversion::number: {
+        std::string normalized;
+        const auto text = numeric_text(trim(raw, whitespace), normalized);
+        const bool converted = conversion == Conversion::integer
+                                   ? append_integer(output, text, 4300)
+                                   : append_number(output, text);
+        if (converted) {
+            return;
+        }
         break;
-    case Conversion::number:
-        if (append_number(output, numeric_text(raw))) return output;
-        break;
+    }
     case Conversion::structured:
-        if (append_structured(output, raw, nullptr)) return output;
-        break;
     case Conversion::structured_union:
-        if (append_structured(output, raw, parameter)) return output;
+        if (append_structured(output, raw,
+                              conversion == Conversion::structured_union ? parameter : nullptr)) {
+            return;
+        }
         break;
     case Conversion::string:
         break;
     }
     json::append_quoted(output, raw, true);
-    return output;
 }
 
 std::string format_parameters(std::string_view text, Properties* properties) {
@@ -442,14 +407,14 @@ std::string format_parameters(std::string_view text, Properties* properties) {
             end = text.find('<', end + 1);
         }
         const bool closed = end != text.npos && starts_with(text.substr(end), parameter_close);
-        const auto body = text.substr(0, end == text.npos && ends_with_newline(text) ?
-                                      text.size() - 1 : end);
+        if (end == std::string_view::npos && !text.empty() && text.back() == '\n') {
+            text.remove_suffix(1);
+        }
+        const auto body = text.substr(0, end);
         const auto separator = body.find('>');
         if (separator != body.npos) {
             const auto name = body.substr(0, separator);
-            auto value = body.substr(separator + 1);
-            if (!value.empty() && value.front() == '\n') value.remove_prefix(1);
-            if (ends_with_newline(value)) value.remove_suffix(1);
+            const auto value = trim_line_feeds(body.substr(separator + 1));
             const auto [entry, inserted] = positions.try_emplace(name, parameters.size());
             if (inserted) {
                 parameters.emplace_back(name, value);
@@ -470,7 +435,7 @@ std::string format_parameters(std::string_view text, Properties* properties) {
             const auto found = properties->find(name);
             if (found != properties->end()) parameter = &found->second;
         }
-        result += convert(value, parameter);
+        append_parameter(result, value, parameter);
     }
     return result + '}';
 }

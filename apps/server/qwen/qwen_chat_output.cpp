@@ -1,6 +1,8 @@
 #include "sglang/server/serving/qwen_parser.h"
 #include "sglang/server/serving/qwen_serving_profile.h"
 
+#include "qwen_tool_syntax.h"
+
 #include <algorithm>
 #include <array>
 #include <charconv>
@@ -11,27 +13,16 @@ namespace sglang::server {
 namespace {
 
 using namespace std::string_view_literals;
+using namespace qwen_tool_syntax;
 using Args = std::vector<ChatArgumentType>;
 using Type = ChatArgumentType;
 
 constexpr auto think_open = "<think>"sv;
 constexpr auto think_close = "</think>"sv;
-constexpr auto tool_open = "<tool_call>"sv;
-constexpr auto tool_close = "</tool_call>"sv;
-constexpr auto function_open = "<function="sv;
-constexpr auto function_close = "</function>"sv;
-constexpr auto parameter_open = "<parameter="sv;
-constexpr auto parameter_close = "</parameter>"sv;
 constexpr auto whitespace = " \t\r\n"sv;
 
 bool starts_with(std::string_view text, std::string_view prefix) {
     return text.substr(0, prefix.size()) == prefix;
-}
-
-std::string_view trim(std::string_view text) {
-    const auto first = text.find_first_not_of(whitespace);
-    return first == text.npos ? std::string_view{} :
-        text.substr(first, text.find_last_not_of(whitespace) + 1 - first);
 }
 
 const json::Value* field(const json::Value& value, std::string_view key) {
@@ -80,7 +71,8 @@ void read_types(const json::Value& schema, Args& types, int depth = 0) {
 }
 
 bool valid_label(std::string_view name) {
-    return !name.empty() && name.find_first_of("<>\r\n") == name.npos && trim(name) == name;
+    return !name.empty() && name.find_first_of("<>\r\n") == std::string_view::npos &&
+           trim(name, whitespace) == name;
 }
 
 std::string_view schema_name(const json::Value* value) {
@@ -163,60 +155,18 @@ ChatToolSchema read_schema(const json::Value* value, bool strict) {
     return schema;
 }
 
-bool append_integer(std::string& output, std::string_view text) {
-    const bool negative = starts_with(text, "-");
-    if (negative || starts_with(text, "+")) {
-        text.remove_prefix(1);
-    }
-    if (text.empty() || text.find_first_not_of("0123456789") != text.npos) {
-        return false;
-    }
-    const auto first = text.find_first_not_of('0');
-    if (first == text.npos) {
-        output += '0';
-    } else {
-        if (negative) {
-            output += '-';
-        }
-        output += text.substr(first);
-    }
-    return true;
-}
-
 bool append_number(std::string& output, std::string_view text) {
     if (append_integer(output, text)) {
         return true;
     }
-    if (starts_with(text, "+")) {
-        text.remove_prefix(1);
-        if (starts_with(text, "-") || starts_with(text, "+")) {
-            return false;
-        }
-    }
-    if (text.empty()) {
-        return false;
-    }
-    double number;
-    const auto* last = text.data() + text.size();
-    const auto parsed = std::from_chars(text.data(), last, number);
-    if (parsed.ec != std::errc{} || parsed.ptr != last || !std::isfinite(number)) {
+    double number = 0;
+    if (parse_float(text, number) != std::errc{} || !std::isfinite(number)) {
         return false;
     }
     char buffer[64];
     const auto formatted = std::to_chars(buffer, buffer + sizeof(buffer), number);
-    const std::string_view spelling(buffer, formatted.ptr - buffer);
-    output += spelling;
-    if (spelling.find_first_of(".eE") == spelling.npos) {
-        output += ".0";
-    }
+    append_float_spelling(output, {buffer, static_cast<std::size_t>(formatted.ptr - buffer)});
     return true;
-}
-
-bool equals_folded(std::string_view text, std::string_view lower) {
-    return std::equal(text.begin(), text.end(), lower.begin(), lower.end(), [](char a, char b) {
-        const char folded = a >= 'A' && a <= 'Z' ? static_cast<char>(a + ('a' - 'A')) : a;
-        return folded == b;
-    });
 }
 
 bool append_boolean(std::string& output, std::string_view text) {
@@ -243,7 +193,7 @@ bool append_collection(std::string& output, std::string_view text, Type type) {
 }
 
 bool append_argument(std::string& output, std::string_view raw, Type type) {
-    const auto text = trim(raw);
+    const auto text = trim(raw, whitespace);
     switch (type) {
     case Type::string:
         json::append_quoted(output, raw);
@@ -423,12 +373,7 @@ void ToolFrame::convert(std::string_view raw, bool partial) {
         arguments_valid_ = false;
         return;
     }
-    if (starts_with(raw, "\n")) {
-        raw.remove_prefix(1);
-    }
-    if (!raw.empty() && raw.back() == '\n') {
-        raw.remove_suffix(1);
-    }
+    raw = trim_line_feeds(raw);
     if (unknown) {
         arguments_valid_ = false;
         return;

@@ -18,7 +18,7 @@ done
 
 qwen="$source_dir/apps/server/qwen"
 sources+=("$qwen"/{qwen_chat_template,qwen_chat_output,qwen_tool_constraints}.cpp
-          "$qwen/qwen_serving_profile.cpp")
+          "$qwen"/{qwen_serving_profile,qwen_tool_syntax}.cpp)
 
 "${CXX:-c++}" -std=c++17 -O2 -pthread -Wall -Wextra -Wpedantic -Werror \
     -ffunction-sections -fdata-sections -I"$source_dir/include" \

@@ -235,6 +235,10 @@ void responses_error(const Socket& connection, unsigned code, std::string_view m
         {"param", parameter ? Value(parameter) : Value{}}, {"code", count(code)}}}}));
 }
 
+ResponseStore::ResponseStore(bool enabled) : enabled_(enabled) {}
+
+bool ResponseStore::enabled() const { return enabled_; }
+
 ResponseStore::Handle ResponseStore::lookup(std::string_view id) const {
     if (id.substr(0, 5) != "resp_") {
         throw RequestError(400, "Invalid 'response_id': '" + std::string(id) +

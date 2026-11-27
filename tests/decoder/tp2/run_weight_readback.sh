@@ -16,9 +16,11 @@ mkdir -p -- "$out"
 cd -- "$root"
 sources=(
     tests/decoder/tp2/weight_readback_check.cpp src/checkpoint.cpp src/json.cpp src/utf8.cpp
-    src/runtime/model/{qwen_checkpoint,decoder_weights}.cpp
-    src/runtime/backend/{cuda_resources,cuda_backend_policy,retired_request_blocks}.cpp
+    src/runtime/model/{qwen_checkpoint,qwen_text_model,qwen_weight_shard}.cpp
+    src/runtime/model/{qwen_weight_upload,decoder_weights}.cpp
+    src/runtime/backend/{cuda_resources,cuda_error,cuda_backend_policy,retired_request_blocks}.cpp
     src/runtime/execution/decoder_execution_policy.cpp
+    src/text/text_dimensions.cpp
 )
 "${CXX:?Missing Pixi C++ compiler}" -std=c++17 -O2 -ffunction-sections -fdata-sections \
     -Iinclude -isystem "$kit/include" "${sources[@]}" -Wl,--gc-sections \

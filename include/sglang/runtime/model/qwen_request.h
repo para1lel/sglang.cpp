@@ -28,7 +28,7 @@ struct TransferBuffers {
 };
 
 struct Workspace {
-    Workspace() = default;
+    Workspace() noexcept;
     explicit Workspace(Allocations& allocations, Bf16* verification_attention = nullptr,
                        TextLogitCandidate* verification_winner = nullptr);
 

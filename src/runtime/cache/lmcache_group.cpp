@@ -245,3 +245,11 @@ void LmCacheGroup::reset() const {
 }
 
 }   
+
+namespace sglang::decoder {
+
+int LmCacheGroup::world_size() const { return static_cast<int>(clients_.size()); }
+
+const LmCacheClient& LmCacheGroup::client(int rank) const { return *clients_.at(rank); }
+
+}

@@ -7,9 +7,7 @@ namespace sglang::decoder {
 struct MnnvlRmsQuantizeRows {
     static constexpr int size = 10;
 
-    static constexpr bool supports(int count) {
-        return count == size || (count >= 3 && count <= 5);
-    }
+    static bool supports(int count);
 
     struct Row {
         __nv_bfloat16* residual;

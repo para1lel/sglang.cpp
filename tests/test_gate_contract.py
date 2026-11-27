@@ -105,7 +105,7 @@ def seed_repository(root, files):
 
 @pytest.fixture
 def header_repository(tmp_path):
-    return seed_repository(tmp_path, {"src/legacy.h": "#pragma once\n"})
+    return seed_repository(tmp_path, {"src/legacy.h": "inline int value() { return 7; }\n"})
 
 
 def selected_hook(root, index):
@@ -123,9 +123,9 @@ def selected_hook(root, index):
     return result
 
 
-def assert_header_rejected(result, path):
+def assert_header_rejected(result, path, line=1):
     assert result.returncode != 0, result.stdout + result.stderr
-    assert path in result.stderr and "include/" in result.stderr
+    assert f"{path}: Line {line} contains a function definition." in result.stderr
 
 
 @pytest.fixture
@@ -137,31 +137,26 @@ def alternate_index(header_repository):
     return index
 
 
-def test_header_location_rejects_retained_header(header_repository, alternate_index):
+def test_header_rule_rejects_retained_internal_definition(header_repository, alternate_index):
     result = selected_hook(header_repository, alternate_index)
     assert_header_rejected(result, "src/legacy.h")
 
 
-@pytest.mark.parametrize(
-    "misplaced", ["src/new.cuh", "include/new.hpp", "new.h", "extensions/future/new.HH"],
-)
-def test_header_location_rejects_staged_header(header_repository, alternate_index, misplaced):
+def test_header_rule_ignores_generated_and_unselected_headers(header_repository, alternate_index):
     root = header_repository
     git_fixture(root, "rm", "--cached", "src/legacy.h", index=alternate_index)
-    write_fixture(root, misplaced, "#pragma once\n")
-    git_fixture(root, "add", misplaced, index=alternate_index)
-    (root / misplaced).unlink()
-    assert_header_rejected(selected_hook(root, alternate_index), misplaced)
+    write_fixture(root, "build/generated.hpp", "int generated() { return 7; }\n")
+    result = selected_hook(root, alternate_index)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (root / "src/legacy.h").is_file()
 
 
-@pytest.mark.parametrize("rename", [False, True], ids=["deletion", "rename"])
-def test_header_location_accepts_relocation(header_repository, alternate_index, rename):
+@pytest.mark.parametrize("path", ["src/new.cuh", "tests/probe.ipp", "tools/probe.tpp"])
+def test_header_rule_accepts_internal_declarations(header_repository, alternate_index, path):
     root = header_repository
     git_fixture(root, "rm", "--cached", "src/legacy.h", index=alternate_index)
-    if rename:
-        allowed = "include/sglang/server/legacy.h"
-        write_fixture(root, allowed, "#pragma once\n")
-        git_fixture(root, "add", allowed, index=alternate_index)
+    write_fixture(root, path, "#pragma once\nint declared();\n")
+    git_fixture(root, "add", path, index=alternate_index)
     result = selected_hook(root, alternate_index)
     assert result.returncode == 0, result.stdout + result.stderr
     assert (root / "src/legacy.h").is_file()
@@ -294,3 +289,73 @@ def test_cpp_macro_literals_and_line_splicing(tmp_path, comment_errors):
     assert len(diagnostics) == 2
     assert diagnostics[0].startswith("Line 1 contains a comment")
     assert diagnostics[1].startswith("Line 2 contains a comment")
+
+
+@pytest.mark.parametrize(("extension", "line", "source"), [
+    ("h", 1, "inline int value() { return 7; }\n"),
+    ("hh", 1, "template<class T> T value(T x) { return x; }\n"),
+    ("hpp", 1, "struct Probe { Probe() : value(7) {} int value; };\n"),
+    ("hxx", 1, "struct Probe { Probe() try {} catch (...) {} };\n"),
+    ("h++", 1, "struct Probe { ~Probe() {} };\n"),
+    ("cuh", 1, "__device__ int value() { return 7; }\n"),
+    ("inl", 1, "struct Probe { explicit operator bool() const { return true; } };\n"),
+    ("ipp", 1, "inline int value() { return 7; }\n"),
+    ("tpp", 1, "template<class T> T value(T x) { return x; }\n"),
+    ("hpp", 1, "inline constexpr auto value = [] { return 7; };\n"),
+    ("h", 1, "struct Probe { Probe() = default; };\n"),
+    ("cuh", 2, "#define DEVICE __device__\nDEVICE int value() { return 7; }\n"),
+    ("h", 2, "#define BODY() \\\n    inline int value() { return 7; }\n"),
+    ("h", 1, "#define CALLBACK [] { return 7; }\n"),
+    ("hpp", 2, "struct Probe { Probe& operator=(const Probe&); };\n"
+               "Probe& Probe::operator=(const Probe&) = default;\n"),
+    ("h", 1, 'void unavailable() = delete("unsupported");\n'),
+])
+def test_staged_headers_reject_function_definitions(comment_repository, extension, line, source):
+    root, index = comment_repository
+    path = f"tests/fixtures/probe.{extension}"
+    write_fixture(root, path, source)
+    git_fixture(root, "add", path, index=index)
+    result = selected_hook(root, index)
+    assert_header_rejected(result, path, line)
+
+
+def test_header_rule_uses_staged_blob(comment_repository):
+    root, index = comment_repository
+    path = "include/sglang/probe.hpp"
+    declaration = (
+        "template<class T> T identity(T);\n"
+        "struct Probe { Probe(); Probe(const Probe&) = delete; virtual void run() = 0; };\n"
+        "void unavailable(int) = delete;\n"
+        "inline int (*probe)(int){nullptr};\n"
+        "inline constexpr int data[] = {1, 2, 3};\n"
+    )
+    definition = "inline int value() { return 7; }\n"
+    write_fixture(root, path, declaration)
+    git_fixture(root, "add", path, index=index)
+    write_fixture(root, path, definition)
+    result = selected_hook(root, index)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+    git_fixture(root, "add", path, index=index)
+    write_fixture(root, path, declaration)
+    result = selected_hook(root, index)
+    assert_header_rejected(result, path)
+
+
+def test_cuda_header_rule_uses_staged_qualifier_macro(comment_repository):
+    root, index = comment_repository
+    qualifiers = "src/probe/qualifiers.cuh"
+    probe = "src/probe/function.cuh"
+    declaration = '#include "qualifiers.cuh"\nQUAL int probe();\n'
+    write_fixture(root, qualifiers, "#ifdef __CUDACC__\n#define QUAL __device__\n"
+                  "#else\n#define QUAL\n#endif\n")
+    write_fixture(root, probe, declaration)
+    git_fixture(root, "add", qualifiers, probe, index=index)
+    write_fixture(root, qualifiers, "#define QUAL unexpected_token\n")
+    result = selected_hook(root, index)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+    write_fixture(root, probe, '#include "qualifiers.cuh"\nQUAL int probe() { return 0; }\n')
+    git_fixture(root, "add", probe, index=index)
+    write_fixture(root, probe, declaration)
+    assert_header_rejected(selected_hook(root, index), probe, 2)

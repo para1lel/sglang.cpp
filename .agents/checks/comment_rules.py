@@ -17,7 +17,9 @@ import tree_sitter_toml
 import tree_sitter_typescript
 import tree_sitter_yaml
 
-C_KINDS = {".c", ".c++", ".cc", ".cpp", ".cxx", ".h", ".h++", ".hh", ".hpp", ".hxx"}
+from function_spans import HEADER_SUFFIXES
+
+C_KINDS = ({".c", ".c++", ".cc", ".cpp", ".cxx"} | HEADER_SUFFIXES) - {".cuh"}
 CUDA_KINDS = {".cu", ".cuh"}
 SHELL_KINDS = {".bash", ".sh"}
 JAVASCRIPT_KINDS = {".js", ".jsx", ".mjs"}

@@ -40,10 +40,7 @@ inline constexpr int staged_serial_min_position = 32768;
 inline constexpr int staged_serial_max_tokens = 131072;
 inline constexpr int staged_serial_min_rows = 1024 - mxfp8_group_size;
 
-constexpr bool wants_long_serial_staging(int position, int rows) {
-    return rows >= staged_serial_min_rows && rows <= 1024 && position >= 0 &&
-        position <= staged_serial_max_tokens - rows && position + rows > staged_serial_min_position;
-}
+bool wants_long_serial_staging(int position, int rows);
 
 std::optional<cudaError_t> try_long_serial_staged_paged_prefill(
     const PagedPrefillSequence& sequence, cudaStream_t stream, PairedPrefillScratch scratch);
@@ -61,13 +58,10 @@ cudaError_t tensor_core_multirow_prefill_gqa(
     const __nv_bfloat16* queries, __nv_bfloat16* output, cudaStream_t stream,
     PairedPrefillScratch scratch);
 
-inline cudaError_t tensor_core_model_prefill_gqa(
+cudaError_t tensor_core_model_prefill_gqa(
     Mxfp8KvCache cache, Mxfp8PageTable pages, int position, int rows,
     const __nv_bfloat16* queries, __nv_bfloat16* output, cudaStream_t stream,
-    PairedPrefillScratch scratch = PairedPrefillScratch{}) {
-    return tensor_core_multirow_prefill_gqa(cache, pages, position, rows, queries, output,
-                                           stream, scratch);
-}
+    PairedPrefillScratch scratch = PairedPrefillScratch{});
 
 }
 

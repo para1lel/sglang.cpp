@@ -10,11 +10,13 @@ two-row graph replay with the selected operators.
 
 ```bash
 toolkit="$CONDA_PREFIX/targets/x86_64-linux"
+nccl=$(python -I -c 'import sysconfig; print(sysconfig.get_path("purelib") + "/nvidia/nccl")')
 checkpoint=/data0/shared/Qwen3.8-27B-FP8
 "$CXX" -std=c++20 -O3 -pthread -Iinclude -isystem "$toolkit/include" \
     tests/decoder/gdn_verify_checkpoint.cpp \
     -Wl,--start-group "$out"/lib/libsglang_*.a -Wl,--end-group \
-    -L"$toolkit/lib" -Wl,-rpath,"$toolkit/lib" -lcudart -lcuda -o "$out/gdn-verify-check"
+    -L"$toolkit/lib" -L"$toolkit/lib/stubs" -Wl,-rpath,"$toolkit/lib" \
+    -Wl,-rpath,"$nccl/lib" "$nccl/lib/libnccl.so.2" -lcudart -lcuda -o "$out/gdn-verify-check"
 CUDA_VISIBLE_DEVICES="${GPU_UUID:?set the reserved B200 UUID}" \
     "$out/gdn-verify-check" "$checkpoint" lane0.txt lane1.txt lane2.txt lane3.txt
 ```
@@ -30,7 +32,8 @@ xmake build -P "$PWD" sglang_cuda
 toolkit="$CONDA_PREFIX/targets/x86_64-linux"
 "$CXX" -std=c++17 -O3 -Wall -Wextra -Werror -Iinclude -I"$toolkit/include" \
     tests/decoder/decode_fp8_alias_check.cpp -L"$out/lib" -L"$toolkit/lib" \
-    -Wl,-rpath,"$toolkit/lib" -Wl,--wrap=cudaLaunchKernel -lsglang_cuda -lcudart \
+    -Wl,-rpath,"$toolkit/lib" -Wl,--wrap=cudaLaunchKernel \
+    -lsglang_cuda -lsglang_cuda_support -lcudart \
     -o "$out/decode-fp8-alias-check"
 CUDA_VISIBLE_DEVICES="${GPU_UUID:?set the reserved B200 UUID}" "$out/decode-fp8-alias-check"
 ```
@@ -48,14 +51,15 @@ xmake build -P "$PWD" sglang-generate
 checkpoint=/data0/shared/Qwen3.8-27B-FP8
 "$CXX" -std=c++17 -O3 -Wall -Wextra -Werror -Iinclude -I"$toolkit/include" \
     tests/decoder/decode_bandwidth_check.cpp -L"$out/lib" -L"$toolkit/lib" \
-    -Wl,-rpath,"$toolkit/lib" -Wl,--wrap=cudaLaunchKernel -lsglang_cuda -lcudart \
+    -Wl,-rpath,"$toolkit/lib" -Wl,--wrap=cudaLaunchKernel \
+    -lsglang_cuda -lsglang_cuda_support -lcudart \
     -o "$out/decode-bandwidth-check"
 "$CXX" -std=c++17 -O3 -Wall -Wextra -Werror -Iinclude -I"$toolkit/include" \
-    tests/decoder/decode_graph_check.cpp -L"$out/lib" -L"$toolkit/lib" \
-    -Wl,-rpath,"$toolkit/lib" \
+    tests/decoder/decode_graph_check.cpp -L"$toolkit/lib" -L"$toolkit/lib/stubs" \
+    -Wl,-rpath,"$toolkit/lib" -Wl,-rpath,"$nccl/lib" \
     -Wl,--wrap=cudaGraphLaunch -Wl,--wrap=cudaStreamBeginCapture \
-    -lsglang_decoder -lsglang_checkpoint -lsglang_json -lsglang_cuda -lsglang_prefill_fp8_sm100 \
-    -lcudart -o "$out/decode-graph-check"
+    -Wl,--start-group "$out"/lib/libsglang_*.a -Wl,--end-group \
+    "$nccl/lib/libnccl.so.2" -lcuda -lcudart -pthread -o "$out/decode-graph-check"
 CUDA_VISIBLE_DEVICES="${GPU_UUID:?set the reserved B200 UUID}" "$out/decode-bandwidth-check"
 CUDA_VISIBLE_DEVICES="$GPU_UUID" "$out/decode-graph-check" "$checkpoint"
 ```
@@ -80,13 +84,13 @@ rejection, width changes, a mixed prefill/decode step, and slot reuse.
 ```bash
 sampler=_ZN6sglang7decoder13sample_logitsEPK13__nv_bfloat16iPiNS0_18SamplingParametersEiPvP11CUstream_st
 "$CXX" -std=c++20 -O3 -Wall -Wextra -Werror -Iinclude -I"$toolkit/include" \
-    tests/decoder/grouped_head_routes.cpp -L"$out/lib" -L"$toolkit/lib" \
+    tests/decoder/grouped_head_routes.cpp -L"$toolkit/lib" -L"$toolkit/lib/stubs" \
     -Wl,-rpath,"$toolkit/lib" -Wl,--wrap=cudaLaunchKernel \
     -Wl,--wrap=cudaStreamBeginCapture -Wl,--wrap=cudaStreamEndCapture \
     -Wl,--wrap=cudaGraphInstantiate -Wl,--wrap=cudaGraphLaunch \
     -Wl,--wrap=cudaMemcpyAsync -Wl,--wrap="$sampler" \
-    -lsglang_decoder -lsglang_checkpoint -lsglang_json -lsglang_cuda -lsglang_prefill_fp8_sm100 \
-    -lcudart -o "$out/grouped-head-routes"
+    -Wl,--start-group "$out"/lib/libsglang_*.a -Wl,--end-group \
+    -Wl,-rpath,"$nccl/lib" "$nccl/lib/libnccl.so.2" -lcuda -lcudart -pthread -o "$out/grouped-head-routes"
 jq -r '.prompt[]' tests/prefix/route-cases.json >"$out/prompt.ids"
 export CUDA_VISIBLE_DEVICES="${GPU_UUID:?set the reserved B200 UUID}"
 for mode in eager graph rejected; do

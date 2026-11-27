@@ -14,9 +14,7 @@ struct ChatTools {
     bool parallel = true;
     bool strict = false;
 
-    bool forced() const {
-        return choice == ChatToolChoice::required || choice == ChatToolChoice::named;
-    }
+    bool forced() const;
 };
 
 json::Value parse_chat_arguments(std::string_view arguments, json::Syntax syntax);
@@ -25,7 +23,7 @@ std::string_view trim_chat_text(std::string_view text);
 
 class ChatTemplate {
 public:
-    virtual ~ChatTemplate() = default;
+    virtual ~ChatTemplate();
     virtual std::string render(const json::OrderedObject& chat, ChatInput input) const = 0;
     virtual std::string render(const json::OrderedObject& chat, ChatInput input,
                                const ChatTools& selection) const = 0;

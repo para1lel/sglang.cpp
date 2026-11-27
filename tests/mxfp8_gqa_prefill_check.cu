@@ -15,18 +15,15 @@
 #include <vector>
 
 namespace gqa_test {
-
 std::vector<__nv_bfloat16> make_queries(int start_token, int count);
 double decode_value(std::uint8_t code, std::uint8_t scale);
 void verify_ordered_prefill(const char* phase, sglang::Mxfp8KvCache cache,
                             sglang::Mxfp8PageTable pages, int first, int rows,
                             const __nv_bfloat16* queries, const std::vector<__nv_bfloat16>& actual,
                             cudaStream_t stream);
-
 }
 
 namespace {
-
 using BFloat = __nv_bfloat16;
 using Byte = std::uint8_t;
 using gqa_test::decode_value;
@@ -83,7 +80,6 @@ public:
         check_cuda(cudaStreamSynchronize(stream), "Complete test stream");
         return result;
     }
-
 private:
     std::size_t bytes() const { return count_ * sizeof(Element); }
 
@@ -121,7 +117,7 @@ public:
         check_cuda(cudaGraphLaunch(executable_, stream), "Replay attention graph");
     }
 
-    void check_grid(unsigned width) const {
+    unsigned check_grid(int visible, unsigned width) const {
         std::size_t count = 0;
         check_cuda(cudaGraphGetNodes(graph_, nullptr, &count), "Count attention graph nodes");
         if (count != 1) {
@@ -132,10 +128,13 @@ public:
         cudaKernelNodeParams kernel{};
         check_cuda(cudaGraphKernelNodeGetParams(node, &kernel), "Get attention graph grid");
         if (kernel.gridDim.x != width || kernel.gridDim.y != query_heads / 2) {
-            throw std::runtime_error("Unexpected prefill dispatch grid at the 32768-token cutoff");
+            throw std::runtime_error("Unexpected prefill dispatch grid at "
+                + std::to_string(visible) + " visible tokens: "
+                + std::to_string(kernel.gridDim.x) + "x" + std::to_string(kernel.gridDim.y)
+                + ", expected " + std::to_string(width) + "x" + std::to_string(query_heads / 2));
         }
+        return kernel.gridDim.x;
     }
-
 private:
     cudaGraph_t graph_ = nullptr;
     cudaGraphExec_t executable_ = nullptr;
@@ -797,8 +796,11 @@ void check_ordered_prefill_precision(cudaStream_t stream) {
 
 void check_ordered_prefill_score_overflow(cudaStream_t stream) {
     constexpr int rows = 65;
-    constexpr int limit = 32768;
-    constexpr int page_count = limit / page_tokens + 1;
+    constexpr std::array cases{
+        std::pair{65, 33u}, std::pair{32768, 17u}, std::pair{32769, 17u},
+        std::pair{131072, 17u}, std::pair{131073, 65u},
+    };
+    constexpr int page_count = (cases.back().first + page_tokens - 1) / page_tokens;
     constexpr auto payload = page_count * sglang::mxfp8_payload_bytes_per_page;
     constexpr auto scales = page_count * sglang::mxfp8_scale_bytes_per_page;
     std::vector<std::int32_t> mapping(page_count);
@@ -829,7 +831,8 @@ void check_ordered_prefill_score_overflow(cudaStream_t stream) {
     const DeviceBuffer<BFloat> queries(input.size());
     queries.upload(input.data(), stream);
     const DeviceBuffer<BFloat> output(rows * query_elements + 2 * prefill_guard);
-    for (const int first : {0, limit - rows, limit - rows + 1}) {
+    for (const auto [visible, expected_width] : cases) {
+        const int first = visible - rows;
         const auto launch = [&](sglang::Mxfp8KvCache cache) {
             return sglang::decoder::tensor_core_multirow_prefill_gqa(
                 cache, pages.view(), first, rows, queries.get(), output.get() + prefill_guard,
@@ -837,8 +840,7 @@ void check_ordered_prefill_score_overflow(cudaStream_t stream) {
         };
         Graph graph;
         graph.capture(stream, [&] { return launch(view); });
-        graph.check_grid(first == 0 ? rows / 2 + rows % 2 :
-                         first + rows <= limit ? rows / 4 + rows % 4 : rows);
+        const auto width = graph.check_grid(visible, expected_width);
         output.fill(attention_sentinel, stream);
         graph.replay(stream);
         const auto actual = download_prefill(output, stream);
@@ -859,14 +861,13 @@ void check_ordered_prefill_score_overflow(cudaStream_t stream) {
                 }
             }
         }
+        std::printf("Prefill overflow visible=%d grid=%u matched unaligned and FP64 reference\n",
+                    visible, width);
     }
-    std::puts("Score overflow matches protected tiles at 32768 and 32769 visible tokens");
 }
-
 }
 
 namespace gqa_test {
-
 void check_bound_gdn(cudaStream_t stream) {
     using namespace sglang;
     const DeviceBuffer<BFloat> convolution(text_gdn_qkv_width * (text_gdn_history_taps + 1));
@@ -996,5 +997,4 @@ void check_raw_attention(cudaStream_t stream) {
     check_paged_replay(stream);
     check_paged_finite_range(stream);
 }
-
 }

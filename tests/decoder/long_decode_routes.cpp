@@ -369,8 +369,8 @@ void mtp_rank_long() {
     constexpr int logical_pages = last_position / mxfp8_page_size + 1;
     constexpr int physical_pages = lanes * logical_pages;
     constexpr int kv_heads = gqa_rank_geometry.kv_heads;
-    constexpr auto payload = physical_pages * gqa_payload_bytes_per_page(kv_heads);
-    constexpr auto scales = physical_pages * gqa_scale_bytes_per_page(kv_heads);
+    const auto payload = physical_pages * gqa_payload_bytes_per_page(kv_heads);
+    const auto scales = physical_pages * gqa_scale_bytes_per_page(kv_heads);
     Allocations memory(0);
     memory.open_stream();
     const auto stream = memory.stream();
@@ -422,10 +422,14 @@ void mtp_rank_long() {
         launches.kv_heads = kv_heads;
         int remaining = 0;
         mtp_routes = &launches;
+        const auto remainder = [&](const GqaVerifySelection& selected) {
+            remaining = std::count(selected.begin(), selected.begin() + count, false);
+        };
         const bool launched = try_gqa_verify_long(layer, rows.data(), count, 0, true,
-            text_attention_max_tokens, stream, [&](const auto& selected) {
-                remaining = std::count(selected.begin(), selected.begin() + count, false);
-            });
+            text_attention_max_tokens, stream,
+            {&remainder, [](const void* context, const GqaVerifySelection& selected) {
+                (*static_cast<const decltype(remainder)*>(context))(selected);
+            }});
         mtp_routes = nullptr;
         check(launched == (readers != 0) && launches.readers == int(readers != 0) &&
                   launches.merges == launches.readers && !launches.legacy && remaining == left,

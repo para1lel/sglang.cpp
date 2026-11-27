@@ -7,6 +7,7 @@ output=$(realpath -m -- "${3:?Pass a fresh evidence directory}")
 gpu=${GPU_UUID:?Set the reserved B200 UUID}
 prefix=${CONDA_PREFIX:?Use the managed Pixi default environment}
 toolkit=$prefix/targets/x86_64-linux
+nccl=$(python -I -c 'import sysconfig; print(sysconfig.get_path("purelib") + "/nvidia/nccl")')
 export LMCACHE_SOCKET=${LMCACHE_SOCKET:?Start the LMCache daemon on the same reserved GPU}
 mkdir "$output"
 
@@ -19,16 +20,22 @@ for name in state graph; do
         wrap=(-Wl,--wrap="$append" -Wl,--wrap=cudaMemcpyAsync -Wl,--wrap=cudaFreeAsync
               -Wl,--wrap=cudaFree -Wl,--wrap=cudaMalloc -Wl,--wrap=cudaEventRecord
               -Wl,--wrap=cudaStreamSynchronize -Wl,--wrap=cudaGetErrorString)
-        extra_sources=(apps/server/batch_cache.cpp src/runtime/cache/lmcache_group.cpp)
+        extra_sources=(apps/server/batch_cache.cpp src/runtime/cache/lmcache_group.cpp
+                       src/runtime/server/{batch_restore_join,cache_identity}.cpp)
+    else
+        extra_sources=(apps/server/detail/batch_state.cpp)
     fi
-    "${CXX:-c++}" -std=c++17 -O3 -pthread -Iinclude -I"$toolkit/include" \
-        "tests/prefix/lmcache_$name.cpp" src/runtime/cache/lmcache_client.cpp \
-        src/runtime/cache/lmcache_prefix.cpp "${extra_sources[@]}" \
-        -L"$build/lib" -L"$toolkit/lib" -L"$prefix/lib64" \
+    "${CXX:-c++}" -std=c++17 -O3 -pthread -ffunction-sections -fdata-sections \
+        -Iinclude -I"$toolkit/include" \
+        "tests/prefix/lmcache_$name.cpp" tests/prefix/prefix_fixture.cpp \
+        src/runtime/cache/{lmcache_client,lmcache_prefix}.cpp "${extra_sources[@]}" \
+        -L"$build/lib" -L"$toolkit/lib" -L"$toolkit/lib/stubs" -L"$prefix/lib64" \
         -Wl,-rpath,"$prefix/lib" -Wl,-rpath,"$toolkit/lib" -Wl,-rpath,"$prefix/lib64" \
-        "${wrap[@]}" -lsglang_decoder -lsglang_checkpoint -lsglang_cuda \
-        -lsglang_prefill_fp8_sm100 -lsglang_tokenizer -lsglang_json \
-        -lcudart -lcudadevrt -lcudart_static -lrt -ldl -o "$output/lmcache-$name"
+        "${wrap[@]}" -Wl,--start-group -lsglang_decoder -lsglang_checkpoint -lsglang_cuda \
+        -lsglang_prefill_fp8_sm100 -lsglang_tokenizer -lsglang_json -lsglang_mnnvl_ar \
+        -lsglang_cuda_support -Wl,--end-group -Wl,--gc-sections \
+        -Wl,-rpath,"$nccl/lib" "$nccl/lib/libnccl.so.2" \
+        -lcuda -lcudart -lcudadevrt -lcudart_static -lrt -ldl -o "$output/lmcache-$name"
     CUDA_VISIBLE_DEVICES="$gpu" timeout --verbose --kill-after=5s "${LMCACHE_TEST_TIMEOUT:-5m}" \
         "$output/lmcache-$name" "$checkpoint" 2>&1 | tee "$output/$name.log"
 done

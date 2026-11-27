@@ -232,7 +232,7 @@ struct Dispatch {
 constexpr Dispatch flash{"flash_prefill_attentionILi88ELb1ELb1EE", 12, head_blocks, 1, 352};
 constexpr Dispatch tmem_paired{"tmem_pair_attentionILb0EE", rows / 64, head_blocks, 1, 416, 2};
 constexpr Dispatch tmem_paired_tail{"tmem_pair_attentionILb1EE", rows / 64, head_blocks, 1, 416, 2};
-constexpr Dispatch exact{"attention_kernel", rows, mxfp8_query_heads};
+constexpr Dispatch exact{"tiled_prefill_attention", rows, head_blocks, 1, 256};
 constexpr Dispatch multirow{"multirow_prefill_attention", rows / 4};
 constexpr Dispatch protected_rows{"protected_prefill_attention", rows};
 
@@ -593,7 +593,7 @@ void check_future_values(const char* label, Input& input, DeviceInput& device, i
                 label, prefix, suffix_differences);
 }
 
-Dispatch long_1023_dispatch() {
+Dispatch long_1023_dispatch(Dispatch fallback = ordered_dispatch(1023)) {
     int device = 0;
     int multiprocessors = 0;
     int shared_limit = 0;
@@ -618,7 +618,7 @@ Dispatch long_1023_dispatch() {
     if (shared_limit >= 138032) {
         return {"flash_prefill_attentionILi64ELb1ELb0EE", 16, head_blocks, 1, 256};
     }
-    return ordered_dispatch(1023);
+    return fallback;
 }
 
 void check_paired_prefill(cudaStream_t stream) {
@@ -776,7 +776,8 @@ void check_long_flash(cudaStream_t stream) {
     device.run("32768 partial tile", input, ordered_visible - partial, long_1023_dispatch(),
                attention_samples(input, ordered_visible - partial, partial), stream,
                {.count = partial});
-    device.run("32769 partial tile", input, ordered_visible + 1 - partial, partial_protected,
+    device.run("32769 partial tile", input, ordered_visible + 1 - partial,
+               long_1023_dispatch(partial_protected),
                attention_samples(input, ordered_visible + 1 - partial, partial), stream,
                {.count = partial});
     device.run("TMEM first long aligned start", input, ordered_visible, tmem_paired,

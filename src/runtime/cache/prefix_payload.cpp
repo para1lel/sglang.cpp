@@ -37,6 +37,8 @@ bool DecoderMediaCacheIdentity::matches(const DecoderMedia& media) const {
         layout_.video_timestamp_tokens == other.video_timestamp_tokens;
 }
 
+std::string_view DecoderMediaCacheIdentity::patches_digest() const { return patches_digest_; }
+
 namespace decoder {
 namespace {
 
@@ -170,4 +172,12 @@ void PrefixCacheKeys::append_row(int token, MropePosition position, std::string_
 }
 
 }
+}
+
+namespace sglang::decoder {
+
+int PrefixCacheKeys::tokens() const { return tokens_; }
+
+int PrefixCacheKeys::cacheable_tokens() const { return static_cast<int>(keys_.size()) - 1; }
+
 }

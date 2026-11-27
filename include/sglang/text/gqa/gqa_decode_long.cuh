@@ -21,9 +21,7 @@ struct LongRequest {
     int first;
     int count = long_rows;
 
-    __host__ __device__ decoder::PagedDecodeLane lane(int row) const {
-        return {cache, pages, first + row, rows[row]};
-    }
+    SGLANG_GQA_HOST_DEVICE decoder::PagedDecodeLane lane(int row) const;
 };
 
 struct LongBatch {
@@ -38,11 +36,7 @@ cudaError_t combine_long_decode(const LongBatch& batch, int requests, int splits
                                 cudaStream_t stream);
 
 #ifdef __CUDACC__
-__device__ inline decoder::PagedDecodeLane resolve(const LongBatch& batch) {
-    const auto& request = batch.requests[blockIdx.z / long_rows];
-    const int row = blockIdx.z % long_rows;
-    return row < request.count ? request.lane(row) : decoder::PagedDecodeLane{{}, {}, -1, {}};
-}
+__device__ decoder::PagedDecodeLane resolve(const LongBatch& batch);
 #endif
 
 }

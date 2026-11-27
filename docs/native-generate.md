@@ -5,17 +5,17 @@
 | Part | Responsibility | Source |
 | --- | --- | --- |
 | HTTP transport | Validate the framing and route `POST` and `PUT /generate` through the shared completion queue. | [Framing](../apps/server/http.cpp#L199)<!-- prefix: "if ((request" --> · [Route](../apps/server/prefix_controls.cpp#L617)<!-- prefix: "void Connect" --> · [Admission](http-server.md#http-admission-and-shutdown) |
-| Request parser | Check the request shape for ID registration, then prepare every prompt and its generation options. | [Shape](../apps/server/text_request.cpp#L778)<!-- prefix: "GenerateInpu" --> · [Prompts](../apps/server/text_request.cpp#L815)<!-- prefix: "std::vector<" --> |
+| Request parser | Check the request shape for ID registration, then prepare every prompt and its generation options. | [Shape](../apps/server/text_request.cpp#L786)<!-- prefix: "GenerateInpu" --> · [Prompts](../apps/server/text_request.cpp#L823)<!-- prefix: "std::vector<" --> |
 | Completion worker | Dispatch the prepared request to its response mode. | [Dispatch](../apps/server/native_generate.cpp#L395)<!-- prefix: "void complet" --> |
 | Batch service | Submit items to available decoder lanes and collect results by input position. | [Batch entry](../apps/server/batch_service.cpp#L929)<!-- prefix: "BatchService" --> · [Result collection](../apps/server/batch_service.cpp#L573)<!-- prefix: "bool BatchSe" --> |
 | Response writer | Encode final JSON or cumulative SSE. | [Result object](../apps/server/native_generate.cpp#L144)<!-- prefix: "std::string " --> · [Batch JSON](../apps/server/native_generate.cpp#L294)<!-- prefix: "void write_b" --> · [Batch SSE](../apps/server/native_generate.cpp#L330)<!-- prefix: "void stream_" --> |
-| Text stops | Match bounded candidate IDs before commit and hold ambiguous text. | [Worker match](../include/sglang/server/text_stop.h#L163)<!-- prefix: "int match_na" --> · [Response frame](../apps/server/native_generate.cpp#L232)<!-- prefix: "std::string " --> |
+| Text stops | Match bounded candidate IDs before commit and hold ambiguous text. | [Worker match](../apps/server/detail/text_stop.cpp#L127)<!-- prefix: "int TokenTex" --> · [Response frame](../apps/server/native_generate.cpp#L232)<!-- prefix: "std::string " --> |
 
 ## Runtime path
 
 [Launch the server](../README.md#serve-token-ids-over-http). For history, use [chat](chat-serving.md) or [native sessions](serving/native-sessions.md).
 
-`POST` and `PUT` accept the same request fields, validation, queue admission, and JSON or SSE response behavior. [Native route matcher](../apps/server/http.cpp#L381)<!-- prefix: "GenerateRout" --> · [Pinned Python methods](https://github.com/sgl-project/sglang/blob/f04d886bf79aa3d6237cbb12a3311838eb9f9bd8/python/sglang/srt/entrypoints/http_server.py#L963)<!-- prefix: "@app.api_rou" -->
+`POST` and `PUT` accept the same request fields, validation, queue admission, and JSON or SSE response behavior. [Native route matcher](../apps/server/http.cpp#L388)<!-- prefix: "GenerateRout" --> · [Pinned Python methods](https://github.com/sgl-project/sglang/blob/f04d886bf79aa3d6237cbb12a3311838eb9f9bd8/python/sglang/srt/entrypoints/http_server.py#L963)<!-- prefix: "@app.api_rou" -->
 
 Send a text prompt for a JSON response.
 
@@ -105,17 +105,17 @@ Eligible unindexed streams can use [bounded decode output](http-server.md#bounde
 `sampling_params.stop` searches generated text including special token pieces, regardless of `skip_special_tokens`. A string is one stop, and a list gives the stops for one item. A single sampling object broadcasts that list to every batch item. Use a `sampling_params` array of objects to set different stops per item.
 
 The worker checks the IDs eligible to commit in the current decoder step. If several stops match, configured string order wins across the step. The worker uses that string's first occurrence, which can start in an earlier step. A text match takes precedence over a token-ID stop or length finish in that step. Text stops also apply when `ignore_eos` is true.
-[Match order](../include/sglang/server/text_stop.h#L163)<!-- prefix: "int match_na" --> · [Worker binding](../apps/server/batch_service.cpp#L525)<!-- prefix: "job->options" -->
+[Match order](../apps/server/detail/text_stop.cpp#L127)<!-- prefix: "int TokenTex" --> · [Worker binding](../apps/server/batch_service.cpp#L525)<!-- prefix: "job->options" -->
 
 The final object contains `{"type":"stop","matched":"…"}` with the configured string. IDs and usage include the token that completes it, even if the match starts inside that token. The decoder ends the lane at that ID before later candidate IDs can commit. [Checkpoint coverage](prefix-cache.md#checkpoint-boundaries) follows processed target state. Other items keep running.
-[Finish serialization](../apps/server/native_generate.cpp#L164)<!-- prefix: "if (type == " --> · [Commit cutoff](../include/sglang/server/text_stop.h#L172)<!-- prefix: "const auto e" -->
+[Finish serialization](../apps/server/native_generate.cpp#L164)<!-- prefix: "if (type == " --> · [Commit cutoff](../apps/server/detail/text_stop.cpp#L136)<!-- prefix: "const auto e" -->
 
 The response searches rendered `text` for the matched string. By default it trims from the first occurrence. Set `sampling_params.no_stop_trim` to `true` to keep text through the end of that occurrence. For example, stopping on `ll` in the token `hello` returns `hell`. If the matched string is absent after special token filtering, both settings return all rendered text through the matching token. IDs, usage, finish metadata, and optional token logprobs follow the same rules with either setting.
 
 Set `sampling_params.skip_special_tokens` to `false` to show generated special tokens in `text`. A matched stop ID contributes visible text when `no_stop_trim` is true and its piece is visible. Prompt tokens stay outside the output and the stop matcher. Generated-token logprob text uses its independent piece decoding.
 
 A split UTF-8 character enters the matcher after its last byte arrives. The decoder emits U+FFFD for invalid bytes or for an incomplete character when it flushes. Stop strings match the resulting UTF-8 text, including replacement characters. The writer holds trailing stop prefixes and text starting at a rendered occurrence until it knows which bytes to release. This keeps text cumulative even when hiding a special token joins visible pieces into a stop string. An event can add IDs while its text stays unchanged. When an item ends without a text match, the terminal event releases the held text.
-[UTF-8 assembly](../src/utf8.cpp#L63)<!-- prefix: "std::string " --> · [UTF-8 flush](../src/utf8.cpp#L96)<!-- prefix: "std::string " --> · [Text release](../include/sglang/server/text_stop.h#L124)<!-- prefix: "std::string " -->
+[UTF-8 assembly](../src/utf8.cpp#L77)<!-- prefix: "std::string " --> · [UTF-8 flush](../src/utf8.cpp#L110)<!-- prefix: "std::string " --> · [Text release](../apps/server/detail/text_stop.cpp#L102)<!-- prefix: "std::string " -->
 
 An unscored and unconstrained scalar prompt with `n: 1` and no text stops uses ID-based callbacks. Text stops, output constraints, and scores use step delivery with the same unindexed shape. A step-delivered event can carry several MTP IDs, including on the terminal step. Positive-MTP buffering requires the per-token path. Unindexed step streams can use the K0 cohort rule. Indexed requests use ordinary scheduling.
 [Dispatch](../apps/server/native_generate.cpp#L408)<!-- prefix: "} else if (!" --> · [Bounded delivery](http-server.md#bounded-decode-output)
@@ -123,7 +123,7 @@ An unscored and unconstrained scalar prompt with `n: 1` and no text stops uses I
 ### Token logprobs
 
 Set top-level `return_logprob: true` and `sampling_params.temperature: 0`. Scoring uses unconstrained greedy decoding. Batches can mix scored and unscored items. See the [server MTP policy](mtp.md#runtime-path) for scored items.
-[Validation](../apps/server/text_request.cpp#L742)<!-- prefix: "void generat" -->
+[Validation](../apps/server/text_request.cpp#L746)<!-- prefix: "void generat" -->
 
 | Top-level field | Accepted values |
 | --- | --- |
@@ -163,7 +163,7 @@ Send one JSON object. The parser rejects duplicate keys, nesting beyond 32 conta
 Supply exactly one non-null prompt field. A prompt array uses one prompt form. An indexed request has a prompt array, `n > 1`, or both.
 Parameter arrays have one entry per original prompt. Missing sampling keys use the defaults.
 The expanded item count is at most 32. The sum of per-prompt output budgets multiplied by `n` is at most 262,144 tokens. Each prompt plus its own budget must fit the model context. The route validates these limits before decoder admission.
-[Batch form](../apps/server/text_request.cpp#L798)<!-- prefix: "input.batch " --> · [Parameter arrays](../apps/server/native_generate.cpp#L795)<!-- prefix: "const json::" --> · [Batch budget](../apps/server/text_request.cpp#L830)<!-- prefix: "int remainin" -->
+[Batch form](../apps/server/text_request.cpp#L806)<!-- prefix: "input.batch " --> · [Parameter arrays](../apps/server/native_generate.cpp#L798)<!-- prefix: "const json::" --> · [Batch budget](../apps/server/text_request.cpp#L838)<!-- prefix: "int remainin" -->
 
 | Sampling field | Accepted values and default |
 | --- | --- |
@@ -187,7 +187,7 @@ The expanded item count is at most 32. The sum of per-prompt output budgets mult
 Null uses the sampling defaults except for `max_new_tokens`. Explicit stop IDs are always validated.
 `stop` belongs inside `sampling_params`. A nested list or a non-string list element returns HTTP 400.
 The empty stop matches at the first generated step if selected by the configured order. It retains the first generated ID and returns empty text. Zero output budget still yields a length finish.
-[Stop parser](../apps/server/text_request.cpp#L78)<!-- prefix: "std::vector<" --> · [Batch options](../apps/server/text_request.cpp#L825)<!-- prefix: "const auto b" -->
+[Stop parser](../apps/server/text_request.cpp#L78)<!-- prefix: "std::vector<" --> · [Batch options](../apps/server/text_request.cpp#L833)<!-- prefix: "const auto b" -->
 Client compatibility fields accept only disabled values.
 Use `false` or null for `return_routed_experts`, and null for `lora_path`.
 Other fields return HTTP 400, including `model`, `messages`, and top-level sampling fields.
@@ -209,7 +209,7 @@ Cache checkpoints the daemon already acknowledged can remain available.
 The [cache reset exclusion](prefix-cache.md#native-http-controls) covers the whole claimed completion.
 [Batch cancellation](../apps/server/batch_service.cpp#L463)<!-- prefix: "void BatchSe" --> · [HTTP error mapping](../apps/server/prefix_controls.cpp#L178)<!-- prefix: "void handle_" --> · [SSE error writer](../apps/server/native_generate.cpp#L243)<!-- prefix: "void write_s" -->
 
-The route matches the decoded `/generate` path and ignores its query. `/generate/` follows the [shared redirect rules](http-server.md#request-targets-and-redirects). After HTTP parsing, methods other than `POST` and `PUT` return HTTP 405 with `Allow: POST, PUT` and `{"detail":"Method Not Allowed"}`. For `HEAD`, the server sends only the headers. [Native route matcher](../apps/server/http.cpp#L381)<!-- prefix: "GenerateRout" --> · [Method response](../apps/server/http.cpp#L556)<!-- prefix: "void write_m" -->
+The route matches the decoded `/generate` path and ignores its query. `/generate/` follows the [shared redirect rules](http-server.md#request-targets-and-redirects). After HTTP parsing, methods other than `POST` and `PUT` return HTTP 405 with `Allow: POST, PUT` and `{"detail":"Method Not Allowed"}`. For `HEAD`, the server sends only the headers. [Native route matcher](../apps/server/http.cpp#L388)<!-- prefix: "GenerateRout" --> · [Method response](../apps/server/http.cpp#L562)<!-- prefix: "void write_m" -->
 
 A disconnected client can cancel queued or active work through the [shared transport](http-server.md#http-admission-and-shutdown).
 Send [`POST /abort_request`](native-abort.md) from a second connection to cancel by ID.

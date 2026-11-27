@@ -491,6 +491,12 @@ ChatToolChoice read_tool_choice(const Value* selector, std::string_view& selecte
 
 }
 
+bool ChatTools::forced() const {
+    return choice == ChatToolChoice::required || choice == ChatToolChoice::named;
+}
+
+ChatTemplate::~ChatTemplate() = default;
+
 json::Value parse_chat_arguments(std::string_view arguments, json::Syntax syntax) {
     auto parsed = json::parse(arguments, syntax);
     if (!parsed.ordered_object()) {

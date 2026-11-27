@@ -30,19 +30,12 @@ struct QwenTextModel {
         int bank;
     };
 
-    constexpr bool is_full_attention(int layer_index) const {
-        return (layer_index + 1) % full_attention_interval == 0;
-    }
+    bool is_full_attention(int layer_index) const;
 
-    constexpr int full_attention_layers() const { return layer_count / full_attention_interval; }
-    constexpr int gdn_layers() const { return layer_count - full_attention_layers(); }
+    int full_attention_layers() const;
+    int gdn_layers() const;
 
-    constexpr LayerMapping layer_mapping(int layer_index) const {
-        const int full_attention_before = layer_index / full_attention_interval;
-        const bool full_attention = is_full_attention(layer_index);
-        return {full_attention, full_attention ? full_attention_before
-                                              : layer_index - full_attention_before};
-    }
+    LayerMapping layer_mapping(int layer_index) const;
 };
 
 inline constexpr QwenTextModel qwen_text_model{};

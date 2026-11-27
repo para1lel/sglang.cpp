@@ -211,6 +211,28 @@ void decoder::reclaim_prefill_workspaces(int device) {
     }
 }
 
+bool decoder::full_tile_prefill_grants(const PrefillGrant* grants, int count) {
+    if (count < 2 || grants[0].rows < batch_prefill_tile_rows) {
+        return false;
+    }
+    for (int index = 0; index < count; ++index) {
+        const auto& grant = grants[index];
+        if (grant.tile_rows != batch_prefill_tile_rows || grant.rows != grants[0].rows ||
+            grant.rows % batch_prefill_tile_rows != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+PrefillGrant decoder::prefill_tile(PrefillGrant grant, int offset) {
+    grant.tokens += offset;
+    grant.position += offset;
+    grant.prompt_remaining -= offset;
+    grant.rows = batch_prefill_tile_rows;
+    return grant;
+}
+
 PrefillWorkspace::PrefillWorkspace(cudaStream_t stream, int capacity)
     : PrefillWorkspace(stream, capacity, Retention::existing) {}
 
@@ -289,6 +311,13 @@ PrefillWorkspace::PrefillWorkspace(cudaStream_t stream, int capacity, Retention 
     }
 }
 
+std::size_t PrefillWorkspace::bytes() const { return bytes_; }
+std::size_t PrefillWorkspace::layout_bytes() const { return layout_bytes_; }
+cudaStream_t PrefillWorkspace::stream() const { return stream_; }
+int PrefillWorkspace::capacity() const { return capacity_; }
+void* PrefillWorkspace::data() const { return data_; }
+PairedPrefillScratch PrefillWorkspace::long_gqa_staging() const { return staging_; }
+
 bool PrefillWorkspace::allow_peer_access(int peer_device) {
     if (pool_->peer_access_device == peer_device) return true;
     if (pool_->peer_access_device >= 0) return false;
@@ -299,6 +328,8 @@ bool PrefillWorkspace::allow_peer_access(int peer_device) {
     pool_->peer_access_device = peer_device;
     return true;
 }
+
+PrefillPeerNorm::PrefillPeerNorm() noexcept = default;
 
 PrefillPeerNorm::~PrefillPeerNorm() {
     for (const auto& rank : ranks_) {

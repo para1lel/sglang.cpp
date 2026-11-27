@@ -17,8 +17,8 @@ public:
     explicit LmCacheGroup(std::vector<LmCacheConfig> configs);
     explicit LmCacheGroup(std::vector<std::unique_ptr<LmCacheClient>> clients);
 
-    int world_size() const { return static_cast<int>(clients_.size()); }
-    const LmCacheClient& client(int rank) const { return *clients_.at(rank); }
+    int world_size() const;
+    const LmCacheClient& client(int rank) const;
 
     bool ready() const;
 

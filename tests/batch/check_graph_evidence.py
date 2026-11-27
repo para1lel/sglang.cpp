@@ -296,7 +296,10 @@ def verify_operators(evidence):
     output = (evidence / "operators.log").read_text()
     assert "Rebound cache, page table and position on four device graph replays" in output
     assert "Rebound GDN history and recurrent banks on six device graph replays" in output
-    assert "Score overflow matches protected tiles at 32768 and 32769 visible tokens" in output
+    overflow_cases = ((65, 33), (32768, 17), (32769, 17), (131072, 17), (131073, 65))
+    for visible, width in overflow_cases:
+        receipt = f"Prefill overflow visible={visible} grid={width}"
+        assert f"{receipt} matched unaligned and FP64 reference" in output
     assert "Paged decode matched FP64 and eager across 24 rebound layer-lanes" in output
     assert "Paged decode recovered from finite-input overflow and value cancellation" in output
     assert "MXFP8 GQA check passed" in output
@@ -306,9 +309,7 @@ def verify_operators(evidence):
         ("cache rebinding", 4),
         ("GDN rebinding", 6),
         ("prefill causal boundary", 1),
-        ("prefill overflow at 65 visible tokens", 1),
-        ("prefill overflow at 32768 visible tokens", 1),
-        ("prefill overflow at 32769 visible tokens", 1),
+        *((f"prefill overflow at {visible} visible tokens", 1) for visible, _ in overflow_cases),
         ("paged decode rebinding", 3),
         ("paged decode overflow and cancellation", 3),
         ("ordered finite-range decode", 1),

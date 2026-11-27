@@ -54,7 +54,7 @@ private:
     friend class BatchCache;
     struct State;
     std::shared_ptr<State> state_;
-    explicit BatchRestoreJoin(std::shared_ptr<State> state) : state_(std::move(state)) {}
+    explicit BatchRestoreJoin(std::shared_ptr<State> state);
     void abandon() noexcept;
 };
 

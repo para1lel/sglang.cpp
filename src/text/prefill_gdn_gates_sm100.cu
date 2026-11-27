@@ -43,8 +43,7 @@ template <int Channels>
 __global__ __launch_bounds__(threads) void project_gdn_gate_partials(
     const __grid_constant__ CUtensorMap weight_b, const __grid_constant__ CUtensorMap weight_a,
     const __grid_constant__ CUtensorMap input, int rows, float* partials) {
-    constexpr unsigned instruction = ((tile_rows / 16) << 24) | ((columns / 8) << 17) |
-                                     (1u << 10) | (1u << 7) | (1u << 4);
+    constexpr unsigned instruction = bf16_instruction<columns>;
     constexpr int channels = Channels;
     constexpr int gates = 2 * channels;
 

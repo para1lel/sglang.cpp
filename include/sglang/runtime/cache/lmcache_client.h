@@ -68,7 +68,7 @@ class LmCacheClient {
 public:
     explicit LmCacheClient(LmCacheConfig config);
 
-    const LmCacheConfig& config() const { return config_; }
+    const LmCacheConfig& config() const;
     bool ready() const;
     std::vector<bool> lookup(const std::vector<LmCacheKey>& keys) const;
     LmCachePrefix lookup_prefix(const PrefixCacheKeys& keys, int max_restore, bool draft) const;

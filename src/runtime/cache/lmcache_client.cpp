@@ -596,3 +596,9 @@ void LmCacheClient::reset() const {
 }
 
 }   
+
+namespace sglang::decoder {
+
+const LmCacheConfig& LmCacheClient::config() const { return config_; }
+
+}

@@ -110,13 +110,14 @@ packed FP8 projection fan-out.
 
 ```bash
 toolkit="${CONDA_PREFIX:?Activate the managed Pixi default environment}/targets/x86_64-linux"
+nccl=$(python -I -c 'import sysconfig; print(sysconfig.get_path("purelib") + "/nvidia/nccl")')
 forward=_ZNK6sglang7Decoder5Model7forwardEPKNS_7decoder11ForwardLaneEiP11CUstream_st
 gemm=_ZN6sglang13text_fp8_gemmEPKhPK13__nv_bfloat16iiPKNS_17TextFp8ProjectionEiP11CUstream_st
 "$CXX" -std=c++17 -O2 -Wall -Wextra -Werror -Iinclude -I"$toolkit/include" \
-    tests/batch/check_wide_lanes.cpp -L"$out/lib" -L"$toolkit/lib" \
+    tests/batch/check_wide_lanes.cpp -L"$toolkit/lib" -L"$toolkit/lib/stubs" \
     -Wl,-rpath,"$toolkit/lib" -Wl,--wrap="$forward" -Wl,--wrap="$gemm" \
-    -lsglang_decoder -lsglang_checkpoint -lsglang_json -lsglang_cuda -lsglang_prefill_fp8_sm100 \
-    -lcudart -o "$out/bin/check-wide-lanes"
+    -Wl,--start-group "$out"/lib/libsglang_*.a -Wl,--end-group \
+    -Wl,-rpath,"$nccl/lib" "$nccl/lib/libnccl.so.2" -lcuda -lcudart -pthread -o "$out/bin/check-wide-lanes"
 "$CXX" -std=c++17 -O2 -fPIC -shared -I"$toolkit/include" \
     tests/batch/graph_activity.cpp -L"$toolkit/lib" -Wl,-rpath,"$toolkit/lib" \
     -lcupti -o "$out/bin/wide-activity.so"
@@ -141,20 +142,23 @@ record the replay.
 ## CPU score slab check
 
 From the repository root in the managed Pixi `default` environment, build and
-run the score-slab check with CUDA hidden. It needs the CUDA headers and uses
-host stubs for allocation and graph APIs. It requires no checkpoint or GPU.
+run the score-slab check with CUDA hidden. It links the checkpoint and JSON
+archives from the Release build above and uses host stubs for allocation and
+graph APIs. It requires no checkpoint files or GPU.
 
 ```bash
 toolkit="${CONDA_PREFIX:?Activate the managed Pixi default environment}/targets/x86_64-linux"
+build="${out:?Set out to the Release build directory}"
 score_check=build/check-score-slab
 mkdir -p "$(dirname "$score_check")"
-"$CONDA_PREFIX/bin/x86_64-conda-linux-gnu-g++" -std=c++17 -O2 -Wall -Wextra -Werror \
+"$CONDA_PREFIX/bin/x86_64-conda-linux-gnu-g++" -std=c++17 -O2 -Wall -Wextra -Werror -pthread \
     -ffunction-sections -fdata-sections -Wl,--gc-sections \
     -Iinclude -I"$toolkit/include" \
     tests/batch/check_score_slab.cpp src/runtime/backend/cuda_resources.cpp \
-    src/runtime/backend/retired_request_blocks.cpp \
-    src/checkpoint.cpp src/runtime/model/qwen_checkpoint.cpp \
-    src/json.cpp src/utf8.cpp -o "$score_check"
+    src/runtime/backend/cuda_error.cpp src/runtime/backend/retired_request_blocks.cpp \
+    src/runtime/model/qwen_request.cpp src/text/text_dimensions.cpp \
+    "$build/lib/libsglang_checkpoint.a" "$build/lib/libsglang_json.a" \
+    -L"$toolkit/lib" -Wl,-rpath,"$toolkit/lib" -lcudart -o "$score_check"
 CUDA_VISIBLE_DEVICES= "$score_check"
 ```
 

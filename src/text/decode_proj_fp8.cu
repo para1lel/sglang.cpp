@@ -232,7 +232,7 @@ template <int Columns, typename Output, int Workers = threads>
 __device__ __noinline__ void reduce_compact(const float* partials, int splits, int row_base,
                                            int out_width, const Output* output) {
     if (out_width % 4 != 0) {
-        reduce_store(partials, splits, Columns, row_base, out_width, *output);
+        reduce_store(partials, splits, Columns, row_base, out_width, output->output);
         return;
     }
     constexpr int vectors = Columns * tile_rows / 4;
@@ -302,7 +302,7 @@ __device__ __forceinline__ void store_compact(const float (&result)[Columns], fl
                                                int splits, int row_base, int out_width,
                                                const Output& output) {
     if (splits == 1) {
-        store_result(result, partials, 1, Columns, row_base, out_width, output);
+        store_result(result, partials, 1, Columns, row_base, out_width, output.output);
         return;
     }
     if (threadIdx.x < tile_rows) {
@@ -371,8 +371,7 @@ __device__ void init_m80_pipeline(DecodePipeline<Slots>& pipe) {
 template <int Columns, int Slots = stages, typename Job = Fp8Job>
 __global__ __launch_bounds__((std::is_same_v<Job, Fp8M80Job> ? m80_threads : threads), 1)
 void fp8_decode(const __grid_constant__ Job job) {
-    constexpr unsigned instruction =
-        ((tile_rows / 16) << 24) | ((Columns / 8) << 17) | (1u << 4);
+    constexpr unsigned instruction = fp8_instruction<Columns>;
     alignas(1024) extern __shared__ unsigned char tiles[];
     __shared__ DecodePipeline<Slots> pipe;
     constexpr bool gate_up = std::is_same_v<Job, Fp8GateUpJob>;
@@ -452,7 +451,7 @@ void fp8_decode(const __grid_constant__ Job job) {
                       job.out_width[target], job.lanes[target]);
     } else if constexpr (!std::is_same_v<Job, Fp8Job>) {
         store_result(result, reinterpret_cast<float*>(tiles), splits, active, row_base,
-                     job.out_width[target], job.lanes[target]);
+                     job.out_width[target], job.lanes[target].output);
     } else {
         store_result(result, reinterpret_cast<float*>(tiles), splits, active, row_base,
                      job.out_width[target], act_row, job.output[target]);

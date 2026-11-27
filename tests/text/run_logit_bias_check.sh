@@ -23,6 +23,7 @@ export CUDA_CACHE_PATH="$output/cache" TMPDIR="$output"
     "$build/lib/libsglang_decoder.a" "$build/lib/libsglang_cuda.a" \
     "$build/lib/libsglang_prefill_fp8_sm100.a" "$build/lib/libsglang_checkpoint.a" \
     "$build/lib/libsglang_tokenizer.a" "$build/lib/libsglang_json.a" \
+    "$build/lib/libsglang_cuda_support.a" \
     "$build/lib/libsglang_mnnvl_ar.a" -Wl,--end-group \
     -L"$toolkit/lib" -L"$toolkit/lib/stubs" -Wl,-rpath,"$toolkit/lib" \
     -lcuda -lcudart "$nccl/lib/libnccl.so.2" -Wl,-rpath,"$nccl/lib" \

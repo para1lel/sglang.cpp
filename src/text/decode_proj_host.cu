@@ -1,5 +1,6 @@
 #include "sglang/text/decode_proj.h"
 #include "sglang/text/decode_proj_sm100.cuh"
+#include "sglang/text/target_fp8.h"
 
 #include <algorithm>
 #include <functional>
@@ -9,7 +10,18 @@
 #include <cuda_runtime.h>
 
 namespace sglang {
+
+bool target_fp8_wide_rows(int count) {
+    return count == text_target_fp8_m40_rows || count == text_target_fp8_m80_rows ||
+           count == text_target_fp8_m160_rows;
+}
+
 namespace decode_proj {
+
+int bf16_columns(int rows) {
+    return rows <= bf16_small_columns ? bf16_small_columns : (rows <= 32 ? 32 : tile_cols);
+}
+
 namespace {
 
 constexpr int max_devices = 64;

@@ -30,12 +30,8 @@ struct ReplayExchange {
 class Graph;
 using Input = std::array<const VerificationRow*, 2>;
 struct Forward {
-    template <typename F>
-    explicit Forward(const F* functor) : state(functor),
-        call([](const void* data, const Input& input) { (*static_cast<const F*>(data))(input); }) {}
-    void operator()(const Input& input) const { call(state, input); }
+    void operator()(const Input& input) const;
 
-private:
     const void* state;
     void (*call)(const void*, const Input&);
 };
@@ -85,12 +81,7 @@ struct HostBinding {
 
 extern thread_local HostBinding* active[2];
 
-inline HostBinding* binding(cudaStream_t stream) {
-    for (auto* rank : active) {
-        if (rank && rank->stream == stream) return rank;
-    }
-    return nullptr;
-}
+HostBinding* binding(cudaStream_t stream);
 
 cudaError_t preprocess(const GqaVerifyRows<GqaVerifyPreprocessRow>& batch, const int* rotary,
                        GqaGeometry geometry, const Bf16* q_norm, const Bf16* k_norm,
@@ -101,5 +92,13 @@ cudaError_t read(const GqaBinding* live, int query_heads, cudaStream_t stream);
 cudaError_t gdn(const GdnVerificationLane* live, TextGdnWeights weights, cudaStream_t stream);
 cudaError_t exchange_rows(const DeviceBinding* table, bool output, cudaStream_t stream);
 cudaError_t exchange_replay(const DeviceBinding* table, cudaStream_t stream);
+
+}
+
+namespace sglang::decoder {
+
+template <>
+tp_verify_graph::DeviceBinding*
+Allocations::allocate<tp_verify_graph::DeviceBinding>(std::size_t count);
 
 }

@@ -313,6 +313,28 @@ std::string Parser::string() {
 
 }
 
+Value::Value() noexcept = default;
+Value::Value(bool value) : data_(value) {}
+Value::Value(int value) : data_(std::int64_t(value)) {}
+Value::Value(std::int64_t value) : data_(value) {}
+Value::Value(std::uint64_t value) : data_(value) {}
+Value::Value(double value) : data_(value) {}
+Value::Value(const char* value) : data_(std::string(value)) {}
+Value::Value(std::string value) : data_(std::move(value)) {}
+Value::Value(Array value) : data_(std::move(value)) {}
+Value::Value(Object value) : data_(std::move(value)) {}
+Value::Value(OrderedObject value) : data_(std::move(value)) {}
+Value::Value(WideInteger value) : data_(std::move(value)) {}
+
+Object* Value::object() { return std::get_if<Object>(&data_); }
+const Object* Value::object() const { return std::get_if<Object>(&data_); }
+OrderedObject* Value::ordered_object() { return std::get_if<OrderedObject>(&data_); }
+const OrderedObject* Value::ordered_object() const { return std::get_if<OrderedObject>(&data_); }
+Array* Value::array() { return std::get_if<Array>(&data_); }
+const Array* Value::array() const { return std::get_if<Array>(&data_); }
+const WideInteger* Value::wide_integer() const { return std::get_if<WideInteger>(&data_); }
+bool Value::is_null() const { return std::holds_alternative<std::monostate>(data_); }
+
 std::optional<std::string_view> Value::string() const {
     const auto* value = std::get_if<std::string>(&data_);
     return value ? std::optional<std::string_view>(*value) : std::nullopt;

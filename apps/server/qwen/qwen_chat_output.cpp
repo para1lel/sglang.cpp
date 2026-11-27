@@ -269,6 +269,12 @@ bool append_argument(std::string& output, std::string_view raw, Type type) {
 
 }
 
+bool ChatOutputOptions::enabled() const { return separate_reasoning || !tools.empty(); }
+
+bool ChatOutputOptions::accepts_tool_calls(std::size_t calls) const {
+    return !tools.empty() && (parallel_tool_calls || calls == 0);
+}
+
 void read_chat_tools(ChatOutputOptions& options, const json::Array& tools) {
     for (const auto& tool : tools) {
         const auto* type = field(tool, "type");
@@ -792,6 +798,8 @@ std::optional<server::SeparatedReasoning> separate_qwen_reasoning(std::string_vi
 }
 
 namespace sglang::server {
+
+std::size_t ChatOutputParser::calls() const { return calls_; }
 
 bool ChatOutputParser::emit_text(std::string_view text, const ChatOutputSink& sink) {
     if (text.empty()) {

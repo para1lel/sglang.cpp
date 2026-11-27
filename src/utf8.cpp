@@ -7,6 +7,20 @@ namespace {
 constexpr std::string_view replacement = "\xef\xbf\xbd";
 }
 
+Utf8Lead utf8_lead(unsigned byte) {
+    if (byte < 0x80) {
+        return {1, 0, 0};
+    }
+    if (byte < 0xc2 || byte > 0xf4) {
+        return {0, 0, 0};
+    }
+    return {
+        byte < 0xe0 ? 2U : byte < 0xf0 ? 3U : 4U,
+        byte == 0xe0 ? 0xa0U : byte == 0xf0 ? 0x90U : 0x80U,
+        byte == 0xed ? 0x9fU : byte == 0xf4 ? 0x8fU : 0xbfU,
+    };
+}
+
 bool valid_utf8(std::string_view bytes) {
     while (!bytes.empty()) {
         const auto [size, low, high] = utf8_lead(static_cast<unsigned char>(bytes.front()));

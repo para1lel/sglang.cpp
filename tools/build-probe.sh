@@ -106,7 +106,9 @@ sha256sum "$nvrtc_probe" "$nvrtc"
 generator="$work/build/bin/sglang-generate"
 echo "Native generator: $generator"
 sha256sum "$generator" "$work/build/lib/libsglang_checkpoint.a" \
-    "$work/build/lib/libsglang_cuda.a" "$work/build/lib/libsglang_decoder.a"
+    "$work/build/lib/libsglang_cuda.a" "$work/build/lib/libsglang_decoder.a" \
+    "$work/build/lib/libsglang_prefill_fp8_sm100.a" "$work/build/lib/libsglang_mnnvl_ar.a" \
+    "$work/build/lib/libsglang_cuda_support.a"
 if [[ "$check" == y ]]; then
     "$xmake" build -P . -v mxfp8-gqa-check
     sha256sum "$work/build/bin/mxfp8-gqa-check"

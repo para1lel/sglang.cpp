@@ -4,7 +4,7 @@ Record verified failures from [session review](../.agents/skills/main-mode/refer
 
 ## L001 · Header placement
 
-Local includes hid nine project headers outside `include/sglang/`. The first gate missed misplaced headers left unchanged. The current gate checks every indexed entry, even in a doc-only change. [Commit gate](../.agents/checks/staged_check.py#L173)<!-- prefix: "def check_he" --> · [Retained-header regression](../tests/test_gate_contract.py#L140)<!-- prefix: "def test_hea" -->
+Local includes hid nine project headers outside `include/sglang/`. The original placement gate missed unchanged files. The declarations gate checks indexed project headers at every path, including `.ipp` and `.tpp` files. [Original placement regression](https://github.com/para1lel/sglang.cpp/blob/572627c81b89b1c75c7bcda1c2e9c23a4c8e95f6/docs/lessons.md#l001--header-placement) · [Current rules](../AGENTS.md#integrating-changes)
 
 ## L002 · Remapped KV pages
 
@@ -32,7 +32,7 @@ A stalled HTTP body previously blocked health and completions on the accept thre
 
 **Correction verified in Candidate B.** Candidate A divided Q by its largest channel and narrowed to FP16. With Q channels `1` and `2^-40`, and K nonzero only in the second channel at `±448 × 2^33`, the scaled scores are `±0.21875`. The split returned zero instead of the FP64 result `tanh(0.21875) = 0.215326`. Ordered BF16 returned `0.214844`. The well-conditioned `2^-16` control used K at `±448 × 2^9` and returned `0.215820` in the split. PV had a second loss when narrowing probability times relative V scale to FP16.
 
-The repair preserves Q in BF16, expands unscaled E4M3 K and V exactly to BF16, and rounds the weighted V operands to BF16. It uses FP32 accumulation and sends a flagged head to FP64 replay when range checks fire. The corrected split returns `0.215820` for both Q controls. Run from the repository root in the managed environment on a reserved B200. [Query load](../src/text/gqa_decode_split.cu#L174)<!-- prefix: "__device__ v" --> · [Regression cases](../tests/decoder/gqa_split_fp64_check.cpp#L181)<!-- prefix: "int main() t" -->
+The repair preserves Q in BF16, expands unscaled E4M3 K and V exactly to BF16, and rounds the weighted V operands to BF16. It uses FP32 accumulation and sends a flagged head to FP64 replay when range checks fire. The corrected split returns `0.215820` for both Q controls. Run from the repository root in the managed environment on a reserved B200. [Query load](../src/text/gqa_decode_split.cu#L175)<!-- prefix: "__device__ v" --> · [Regression cases](../tests/decoder/gqa_split_fp64_check.cpp#L181)<!-- prefix: "int main() t" -->
 
 ```bash
 out="$PWD/build/long-decode"
@@ -46,7 +46,7 @@ The test compares well-conditioned, query-range, and weighted-value cases with F
 
 ## L007 · Singleton route parity
 
-**Correction verified in Candidate B.** Candidate A changed tensor-core singleton graph attention to the fused split and kept legacy attention in eager. On identical token histories, all 78 eager rows matched HEAD bitwise and 274 replay rows differed. A link-only control restored legacy attention and recovered all 44 sampled rows. Candidate B keeps legacy singleton attention in eager, capture, replay, and eager continuation after an eligible launch rejection. The checkpoint rerun recovered all 352 decode logit rows bitwise. [Bound attention](../include/sglang/runtime/execution/decoder_forward_layers.h#L694)<!-- prefix: "inline void " -->
+**Correction verified in Candidate B.** Candidate A changed tensor-core singleton graph attention to the fused split and kept legacy attention in eager. On identical token histories, all 78 eager rows matched HEAD bitwise and 274 replay rows differed. A link-only control restored legacy attention and recovered all 44 sampled rows. Candidate B keeps legacy singleton attention in eager, capture, replay, and eager continuation after an eligible launch rejection. The checkpoint rerun recovered all 352 decode logit rows bitwise. [Bound attention](../src/runtime/execution/decoder_forward_attention.cpp#L251)<!-- prefix: "void attend_" -->
 
 Build using the [batch graph runbook](../tests/batch/README.md). Set `out` to the Release build directory, `checkpoint` to the local checkpoint, and `GPU_UUID` to a reserved B200. Use a fresh `$out/singleton` directory.
 
@@ -108,7 +108,7 @@ In the unpublished long-target composition, `exact_scores_kernel` gained a
 sixth parameter, `split_end`. The chunked draft path still packed five arguments
 and crashed after one token per lane. The selected repair derives the host
 argument pack from the kernel function pointer and passes `0` explicitly for
-the chunked draft path. [Typed launcher](../include/sglang/text/gqa_decode_split.cuh#L18)<!-- prefix: "cudaError_t " --> · [Draft call](../include/sglang/text/mtp/gqa_long.cuh#L163)<!-- prefix: "auto status " -->
+the chunked draft path. [Typed launcher](https://github.com/para1lel/sglang.cpp/blob/8e4f210b7cde78ab935faabaa0e3693467fa8b5b/include/sglang/text/gqa_decode_split.cuh#L17)<!-- prefix: "cudaError_t " --> · [Draft call](https://github.com/para1lel/sglang.cpp/blob/8e4f210b7cde78ab935faabaa0e3693467fa8b5b/include/sglang/text/mtp/gqa_long.cuh#L104)<!-- prefix: "auto status " -->
 
 Keep the launch typed when changing a migrated kernel signature. In the selected
 `8e4f210b` verification, removing the sixth argument failed NVCC compilation

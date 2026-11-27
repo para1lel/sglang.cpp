@@ -2,7 +2,7 @@
 
 #include "sglang/decoder_cuda.cuh"
 
-#include <type_traits>
+#include "sglang/text/gqa/geometry.cuh"
 #include "sglang/mxfp8_gqa.h"
 
 #include <cstdint>
@@ -10,20 +10,6 @@
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
-#include <math_constants.h>
-
-namespace sglang {
-
-template <typename... Parameters>
-cudaError_t launch_gqa_kernel(void (*kernel)(Parameters...), dim3 grid, dim3 block,
-                              cudaStream_t stream,
-                              std::enable_if_t<std::is_trivially_copyable_v<Parameters>,
-                                               Parameters>... arguments) {
-    void* packed[] = {&arguments...};
-    return cudaLaunchKernel(kernel, grid, block, packed, 0, stream);
-}
-
-}
 
 namespace sglang::gqa_decode {
 
@@ -43,43 +29,14 @@ static_assert(sizeof(Partial) * max_splits * mxfp8_query_heads <=
               decoder::paged_decode_scratch_bytes);
 
 template <int Stride = max_splits>
-__host__ __device__ inline Partial* partials(void* scratch, int head) {
-    return static_cast<Partial*>(scratch) + head * Stride;
-}
+SGLANG_GQA_HOST_DEVICE Partial* partials(void* scratch, int head);
 
-__host__ __device__ inline int split_count(int position) {
-    const int chunks = position / split_chunk_tokens + 1;
-    const int splits = (chunks + min_split_chunks - 1) / min_split_chunks;
-    return splits < max_splits ? splits : max_splits;
-}
+SGLANG_GQA_HOST_DEVICE int split_count(int position);
+SGLANG_GQA_HOST_DEVICE bool readable(const decoder::PagedDecodeLane& lane);
+SGLANG_GQA_HOST_DEVICE bool tensor_aligned(const decoder::PagedDecodeLane& lane);
 
-inline bool supports_eager_wide_split(int position) {
-    constexpr int max_average_chunks_per_split = 10;
-    const int chunks = position / split_chunk_tokens + 1;
-    return chunks <= max_average_chunks_per_split * split_count(position);
-}
-
-__host__ __device__ inline bool readable(const decoder::PagedDecodeLane& lane) {
-    const int last_page = lane.position / mxfp8_page_size;
-    return lane.position >= 0 && lane.position < text_attention_max_tokens &&
-           last_page < lane.cache.page_count && last_page < lane.pages.page_count &&
-           lane.pages.device_pages && lane.cache.key_payload && lane.cache.value_payload &&
-           lane.cache.key_scales && lane.cache.value_scales;
-}
-
-__host__ __device__ inline bool tensor_aligned(const decoder::PagedDecodeLane& lane) {
-    const auto addresses = reinterpret_cast<std::uintptr_t>(lane.buffers.queries) |
-        reinterpret_cast<std::uintptr_t>(lane.cache.key_payload) |
-        reinterpret_cast<std::uintptr_t>(lane.cache.value_payload) |
-        reinterpret_cast<std::uintptr_t>(lane.cache.key_scales) |
-        reinterpret_cast<std::uintptr_t>(lane.cache.value_scales);
-    return addresses % 16 == 0;
-}
-
-inline bool valid_buffers(const decoder::PagedDecodeBuffers& buffers) {
-    const auto scratch = reinterpret_cast<std::uintptr_t>(buffers.scratch);
-    return buffers.queries && buffers.output && scratch && scratch % alignof(Partial) == 0;
-}
+bool supports_eager_wide_split(int position);
+bool valid_buffers(const decoder::PagedDecodeBuffers& buffers);
 
 struct TargetLane {
     decoder::PagedDecodeLane eager;
@@ -106,69 +63,9 @@ std::optional<cudaError_t> try_launch_reuse(const EagerTargetBatch& batch, int c
                                            cudaStream_t stream);
 
 #ifdef __CUDACC__
-__device__ inline decoder::PagedDecodeLane resolve(TargetLane lane) {
-    const auto& bound = lane.bound;
-    return bound.position ? decoder::PagedDecodeLane{*bound.cache, *bound.pages, *bound.position,
-                                                      bound.buffers} : lane.eager;
-}
-
-__device__ inline decoder::PagedDecodeLane resolve(const TargetBatch& batch) {
-    return resolve(TargetLane{{}, batch.lanes[blockIdx.z], batch.end});
-}
-
-__device__ inline decoder::PagedDecodeLane resolve(const EagerTargetBatch& batch) {
-    return batch.lanes[blockIdx.z];
-}
-
-template <int FixedSplits = 0>
-__device__ inline bool combine_head(const decoder::PagedDecodeLane& lane, int head) {
-    constexpr int stride = FixedSplits ? FixedSplits : max_splits;
-    static_assert(stride <= 32);
-    __shared__ float weights[stride];
-    __shared__ float total;
-    const int channel = static_cast<int>(threadIdx.x);
-    const int splits = FixedSplits ? FixedSplits : split_count(lane.position);
-    auto* part = partials<stride>(lane.buffers.scratch, head);
-    const float maximum = channel < splits ? part[channel].maximum : -CUDART_INF_F;
-    bool invalid = __syncthreads_or(channel < splits && !isfinite(maximum));
-    if (!invalid) {
-        if (channel < 32) {
-            float global = maximum;
-            for (int offset = 16; offset > 0; offset /= 2) {
-                global = fmaxf(global, __shfl_xor_sync(0xffffffffu, global, offset));
-            }
-            const float delta = maximum - global;
-            const float weight = channel >= splits ? 0.0f :
-                delta < -126.0f ? CUDART_NAN_F : exp2f(delta);
-            float contribution = channel < splits ? weight * part[channel].mass : 0.0f;
-            for (int offset = 16; offset > 0; offset /= 2) {
-                contribution += __shfl_xor_sync(0xffffffffu, contribution, offset);
-            }
-            if (channel < stride) {
-                weights[channel] = weight;
-            }
-            if (channel == 0) {
-                total = contribution;
-            }
-        }
-        __syncthreads();
-        float numerator = 0.0f;
-        for (int split = 0; split < splits; ++split) {
-            numerator = fmaf(weights[split], part[split].value[channel], numerator);
-        }
-        const auto result = __float2bfloat16_rn(numerator / total);
-        invalid = __syncthreads_or(!(total > 0.0f) || !isfinite(total) || !isfinite(numerator) ||
-                                   !isfinite(__bfloat162float(result)));
-        if (!invalid) {
-            lane.buffers.output[head * mxfp8_head_dim + channel] = result;
-            return true;
-        }
-    }
-    if (channel == 0) {
-        part[0].maximum = CUDART_NAN_F;
-    }
-    return false;
-}
+__device__ decoder::PagedDecodeLane resolve(TargetLane lane);
+__device__ decoder::PagedDecodeLane resolve(const TargetBatch& batch);
+__device__ decoder::PagedDecodeLane resolve(const EagerTargetBatch& batch);
 #endif
 
 }

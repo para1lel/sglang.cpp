@@ -582,6 +582,9 @@ struct NativeGenerate::Registration {
     std::vector<std::unique_ptr<BatchRequestId>> items;
 };
 
+NativeGenerate::NativeGenerate(BatchService& service, const CompletionTokenizer& tokenizer)
+    : service_(service), tokenizer_(tokenizer) {}
+
 std::shared_ptr<NativeGenerate::Registration>
 NativeGenerate::register_ids(const GenerateInput& input) {
     auto ids = generate_ids(input);

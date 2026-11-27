@@ -2,6 +2,8 @@
 
 #include "sglang/checkpoint.h"
 
+#include <stdexcept>
+#include <string>
 #include <vector>
 
 namespace sglang::vision_detail {

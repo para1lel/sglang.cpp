@@ -46,7 +46,7 @@ Each rank in a two-GPU native group runs its own daemon on its own GPU. Pass `--
 
 Ranked clients select the operations `lookup_prefix_detail`, `retrieve_v4`, and `store_v4`. A `retrieve_v4` or `store_v4` frame matches the SLC3 frame and inserts the KV head count after the end row bound of each nonempty MXFP8 section. A daemon without these operations rejects the request, so the client reports an error instead of a partial restore. [Operations](../../src/runtime/cache/lmcache_client.cpp#L46)<!-- prefix: "lookup_prefi" --> · [KV head count](../../src/runtime/cache/lmcache_client.cpp#L282)<!-- prefix: "if (v4) appe" -->
 
-Ranked records live in per-rank key domains that name the world size, rank, KV head counts, and lane role. The TP1 domain stays unchanged, so TP1 and TP2 records do not mix. [Key domain](../../src/runtime/cache/prefix_payload.cpp#L61)<!-- prefix: "std::string " -->
+Ranked records live in per-rank key domains that name the world size, rank, KV head counts, and lane role. The TP1 domain stays unchanged, so TP1 and TP2 records do not mix. [Key domain](../../src/runtime/cache/prefix_payload.cpp#L65)<!-- prefix: "std::string " -->
 
 A ranked lookup asks every rank for its matched lengths and endpoint inventory. The group takes the minimum matched GQA and GDN lengths. It picks the largest GDN endpoint present on every rank, draft-eligible on the draft lane when a draft is requested. A truncated inventory reply is refused. [Composite lookup](../../src/runtime/cache/lmcache_group.cpp#L87)<!-- prefix: "PrefixCacheR" -->
 
@@ -54,7 +54,7 @@ A ranked restore drives one transfer per rank and reports completion only when e
 
 ## Cache identity and vendor isolation
 
-Each request's key domain embeds a checkpoint identity: a SHA-256 over `config.json`, the safetensors index, and every safetensors file's stat data. [Checkpoint identity](../../include/sglang/runtime/server/cache_identity.h#L43)<!-- prefix: "inline std::" --> · [Request domain](../../apps/server/batch_service_cache.cpp#L24)<!-- prefix: "std::string " -->
+Each request's key domain embeds a checkpoint identity: a SHA-256 over `config.json`, the safetensors index, and every safetensors file's stat data. [Checkpoint identity](../../src/runtime/server/cache_identity.cpp#L38)<!-- prefix: "std::string " --> · [Request domain](../../apps/server/detail/batch_service_cache.cpp#L24)<!-- prefix: "std::string " -->
 
 Current native ranked keys use the checkpoint identity without a recurrence tag. [Frozen vendor recurrence tag behavior](https://github.com/para1lel/sglang.cpp/blob/a5974ba4eb99bd8e8f890c2e7262a27dbc3aace1/docs/serving/lmcache.md#cache-identity-and-vendor-isolation)
 

@@ -58,14 +58,14 @@ carries the final stop reason and output token count. `message_stop` ends the re
 The adapter uses `end_turn` for EOS or a text stop, `max_tokens` for a length cut, and `tool_use`
 for a completed tool turn. The pin omits `stop_sequence`. Native prefix hits split input
 usage into uncached `input_tokens` and `cache_read_input_tokens`.
-[Event writer](../../apps/server/anthropic_messages.cpp#L96)<!-- prefix: "bool Anthrop" --> ·
-[Finish](../../apps/server/anthropic_messages.cpp#L112)<!-- prefix: "void Anthrop" -->
+[Event writer](../../apps/server/anthropic_messages.cpp#L98)<!-- prefix: "bool Anthrop" --> ·
+[Finish](../../apps/server/anthropic_messages.cpp#L114)<!-- prefix: "void Anthrop" -->
 
 Request validation errors return an Anthropic JSON envelope. Native transport limits and
 unsupported model features can produce different validation details from Python SGLang.
 A decoder failure while streaming closes any open block, sends `error`, and sends
 `message_stop` if the socket remains writable. Closing the connection cancels the native
-job. [Failure events](../../apps/server/anthropic_messages.cpp#L140)<!-- prefix: "void Anthrop" --> ·
+job. [Failure events](../../apps/server/anthropic_messages.cpp#L142)<!-- prefix: "void Anthrop" --> ·
 [Socket lifecycle](../http-server.md)
 
 The [pinned adapter](https://github.com/sgl-project/sglang/blob/f04d886bf79aa3d6237cbb12a3311838eb9f9bd8/python/sglang/srt/entrypoints/anthropic/serving.py#L797)<!-- prefix: "async def _h" -->

@@ -11,13 +11,13 @@ namespace sglang::server {
 
 class Socket {
 public:
-    explicit Socket(int descriptor) : descriptor_(descriptor) {}
+    explicit Socket(int descriptor);
     ~Socket();
     Socket(const Socket&) = delete;
     Socket& operator=(const Socket&) = delete;
     Socket(Socket&& other) noexcept;
 
-    int get() const { return descriptor_; }
+    int get() const;
 
 private:
     int descriptor_;
@@ -49,8 +49,7 @@ enum class GenerateRoute { none, allowed, method_not_allowed };
 enum class TokenizationRoute { none, tokenize, detokenize, anthropic_count };
 
 struct HttpError : std::runtime_error {
-    HttpError(std::string_view status, const char* message)
-        : std::runtime_error(message), status(status) {}
+    HttpError(std::string_view status, const char* message);
 
     std::string_view status;
 };
@@ -88,10 +87,9 @@ class EventStream {
 public:
     enum class Format { sse, ndjson };
 
-    explicit EventStream(const Socket& connection, Format format = Format::sse)
-        : connection_(connection), format_(format) {}
+    explicit EventStream(const Socket& connection, Format format = Format::sse);
 
-    bool started() const { return last_write_.has_value(); }
+    bool started() const;
     bool start();
     bool poll();
     bool write(std::string_view data, std::string_view event = std::string_view{});

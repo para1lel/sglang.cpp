@@ -947,3 +947,11 @@ bool MnnvlAllReduce::try_reduce_norm(Bf16* const buffers[], const cudaStream_t s
 }
 
 }   
+
+namespace sglang::decoder {
+
+bool MnnvlRmsQuantizeRows::supports(int count) {
+    return count == size || (count >= 3 && count <= 5);
+}
+
+}

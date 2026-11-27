@@ -3,9 +3,6 @@
 #include "sglang/vision.h"
 
 #include <array>
-#include <cstdio>
-#include <stdexcept>
-#include <string>
 #include <string_view>
 
 namespace sglang::vision_detail {
@@ -21,59 +18,14 @@ inline constexpr int table_side = 48;
 inline constexpr int threads = 128;
 inline constexpr std::size_t weight_bytes = 921460192;
 
-inline void check(cudaError_t status, std::string_view operation) {
-    if (status != cudaSuccess) {
-        throw std::runtime_error(std::string(operation) + ": " + cudaGetErrorString(status));
-    }
-}
-
-inline bool cleanup(cudaError_t status, const char* operation) noexcept {
-    if (status == cudaSuccess) {
-        return true;
-    }
-    std::fprintf(stderr, "%s: %s\n", operation, cudaGetErrorString(status));
-    return false;
-}
-
-template <typename Element>
-class DeviceBuffer {
-public:
-    explicit DeviceBuffer(std::size_t count) {
-        check(cudaGetDevice(&device_), "Get vision allocation device");
-        void* storage = nullptr;
-        check(cudaMalloc(&storage, count * sizeof(Element)), "Allocate vision buffer");
-        data_ = static_cast<Element*>(storage);
-    }
-    ~DeviceBuffer() {
-        int previous = 0;
-        if (!cleanup(cudaGetDevice(&previous), "Get current device for vision cleanup")) {
-            return;
-        }
-        const bool changed = previous != device_;
-        if (changed && !cleanup(cudaSetDevice(device_), "Select vision allocation device")) {
-            return;
-        }
-        cleanup(cudaFree(data_), "Free vision buffer");
-        if (changed) {
-            cleanup(cudaSetDevice(previous), "Restore device after vision cleanup");
-        }
-    }
-
-    DeviceBuffer(const DeviceBuffer&) = delete;
-    DeviceBuffer& operator=(const DeviceBuffer&) = delete;
-    Element* get() const { return data_; }
-
-private:
-    int device_;
-    Element* data_ = nullptr;
-};
+void check(cudaError_t status, std::string_view operation);
+bool cleanup(cudaError_t status, const char* operation) noexcept;
 
 struct Grid {
     int rows;
     int height;
     int width;
-
-    __host__ __device__ int frame() const { return height * width; }
+    int frame;
 };
 
 struct Affine {

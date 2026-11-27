@@ -1,10 +1,12 @@
 #include "sglang/text/mtp/draft_state.h"
 
 #include "sglang/decoder_verify.h"
+#include "sglang/text/mtp/draft_batch_ops.h"
 #include "sglang/text/mtp/draft_projection.h"
 #include "sglang/text/mtp/tc_vocab.h"
 
 #include <algorithm>
+#include <stdexcept>
 #include <utility>
 
 namespace sglang::decoder {
@@ -16,7 +18,8 @@ constexpr int repair_depth = decoder_batch_max_mtp_steps;
 constexpr int repair_seed_rows = repair_lanes * target_verify_max_rows;
 constexpr int repair_kv_width = text_gqa_kv_width;
 constexpr auto repair_kv_values = repair_depth * repair_lanes * 2 * repair_kv_width;
-constexpr int repair_scale_stride = text_fp8_group_count(hidden_size);
+static_assert(hidden_size % text_fp8_group_size == 0);
+constexpr int repair_scale_stride = hidden_size / text_fp8_group_size;
 
 int repair_seed_index(int lane, int depth) {
     return lane / draft_wave_rows * draft_wave_rows * target_verify_max_rows +
@@ -44,22 +47,10 @@ struct RepairEvent {
     cudaEvent_t event{};
 };
 
-struct RepairProjectionRow {
-    struct Work {
-        Bf16* attention{};
-        Bf16* residual{};
-        Bf16* concatenated{};
-        Bf16* normalized{};
-        TextFp8Activation activation{};
-        Bf16* keys{};
-        Bf16* values{};
-    } work;
+}
 
-    void embed(int, const Bf16*, cudaStream_t) {
-        throw std::logic_error("Peer repair requires packed input");
-    }
-};
-
+void RepairProjectionRow::embed(int, const Bf16*, cudaStream_t) {
+    throw std::logic_error("Peer repair requires packed input");
 }
 
 struct PeerDraftRepair::State {

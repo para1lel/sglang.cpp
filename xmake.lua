@@ -62,6 +62,77 @@ target("nvrtc-probe")
     add_syslinks("nvrtc", "cuda")
     add_files("tools/nvrtc-probe.cpp")
 
+rule("sglang.cuda.device-lto")
+    before_link(function (target, opt)
+        import("core.base.option")
+        import("core.project.depend")
+        import("core.tool.linker")
+        import("utils.progress")
+
+        local objects = {}
+        for _, batch in pairs(target:sourcebatches()) do
+            if batch.sourcekind == "cu" then
+                table.join2(objects, batch.objectfiles)
+            end
+        end
+        local stem = target:basename() .. "_gpucode.cu"
+        local output = target:objectfile(path.join("rules", "cuda", "devlink", stem))
+        table.insert(target:objectfiles(), output)
+
+        local arch = target:values("sglang.cuda.lto_arch")
+        local link = linker.load("gpucode", "cu", {target = target})
+        local flags = {"-m64", "-dlink", "-dlto",
+                       "-ccbin=" .. target:tool("cu-ccbin"),
+                       "-gencode=arch=compute_" .. arch .. ",code=sm_" .. arch}
+        local dryrun = option.get("dry-run")
+        depend.on_changed(function ()
+            progress.show(opt.progress, "${color.build.target}devlinking.$(mode) %s",
+                          path.filename(output))
+            if option.get("verbose") then
+                print(link:linkcmd(objects, output, {linkflags = flags, rawargs = true}))
+            end
+            if not dryrun then
+                assert(link:link(objects, output, {linkflags = flags}))
+            end
+        end, {dependfile = target:dependfile(output), lastmtime = os.mtime(output),
+              changed = target:is_rebuilt(), values = {link:program(), flags},
+              files = objects, dryrun = dryrun})
+    end)
+rule_end()
+
+local function add_cuda_device_lto(arch, sources, shared_sources, shared_flags)
+    add_rules("sglang.cuda.device-lto")
+    set_values("sglang.cuda.lto_arch", arch)
+    local flags = {"-rdc=true", "-gencode=arch=compute_" .. arch .. ",code=lto_" .. arch}
+    for _, source in ipairs(sources) do
+        add_files(source, {force = {cuflags = flags}})
+    end
+
+    local alias_flags = table.join(flags, shared_flags)
+    on_load(function (target)
+        local directory = path.join(target:autogendir(), "cuda-link")
+        directory = path.absolute(directory, os.projectdir())
+        os.mkdir(directory)
+        for _, file in ipairs(shared_sources) do
+            local source = path.absolute(file, os.projectdir())
+            local alias = path.join(directory, target:name() .. "_" .. path.filename(file))
+            if os.islink(alias) and os.readlink(alias) ~= source then
+                os.rm(alias)
+            end
+            if not os.islink(alias) then
+                os.ln(source, alias)
+            end
+            target:add("files", alias, {force = {cuflags = alias_flags}})
+        end
+    end)
+end
+
+local gqa_device_sources = {
+    "src/text/gqa/device_geometry.cu",
+    "src/text/gqa/decode_layout.cu",
+    "src/text/gqa/prefill_common.cu",
+}
+
 target("sglang_cuda")
     set_kind("static")
     set_toolchains("host-pixi")
@@ -73,21 +144,35 @@ target("sglang_cuda")
     add_linkdirs(path.join(toolkit, "lib"), {public = true})
     add_rpathdirs(path.join(toolkit, "lib"), {interface = true})
     add_syslinks("cudart", {public = true})
-    add_deps("sglang_prefill_fp8_sm100")
-    add_files("src/mxfp8_gqa.cu", "src/text_decode_fp8.cu")
+    add_deps("sglang_prefill_fp8_sm100", "sglang_cuda_support")
+    add_files("src/text_decode_fp8.cu")
     add_files("src/runtime/execution/tp_verify_graph.cu")
     add_files("src/text/draft_seed_fc.cu")
     add_files("src/text/bf16_head_projection.cu")
     add_files("src/text/target_fp8.cu")
-    add_files("src/text/gdn_verify.cu")
     add_files("src/runtime/execution/verification_row_copy.cu")
-    add_files("src/mxfp8_gqa_prefill.cu")
     add_files("src/text_decode_bandwidth.cu")
-    add_files("src/text_ops.cu", "src/text_attention_gdn.cu",
-              "src/text/text_gdn_batched_replay.cu", "src/text_attention_gqa.cu")
-    add_files("src/text_normalization.cu")
+    add_files("src/text/text_gdn_batched_replay.cu", "src/text/gdn_chunk.cu")
     add_files("src/decoder_sampling.cu", "src/decoder_constraint.cu",
               "src/text/decoder_logprobs.cu")
+    add_cuda_device_lto("100", {
+        "src/mxfp8_gqa.cu",
+        "src/mxfp8_gqa_prefill.cu",
+        "src/text_attention_gdn.cu",
+        "src/text_attention_gqa.cu",
+        "src/text_normalization.cu",
+        "src/text_ops.cu",
+        "src/text/fp8_projection.cu",
+        "src/text/gdn_prefill.cu",
+        "src/text/gdn_verify.cu",
+        "src/text/rms_quantize.cu",
+        "src/text/text_cuda_primitives.cu",
+        "src/text/gqa/draft_attention.cu",
+        "src/text/gqa/kv_append.cu",
+        "src/text/gqa/ordered_prefill.cu",
+        "src/text/gqa/paged_decode.cu",
+        "src/text/gqa/target_split.cu",
+    }, gqa_device_sources, {"-DSGLANG_GQA_DEVICE_ONLY"})
 
 target("sglang_prefill_fp8_sm100")
     set_kind("static")
@@ -97,15 +182,34 @@ target("sglang_prefill_fp8_sm100")
     add_cugencodes("sm_100a")
     add_cuflags("--dependency-target-name=", {force = true})
     add_includedirs("include", path.join(toolkit, "include"))
-    add_files("src/prefill_fp8_sm100.cu", "src/text/mxfp8_gqa_prefill_tmem.cu")
-    add_files("src/text/gqa_decode_split.cu", "src/text/gqa_decode_long.cu")
-    add_files("src/text/tc_vocab.cu", "src/text/draft_depth.cu")
+    add_deps("sglang_cuda_support")
+    add_files("src/prefill_fp8_sm100.cu", "src/text/gqa/geometry.cpp")
     add_files("src/text/draft_seed_fc_sm100.cu")
-    add_files("src/text/decode_proj_fp8.cu", "src/text/decode_proj_bf16.cu",
-              "src/text/decode_proj_host.cu")
-    add_files("src/text/prefill_gdn_gates_sm100.cu")
+    add_files("src/text/decode_proj_host.cu")
     add_packages("sglang-cutlass-headers")
     add_files("src/text/prefill_down_sm100.cu", {cuflags = "--expt-relaxed-constexpr"})
+    add_cuda_device_lto("100a", table.join(gqa_device_sources, {
+        "src/text/decode_proj_sm100.cu",
+        "src/text/decode_proj_fp8.cu",
+        "src/text/decode_proj_bf16.cu",
+        "src/text/draft_depth.cu",
+        "src/text/gqa_decode_long.cu",
+        "src/text/gqa_decode_split.cu",
+        "src/text/mxfp8_gqa_prefill_tmem.cu",
+        "src/text/prefill_gdn_gates_sm100.cu",
+        "src/text/tc_vocab.cu",
+        "src/text/gqa/tmem_ops.cu",
+        "src/text/gqa/tmem_staged.cu",
+        "src/text/gqa/tmem_staged_kernels.cu",
+    }), {"src/text/text_cuda_primitives.cu"}, {"-DSGLANG_TEXT_DEVICE_ONLY"})
+
+target("sglang_cuda_support")
+    set_kind("static")
+    set_toolchains("host-pixi")
+    set_targetdir("$(builddir)/lib")
+    add_includedirs("include", path.join(toolkit, "include"))
+    add_files("src/runtime/backend/cuda_error.cpp", "src/runtime/backend/text_cuda_host.cpp",
+              "src/text/text_dimensions.cpp")
 
 target("sglang_json")
     set_kind("static")
@@ -129,6 +233,7 @@ target("sglang_checkpoint")
     add_includedirs("include", {public = true})
     add_deps("sglang_json")
     add_files("src/checkpoint.cpp", "src/runtime/model/qwen_checkpoint.cpp")
+    add_files("src/runtime/model/qwen_text_model.cpp")
 
 target("sglang_vision")
     set_kind("static")
@@ -162,6 +267,22 @@ target("sglang_decoder")
               "src/runtime/execution/decoder_execution_policy.cpp",
               "src/runtime/execution/decoder_prefill_workspace.cpp",
               "src/runtime/cache/kv_residency_policy.cpp", "src/runtime/cache/prefix_payload.cpp")
+    add_files("src/runtime/model/decoder_batch_lane.cpp",
+              "src/runtime/model/qwen_weight_shard.cpp", "src/runtime/model/qwen_weight_upload.cpp",
+              "src/runtime/cache/prefix_cache_layout.cpp",
+              "src/runtime/execution/batch_admission_order.cpp",
+              "src/runtime/execution/decoder_batch_state.cpp",
+              "src/runtime/execution/decoder_forward_attention.cpp",
+              "src/runtime/execution/decoder_forward_layers.cpp",
+              "src/runtime/execution/decoder_options.cpp",
+              "src/runtime/execution/decoder_prefill_plan.cpp",
+              "src/runtime/execution/decoder_prefill_staged_gqa.cpp",
+              "src/runtime/execution/decoder_prefill_tiles.cpp",
+              "src/runtime/execution/decoder_verify_replay.cpp",
+              "src/runtime/execution/decoder_verify_workspace.cpp",
+              "src/text/decoder_batch_plan.cpp", "src/text/draft_projection.cpp",
+              "src/text/gqa/verify_batch.cpp", "src/text/label_logprobs.cpp",
+              "src/text/tc_vocab.cpp")
 
 target("sglang-generate")
     set_kind("binary")
@@ -196,7 +317,7 @@ target("sglang-server")
     add_deps("sglang_decoder", "sglang_tokenizer", "sglang_media_preprocess", "sglang_vision")
     add_rpathdirs(path.join(prefix, "lib"), path.join(toolkit, "lib"))
     add_files("apps/sglang-server.cpp", "apps/server/batch_service.cpp",
-              "apps/server/batch_cache.cpp", "apps/server/batch_service_cache.cpp",
+              "apps/server/batch_cache.cpp",
               "src/runtime/cache/lmcache_client.cpp", "src/runtime/cache/lmcache_prefix.cpp",
               "apps/server/completions.cpp",
               "apps/server/flush_cache.cpp", "apps/server/http.cpp", "apps/server/loads.cpp",
@@ -214,6 +335,9 @@ target("sglang-server")
               "apps/server/tokenization.cpp",
               "apps/server/tokenization_validation.cpp", "apps/server/tool_literal.cpp",
               "apps/server/tool_union.cpp")
+    add_files("apps/server/detail/*.cpp",
+              "src/runtime/server/batch_executor.cpp", "src/runtime/server/batch_restore_join.cpp",
+              "src/runtime/server/cache_identity.cpp")
     add_files("apps/server/qwen/*.cpp")
     add_media_codecs()
 
@@ -240,6 +364,8 @@ if has_config("mxfp8-gqa-check") then
         set_kind("binary")
         set_toolchains("host-pixi")
         set_targetdir("$(builddir)/bin")
+        set_values("cuda.rdc", false)
+        set_values("cuda.build.devlink", false)
         add_cugencodes("sm_100")
         add_cuflags("--dependency-target-name=", {force = true})
         add_deps("sglang_cuda")
@@ -274,6 +400,8 @@ if has_config("gdn-check") then
         set_kind("binary")
         set_toolchains("host-pixi")
         set_targetdir("$(builddir)/bin")
+        set_values("cuda.rdc", false)
+        set_values("cuda.build.devlink", false)
         add_cugencodes("sm_100")
         add_cuflags("--dependency-target-name=", {force = true})
         add_deps("sglang_cuda")
@@ -289,7 +417,7 @@ if has_config("gdn-check") then
         add_deps("sglang_decoder", "sglang_tokenizer")
         add_rpathdirs(path.join(prefix, "lib"), path.join(toolkit, "lib"))
         add_ldflags("-Wl,--wrap=cudaLaunchKernel", {force = true})
-        add_files("tests/decoder/gdn_routes.cpp")
+        add_files("tests/decoder/gdn_routes.cpp", "tests/prefix/prefix_fixture.cpp")
         add_files("src/runtime/cache/lmcache_client.cpp", "src/runtime/cache/lmcache_prefix.cpp")
     target_end()
 end
@@ -319,7 +447,9 @@ if has_config("decoder-batch-plan-check") then
         set_toolchains("host-pixi")
         set_targetdir("$(builddir)/bin")
         add_includedirs("include")
-        add_files("tests/decoder/decoder_batch_plan_check.cpp")
+        add_files("tests/decoder/decoder_batch_plan_check.cpp",
+                  "src/runtime/execution/batch_admission_order.cpp",
+                  "src/text/decoder_batch_plan.cpp")
     target_end()
 end
 
@@ -381,6 +511,8 @@ if has_config("long-decode-check") then
         set_kind("binary")
         set_toolchains("host-pixi")
         set_targetdir("$(builddir)/bin")
+        set_values("cuda.rdc", false)
+        set_values("cuda.build.devlink", false)
         add_cugencodes("sm_100")
         add_cuflags("--dependency-target-name=", {force = true})
         add_deps("sglang_cuda")
@@ -400,7 +532,7 @@ if has_config("long-decode-check") then
                     "9WorkspaceERKNS_14DecoderOptionsERKNS0_19ConstraintWorkspaceEPKNS0_" ..
                     "18SamplingParametersEPvP11CUstream_stPKNS0_23AdjustedLogitsWorkspaceE",
                     {force = true})
-        add_files("tests/decoder/long_decode_routes.cpp")
+        add_files("tests/decoder/long_decode_routes.cpp", "tests/prefix/prefix_fixture.cpp")
         add_files("src/runtime/cache/lmcache_client.cpp", "src/runtime/cache/lmcache_prefix.cpp")
     target_end()
 end
@@ -478,7 +610,10 @@ target("sglang_mnnvl_ar")
     add_cuflags("--expt-relaxed-constexpr", {force = true})
     add_includedirs("include", path.join(toolkit, "include"))
     add_syslinks("cuda", {public = true})
-    add_files("src/runtime/backend/mnnvl_ar.cu")
+    add_deps("sglang_cuda_support")
+    add_cuda_device_lto("100a", {"src/runtime/backend/mnnvl_ar.cu"},
+                        {"src/text/rms_quantize.cu", "src/text/text_cuda_primitives.cu"},
+                        {"-DSGLANG_TEXT_DEVICE_ONLY"})
 target_end()
 
 target("sglang_decoder")

@@ -45,29 +45,14 @@ struct Job {
     std::shared_future<bool> prefix_operation;
     std::optional<DecoderFinishReason> deferred_finish;
 
-    ~Job() {
-        if (restore_join) restore_join->fail();
-    }
+    ~Job();
 
-    bool aborted() const { return request_id && request_id->aborted(); }
-    bool discard_deferred_store() const {
-        return prefix_pending && !prefix_operation.valid() && (cancelled || aborted());
-    }
-    bool has_output() const { return !pending.empty() && !(output_overlapped && aborted()); }
-    bool can_overlap_mtp_output() const {
-        return options.mtp_steps > 0 && buffer_decode_output && output_started;
-    }
-    bool ready(bool buffered = false) const {
-        return !prefix_pending && (cancelled || aborted() || (!cache_reading &&
-            (buffered || can_overlap_mtp_output() ? !pending.full() : pending.empty())));
-    }
-    bool can_buffer(bool per_token = false) const {
-        const bool eligible = options.mtp_steps > 0
-            ? per_token && !options.requires_target_only() && !options.label_token_ids
-            : prompt.size() >= decoder_batch_max_step_tokens;
-        return eligible && media.empty() &&
-            !options.samples() && !options.constraint && !options.eager && options.top_logits == 0;
-    }
+    bool aborted() const;
+    bool discard_deferred_store() const;
+    bool has_output() const;
+    bool can_overlap_mtp_output() const;
+    bool ready(bool buffered = false) const;
+    bool can_buffer(bool per_token = false) const;
 };
 
 using Clock = std::chrono::steady_clock;
@@ -119,13 +104,7 @@ struct BatchService::State {
     void begin_cache_read(int slot, const std::shared_ptr<Job>& job);
     void cancel_cache_read(Job& job);
     void configure_checkpoint(Job& job);
-    bool prefix_ready(const Job& job) const {
-        if (!job.prefix_pending) return false;
-        if (!job.prefix_operation.valid()) {
-            return job.discard_deferred_store() || (lmcache && lmcache->store_capacity());
-        }
-        return job.prefix_operation.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
-    }
+    bool prefix_ready(const Job& job) const;
     bool poll_prefix(BatchSession& batch, int slot, const std::shared_ptr<Job>& job);
     void fail_jobs(std::exception_ptr error, bool permanent);
     void cancel(std::unique_lock<std::mutex>& lock, int slot, Job& job);

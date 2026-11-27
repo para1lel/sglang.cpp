@@ -47,6 +47,11 @@ here-documents are not comments. Remove comments only from code files you actual
 do not clean up untouched legacy files. Perform semantic and English review separately.
 Keep raw results in `artifacts/`.
 
+The declaration-only function rule applies to every tracked project header, including
+private headers and `.ipp` and `.tpp` files. Put function bodies, lambdas, and `= default`
+definitions in compiled `.cpp` or `.cu` files. The sole exception is a deleted function
+written `= delete` on its first declaration.
+
 Run tests only when concrete evidence strongly supports the expected outcome.
 Prioritize operator and framework tuning and focused local measurements.
 Start E2E only when prior evidence makes success highly likely, and stop at the first missed

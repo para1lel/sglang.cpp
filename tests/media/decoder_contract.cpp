@@ -4,9 +4,11 @@
 #include "sglang/testing/media/decoder_fixture.h"
 #include "sglang/testing/media/decoder_trace.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <stdexcept>
 #include <string_view>
 #include <limits>
 

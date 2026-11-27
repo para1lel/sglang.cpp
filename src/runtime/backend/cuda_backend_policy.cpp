@@ -41,3 +41,11 @@ CudaBackendDevice read_cuda_backend_device(int device) {
 }
 
 }
+
+namespace sglang::decoder {
+
+bool wide_mtp_width(int lanes) {
+    return lanes == wide_mtp_lanes || lanes == 2 * wide_mtp_lanes || lanes == max_wide_mtp_lanes;
+}
+
+}

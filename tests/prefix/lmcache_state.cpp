@@ -6,7 +6,9 @@
 #include "sglang/runtime/server/batch_cache.h"
 #include "sglang/text/decoder_logprobs.h"
 #include "sglang/testing/prefix_fixture.h"
+#include "sglang/tokenizer/tokenizer.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -16,6 +18,8 @@
 #include <limits>
 #include <mutex>
 #include <tuple>
+#include <stdexcept>
+#include <thread>
 #include <utility>
 
 using namespace sglang;

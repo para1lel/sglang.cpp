@@ -58,6 +58,14 @@ cudaError_t cudaFree(void* address) {
     return cudaSuccess;
 }
 
+cudaError_t cudaFreeHost(void*) {
+    throw std::runtime_error("Unexpected pinned host release");
+}
+
+cudaError_t cudaFreeAsync(void*, cudaStream_t) {
+    throw std::runtime_error("Unexpected asynchronous release");
+}
+
 cudaError_t cudaStreamCreateWithFlags(cudaStream_t* stream, unsigned int) {
     *stream = handle<cudaStream_t>(1);
     return cudaSuccess;

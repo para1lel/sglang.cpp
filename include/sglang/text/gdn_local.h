@@ -27,20 +27,9 @@ using GdnFull = GdnShape<text_gdn_qk_heads, text_gdn_value_heads>;
 using GdnLocal = GdnShape<text_gdn_qk_heads / 2, text_gdn_value_heads / 2>;
 static_assert(GdnLocal::heads_per_qk == GdnFull::heads_per_qk);
 
-inline constexpr std::size_t text_gdn_local_history_bytes() {
-    return sizeof(__nv_bfloat16) * static_cast<std::size_t>(GdnLocal::qkv_width) *
-           GdnLocal::history_taps;
-}
-inline constexpr std::size_t text_gdn_local_recurrent_bytes() {
-    return sizeof(float) * static_cast<std::size_t>(GdnLocal::value_heads) * GdnLocal::head_dim *
-           GdnLocal::head_dim;
-}
-inline constexpr std::size_t text_gdn_local_workspace_bytes(int rows) {
-    return rows > 0 && rows <= text_attention_max_tokens
-               ? sizeof(__nv_bfloat16) * static_cast<std::size_t>(rows) *
-                     (GdnLocal::qkv_width + GdnLocal::value_width)
-               : 0;
-}
+std::size_t text_gdn_local_history_bytes();
+std::size_t text_gdn_local_recurrent_bytes();
+std::size_t text_gdn_local_workspace_bytes(int rows);
 
 cudaError_t text_gdn_forward_local(int token_count, TextGdnMode mode,
                                    const __nv_bfloat16* qkv, const __nv_bfloat16* z,

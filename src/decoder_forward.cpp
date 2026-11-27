@@ -58,11 +58,12 @@ void Decoder::Model::decode_graph(Request& request) const {
 
 void Decoder::Model::capture_batch_decode(const BatchGraphLane* lanes, int count,
                                           cudaStream_t stream) const {
-    const LayerBatch<BatchGraphLane> batch{lanes, count, stream};
-    batch.each([&](const BatchGraphLane& lane, Workspace& work) {
+    for (int index = 0; index < count; ++index) {
+        const auto& lane = lanes[index];
+        auto& work = *lane.work;
         check(decode_embedding(embedding, vocab_size, hidden_size, &lane.binding->input,
                                work.residual, stream), "Look up bound token embedding");
-    });
+    }
     forward_layers(lanes, count, stream);
     DecodeHeadRows rows;
     if (count == static_cast<int>(rows.size())) {
@@ -74,9 +75,10 @@ void Decoder::Model::capture_batch_decode(const BatchGraphLane* lanes, int count
         compute_decode_logits(rows, stream, &states);
         return;
     }
-    batch.each([&](const BatchGraphLane& lane, Workspace& work) {
-        compute_logits(work, stream, true, &lane.binding->final_state);
-    });
+    for (int index = 0; index < count; ++index) {
+        const auto& lane = lanes[index];
+        compute_logits(*lane.work, stream, true, &lane.binding->final_state);
+    }
 }
 
 template <typename Lane>
@@ -122,17 +124,32 @@ void Decoder::Model::forward_layers(const Lane* lanes, int count, cudaStream_t s
             }
             return;
         }
-        batch.each([&](const Lane&, Workspace& work) {
+        for (int index = 0; index < count; ++index) {
+            auto& work = workspace(lanes[index]);
             const auto residual_pair = residuals(work);
             check(text_rms_norm(residual_pair.branch, residual_pair.residual, weight,
                                 hidden_size, work.normalized, residual_pair.residual, stream),
                   operation);
-        });
+        }
     };
-    execute_layers(layers, normalize,
-                   [&](const GqaLayer& layer, int bank) { run_gqa(layer, batch, bank); },
-                   [&](const GdnLayer& layer, int bank) { run_gdn(layer, batch, bank); },
-                   [&](const Layer& layer) { run_mlp(layer, batch); });
+    for (int index = 0; index < layer_count; ++index) {
+        const auto& layer = layers[index];
+        const auto [full_attention, bank] = qwen_text_model.layer_mapping(index);
+        const auto input = [first = index == 0](const auto& work) {
+            return first ? LayerResidual{work.residual, nullptr}
+                         : LayerResidual{work.hidden, work.residual};
+        };
+        normalize(layer.input_norm, "Normalize layer input", input);
+        if (full_attention) {
+            run_gqa(layer.gqa, batch, bank);
+        } else {
+            run_gdn(layer.gdn, batch, bank);
+        }
+        normalize(layer.attention_norm, "Normalize post-attention residual", [](const auto& work) {
+            return LayerResidual{work.projected_attention, work.residual};
+        });
+        run_mlp(layer, batch);
+    }
 }
 
 }

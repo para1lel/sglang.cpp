@@ -11,6 +11,9 @@ executor="$source/src/runtime/server/single_device_batch_executor.cpp"
 if [[ -f "$executor" ]]; then
     sources+=("$executor")
 fi
+sources+=("$source"/apps/server/detail/{batch_state,batch_trace,text_stop}.cpp
+          "$source"/src/runtime/execution/{batch_admission_order,decoder_options}.cpp
+          "$source"/src/runtime/server/{batch_executor,batch_restore_join,cache_identity}.cpp)
 for name in batch_service completions flush_cache http loads text_request text_completion \
     chat_template chat_media chat_output chat_tool_constraints native_generate native_sessions \
     ollama_discovery ollama_generate \
@@ -24,8 +27,11 @@ done
 
 lmcache_api=()
 if [[ -f "$source/apps/server/batch_cache.cpp" ]]; then
-    sources+=("$source"/apps/server/{batch_cache,batch_service_cache}.cpp
-              "$source"/src/runtime/cache/{lmcache_client,lmcache_prefix,prefix_payload}.cpp)
+    sources+=("$source/apps/server/batch_cache.cpp"
+              "$source/apps/server/detail/batch_service_cache.cpp"
+              "$source"/src/runtime/cache/{lmcache_client,lmcache_prefix}.cpp
+              "$source"/src/runtime/cache/{prefix_cache_layout,prefix_payload}.cpp
+              "$source/src/runtime/model/qwen_text_model.cpp")
     if [[ -f "$source/src/runtime/cache/lmcache_group.cpp" ]]; then
         sources+=("$source/src/runtime/cache/lmcache_group.cpp")
     fi

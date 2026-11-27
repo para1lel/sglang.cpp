@@ -49,39 +49,8 @@ void project_verification_bf16(Bf16Weight weight, const VerificationRow* rows, i
                                Bf16* Workspace::*output, cudaStream_t stream);
 
 struct VerificationWorkspace {
-    VerificationWorkspace(Allocations& memory, int rows) {
-        const int layer_elements = 2 * rows * (text_gdn_qkv_width + text_gdn_value_heads);
-        auto* storage = memory.allocate<Bf16>(gdn_layers * layer_elements);
-        for (auto& layer : replay) {
-            const int qkv = rows * text_gdn_qkv_width;
-            const int gates = rows * text_gdn_value_heads;
-            layer.inputs = {storage, storage + qkv, storage + 2 * qkv,
-                            storage + 2 * qkv + gates};
-            storage += layer_elements;
-        }
-        auto* z = memory.allocate<Bf16>(rows * text_gdn_value_width);
-        auto* attention = memory.allocate<Bf16>(rows * text_gdn_value_width);
-        observable = memory.allocate<Bf16>(rows * text_gdn_value_width);
-        winners = memory.allocate<TextLogitCandidate>(rows);
-        bf16_head_packed = memory.allocate<Bf16>(
-            static_cast<std::size_t>(verification_packet_rows) * (hidden_size + vocab_size));
-        bf16_head_packed_logits =
-            bf16_head_packed + static_cast<std::size_t>(verification_packet_rows) * hidden_size;
-        work.reserve(rows);
-        for (int index = 0; index < rows; ++index) {
-            auto& row = work.emplace_back(memory, attention + index * text_gdn_value_width,
-                                          winners + index);
-            row.gdn_z = z + index * text_gdn_value_width;
-        }
-    }
-    void bind_gdn(int layer, int rows) {
-        const auto inputs = replay[layer].inputs;
-        for (int index = 0; index < rows; ++index) {
-            work[index].gdn_qkv = inputs.qkv + index * text_gdn_qkv_width;
-            work[index].gdn_b = inputs.b + index * text_gdn_value_heads;
-            work[index].gdn_a = inputs.a + index * text_gdn_value_heads;
-        }
-    }
+    VerificationWorkspace(Allocations& memory, int rows);
+    void bind_gdn(int layer, int rows);
 
     struct ReplayLayer {
         TextGdnReplayRows inputs;
@@ -108,6 +77,9 @@ struct VerificationGraphBinding {
     std::array<TextModelStateRow, k1_verification_rows> final_states;
 };
 
+template <>
+VerificationGraphBinding* Allocations::allocate<VerificationGraphBinding>(std::size_t count);
+
 struct VerificationGraphScratch {
     explicit VerificationGraphScratch(int device);
     void upload(const VerificationSequence& sequence, cudaStream_t stream);
@@ -119,7 +91,7 @@ struct VerificationGraphScratch {
 };
 
 struct VerificationGraph {
-    explicit VerificationGraph(Allocations& owner) : execution(owner) {}
+    explicit VerificationGraph(Allocations& owner);
 
     Allocations& execution;
     std::unique_ptr<VerificationGraphScratch> scratch;
@@ -132,8 +104,8 @@ public:
 
     void begin(const ConstraintCursor& committed, int remaining);
     bool advance(int row, int token);
-    const ConstraintCandidates& candidates(int row) const { return rows_[row]; }
-    int rows() const { return prepared_rows_; }
+    const ConstraintCandidates& candidates(int row) const;
+    int rows() const;
 
 private:
     void prepare(int row, int remaining);
@@ -208,23 +180,19 @@ public:
     void commit(int count, TextGdnReplayBatch* gdn_batch = nullptr);
 
     int winner(int index, bool sampled = false, bool constrained = false) const;
-    bool needs_logits() const { return host_logits_ != nullptr; }
+    bool needs_logits() const;
     const Bf16* logits(int index) const;
-    bool needs_generated_logprobs() const { return host_generated_logprobs_ != nullptr; }
+    bool needs_generated_logprobs() const;
     std::shared_ptr<const DecoderTokenLogprobs> generated_logprobs(int index) const;
-    int pending_rows() const { return pending_rows_; }
-    bool rank_local_gdn() const { return rank_local_gdn_; }
-    cudaStream_t stream() const { return stream_; }
+    int pending_rows() const;
+    bool rank_local_gdn() const;
+    cudaStream_t stream() const;
 
-    Bf16* bf16_head_staging() const {
-        return active_workspace_ ? active_workspace_->bf16_head_packed : nullptr;
-    }
-    Bf16* bf16_head_logits_staging() const {
-        return active_workspace_ ? active_workspace_->bf16_head_packed_logits : nullptr;
-    }
+    Bf16* bf16_head_staging() const;
+    Bf16* bf16_head_logits_staging() const;
 private:
     void enqueue_results();
-    VerificationWorkspace& workspace() { return *active_workspace_; }
+    VerificationWorkspace& workspace();
 
     Request& request_;
     cudaStream_t stream_;

@@ -10,16 +10,11 @@
 namespace sglang::decoder {
 
 struct PendingBatchPrefix {
-    explicit PendingBatchPrefix(PrefixDeviceTransfer&& view) : command(std::move(view)) {}
+    explicit PendingBatchPrefix(PrefixDeviceTransfer&& view);
 
-    ~PendingBatchPrefix() {
-        // Keep the descriptor and every borrowed CUDA allocation live through daemon quiescence.
-        if (completion.valid()) completion.wait();
-    }
+    ~PendingBatchPrefix();
 
-    bool ready() const {
-        return completion.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
-    }
+    bool ready() const;
 
     PrefixDeviceTransfer command;
     bool discard = false;

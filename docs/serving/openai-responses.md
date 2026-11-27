@@ -92,7 +92,7 @@ up to 256 UTF-8 bytes. The server validates the descriptor and compiles the
 [native JSON Schema subset](../output-constraints.md#json-schema) with the checkpoint
 tokenizer. Other formats such as `json_object`, unsupported schema keywords, text stops,
 and output budgets below the grammar minimum return HTTP 400 before SSE opens. The explicit
-budget still reserves two tokens. [Descriptor validation](../../apps/server/responses.cpp#L389)<!-- prefix: "OrderedObjec" -->
+budget still reserves two tokens. [Descriptor validation](../../apps/server/responses.cpp#L393)<!-- prefix: "OrderedObjec" -->
 
 The response echoes the descriptor in `text.format` and returns the generated JSON as an
 `output_text` string in the assistant message. The schema constrains output from the first

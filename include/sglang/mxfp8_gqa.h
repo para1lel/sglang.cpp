@@ -23,10 +23,7 @@ struct GqaGeometry {
 inline constexpr GqaGeometry gqa_full_geometry{mxfp8_query_heads, mxfp8_kv_heads};
 inline constexpr GqaGeometry gqa_rank_geometry{mxfp8_query_heads / 2, mxfp8_kv_heads / 2};
 
-constexpr bool gqa_geometry_valid(GqaGeometry geometry) {
-    return geometry.query_heads == mxfp8_queries_per_kv_head * geometry.kv_heads &&
-           (geometry.kv_heads == mxfp8_kv_heads || geometry.kv_heads == mxfp8_kv_heads / 2);
-}
+bool gqa_geometry_valid(GqaGeometry geometry);
 
 struct Mxfp8KvCache {
     std::uint8_t* key_payload;
@@ -42,13 +39,8 @@ struct Mxfp8PageTable {
     int page_count;
 };
 
-constexpr bool gqa_geometry_matches(GqaGeometry geometry, const Mxfp8KvCache& cache) {
-    return gqa_geometry_valid(geometry) && geometry.kv_heads == cache.kv_heads;
-}
-
-inline int gqa_head_pairs(const Mxfp8KvCache& cache) {
-    return gqa_query_heads(cache.kv_heads) / 2;
-}
+bool gqa_geometry_matches(GqaGeometry geometry, const Mxfp8KvCache& cache);
+int gqa_head_pairs(const Mxfp8KvCache& cache);
 
 cudaError_t mxfp8_kv_append(Mxfp8KvCache cache, Mxfp8PageTable pages, int first_position,
                            int token_count, const __nv_bfloat16* keys,

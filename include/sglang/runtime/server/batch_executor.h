@@ -19,16 +19,16 @@ public:
     using Ready = std::function<void(BatchSession&)>;
     using Process = std::function<void(BatchSession&)>;
 
-    virtual ~BatchExecutor() = default;
+    virtual ~BatchExecutor();
 
-    const Options& options() const noexcept { return options_; }
+    const Options& options() const noexcept;
     virtual BatchTopology topology() const noexcept = 0;
 
     virtual void start(Ready ready, Process process) = 0;
     virtual void join() noexcept = 0;
 
 protected:
-    explicit BatchExecutor(Options options) : options_(options) {}
+    explicit BatchExecutor(Options options);
 
 private:
     const Options options_;

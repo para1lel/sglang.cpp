@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 
+
 def git(root, arguments, environment, required=True, input_data=None):
     result = subprocess.run(
         ["git", "--no-replace-objects", "--no-optional-locks", "-C", str(root), *arguments],
@@ -170,26 +171,12 @@ def snapshot_repository(root, snapshot, entries, environment, head):
         git(snapshot, ["update-ref", "HEAD", head.strip().decode("ascii")], clean)
 
 
-def check_header_layout(entries):
-    suffixes = {".h", ".hh", ".hpp", ".hxx", ".h++", ".cuh"}
-    for name in entries:
-        if (
-            PurePosixPath(name).suffix.lower() in suffixes
-            and not name.startswith("include/sglang/")
-        ):
-            raise ValueError(f"Move project header {name!r} under include/sglang/.")
-
-
 def run(root):
     with tempfile.TemporaryDirectory(prefix="meta-harness-staged-") as directory:
         temporary = Path(directory).resolve()
         if not temporary.is_relative_to(Path(tempfile.gettempdir()).resolve()):
             raise ValueError("The temporary snapshot leaves its selected directory.")
         entries, changed, environment, index, original = freeze(root, temporary)
-        check_header_layout(entries)
-        if not changed:
-            print("Passed: the selected index has no changed files.")
-            return 0
         head = git(root, ["rev-parse", "--verify", "HEAD"], environment, required=False)
         snapshot = temporary / "source"
         snapshot.mkdir()
@@ -205,6 +192,9 @@ def run(root):
             if not selected_checker.is_file():
                 raise ValueError("Stage the rule checker before using the repository gate.")
             comments = checker.with_name("comment_rules.py")
+            functions = checker.with_name("function_spans.py")
+            if not (snapshot / functions.relative_to(root)).is_file():
+                raise ValueError("Stage function_spans.py before using the repository gate.")
             if not (snapshot / comments.relative_to(root)).is_file():
                 raise ValueError("Stage the comment rules before using the repository gate.")
         else:
@@ -215,6 +205,9 @@ def run(root):
             )
             selected_checker.with_name("comment_rules.py").write_bytes(
                 checker.with_name("comment_rules.py").read_bytes()
+            )
+            selected_checker.with_name("function_spans.py").write_bytes(
+                checker.with_name("function_spans.py").read_bytes()
             )
         full = any(
             shared_change(name) or gate_config.matches(

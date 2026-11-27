@@ -16,8 +16,8 @@ inline constexpr int hidden_size = qwen_text_model.hidden_size;
 inline constexpr int intermediate_size = qwen_text_model.intermediate_size;
 inline constexpr int vocab_size = qwen_text_model.vocab_size;
 inline constexpr int layer_count = qwen_text_model.layer_count;
-inline constexpr int full_attention_layers = qwen_text_model.full_attention_layers();
-inline constexpr int gdn_layers = qwen_text_model.gdn_layers();
+inline constexpr int full_attention_layers = layer_count / qwen_text_model.full_attention_interval;
+inline constexpr int gdn_layers = layer_count - full_attention_layers;
 inline constexpr std::size_t gdn_history_elements = text_gdn_qkv_width * text_gdn_history_taps;
 inline constexpr std::size_t gdn_state_elements =
     text_gdn_value_heads * text_gdn_head_dim * text_gdn_head_dim;
@@ -84,41 +84,5 @@ struct LayerResidual {
     Bf16* residual;
 };
 
-template <typename Normalize, typename Gqa, typename Gdn, typename Mlp>
-void execute_layers_with_attention_input(const std::array<Layer, layer_count>& layers,
-                                         Normalize normalize, Gqa gqa, Gdn gdn, Mlp mlp) {
-    for (int index = 0; index < layer_count; ++index) {
-        const auto& layer = layers[index];
-        const auto input = [first = index == 0](const auto& work) {
-            return first ? LayerResidual{work.residual, nullptr}
-                         : LayerResidual{work.hidden, work.residual};
-        };
-        const auto [full_attention, bank] = qwen_text_model.layer_mapping(index);
-        if (full_attention) {
-            gqa(layer, bank, input);
-        } else {
-            gdn(layer, bank, input);
-        }
-        normalize(layer.attention_norm, "Normalize post-attention residual", [](const auto& work) {
-            return LayerResidual{work.projected_attention, work.residual};
-        });
-        mlp(layer);
-    }
-}
-
-template <typename Normalize, typename Gqa, typename Gdn, typename Mlp>
-void execute_layers(const std::array<Layer, layer_count>& layers, Normalize normalize,
-                    Gqa gqa, Gdn gdn, Mlp mlp) {
-    execute_layers_with_attention_input(
-        layers, normalize,
-        [&](const Layer& layer, int bank, const auto& input) {
-            normalize(layer.input_norm, "Normalize layer input", input);
-            gqa(layer.gqa, bank);
-        },
-        [&](const Layer& layer, int bank, const auto& input) {
-            normalize(layer.input_norm, "Normalize layer input", input);
-            gdn(layer.gdn, bank);
-        }, mlp);
-}
 
 }

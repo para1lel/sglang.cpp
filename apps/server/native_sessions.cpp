@@ -268,6 +268,10 @@ void NativeGenerate::SessionTurn::reserve(const BatchPrompt& item) {
     pending = true;
 }
 
+NativeGenerate::SessionTurn::SessionTurn(NativeGenerate& owner, std::shared_ptr<Session> session,
+                                         std::string id)
+    : owner(owner), session(std::move(session)), id(std::move(id)) {}
+
 NativeGenerate::SessionTurn::~SessionTurn() {
     if (!pending) {
         return;

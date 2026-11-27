@@ -75,8 +75,8 @@ public:
                     const std::vector<DecoderMedia>* media = nullptr,
                     const PrefixCacheLayout* layout = nullptr);
 
-    int tokens() const { return tokens_; }
-    int cacheable_tokens() const { return static_cast<int>(keys_.size()) - 1; }
+    int tokens() const;
+    int cacheable_tokens() const;
     std::string key(int end) const;
     void append(int token);
 

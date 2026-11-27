@@ -38,6 +38,8 @@ AnthropicMessages::AnthropicMessages(const Socket& connection, EventStream& stre
     : connection_(connection), stream_(stream), streaming_(streaming),
       prompt_tokens_(prompt_tokens), id_(message_id()) {}
 
+void AnthropicMessages::admit(std::size_t cached_tokens) { cached_tokens_ = cached_tokens; }
+
 OrderedObject AnthropicMessages::message(json::Array content) const {
     return {{"id", id_}, {"type", "message"}, {"role", "assistant"},
             {"content", std::move(content)}, {"model", "Qwen3.8-27B-FP8"}};

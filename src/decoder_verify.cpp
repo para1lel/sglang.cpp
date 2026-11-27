@@ -24,6 +24,11 @@ bool TargetVerification::can_begin(int position, int count, cudaStream_t stream)
            count <= request_.pages.page_count * mxfp8_page_size - position;
 }
 
+template <>
+VerificationGraphBinding* Allocations::allocate<VerificationGraphBinding>(std::size_t count) {
+    return static_cast<VerificationGraphBinding*>(
+        allocate_elements(count, sizeof(VerificationGraphBinding)));
+}
 
 VerificationGraphScratch::VerificationGraphScratch(int device)
     : memory(device), workspace(memory, k1_verification_rows),
@@ -507,39 +512,6 @@ void TargetVerification::enqueue_results() {
                             "Read target verification logits");
         }
     }
-}
-
-void TargetVerification::commit(int count, TextGdnReplayBatch* gdn_batch) {
-    if (!ready_ || count < 0 || count > pending_rows_) {
-        throw std::logic_error("Invalid target verification commit");
-    }
-    if (count > 0 && count < pending_rows_) {
-        const bool batched = try_fill_gdn_replay_batch(
-            gdn_batch, count, gdn_layers, [&](int layer) {
-                const auto& saved = workspace().replay[layer];
-                return TextGdnReplayEntry{saved.inputs, saved.weights, request_.states[layer],
-                                          tail_[layer], count};
-            });
-        if (!batched) {
-            for (int layer = 0; layer < gdn_layers; ++layer) {
-                const auto& saved = workspace().replay[layer];
-                const auto status = rank_local_gdn_
-                    ? text_gdn_replay_prefix_local(count, saved.inputs, saved.weights,
-                                                   request_.states[layer], tail_[layer],
-                                                   stream_)
-                    : text_gdn_replay_prefix(count, saved.inputs, saved.weights,
-                                             request_.states[layer], tail_[layer], stream_);
-                check(status, "Replay committed target GDN prefix");
-            }
-        }
-    }
-    if (count > 0) {
-        request_.states.swap(tail_);
-        valid_prefix_ += count;
-    }
-    ready_ = false;
-    pending_rows_ = 0;
-    active_workspace_ = nullptr;
 }
 
 int TargetVerification::winner(int index, bool sampled, bool constrained) const {

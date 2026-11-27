@@ -16,7 +16,7 @@ It checks the names, BF16 dtype, and shapes of the required tensors.
 The pinned configuration has an empty DeepStack index list and produces zero DeepStack feature levels.
 The constructor copies 921,460,192 bytes of weights to the current device and waits for the upload.
 The encoder owns those weights. The caller can release the host checkpoint after construction.
-[Configuration validation](../src/checkpoint.cpp#L340)<!-- prefix: "void Checkpo" --> · [Weight validation](../src/vision/weights.cu#L53)<!-- prefix: "const Bf16* " -->
+[Configuration validation](../src/checkpoint.cpp#L340)<!-- prefix: "void Checkpo" --> · [Weight validation](../src/vision/weights.cu#L55)<!-- prefix: "const Bf16* " -->
 
 ## Encode patches
 
@@ -26,7 +26,7 @@ Keep source frame indices and timestamps with the caller's metadata.
 The grid requires `T >= 1`, positive even `H` and `W`, `H * W <= 4096`, and `T * H * W <= 16384`.
 Call `vision_feature_rows(grid)` to validate those limits and get `T * H * W / 4`.
 The CPU preprocessor has its own storage limits. Check the encoder grid before allocating device buffers.
-[Grid validation](../src/vision/encoder.cu#L10)<!-- prefix: "Grid checked" -->
+[Grid validation](../src/vision/encoder.cu#L65)<!-- prefix: "Grid checked" -->
 
 Upload the contiguous `MediaPatches::pixels` buffer as finite FP32 values.
 Keep the [preprocessor's patch order](media-preprocessing.md#patch-layout-and-timestamps).
@@ -46,13 +46,13 @@ Each call owns its scratch buffers and synchronizes the stream before a successf
 Keep both device buffers and the encoder live through the call.
 An unsupported grid, device, stream, or span fails validation. Allocation and CUDA failures also throw.
 Discard the output if the call throws.
-[Stream and span checks](../src/vision/encoder.cu#L35)<!-- prefix: "void validat" --> · [Encode and completion](../src/vision/encoder.cu#L161)<!-- prefix: "void VisionE" -->
+[Stream and span checks](../src/vision/encoder.cu#L90)<!-- prefix: "void validat" --> · [Encode and completion](../src/vision/encoder.cu#L216)<!-- prefix: "void VisionE" -->
 
 The forward path projects patches, adds learned positions, and runs 27 transformer blocks with split-half height and width RoPE.
 Attention is bidirectional within each temporal pair.
 The spatial merger maps each consecutive group of four patches into one feature row.
 Output rows follow temporal pair and then spatial block order.
-[Forward path](../src/vision/encoder.cu#L117)<!-- prefix: "void forward" -->
+[Forward path](../src/vision/encoder.cu#L172)<!-- prefix: "void forward" -->
 
 ## Build and verify
 
@@ -71,7 +71,7 @@ host=/data1/shared/dongwu.chen
 
 The static library uses native SM100 CUDA kernels. Its XMake target links `sglang_checkpoint` and CUDA Runtime.
 The checkpoint target also links `sglang_json`. The runtime uses C++ and CUDA libraries.
-[Vision target](../xmake.lua#L133)<!-- prefix: "target(\"sgla" --> · [Checkpoint target](../xmake.lua#L125)<!-- prefix: "target(\"sgla" -->
+[Vision target](../xmake.lua#L238)<!-- prefix: "target(\"sgla" --> · [Checkpoint target](../xmake.lua#L229)<!-- prefix: "target(\"sgla" -->
 
 On a reserved B200, feed the same pinned FP32 patch fixtures to the public API and the independent reference.
 Use FP64 affine, LayerNorm, and attention reductions with BF16 activation boundaries in the reference.

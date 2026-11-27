@@ -35,7 +35,7 @@ namespace {
 
 using namespace sglang::server;
 
-constexpr int default_max_active = sglang::decoder_default_max_running_requests *
+const int default_max_active = sglang::decoder_default_max_running_requests *
     single_device_batch_topology.device_count();
 
 struct Arguments {
@@ -340,7 +340,7 @@ void print_usage() {
                      "Tensor parallel: 1 by default. --tp 2 shards the model across\n"
                      "the device and its successor; MTP drafting stays on rank 0 and\n"
                      "decode runs eager (no CUDA graphs) under tensor parallel.\n"
-                     "Default MTP uses 0 steps for output logprobs.\n"
+                     "Eligible greedy output logprobs use the configured MTP depth.\n"
                      "Batch graphs: enabled by default for eligible decode steps.\n"
                      "Eager decode: disable graph replay.\n"
                      "LMCache enabled by default. Set --prefix-cache-entries 0 to disable.\n"

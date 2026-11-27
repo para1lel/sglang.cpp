@@ -9,6 +9,7 @@ toolkit=${CUDA_TOOLKIT_ROOT:-}
 if [[ -z $toolkit ]]; then
     toolkit=${CONDA_PREFIX:?run in the project Pixi environment}/targets/x86_64-linux
 fi
+nccl=$(python -I -c 'import sysconfig; print(sysconfig.get_path("purelib") + "/nvidia/nccl")')
 lib=$build/lib
 symbols=$(nm --defined-only "$lib/libsglang_cuda.a")
 wrap=(-Wl,--wrap=cudaMallocFromPoolAsync -Wl,--wrap=cudaStreamBeginCapture)
@@ -27,9 +28,12 @@ for index in "${!names[@]}"; do
 done
 "${CXX:-c++}" -std=c++17 -O2 -pthread -Wall -Wextra -Werror -I"$repo/include" -I"$toolkit/include" \
     "$repo/tests/media/decoder_contract.cpp" "$repo/tests/media/decoder_trace.cpp" \
-    -L"$lib" -L"$toolkit/lib" -Wl,-rpath,"$toolkit/lib" "${wrap[@]}" \
-    -lsglang_decoder -lsglang_checkpoint -lsglang_json -lsglang_cuda \
-    -lsglang_prefill_fp8_sm100 -lsglang_tokenizer -lcudart -o "$output"
+    "$repo/tests/media/decoder_fixture.cpp" \
+    -L"$lib" -L"$toolkit/lib" -L"$toolkit/lib/stubs" -Wl,-rpath,"$toolkit/lib" "${wrap[@]}" \
+    -Wl,--start-group -lsglang_decoder -lsglang_checkpoint -lsglang_json -lsglang_cuda \
+    -lsglang_prefill_fp8_sm100 -lsglang_tokenizer -lsglang_mnnvl_ar \
+    -lsglang_cuda_support -Wl,--end-group \
+    -Wl,-rpath,"$nccl/lib" "$nccl/lib/libnccl.so.2" -lcuda -lcudart -o "$output"
 if [[ ${MEDIA_CONTRACT_BUILD_ONLY:-0} != 1 ]]; then
     "$output" "$checkpoint"
 fi

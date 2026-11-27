@@ -22,8 +22,8 @@ public:
     };
     using Handle = std::shared_ptr<Entry>;
 
-    explicit ResponseStore(bool enabled) : enabled_(enabled) {}
-    bool enabled() const { return enabled_; }
+    explicit ResponseStore(bool enabled);
+    bool enabled() const;
     Handle insert(const json::OrderedObject& response, std::string envelope,
                   std::string history);
     bool update(const Handle& entry, const json::OrderedObject& response,

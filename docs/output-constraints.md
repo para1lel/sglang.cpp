@@ -11,7 +11,7 @@ Native text and text-only chat accept [finite-choice EBNF](text-serving.md#finit
 | Regular expression compiler | Build the token transition table and compute the minimum budget. | [Tokenizer compiler](../src/tokenizer/regex_constraint.cpp#L153)<!-- prefix: "std::shared_" --> |
 | Schema compiler | Convert the supported schema to a token constraint. | [Schema compiler](../src/tokenizer/json_schema.cpp#L435)<!-- prefix: "std::shared_" --> |
 | Tool-call constraint | Compile and cache the grammar for the selected functions and request mode. | [Tool grammar cache](../apps/server/qwen/qwen_tool_constraints.cpp#L71)<!-- prefix: "std::shared_" --> · [Trigger compiler](../src/tokenizer/regex_constraint.cpp#L166)<!-- prefix: "std::shared_" --> |
-| Decoder | Apply the request cursor to target scores and commit the selected ID. | [Selection](../src/decoder_constraint.cpp#L28)<!-- prefix: "void select_" --> · [Cursor update](../include/sglang/decoder_constraint.h#L134)<!-- prefix: "bool commit(" --> |
+| Decoder | Apply the request cursor to target scores and commit the selected ID. | [Selection](../src/decoder_constraint.cpp#L28)<!-- prefix: "void select_" --> · [Cursor update](../src/tokenizer/constraint.cpp#L162)<!-- prefix: "bool Constra" --> |
 
 ## Runtime path
 
@@ -55,7 +55,7 @@ Compilation allows up to 4,096 nondeterministic states, 256 deterministic states
 
 ### Native generate
 
-Set `sampling_params.regex` to constrain generated text in `POST /generate`. Omission, null, and `""` disable that field. At most one of `regex`, `json_schema`, and `ebnf` can be active per item. A broadcast sampling object shares the compiled constraint. Each item owns its cursor and budget. Use a sampling object array for distinct constraints or to mix constrained and unconstrained items. [Native validation](../apps/server/native_generate.cpp#L745)<!-- prefix: "void set_gen" -->
+Set `sampling_params.regex` to constrain generated text in `POST /generate`. Omission, null, and `""` disable that field. At most one of `regex`, `json_schema`, and `ebnf` can be active per item. A broadcast sampling object shares the compiled constraint. Each item owns its cursor and budget. Use a sampling object array for distinct constraints or to mix constrained and unconstrained items. [Native validation](../apps/server/native_generate.cpp#L748)<!-- prefix: "void set_gen" -->
 
 ```json
 {
@@ -129,7 +129,7 @@ Put the serialized schema in `sampling_params.json_schema` on `POST /generate`. 
 
 The [native sampling rules](#native-generate) apply. JSON and cumulative SSE return the generated JSON as a string in `text`.
 
-The [schema subset](#json-schema) and [native finish rules](#native-generate) apply. A complete match at the token cap reports `length` unless a stop takes precedence. Text stops can trim the displayed JSON. Use model EOS handling and omit `stop_token_ids`. Zero or insufficient budget, malformed or unsupported schemas, and generated logprobs on the same constrained item return HTTP 400 before decoder admission or SSE headers. An unconstrained sibling can request generated logprobs. [Native validation](../apps/server/native_generate.cpp#L745)<!-- prefix: "void set_gen" -->
+The [schema subset](#json-schema) and [native finish rules](#native-generate) apply. A complete match at the token cap reports `length` unless a stop takes precedence. Text stops can trim the displayed JSON. Use model EOS handling and omit `stop_token_ids`. Zero or insufficient budget, malformed or unsupported schemas, and generated logprobs on the same constrained item return HTTP 400 before decoder admission or SSE headers. An unconstrained sibling can request generated logprobs. [Native validation](../apps/server/native_generate.cpp#L748)<!-- prefix: "void set_gen" -->
 
 ### Native EBNF
 
@@ -159,7 +159,7 @@ Use the [JSON Schema subset](#json-schema) for nested objects and arrays, which 
 
 The triggered compiler allows up to 4,096 nondeterministic states, 4,096 deterministic subsets before minimization, 1,024 final states, and 8,388,608 token transitions. Unsupported schemas and exceeded compiler limits return HTTP 400. The tokenizer caches up to eight compiled grammars in least-recently-used order. The key includes the generated pattern, choice mode, parallel setting, and open reasoning state. Cache lookup and cold compilation share one mutex. [Automaton limits](../src/tokenizer/regex_automaton.cpp#L353)<!-- prefix: "std::vector<" --> · [Token compiler](../src/tokenizer/regex_constraint.cpp#L203)<!-- prefix: "std::shared_" --> · [Tool grammar cache](../apps/server/qwen/qwen_tool_constraints.cpp#L71)<!-- prefix: "std::shared_" -->
 
-The triggered cursor allows a token-budget cut within a tool frame. At a length cut, the parser suppresses pending wrapper markup. It can return a partial call after recognizing the opening function tag. Partial arguments can omit required keys or contain incomplete values. If the last allowed token closes the frame, the finish reason is still `length` in JSON and SSE. [Cursor budget](../include/sglang/decoder_constraint.h#L89)<!-- prefix: "void candida" --> · [Length-cut recovery](../apps/server/qwen/qwen_chat_output.cpp#L646)<!-- prefix: "bool ToolFra" -->
+The triggered cursor allows a token-budget cut within a tool frame. At a length cut, the parser suppresses pending wrapper markup. It can return a partial call after recognizing the opening function tag. Partial arguments can omit required keys or contain incomplete values. If the last allowed token closes the frame, the finish reason is still `length` in JSON and SSE. [Cursor budget](../src/tokenizer/constraint.cpp#L116)<!-- prefix: "void Constra" --> · [Length-cut recovery](../apps/server/qwen/qwen_chat_output.cpp#L652)<!-- prefix: "bool ToolFra" -->
 
 ## Verification
 

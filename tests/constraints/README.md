@@ -7,19 +7,23 @@ directory, `checkpoint` to the Qwen3.8-27B-FP8 checkpoint directory and
 
 ```bash
 tests=tests/constraints
+toolkit="$CONDA_PREFIX/targets/x86_64-linux"
+nccl=$(python -I -c 'import sysconfig; print(sysconfig.get_path("purelib") + "/nvidia/nccl")')
 g++ -std=c++17 -O2 -Wall -Wextra -Werror -Iinclude "$tests/token_probe.cpp" \
     "$build/lib/libsglang_tokenizer.a" "$build/lib/libsglang_json.a" \
     -o "$build/bin/token-probe"
 g++ -std=c++17 -O2 -Wall -Wextra -Werror -Iinclude \
-    -I"$CONDA_PREFIX/targets/x86_64-linux/include" "$tests/mtp_guard.cpp" \
+    -I"$toolkit/include" "$tests/mtp_guard.cpp" \
     -Wl,--start-group "$build/lib/"*.a -Wl,--end-group \
-    -L"$CONDA_PREFIX/lib" -lcudart -pthread -ldl -lrt \
+    -L"$toolkit/lib" -L"$toolkit/lib/stubs" -Wl,-rpath,"$toolkit/lib" -Wl,-rpath,"$nccl/lib" \
+    "$nccl/lib/libnccl.so.2" -lcuda -lcudart -pthread -ldl -lrt \
     -o "$build/bin/mtp-guard"
 "$build/bin/mtp-guard" "$checkpoint/tokenizer.json"
 g++ -std=c++17 -O2 -Wall -Wextra -Werror -Iinclude \
-    -I"$CONDA_PREFIX/targets/x86_64-linux/include" "$tests/mtp_native.cpp" \
+    -I"$toolkit/include" "$tests/mtp_native.cpp" \
     -Wl,--start-group "$build/lib/"*.a -Wl,--end-group \
-    -L"$CONDA_PREFIX/lib" -lcudart -pthread -ldl -lrt \
+    -L"$toolkit/lib" -L"$toolkit/lib/stubs" -Wl,-rpath,"$toolkit/lib" -Wl,-rpath,"$nccl/lib" \
+    "$nccl/lib/libnccl.so.2" -lcuda -lcudart -pthread -ldl -lrt \
     -o "$build/bin/mtp-native"
 "$build/bin/mtp-native" "$checkpoint"
 python "$tests/token_oracle.py" "$build/bin/token-probe" \

@@ -55,6 +55,51 @@ def test_joint_gpu_ownership_includes_one_server_and_one_shared_daemon(tmp_path:
             owners(inventory, DEVICES, 41, 31)
 
 
+@pytest.mark.parametrize("count", [0, 1, 2])
+def test_compute_ownership_before_first_transfer(tmp_path: Path, count: int) -> None:
+    inventory = tmp_path / "compute.csv"
+    daemon = [f"{gpu}, 41, owned, 50 MiB" for gpu in DEVICES[:count]]
+    server = [f"{gpu}, 31, owned, 50 MiB" for gpu in DEVICES]
+    other = [f"{DEVICES[0][:-1]}3, 99, unrelated, 50 MiB"]
+    inventory.write_text("\n".join(daemon + other), encoding="utf-8")
+    owners(inventory, DEVICES, 41, before_transfer=True)
+    inventory.write_text("\n".join(server + daemon + other), encoding="utf-8")
+    owners(inventory, DEVICES, 41, 31, before_transfer=True)
+    if len(daemon) < len(server):
+        with pytest.raises(ValueError, match="ownership"):
+            owners(inventory, DEVICES, 41, 31)
+
+
+@pytest.mark.parametrize(
+    ("gpu", "pid", "message"),
+    [
+        (0, "99", "ownership"),
+        (0, "31", "ownership"),
+        (1, "[Not Found]", "malformed"),
+        (1, "0", "malformed"),
+        (2, "41", "ownership"),
+    ],
+)
+def test_compute_preflight_rejects_foreign_or_unresolved_owners(
+    tmp_path: Path, gpu: int, pid: str, message: str
+) -> None:
+    inventory = tmp_path / "compute.csv"
+    device = (*DEVICES, f"{DEVICES[0][:-1]}3")[gpu]
+    inventory.write_text(f"{device}, {pid}, owned, 50 MiB\n", encoding="utf-8")
+    with pytest.raises(ValueError, match=message):
+        owners(inventory, DEVICES, 41, before_transfer=True)
+
+
+def test_compute_ready_requires_both_server_contexts(tmp_path: Path) -> None:
+    inventory = tmp_path / "compute.csv"
+    other = f"{DEVICES[0][:-1]}3"
+    rows = [f"{gpu}, 31, owned, 50 MiB" for gpu in DEVICES]
+    for changed in (rows[:1], [*rows, rows[-1]], [*rows, f"{other}, 31, owned, 50 MiB"]):
+        inventory.write_text("\n".join(changed), encoding="utf-8")
+        with pytest.raises(ValueError, match="ownership"):
+            owners(inventory, DEVICES, 41, 31, before_transfer=True)
+
+
 @pytest.mark.parametrize("fault", [None, "idle-rank", "wrong-draft-owner", "partial-shard",
                                     "cold-read", "between-cohorts"])
 def test_rank_cache_deltas_reconcile_each_family_on_both_daemons(fault):

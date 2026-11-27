@@ -13,22 +13,53 @@ from saved_evidence import UUID, command, compute_owners, hash_manifest, load, r
 
 RANK = re.compile(r"tp2 rank=(\d+) device=(\d+) uuid=([0-9a-fA-F-]+) pid=(\d+) nccl=ok "
                   r"weights=(\d+) lm_head=([01]) mtp=([01])")
+TP2_RANKS = 2
+COMPUTE_FIELDS = 4
 
 
-def owners(path: Path, devices: list[str], daemon: int, server: int | None = None) -> None:
-    require(type(daemon) is int and daemon > 0 and server != daemon, "Invalid daemon PID")
+def owners(
+    path: Path,
+    devices: list[str],
+    daemon: int,
+    server: int | None = None,
+    *,
+    before_transfer: bool = False,
+) -> None:
     processes = (daemon,) if server is None else (daemon, server)
-    expected = {(gpu.lower(), str(pid)) for gpu in devices for pid in processes}
+    require(
+        len(set(processes)) == len(processes)
+        and all(type(pid) is int and pid > 0 for pid in processes),
+        "Invalid process ownership identities",
+    )
     selected = {gpu.lower() for gpu in devices}
+    require(
+        len(devices) == len(selected) == TP2_RANKS and all(UUID.fullmatch(gpu) for gpu in selected),
+        "Invalid GPU ownership identities",
+    )
     pids = {str(pid) for pid in processes}
+    allowed = {(gpu, pid) for gpu in selected for pid in pids}
+    required = allowed if not before_transfer else {row for row in allowed if row[1] != str(daemon)}
     with path.open(encoding="utf-8", newline="") as stream:
-        rows = [row for row in csv.reader(stream, skipinitialspace=True) if row]
-    require(all(len(row) == 4 and UUID.fullmatch(row[0].strip()) and row[1].strip().isdecimal()
-                for row in rows), "Malformed compute inventory")
-    found = [(row[0].strip().lower(), row[1].strip()) for row in rows
-             if row[0].strip().lower() in selected or row[1].strip() in pids]
-    require(len(found) == len(expected) and set(found) == expected,
-            f"{path}: expected rank/device ownership {expected}, observed {found}")
+        rows = [row for row in csv.reader(stream, skipinitialspace=True, strict=True) if row]
+    require(
+        all(
+            len(row) == COMPUTE_FIELDS
+            and UUID.fullmatch(row[0].strip())
+            and re.fullmatch(r"[1-9][0-9]*", row[1].strip())
+            and row[2].strip()
+            and row[3].strip()
+            for row in rows
+        ),
+        f"{path}: malformed compute inventory",
+    )
+    observed = {(row[0].strip().lower(), row[1].strip()) for row in rows}
+    require(len(observed) == len(rows), f"{path}: duplicate compute ownership rows")
+    found = {(gpu, pid) for gpu, pid in observed if gpu in selected or pid in pids}
+    require(
+        required <= found <= allowed,
+        f"{path}: required ownership {sorted(required)}, allowed {sorted(allowed)}, "
+        f"observed {sorted(found)}",
+    )
 
 
 def rank_table(text, devices, pid):
@@ -160,8 +191,8 @@ def verify(run, completed=False):
     daemon = verify_daemon(run, identity, Path(env["XDG_RUNTIME_DIR"]), completed=completed)
     for gpu in devices:
         compute_owners(run / "compute-before-daemons.csv", gpu, ())
-    owners(run / "compute-before.csv", devices, daemon)
-    owners(run / "compute-ready.csv", devices, daemon, pid)
+    owners(run / "compute-before.csv", devices, daemon, before_transfer=True)
+    owners(run / "compute-ready.csv", devices, daemon, pid, before_transfer=True)
     if completed:
         owners(run / "compute-measurement-end.csv", devices, daemon, pid)
         require((run / "live-environment-end.bin").read_bytes() == raw,
@@ -177,6 +208,13 @@ def verify(run, completed=False):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("run", type=Path)
-    parser.add_argument("--completed", action="store_true")
+    phases = parser.add_mutually_exclusive_group()
+    phases.add_argument("--preflight", action="store_true")
+    phases.add_argument("--completed", action="store_true")
     args = parser.parse_args()
-    print(json.dumps(verify(args.run, args.completed), indent=2))
+    if args.preflight:
+        devices = load(args.run.parent.parent / "identity.json")["devices"]
+        daemon = int((args.run / "daemon/lmcache-pid.txt").read_text(encoding="utf-8"))
+        owners(args.run / "compute-before.csv", devices, daemon, before_transfer=True)
+    else:
+        print(json.dumps(verify(args.run, args.completed), indent=2))

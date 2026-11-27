@@ -100,12 +100,9 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 server_preflight() {
-    record_compute "$1/compute-before.csv"
+    record_compute "$1/compute-before.csv" || return
     if [[ -z $lmcache_pid ]]; then pair_idle; return; fi
-    local gpu
-    for gpu in "${devices[@]}"; do
-        lmcache_evidence owners "$1/compute-before.csv" "$gpu" "$lmcache_pid"
-    done
+    "$client_python" -B "$tp2_dir/native.py" "$1" --preflight
 }
 
 launch_native() {

@@ -83,7 +83,7 @@ The campaign records `daemon_port` and `lmcache_capacity_bytes`. Native
 readiness and completion receipts report one `daemon_pid` and two ranks.
 The `daemon/` receipts bind both UUIDs, the socket peer, and the process
 configuration. Replay `tp2-paired-v1` at its pinned revision with the original
-evidence. [Campaign identity](../../benchmarks/tp2/run.sh#L75)<!-- prefix: "'{protocol:\"" --> · [Daemon receipts](../../benchmarks/tp2/native.py#L57)<!-- prefix: "def verify_d" --> · [Historical two-daemon protocol](https://github.com/para1lel/sglang.cpp/blob/57ac5fbbdf20a5a80c5bc079b49073a44c06680f/benchmarks/tp2/run.sh#L73)
+evidence. [Campaign identity](../../benchmarks/tp2/run.sh#L75)<!-- prefix: "'{protocol:\"" --> · [Daemon receipts](../../benchmarks/tp2/native.py#L88)<!-- prefix: "def verify_d" --> · [Historical two-daemon protocol](https://github.com/para1lel/sglang.cpp/blob/57ac5fbbdf20a5a80c5bc079b49073a44c06680f/benchmarks/tp2/run.sh#L73)
 
 See the [named workloads](../../docs/performance.md#named-workloads) for row sizes.
 

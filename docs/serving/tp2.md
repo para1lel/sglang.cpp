@@ -10,25 +10,13 @@ Both ranks own target workers and store 16,896 target KV bytes per token per ran
 
 The archived `e912b39b` campaign (`6f7754f4-b4f7-4e0b-acb1-ea2f8df74e73`) passed W1–W3 at 1.0474×, 1.0117×, and 1.0639×. W4 took 29.046274476 s native and 25.335314580 s vLLM (1.146473804×), so the campaign stopped before W5. Both arms completed all sixteen W4 requests. Native stored eighty checkpoints per rank for W4, with zero restores or I/O errors. [Frozen results, identities, and receipts](https://github.com/para1lel/sglang.cpp/blob/a5974ba4eb99bd8e8f890c2e7262a27dbc3aace1/docs/serving/tp2.md#campaign-record)
 
-## W4 wide-verification release
+<a id="w4-wide-verification-release"></a>
+<a id="w1-diagnostic-profile"></a>
+<a id="w2-divergence-evidence"></a>
+<a id="w4-readiness-diagnostic"></a>
+<a id="w3-wide-verify-diagnostic"></a>
 
-Sixteen-lane staging cut cold diagnostic W4 makespan from 50.816 to 38.789 s versus eight lanes. [Frozen release and W3 receipts](https://github.com/para1lel/sglang.cpp/blob/a5974ba4eb99bd8e8f890c2e7262a27dbc3aace1/docs/serving/tp2.md#w4-wide-verification-release)
-
-## W1 diagnostic profile
-
-An archived W1 profile compared one- and two-lane target traversals and isolated attention, reductions, scoring, and draft work. Native and vLLM ran on different B200 pairs. [Frozen method, traces, and operator replays](https://github.com/para1lel/sglang.cpp/blob/a5974ba4eb99bd8e8f890c2e7262a27dbc3aace1/docs/serving/tp2.md#w1-diagnostic-profile)
-
-## W2 divergence evidence
-
-Arrival timing reproduced the former W2 determinism rejection. Identical top scores at the first differing position made token identity sensitive to batch composition. [Frozen divergence and submission controls](https://github.com/para1lel/sglang.cpp/blob/a5974ba4eb99bd8e8f890c2e7262a27dbc3aace1/docs/serving/tp2.md#w2-divergence-evidence)
-
-## W4 readiness diagnostic
-
-[Frozen 16-lane readiness cohorts, output diffs, and rank-store counts](https://github.com/para1lel/sglang.cpp/blob/a5974ba4eb99bd8e8f890c2e7262a27dbc3aace1/docs/serving/tp2.md#w4-readiness-diagnostic)
-
-## W3 wide-verify diagnostic
-
-One eight-lane cold diagnostic matched IDs and reduced W3-shaped makespan from 7.039 to 6.574 s with wide verification. [Frozen cohort and operator replays](https://github.com/para1lel/sglang.cpp/blob/a5974ba4eb99bd8e8f890c2e7262a27dbc3aace1/docs/serving/tp2.md#w3-wide-verify-diagnostic) · [Matched W3](#campaign-record)
+[Archived W1–W4 profiles, readiness, and wide verification](https://github.com/para1lel/sglang.cpp/blob/a5974ba4eb99bd8e8f890c2e7262a27dbc3aace1/docs/serving/tp2.md#w4-wide-verification-release)
 
 ## Two-rank wide verification
 

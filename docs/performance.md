@@ -132,15 +132,8 @@ Retain the run manifest, commands, environment, fixture hashes, raw samples, and
 The archived TP1 release `c701d294b3823c655c6adc38bbd87d077147bbcc` passed all five rows with direct GPU LMCache 0.5.8. W5 took 38.396171943 s native and 35.940895116 s pinned vLLM (1.068314293×). [Frozen TP1 results and SSE replay](https://github.com/para1lel/sglang.cpp/blob/a5974ba4eb99bd8e8f890c2e7262a27dbc3aace1/docs/performance.md#matched-k4-evidence)
 
 <a id="traced-one-output-prefill-diagnostic"></a>
-The traced prefill comparison is diagnostic. [Frozen one-output W5 diagnostic](https://github.com/para1lel/sglang.cpp/blob/a5974ba4eb99bd8e8f890c2e7262a27dbc3aace1/docs/performance.md#traced-one-output-prefill-diagnostic) · [TP2 run evidence](serving/tp2.md)
-
 <a id="current-single-round-v5"></a>
-### Archived single-round v5
+<a id="archived-single-round-v5"></a>
+<a id="archived-multi-cohort-v4"></a>
 
-The former device-resident cache also passed W1–W5. Keep this result under its original cache control. [Frozen v5 results](https://github.com/para1lel/sglang.cpp/blob/a5974ba4eb99bd8e8f890c2e7262a27dbc3aace1/docs/performance.md#archived-single-round-v5)
-
-### Archived multi-cohort v4
-
-Final v4 passed all five rows. W1–W2 used three warmups and nine measurements, W3–W5 two and five. W5 medians were 38.170671560 seconds native and 35.974923597 seconds vLLM (1.061036×). [Full v4 results](https://github.com/para1lel/sglang.cpp/blob/6f4d54d3a07ea8ad5bae68ea020105b8ecaeba93/docs/performance.md#matched-k4-evidence) · [Measured v4 release](https://github.com/para1lel/sglang.cpp/commit/b8764ee28523c7223865a0e1de8ebc8041ca857a)
-
-The previous v4 campaign passed W1–W4 and missed W5. [Prior v4 evidence](https://github.com/para1lel/sglang.cpp/blob/17d8634f1f9677bf4b2bc3dea93b7e5ca58eca5a/docs/performance.md#matched-k4-evidence)
+[Archived v4, v5, and one-output diagnostics](https://github.com/para1lel/sglang.cpp/blob/5ee79416d3e30cd178abab69598d047c4393793d/docs/performance.md#matched-k4-evidence) · [TP2 campaign record](serving/tp2.md#campaign-record)

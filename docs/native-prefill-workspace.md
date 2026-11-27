@@ -109,48 +109,23 @@ Both streams record projection-ready events before either waits for its peer. Ea
 
 The `decoder-batch-plan-check` CPU target checks decode reservations, MTP budget clipping, prompt order, slot reuse, and full occupancy. Enable it with `xmake f --decoder-batch-plan-check=y`. [Planner assertions](../tests/decoder/decoder_batch_plan_check.cpp#L24)<!-- prefix: "void check_d" --> · [Planner target](../xmake.lua#L317)<!-- prefix: "target(\"deco" -->
 
-On one reserved B200, replay checkpoint Q, MXFP8 payloads and scales, and remapped pages. Compare full BF16 output with raw paired and archived wide Flash. Cover both bounds, nonzero page offsets, a short tail, masks, invalid full- and partial-page V, and repair.
+On a reserved B200, compare staged and raw readers on checkpoint Q, MXFP8 KV, and remapped pages. Cover bounds, nonzero page offsets, masks, short tails, invalid V, and repair. Require canaries, raw parity with scratch one byte short or rejected setup, one raw node at cold capture, and parity after selector changes. Count allocations and time eager predecode plus attention in A/B/B/A order.
 
-Check span bounds, canaries, and scratch one byte short. Require raw output parity after descriptor rejection, empty cluster occupancy, or unavailable predecode.
+Compare four-, two-, and one-lane staging bitwise against per-lane dispatch. Cover mixed starts, invalid KV, aliasing, stream rejection, and either launch rejected. Later groups may still stage after a clean decline. Unexpected errors after predecode must propagate without relaunch. Record allocation counts and arena high-water marks.
 
-Compare four-grant staging bitwise with per-lane dispatch. Cover four-, two-, and one-lane groups, invalid KV, aliasing, mixed starts, and stream rejection. Reject each launch and check subgroup fallback and later staging. Unexpected attention errors after predecode must propagate without relaunch. Compare allocations and arena high-water marks.
-
-Check a cold capture with scratch supplied. Require one raw kernel node and compare replay after a selector change. Check explicit `paired` and the default dispatch boundaries. Count allocation calls on each arm.
-
-Time eager predecode plus attention in base, candidate, candidate, base order. Archived checkpoint replay matched BF16 bitwise and reduced operator time. Check lifetime and serving separately. [Operator evidence](https://github.com/para1lel/sglang.cpp/blob/4dd8c887c278c67744ed80e7feb2a825a92197a2/docs/native-prefill-workspace.md#verification)
-
-On B200, fix admissions and grants. Compare scores, state, IDs, and terminal records with ordinary dispatch. Cover unequal or trailing grants, a singleton, two 256-row K0 grants, and mixed prefill and decode. Check group and row counts. Deny grouped allocation to check ordinary prefill with smaller scratch. Measure active and retained memory separately.
-
-Check whole-tile pairs at both lane offsets, including mixed, partial, and split grants. Compare full logits and recurrent state plus sampled hidden and residual values.
-
-With the 32,768-row budget, check four 8,192-row grants and equal grants with distinct restored starts. Compare scores, target and draft KV and scales, GDN carry and history, hidden, residual, and IDs. Cover unequal grants and mixed decode. Deny 4,096-row workspace at and above the 8,192-row pair limit. Check paired fallback at the limit, causal and ordinary fallback above it, and recovery. Record groups and active and retained GPU memory.
-
-Check grant sizes and admission/decode overlap before attributing serving gains to pairing. [Frozen K0 pairing controls](https://github.com/para1lel/sglang.cpp/blob/4dd8c887c278c67744ed80e7feb2a825a92197a2/docs/native-prefill-workspace.md#verification)
+Fix admissions and grants. Compare scores, KV and scales, GDN carry and history, hidden and residual values, IDs, and terminal records. Include singleton, unequal, trailing, split, restored, and mixed decode grants, both offsets of whole-tile pairs, two 256-row K0 grants, and four 8,192-row grants under the 32,768-row budget. Deny grouped scratch, including 4,096-row workspace at and above the 8,192-row pair limit. Require paired fallback at the limit, causal and ordinary fallback above it, and recovery. Measure active and retained memory separately.
 
 ### TP2 paired prefill replay
 
-Compare both ranks’ state and first-token logits, proposal and acceptance histories, and ranked cache objects including rank 0 draft data. Force allocation pressure on each rank. Require reference first tokens and zero used and reserved transient pool bytes after synchronization. [Frozen direct and ranked HTTP replays](https://github.com/para1lel/sglang.cpp/blob/a5974ba4eb99bd8e8f890c2e7262a27dbc3aace1/docs/native-prefill-workspace.md#tp2-paired-prefill-replay)
+Compare state and first-token logits on both ranks, proposals and acceptances, and ranked cache objects including root draft data. Apply allocation pressure to each rank and require zero transient pool bytes used or reserved after synchronization.
 
-### TP2 grouped RMSNorm replay
+<a id="tp2-grouped-rmsnorm-replay"></a>
+<a id="tp2-causal-gqa-operator-replay"></a>
+<a id="tp2-grouped-gateup-replay"></a>
+<a id="tp2-packed-qkv-replay"></a>
+<a id="tp2-grouped-attention-output-replay"></a>
+<a id="tp2-long-down-projection-replay"></a>
 
-Compare BF16 and quantized tensors and teacher scores on both ranks, including forced FP8 projection fallback. [Frozen two-B200 tile replay](https://github.com/para1lel/sglang.cpp/blob/a5974ba4eb99bd8e8f890c2e7262a27dbc3aace1/docs/native-prefill-workspace.md#tp2-grouped-rmsnorm-replay)
+Compare both rank shards for grouped RMSNorm, causal GQA, gate/up, packed QKV, attention output, and the long down projection. Match BF16 tensors, quantized values and scales, and teacher logits where arithmetic is preserved. Exercise eager, replay, clean fallback, and injected submission failures. Include zero and nonzero cached rows, two 4,096-row grants, and 4,096/1,024-row down with a 1,004-row decline. Check committed state and MTP continuation after priming.
 
-### TP2 causal GQA operator replay
-
-Compare BF16 staged-reader outputs across both rank shards with fixed Q and KV, including eager and replay. Compare rotated Q/K, KV planes and scales, activation codes and scales, and projection output. Check zero and nonzero already-visible rows and propagate injected staged-reader and epilogue errors. [Frozen W4/W5 shard, preprocessing, and caller probes](https://github.com/para1lel/sglang.cpp/blob/a5974ba4eb99bd8e8f890c2e7262a27dbc3aace1/docs/native-prefill-workspace.md#tp2-causal-gqa-operator-replay)
-
-### TP2 grouped gate/up replay
-
-Compare full BF16 outputs of [4,096-row gate/up](fp8-prefill-projections.md#large-prefill-tiles) on both shards, then compare hidden and residual state, IDs, and acceptance after direct W4 priming. [Frozen operator and caller replay](https://github.com/para1lel/sglang.cpp/blob/a5974ba4eb99bd8e8f890c2e7262a27dbc3aace1/docs/native-prefill-workspace.md#tp2-grouped-gateup-replay)
-
-### TP2 packed QKV replay
-
-Compare BF16 logits, both rank states, and MTP continuation after two 4,096-row grants. [Frozen two-B200 direct replay](https://github.com/para1lel/sglang.cpp/blob/a5974ba4eb99bd8e8f890c2e7262a27dbc3aace1/docs/native-prefill-workspace.md#tp2-packed-qkv-replay)
-
-### TP2 grouped attention output replay
-
-Compare full BF16 outputs of the [3,072-input route](fp8-prefill-projections.md#large-prefill-tiles) on early and late W4/W5 rank captures. Check eager, graph, and clean fallback, plus hidden and residual state, IDs, and acceptance at the caller. [Frozen operator and direct priming replays](https://github.com/para1lel/sglang.cpp/blob/a5974ba4eb99bd8e8f890c2e7262a27dbc3aace1/docs/native-prefill-workspace.md#tp2-grouped-attention-output-replay)
-
-### TP2 long down projection replay
-
-Compare BF16 down outputs, E4M3 SwiGLU values, and FP32 scales bitwise in eager, replay, and forced fallback. Use 4,096 and 1,024 rows, and test the 1,004-row shape decline. Time from residual reset and RMSNorm through down projection, including scale preparation. [Frozen rank inputs, timing, and fallback receipts](https://github.com/para1lel/sglang.cpp/blob/a5974ba4eb99bd8e8f890c2e7262a27dbc3aace1/docs/native-prefill-workspace.md#tp2-long-down-projection-replay)
+[Full replay matrix and pinned receipts](https://github.com/para1lel/sglang.cpp/blob/5ee79416d3e30cd178abab69598d047c4393793d/docs/native-prefill-workspace.md#verification)

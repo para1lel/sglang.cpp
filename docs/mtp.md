@@ -114,24 +114,13 @@ If a constrained draft row has no valid winner, drafting stops and the target ca
 
 Run the [MTP acceptance procedure](../tests/mtp/README.md) with both release binaries, the pinned checkpoint, and a reserved B200. Require exit status zero. Match target dispatch and prompt tiles for the K0 control. Compare default generation with explicit K4. Check IDs, finish reasons, usage, and SSE at wider capacities. For seed parity, pass a row-wise seed generator with the same target verifier to `--reference-generate`. [Runner](../tests/mtp/run_native.py#L1)<!-- prefix: "\"\"\"Opt-in re" -->
 
-Compare full BF16 rows bitwise and winner IDs and scores exactly against per-lane scoring in waves of two, three, and four. Cover ties across tiles and nonfinite inputs. Trace both grouped argmax launches in eager and graph modes. Require mapped winner writes without copies, working per-lane fallback, and BF16 retry.
+Compare grouped argmax with per-lane scoring at widths two through four. Require identical BF16 rows, winners, and scores through ties and nonfinite inputs. Trace both launches, mapped writes without copies, per-lane fallback, and BF16 retry in eager and graph modes.
 
-Compare paired RMSNorm and key-only preprocessing with the single-row operations. At matched compute boundaries, compare full logits, final-normalized rows, target state, and draft KV where arithmetic agrees. Check subsequent draft and verifier logits. Exercise 1, 127, 128, 129, and 257 positions and a longer multi-tile prompt. Cover cold and restored prompts, media, and scored generation. Keep the K0 graph control. Disconnect during prefill and verify queued-request parity after retirement. [Paired RMSNorm](../src/text_normalization.cu#L479)<!-- prefix: "cudaError_t " --> · [Key preprocessing](../src/text_attention_gqa.cu#L278)<!-- prefix: "cudaError_t " -->
+Compare paired RMSNorm, key preprocessing, paired K/V projection, and TMA seed FC with their single-row, per-slice, and WMMA controls. Require byte parity where arithmetic is preserved, including target state, draft KV, and subsequent logits. Cover positions 1, 127, 128, 129, and 257, long and partial tiles, prefix restore, media, and scores. Trace one paired projection and append per multi-row B200 seed tile. Inject the second-slice seed launch failure and verify prefix advance only through the first slice, retirement, and replacement. Check pre-submission WMMA fallback and boundary SIMT.
 
-Compare paired K and V BF16 projections byte for byte with the exact per-slice
-projections before key preprocessing. Trace one paired projection and one
-append per multi-row B200 seed tile. Include a prefix restore and a tile with
-a partial final slice. Inject a seed FC launch error in the second slice.
-Check that the first slice extends the draft prefix, the failed request retires,
-and the batch admits a replacement.
+Check zero, partial, and full acceptance against row-wise verification, including logits, target KV and GDN, rewind, KV crossings, mixed depths, and exact score capacity. At widths 8, 16, and 32, compare dense drafting with four-lane drafting at fixed grants and target dispatch. Compare draft drift separately from committed target state on fixed histories. Exercise full and sparse depths, clean decline, hard errors, and replacement. Use the [wide projection controls](fp8-prefill-projections.md#wide-verifier-checks).
 
-Compare TMA seed FC output byte for byte with WMMA at every eligible row count. Trace TMA launches and check WMMA fallback before submission, SIMT at the row boundaries, and retirement after a launch error.
-
-Compare BF16 logits, normalized rows, target KV, and GDN with row-wise eager verification through zero, partial, and full acceptance. Check draft KV and continuation after rewind, KV crossings, mixed depths, and the exact GQA score-capacity boundary. Reset a lane and check retained and replacement streams. Require zero request bytes after retirement. Check recovery from result-sync failure and real launches for K0 and positive-K graphs. Use the [wide projection controls](fp8-prefill-projections.md#wide-verifier-checks) for 40-, 80-, and 160-row routes.
-
-At widths 8, 16, and 32, compare dense draft with four-lane controls at fixed grants and target dispatch. Cover full and sparse proposal and repair depths. Dense BF16 FC can change draft KV and acceptance. On fixed histories, compare draft projections and KV separately from target state and continuation IDs. Check clean setup decline, error propagation, and replacement.
-
-At server capacity 32, check K1 with more than four verifying lanes. Check sparse slot selections. Match committed IDs, finish reasons, and usage against same-policy controls. Check the combined target-row count against the step cap. Include a lane that receives one verification row and makes zero proposals. Check final-token eager decode, zero-budget completion, and reset recovery. Run [performance measurement](performance.md#native-mtp) separately.
+At capacity 32, check K1 with more than four verifying lanes and sparse slot selections. Match committed IDs, finish, and usage. Enforce the target-row cap, including zero proposals on a one-row grant. Check final-token eager decode, zero budget, reset recovery, and zero bytes after retirement. [Full MTP probe matrix](https://github.com/para1lel/sglang.cpp/blob/5ee79416d3e30cd178abab69598d047c4393793d/docs/mtp.md#verification) · [Timing](performance.md#native-mtp)
 
 ### Verification graph checks
 

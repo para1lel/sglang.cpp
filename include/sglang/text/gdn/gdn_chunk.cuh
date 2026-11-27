@@ -231,9 +231,10 @@ inline bool eligible(int count, const void* scratch, std::size_t bytes) {
 template <typename S>
 inline constexpr int recurrence_warps = std::is_same_v<S, GdnLocal> ? 4 : warp_mma::block_warps;
 
-template <typename S, bool StageValues = false>
+template <typename S, bool StageValues = false, bool Pipelined = false>
 inline constexpr auto recurrence_kernel =
-    warp_mma::recur_warp<S, recurrence_warps<S>, std::is_same_v<S, GdnLocal>, StageValues>;
+    warp_mma::recur_warp<S, recurrence_warps<S>, std::is_same_v<S, GdnLocal>,
+                        StageValues, Pipelined>;
 
 template <typename S>
 inline constexpr bool stage_values(int count) {
@@ -241,7 +242,8 @@ inline constexpr bool stage_values(int count) {
 }
 
 template <typename S = GdnFull>
-inline cudaError_t configure(bool& enabled, bool grouped = false, bool* staged_values = nullptr) {
+inline cudaError_t configure(bool& enabled, bool grouped = false, bool* staged_values = nullptr,
+                             bool* pipelined = nullptr) {
     int device = 0, major = 0, minor = 0;
     auto status = cudaGetDevice(&device);
     if (status == cudaSuccess) {
@@ -274,6 +276,14 @@ inline cudaError_t configure(bool& enabled, bool grouped = false, bool* staged_v
                 return cudaSuccess;
             }
             *staged_values = *staged_values && shared_limit >= warp_mma::value_shared_bytes;
+            if (pipelined) {
+                *pipelined = *staged_values && shared_limit >= warp_mma::pipeline_shared_bytes;
+                if (*pipelined) {
+                    return cudaFuncSetAttribute(recurrence_kernel<S, true, true>,
+                        cudaFuncAttributeMaxDynamicSharedMemorySize,
+                        warp_mma::pipeline_dynamic_bytes);
+                }
+            }
             if (*staged_values) {
                 return cudaFuncSetAttribute(recurrence_kernel<S, true>,
                     cudaFuncAttributeMaxDynamicSharedMemorySize, warp_mma::value_dynamic_bytes);
@@ -285,7 +295,7 @@ inline cudaError_t configure(bool& enabled, bool grouped = false, bool* staged_v
                                 warp_mma::dynamic_bytes);
 }
 
-template <typename S, bool StageValues>
+template <typename S, bool StageValues, bool Pipelined = false>
 inline cudaError_t launch_chunk(int count, const Bf16* convolved, const float2* gates,
                                 void* scratch, float* recurrent, Bf16* observable,
                                 cudaStream_t stream) {
@@ -299,18 +309,24 @@ inline cudaError_t launch_chunk(int count, const Bf16* convolved, const float2* 
         return status;
     }
     void* recur_args[] = {&count, &convolved, &matrices, &recurrent, &observable};
+    constexpr int recurrence_threads = recurrence_warps<S> * (Pipelined ? 64 : 32);
+    constexpr int shared = Pipelined ? warp_mma::pipeline_dynamic_bytes :
+                           StageValues ? warp_mma::value_dynamic_bytes : warp_mma::dynamic_bytes;
     return cudaLaunchKernel(
-        recurrence_kernel<S, StageValues>,
+        recurrence_kernel<S, StageValues, Pipelined>,
         dim3(S::value_heads, dimension / (warp_mma::columns * recurrence_warps<S>)),
-        dim3(recurrence_warps<S> * 32), recur_args,
-        StageValues ? warp_mma::value_dynamic_bytes : warp_mma::dynamic_bytes, stream);
+        dim3(recurrence_threads), recur_args, shared, stream);
 }
 
 template <typename S = GdnFull>
 inline cudaError_t launch(int count, const Bf16* convolved, const float2* gates,
                           void* scratch, float* recurrent, Bf16* observable,
-                          cudaStream_t stream, bool staged_values) {
+                          cudaStream_t stream, bool staged_values, bool pipelined) {
     if constexpr (std::is_same_v<S, GdnLocal>) {
+        if (pipelined) {
+            return launch_chunk<S, true, true>(count, convolved, gates, scratch, recurrent,
+                                               observable, stream);
+        }
         if (staged_values) {
             return launch_chunk<S, true>(count, convolved, gates, scratch, recurrent, observable,
                                          stream);

@@ -12,12 +12,7 @@ GPU=1 bash benchmarks/vllm/run.sh benchmarks/vllm/small-fp8.json
 
 ## Environment
 
-`setup.sh` provisions `/data1/shared/dongwu.chen/environments/vllm-81a8cb063e62` with a detached
-source checkout, a CPython 3.12 virtual environment, and official Linux x86-64 wheels. It checks
-the upstream commit-specific CUDA 13.2 index, artifact digests, installed vLLM version, and
-dependency compatibility. `constraints.txt` pins the resolved transitive package versions.
-`wheel.sha256` pins the two directly installed wheels. `freeze.txt` and `native.sha256` in the
-environment record the installed packages and the hashes of vLLM shared objects.
+`setup.sh` provisions `/data1/shared/dongwu.chen/environments/vllm-81a8cb063e62` with a detached source checkout and CPython 3.12 venv. It checks the commit-specific CUDA 13.2 index for the vLLM wheel, fetches that commit wheel from `wheels.vllm.ai`, and fetches the PyTorch wheel separately from `download-r2.pytorch.org`. It verifies both digests, the installed vLLM version and dependency compatibility. `constraints.txt` and `wheel.sha256` pin dependencies and direct wheels. The environment keeps installed package versions and shared-object hashes in `freeze.txt` and `native.sha256`.
 
 | Component | Identity |
 | --- | --- |
@@ -28,32 +23,13 @@ environment record the installed packages and the hashes of vLLM shared objects.
 | Local checkpoint | `/data0/shared/Qwen3.8-27B-FP8`, `Qwen3_5ForConditionalGeneration` |
 | Checkpoint manifest SHA-256 | `b54fe44144f1701a9369e8b912997ee5cab77cd176c8f97ad3fe63e78cf3c303` |
 
-Setup uses `git`, `curl`, `jq`, `flock`, and `uv` from the host. Every package installation names
-the isolated interpreter explicitly. Network access defaults to `http://127.0.0.1:7890`
-and accepts the usual HTTP, HTTPS, and all-proxy environment overrides.
-The runner verifies the provisioned wheel and native vLLM hashes and hashes the local checkpoint
-before loading. It sets Hugging Face offline mode. vLLM and kernel libraries can download
-or compile kernels during initialization. The runner keeps generated kernels, autotuning data,
-and temporary files in the run directory. It seeds the cache from
-`/data1/shared/dongwu.chen/cache/vllm-81a8cb063e62` when present. Set `VLLM_RUNS_DIR` to
-save runs outside the provisioned environment's `runs/` directory.
+Setup uses host `git`, `curl`, `jq`, `flock` and `uv` with the isolated interpreter. Proxy access defaults to `http://127.0.0.1:7890` and accepts HTTP, HTTPS and all-proxy environment overrides. The runner verifies wheel, native binary and checkpoint hashes before loading, sets Hugging Face offline mode and keeps generated kernels, autotuning and temporary files in the run directory. It seeds from `/data1/shared/dongwu.chen/cache/vllm-81a8cb063e62` when present. `VLLM_RUNS_DIR` overrides the environment's `runs/` directory.
 
 ## Small workload
 
-`small.json` supplies the five token IDs for `The capital of France is`. The engine accepts IDs
-directly and returns greedy token IDs without detokenization. One resident eager engine serves
-one warmup and one measured serial request, each with eight output tokens, EOS
-ignored, prefix caching disabled, and seed 0. Both calls must complete at the
-requested length and produce the same IDs. The text-only path uses checkpoint
-FP8 weights, BF16 activations, tensor parallelism 1, a 256-token context, and a
-1 GiB KV cache allocation.
+[`small.json`](small.json#L2)<!-- prefix: "\"prompt_toke" --> sends five direct token IDs and returns IDs without detokenization. The eager TP1 FP8-weight/BF16-activation engine uses a 256-token context and 1 GiB KV cache. One warmup and one measured request must each return the same eight greedy IDs and finish at length, with EOS ignored, seed 0 and prefix caching off.
 
-Latency starts immediately before `LLM.generate` and ends when it returns the
-completed request. It includes scheduling, prefill, and decode. Model loading,
-checkpoint hashing, and the warmup occur outside the measured request. The
-runner divides eight output tokens by that request's duration. The run directory
-keeps the timing, IDs, settings, engine log, and device snapshots. The runner
-enforces a ten-minute timeout and preserves the log and exit status on failure.
+Measure scheduling, prefill and decode inside `LLM.generate` after loading and warmup. Throughput is eight tokens divided by the measured request duration. The ten-minute timeout preserves logs and exit status on failure. Run evidence includes settings, IDs, timing, logs and GPU snapshots.
 
 ## FP8 comparator
 
@@ -72,32 +48,13 @@ TRTLLM-GEN for its first GQA step and prefill for its first GDN step. With a mul
 prompt and one output token, GQA and GDN only exercise prefill. Unused GQA phases report
 zero calls with `null` for the entry and backend.
 
-[small-fp8-result.json](small-fp8-result.json#L1)<!-- prefix: "{" -->
-preserves `run.cctk0V`, measured on
-GPU 1 (`GPU-9a94015a-6a0d-1ae1-82db-b6736b77562e`) on November 18, 2026. The seven
-samples yielded **26.0176 output tokens/s** and **307.766493 ms** median request
-latency, with a range of 305.747803–308.984207 ms. The archive includes the runtime
-identity and hashes of the original raw evidence under `artifacts/decoder-oracle/run.cctk0V/`.
-That run used `small.json` with the FP8 engine options applied separately. The standalone FP8
-fixture records the same options and observed IDs. The stored samples use the
-original two-warmup, seven-measurement schedule.
+[FP8 result](small-fp8-result.json#L1)<!-- prefix: "{" --> preserves `run.cctk0V`, including the historical two-warmup, seven-measurement result and raw-evidence hashes. [Frozen two-warmup, seven-measurement revision](https://github.com/para1lel/sglang.cpp/blob/e681f90867aa9c59bb0c11bf0e796557f36ce088/benchmarks/vllm/README.md#fp8-comparator)
 
 ## Historical BF16 result
 
 Run the BF16 diagnostic with `GPU=1 bash benchmarks/vllm/run.sh benchmarks/vllm/small.json`.
 
-On November 18, 2026, `run.GeXtAT` exited 0 on GPU 1. All nine requests returned the same eight
-greedy token IDs. The seven timed requests emitted 56 tokens in 2.16324338 seconds, yielding
-**25.8871 output tokens/s**. Median whole-request latency was **309.060392 ms**, with a range
-of 307.310171–310.591344 ms. The portable `small-result.json` includes all samples, IDs, and
-runtime settings verified against the engine log. The log reports 27.55 GiB for model loading
-and 1.0 GiB explicitly reserved for the BF16 KV cache. The cache held 1,216 tokens.
-
-The raw files are under the environment's `runs/run.GeXtAT/` directory. The engine logged a
-chat-template warmup warning because this token-ID fixture skips tokenizer initialization.
-The earlier `runs/run.sxPaAx/` attempt generated a result and exited 127 during the launcher's
-final print step. That directory retains its exit status and the original combined output in
-`engine-and-launcher.log`. The reported samples come exclusively from `run.GeXtAT`.
+[BF16 result](small-result.json#L1)<!-- prefix: "{" --> preserves the successful `run.GeXtAT` samples, IDs and runtime. [Frozen run and failure notes](https://github.com/para1lel/sglang.cpp/blob/e681f90867aa9c59bb0c11bf0e796557f36ce088/benchmarks/vllm/README.md#historical-bf16-result)
 
 ## Pairing with sglang.cpp
 

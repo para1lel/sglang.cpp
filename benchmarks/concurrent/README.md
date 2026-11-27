@@ -7,12 +7,7 @@
 | W5 | 32,768 | 4,096 | 32 | 864 / 2,620 |
 | W6 | 131,072 | 1,024 | 4 | 344 / 2,620 |
 
-The frozen vLLM run completed all four rows on B200
-`GPU-7e25f95a-29b7-9f94-ce9a-2a2871cf7c0c`. A paired comparison uses that physical GPU.
-The 280 timed requests emitted 778,240 IDs, all with a `length` finish and zero cached prompt
-tokens. All 112 warmup and 56 diagnostic requests also matched their exact lane goldens.
-The reference represents vLLM results. Candidate performance and correctness remain unmeasured
-by this publication.
+The November 18 vLLM reference uses B200 `GPU-7e25f95a-29b7-9f94-ce9a-2a2871cf7c0c`. Pair on that physical GPU. All 280 timed requests finished with `length`, zero cached tokens and exact lane goldens, as did the warmup and diagnostic cohorts. [Frozen capture details](https://github.com/para1lel/sglang.cpp/blob/aab1101e145507c4c40435602e3a2d3c5d88111d/benchmarks/concurrent/README.md)
 
 ## Regenerate and measure
 
@@ -58,87 +53,18 @@ The summary also reports request and input-plus-output rates.
 
 ## Conditions and gates
 
-The [reference](gpu2-reference.json#L2)<!-- prefix: "\"format\": \"s" -->
-records the exact launch arguments, runtime identities, checkpoint hash, live scheduler and
-cache settings, profile signatures, and full-precision gates.
-Use the vLLM pin `81a8cb063e6247fe254d7caf7e98a6691d71022a`, BF16 Q, and per-tensor E4M3 K/V
-with FP32 unit scales. Disable prefix caching, MTP, and KV and weight offload. Use one
-device and BF16 GDN convolution with FP32 recurrence. The baseline used 8,192 scheduled
-tokens, 32 sequence slots, and 132,096 maximum sequence length. It allocated
-137,415,884,800 bytes of physical KV backing, including one reserved page.
+The [reference](gpu2-reference.json#L2)<!-- prefix: "\"format\": \"s" --> stores launch arguments, runtime and checkpoint identities, scheduler, KV backing, profiles and full-precision cutoffs.
 
-vLLM used `FULL_AND_PIECEWISE` CUDA graphs with compile mode `NONE` and `enforce_eager=false`.
-The separate diagnostic cohort profiled four initial steps and four full-batch decode
-steps per row. Profile replay checks FlashInfer FA2 paged GQA and Blackwell chunked GDN
-in prefill, with TRTLLM-Gen GQA in any mixed steps. Full decode uses TRTLLM-Gen GQA and
-packed recurrent GDN. Establish effective hardware, cache, and dispatched
-backend conditions independently for any paired run.
-Use native MXFP8 KV for the candidate as specified by the project benchmark contract.
+Use vLLM `81a8cb063e6247fe254d7caf7e98a6691d71022a`, one device, BF16 Q, E4M3 K/V with FP32 unit scales, BF16 GDN convolution and FP32 recurrence. Disable prefix caching, MTP and KV/weight offload. The reference used 8,192 scheduled tokens, 32 sequence slots, a 132,096-token context and `FULL_AND_PIECEWISE` with compile mode `NONE` and `enforce_eager=false`. Independently verify hardware, KV backing, native MXFP8 and dispatch. Check FlashInfer FA2 and chunked GDN in prefill, TRTLLM-Gen GQA in mixed steps and decode, and packed recurrent GDN in full decode. [Frozen scheduler and profiles](https://github.com/para1lel/sglang.cpp/blob/aab1101e145507c4c40435602e3a2d3c5d88111d/benchmarks/concurrent/README.md#conditions-and-gates)
 
-The standalone client checks the measured cohort against the frozen thresholds
-and reports failure on a miss. The archived capture used two warmups and five
-measured cohorts. Its replay checks the original wire and timing gates.
-
-Require median cohort output IDs/s to **strictly exceed** the baseline median times
-`1 + max(0.01, 2 × sample SD / median)`. Require each request-level p95 to stay at or
-below its baseline p95 plus `max(1% × p95, 2 × sample SD)`. Interpolate at `(n−1) × p`
-and pool measured requests for latency. The 1% throughput floor governed all four
-rows. W4 and W6 TTFT caps exceed their respective E2E caps because the independent
-TTFT samples have larger spreads. Both caps still apply. JSON holds the unrounded
-numbers, and replay derives them from the original samples.
-
-| Row | Median output IDs/s must exceed | TTFT p95 cap (ms) | TPOT p95 cap (ms) | E2E p95 cap (ms) |
-| --- | ---: | ---: | ---: | ---: |
-| W3 | 383.319743 | 2,234.493277 | 11.000384 | 10,903.335753 |
-| W4 | 358.722515 | 50,226.957122 | 59.994477 | 46,590.145259 |
-| W5 | 886.518814 | 99,323.812404 | 43.649717 | 150,758.159149 |
-| W6 | 48.709172 | 113,118.073927 | 104.925433 | 85,806.011537 |
+The standalone client fails if the measured cohort misses any stored gate. Median cohort output IDs/s must exceed the baseline median multiplied by `1 + max(0.01, 2 × sample SD / median)`. Each pooled request p95 for TTFT, TPOT and E2E must be at most the baseline p95 plus `max(0.01 × p95, 2 × sample SD)`. Interpolate at `(n−1) × p`. Use the unrounded JSON values. Archived replay checks two warmups and five measured cohorts and derives the cutoffs from measured samples.
 
 ## Corpus registration
 
-V1 was registered on November 18, 2026 at 13:28:35 UTC with exact lane repeatability
-as a prerequisite. Two W3 exploratory warmups completed. Lane 0 first diverged at
-zero-based output index 11, emitting 264 versus 279. Across the 1,024 positions,
-1,013 differed. The other three lanes matched. V1 contributed zero measured cohorts.
-
-V2 included the checkpoint's no-thinking assistant prefill so the requested repeated
-text began outside the reasoning turn. It was registered at 13:30:04 UTC before its
-warmups. The first measured cohort began at 13:30:26.464082 UTC. The policy file was
-byte-identical in both registrations. V2 met the exact-repeat criterion in every
-warmup, measured, and diagnostic cohort. Row gates froze at 13:37:14.448140,
-13:38:57.191827, 13:59:10.887623, and 14:10:35.670787 UTC, respectively, before any
-paired candidate measurements. The repetitive continuation narrows the test's
-coverage. Exact candidate agreement on this corpus would leave open agreement on
-less constrained or numerically sensitive continuations, including V1 reasoning.
+V2 froze before measurement and uses the checkpoint's no-thinking assistant prefill. Its exact repeatability covers the authored repetitive continuations. V1 failed that prerequisite and contributed no measured cohorts. [Frozen registration and row receipts](https://github.com/para1lel/sglang.cpp/blob/aab1101e145507c4c40435602e3a2d3c5d88111d/benchmarks/concurrent/README.md#corpus-registration)
 
 ## Provenance and offline replay
 
-The generator contains original synthetic fixture prose. The compact goldens contain
-observed numeric output IDs. The loader joins string chunks in order to recover the exact
-base64 payloads, kernel signatures, profiler argument, and offload configuration. The
-profiles refer to the shared kernel name list by zero-based index. The golden payloads
-decode to lane-major, little-endian unsigned 32-bit IDs and are checked against a digest
-of the full decoded sequence. Checkpoint weights and tokenizer files are separate inputs.
-The captured checkpoint distribution includes the Apache 2.0 `LICENSE` and a model card
-for attribution.
-vLLM and its runtime dependencies retain their own distribution terms.
+The [fixture manifest](fixture-manifest.json#L3)<!-- prefix: "\"tokenizer_s" --> pins the tokenizer and request digests. Concatenate the golden base64 chunks in order and decode lane-major little-endian `uint32` IDs. The loader checks the decoded digest. Checkpoint weights and tokenizer files are separate inputs. [Frozen encoding and provenance](https://github.com/para1lel/sglang.cpp/blob/aab1101e145507c4c40435602e3a2d3c5d88111d/benchmarks/concurrent/README.md#provenance-and-offline-replay)
 
-The capture input tree was `5a83bcc0d7aba2ac1ccbf476818b635c68208cf5`. This publication
-uses `5119e6436892a28553b3cfae55e7b648176d548d`. Checkpoint cleanup leaves the tracked
-reference and fixture generator. Offline replay requires a separately retained copy of
-the original `gpu2.20261118T1319Z-evidence.tar.gz`. Check its SHA-256 against
-`archive.bundle_sha256` before extracting. The archive contains raw cohorts, counters,
-profiles, and the original launch and worker observer sources.
-
-A fresh live run can regenerate the fixtures, evidence, and warmed runtime cache on
-the pinned checkpoint, runtime, and GPU using the recorded launch settings. The
-original launcher used `concurrent_observer.py` and seeded its cache from the earlier
-W1/W2 run. Repeating that setup requires the original launcher and observer from a
-separate copy of the capture sources and the W1/W2 seed cache.
-
-Extract and verify the bundle using the [archived offline replay procedure](https://github.com/para1lel/sglang.cpp/blob/acbf95b0de14108b37c37bdc3dc40daaf2db2099/benchmarks/concurrent/README.md#provenance-and-offline-replay).
-Run the checker from that revision and pass it the extracted bundle directory.
-
-Replay checks raw cohort and trace digests, exact requests and outputs, overlap,
-latencies, full-precision gate arithmetic, and scheduler and kernel dispatch. The
-bundle's `files.sha256` supports checking the remaining archived evidence as well.
+Replay requires a separately retained `gpu2.20261118T1319Z-evidence.tar.gz`. Check `archive.bundle_sha256`, extract the bundle and pass its directory to the checker from the [archived replay revision](https://github.com/para1lel/sglang.cpp/blob/acbf95b0de14108b37c37bdc3dc40daaf2db2099/benchmarks/concurrent/README.md#provenance-and-offline-replay). It checks raw digests, exact requests and outputs, overlap, latency, gate arithmetic, scheduler and kernel dispatch. `files.sha256` covers the remaining evidence.

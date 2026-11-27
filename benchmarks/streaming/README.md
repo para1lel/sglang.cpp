@@ -5,11 +5,12 @@
 | W1 | 128 | 128 | 1 |
 | W2 | 2,048 | 512 | 1 |
 
-The JSON token lists are the inputs. Both come from scripted English prose,
-encoded with the frozen local checkpoint `tokenizer.json` and truncated by token
-position. `freeze_fixtures.py` records the source text and verifies the tokenizer
-hash. Direct IDs remove any dependency on a tokenizer or chat template in either
-server. No special tokens or chat expansion are applied to the prompts.
+Send the exact [W1](W1.json#L3)<!-- prefix: "\"prompt_toke" --> and [W2](W2.json#L3)<!-- prefix: "\"prompt_toke" --> JSON IDs directly. To regenerate from scripted English prose, use the frozen checkpoint tokenizer with `tokenizers` installed. The generator checks its hash and truncates by token position without special tokens or template expansion.
+
+```sh
+mkdir -p "$FIXTURES"
+python -B benchmarks/streaming/freeze_fixtures.py "$CHECKPOINT/tokenizer.json" "$FIXTURES"
+```
 
 ## Wire contract
 
@@ -27,83 +28,25 @@ even if its output ID array is empty. The final choice reports
 `finish_reason="length"` and may also carry token IDs. Send a subsequent usage frame with `choices=[]`,
 `usage.prompt_tokens`, `usage.completion_tokens`, and
 `usage.prompt_tokens_details.cached_tokens=0`. End with `data: [DONE]`.
-The client validates all lengths, the prompt echo, usage, and completion reason.
-It compares the complete emitted ID sequence across repetitions and against the
-baseline when `--reference` is supplied. The reference also checks client,
-fixture and request hashes and reports the measured throughput ratio.
+The client validates lengths, prompt echo, usage and finish, and compares exact greedy IDs across repetitions and against `--reference`. It checks fixture, request and client digests, with a client digest exception for the exact published GPU3 reference.
 
 ## Frozen measurement protocol
 
-Live collection runs one warmup and one measured round. Each round sends W1,
-then W2. Submit the next request after storing the previous request's events.
-The measured round supplies the point estimates. The archived GPU3 capture
-used three warmup and nine measured rounds.
-Each request uses a fresh localhost HTTP connection. Set GPU visibility to the
-selected physical UUID. Keep the prefix cache disabled for startup, warmup,
-measurement, and dispatch observation. Preserve all attempts without retries
-or outlier removal. Start measurements after server health and warmups.
+Run one warmup and one measured round, each in W1–W2 order. After server health, submit on fresh loopback connections, saving each attempt before the next. Use the selected physical GPU UUID and keep prefix reuse off during startup, warmup, timing and dispatch observation. Preserve all attempts without retries or outlier removal.
 
-All timestamps use the client process's `perf_counter_ns`. Submission is
-immediately before the HTTP connection and send. A frame takes the timestamp
-of the HTTP-body read that completes it. Frames completed by the same read
-share a timestamp. IDs in one frame also share that timestamp. Empty frames
-have no token time. TTFT runs to the first observed ID. TPOT divides the
-first-to-last ID interval by the actual output count minus one. E2E runs to
-`[DONE]`. Output tokens/s divides the useful output count by E2E seconds.
-Raw JSONL includes the SSE lines, read timestamps, output IDs, counts, and
-failures. Disk writes happen between requests.
+Use the client’s `perf_counter_ns`, starting just before connect and send. A frame and its IDs take the timestamp of the HTTP body read that completed it. Empty frames add no token timestamp. TTFT runs to the first ID. TPOT divides first-to-last ID time by output count minus one. E2E runs to `[DONE]`, and output tokens/s divides the output count by E2E seconds. Raw JSONL keeps SSE, read times, IDs, counts and failures.
 
-`--reference` applies saved thresholds when the reference includes them. A
-reference captured with one measured round supplies a throughput ratio.
-
-The original GPU3 protocol used the following statistics and limits.
-
-Report median and range of throughput, and p50/p95 per-request latencies
-using linear interpolation at `(n - 1) × p`. Compute sample standard deviation
-over all nine measurements for each metric. For each workload, require
-candidate median throughput divided by baseline median throughput to strictly
-exceed `1 + max(0.01, 2 × baseline throughput stdev / baseline median throughput)`.
-Each candidate p95 latency must be at or below baseline p95 plus
-`max(0.01 × baseline p95, 2 × baseline latency stdev)`. These are engineering
-noise allowances with a 1% floor. Accept a workload only when every request
-passes the stream and greedy ID checks and the hardware and runtime policies
-match the comparison contract.
+When `--reference` has thresholds, require valid streams, a median throughput ratio strictly above `1 + max(0.01, 2 × baseline sample SD / baseline median)` and each p95 latency at most baseline p95 plus `max(0.01 × baseline p95, 2 × baseline sample SD)`. Use the unrounded limits. The archived three-warmup, nine-measurement protocol uses sample standard deviations and interpolates p95 at `(n−1) × p`. A one-round reference without thresholds reports the ratio.
 
 ## GPU3 reference
 
-`gpu3-reference.json` contains the exact greedy output IDs, summary statistics
-and full-precision thresholds from run `run.unEIDU`, frozen on November 18, 2026
-at 12:47:05 UTC. The run used B200 UUID `GPU-ceeff2f7-3f39-50b4-8d29-576159781b9d`
-and recorded project HEAD `2477f3704986a0e5863e60a13097fe1b7e0cd4c8`.
-
-| Workload | Median output tokens/s | p95 TTFT (ms) | p95 TPOT (ms) | p95 E2E (ms) |
-| --- | ---: | ---: | ---: | ---: |
-| W1 | 115.87776 | 20.90009 | 8.53934 | 1105.11860 |
-| W2 | 114.66872 | 79.49577 | 8.58548 | 4466.23870 |
-
-The reference `manifest` records the checkout's protocol, client and fixture
-SHA-256 hashes. `archive` records the measured versions of those files, the
-measurement summary, the raw events and the evidence bundle. The fixtures
-retain the same token IDs. Both clients produce byte-identical HTTP requests,
-whose SHA-256 hashes are in `manifest.request_sha256`. The checkout client
-enforces the first-choice echo rule. All 24 archived warmup and measured
-streams pass replay with their original recorded timestamps, and both
-archived dispatch traces pass the checkout validator. `verification` records
-the replay count and the dispatch validator and trace hashes. The archive
-retains the original files and output under `artifacts/workload-baselines/run.unEIDU`.
+The [GPU3 reference](gpu3-reference.json#L1)<!-- prefix: "{" --> contains exact greedy IDs, statistics and thresholds from `run.unEIDU` on B200 `GPU-ceeff2f7-3f39-50b4-8d29-576159781b9d`. Its `manifest.protocol_sha256` identifies the [published frozen protocol bytes](https://github.com/para1lel/sglang.cpp/blob/e681f90867aa9c59bb0c11bf0e796557f36ce088/benchmarks/streaming/README.md#frozen-measurement-protocol). The `archive` identifies the measured inputs and evidence bundle. `verification` records 24 replayed streams and both dispatch trace digests. [Frozen evidence details](https://github.com/para1lel/sglang.cpp/blob/aab1101e145507c4c40435602e3a2d3c5d88111d/benchmarks/streaming/README.md#gpu3-reference)
 
 ## Run
 
-Use the [archived GPU3 capture procedure](https://github.com/para1lel/sglang.cpp/blob/acbf95b0de14108b37c37bdc3dc40daaf2db2099/benchmarks/streaming/README.md#run) for the original launcher and its W1 and W2 probes.
-That procedure uses the pinned vLLM environment, a UUID lock, checkpoint
-and wheel identity checks, and a loopback server. It enables the normal
-vLLM graph policy, FlashInfer BF16 queries, E4M3 KV, and BF16/FP32 GDN state.
-It reads live tensor metadata and scales before warmup and collects one
-untimed dispatch profile per workload.
+Use the [archived GPU3 procedure](https://github.com/para1lel/sglang.cpp/blob/e681f90867aa9c59bb0c11bf0e796557f36ce088/benchmarks/streaming/README.md#run) for the original three-warmup, nine-measurement vLLM launch and untimed dispatch probes. Its `measurement/summary.json` records the multi-round results.
 
-For a native server with the wire contract, run
-the checkout client under the same device and host controls. The compact
-reference works without the archived run.
+Run the current client against a native server on the same GPU under the same host controls. The compact reference works without the archived run.
 
 ```sh
 /usr/bin/python3 -IB benchmarks/streaming/client.py \
@@ -111,5 +54,4 @@ reference works without the archived run.
     --reference benchmarks/streaming/gpu3-reference.json
 ```
 
-Use the archived client and fixtures to reproduce the original multi-round run.
-Its `measurement/summary.json` remains evidence for that protocol.
+Use `--fixtures "$FIXTURES"` for a regenerated fixture directory. `--freeze-baseline` records a single-round reference without `--reference`. `--probe W1` or `--probe W2` runs one untimed dispatch probe.

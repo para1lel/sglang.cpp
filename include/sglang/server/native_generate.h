@@ -28,8 +28,8 @@ struct GenerateInput {
     bool batch = false;
     bool text = false;
 
-    std::size_t item_count() const { return count * samples; }
-    bool indexed() const { return batch || samples > 1; }
+    std::size_t item_count() const;
+    bool indexed() const;
 };
 
 GenerateInput parse_generate_input(std::string_view body);
@@ -46,8 +46,7 @@ bool session_control_route(std::string_view path);
 
 class NativeGenerate {
 public:
-    NativeGenerate(BatchService& service, const CompletionTokenizer& tokenizer)
-        : service_(service), tokenizer_(tokenizer) {}
+    NativeGenerate(BatchService& service, const CompletionTokenizer& tokenizer);
 
     QueuedGenerate prepare(std::string_view body);
     QueuedGenerate prepare_ollama(const Socket& connection, std::string_view body, bool json_body,
@@ -59,8 +58,7 @@ private:
     struct Registration;
     struct Session;
     struct SessionTurn {
-        SessionTurn(NativeGenerate& owner, std::shared_ptr<Session> session, std::string id)
-            : owner(owner), session(std::move(session)), id(std::move(id)) {}
+        SessionTurn(NativeGenerate& owner, std::shared_ptr<Session> session, std::string id);
         ~SessionTurn();
         void reserve(const BatchPrompt& item);
         void finish(const DecoderResult& result);

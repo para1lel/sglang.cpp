@@ -2,58 +2,19 @@ import argparse
 import base64
 import collections
 import hashlib
-import http.client
 import json
 import statistics
 from pathlib import Path
-from time import perf_counter_ns
-from urllib.parse import urlsplit
-
-from benchmarks.streaming.check_vllm import audit
-
 
 HERE = Path(__file__).resolve().parent
 NAMES = ("W1-image", "W1-video")
 ARCHIVED_COUNTS = (3, 9)
-SINGLE_ROUND_COUNTS = (1, 1)
-SINGLE_ROUND_PROTOCOL = "media-single-round-v2"
 TOKEN_LIMIT = 128
 ENDPOINT = "/v1/chat/completions"
-TOKENIZE_KEYS = {
-    "model", "messages", "chat_template_kwargs", "add_special_tokens", "add_generation_prompt",
-    "media_io_kwargs", "mm_processor_kwargs",
-}
 
 
 def load(path):
     return json.loads((HERE / path).read_bytes())
-
-
-def write(path, value):
-    path.write_text(json.dumps(value, indent=2, allow_nan=False) + "\n")
-
-
-def connection(url):
-    address = urlsplit(url)
-    assert address.scheme == "http" and address.hostname == "127.0.0.1"
-    return http.client.HTTPConnection(address.hostname, address.port, timeout=180)
-
-
-def json_post(url, path, body):
-    conn = connection(url)
-    start = perf_counter_ns()
-    raw = json.dumps(body, separators=(",", ":")).encode()
-    try:
-        conn.request("POST", path, raw, {"Content-Type": "application/json"})
-        response = conn.getresponse()
-        data = response.read()
-        elapsed_ns = perf_counter_ns() - start
-        if response.status != 200:
-            detail = data[:1000].decode(errors="replace")
-            raise ValueError(f"{path}: HTTP {response.status}: {detail}")
-        return json.loads(data), elapsed_ns
-    finally:
-        conn.close()
 
 
 def read_request(name):
@@ -62,44 +23,6 @@ def read_request(name):
     assert hashlib.sha256(data).hexdigest() == case["request_sha256"]
     assert len(data) == case["request_bytes"]
     return case, data
-
-
-def request(url, phase, cohort, name, raw):
-    events = []
-    record = {"name": name, "phase": phase, "cohort": cohort, "events": events}
-    conn = connection(url)
-    record["submission_ns"] = perf_counter_ns()
-    try:
-        conn.request(
-            "POST", ENDPOINT, raw,
-            {"Content-Type": "application/json", "Accept": "text/event-stream"},
-        )
-        response = conn.getresponse()
-        record["status"] = response.status
-        record["content_type"] = response.getheader("Content-Type")
-        if response.status != 200 or not (record["content_type"] or "").startswith(
-            "text/event-stream"
-        ):
-            raise ValueError(response.read(65536).decode(errors="replace"))
-        pending = b""
-        while True:
-            block = response.read1(65536)
-            now = perf_counter_ns()
-            if not block:
-                raise ValueError("stream closed before [DONE]")
-            pending += block
-            while b"\n\n" in pending:
-                frame, pending = pending.split(b"\n\n", 1)
-                frame = frame.decode("utf-8")
-                events.append([now, frame])
-                if frame == "data: [DONE]":
-                    assert not pending.strip(), pending
-                    return record
-    except Exception as error:
-        record["error"] = f"{type(error).__name__}: {error}"
-        return record
-    finally:
-        conn.close()
 
 
 def validate(record, case, expected=None):
@@ -181,12 +104,7 @@ def percentile(values, probability):
     return ordered[lower] + (index - lower) * (ordered[upper] - ordered[lower])
 
 
-def summarize(samples, output_ids, counts=ARCHIVED_COUNTS):
-    if counts == SINGLE_ROUND_COUNTS:
-        sample, = samples
-        return {"requests": {"warmup": 1, "measured": 1}, "output_ids": output_ids,
-                "finish_reason": "length", "measurement": {key: sample[key]
-                    for key in ("throughput_tps", "ttft_ms", "tpot_ms", "e2e_ms")}}
+def summarize(samples: list[dict[str, float]], output_ids: list[int]) -> dict[str, object]:
     durations = {}
     for metric in ("throughput_tps", "ttft_ms", "tpot_ms", "e2e_ms"):
         values = [result[metric] for result in samples]
@@ -201,8 +119,10 @@ def summarize(samples, output_ids, counts=ARCHIVED_COUNTS):
         for metric, stats in durations.items() if metric != "throughput_tps"
     }
     return {
-        "requests": dict(zip(("warmup", "measured"), counts, strict=True)),
-        "output_ids": output_ids, "finish_reason": "length", "statistics": durations,
+        "requests": dict(zip(("warmup", "measured"), ARCHIVED_COUNTS, strict=True)),
+        "output_ids": output_ids,
+        "finish_reason": "length",
+        "statistics": durations,
         "thresholds": {
             "median_throughput_ratio_strictly_greater_than": 1 + margin,
             "median_throughput_tps_strictly_greater_than": throughput["p50"] * (1 + margin),
@@ -244,102 +164,8 @@ def verify():
         print(f"{name}: verified media, request, input IDs, and {measured} timing rows")
 
 
-def replay(path):
-    cases = {name: read_request(name)[0] for name in NAMES}
-    raw = [json.loads(line) for line in path.read_text().splitlines()]
-    versions = {row.get("protocol") for row in raw}
-    if versions == {SINGLE_ROUND_PROTOCOL}:
-        counts = SINGLE_ROUND_COUNTS
-    elif versions == {None}:
-        counts = ARCHIVED_COUNTS
-    else:
-        raise ValueError("Unknown or mixed media protocols")
-    schedule = [(phase, cohort, name)
-                for phase, rounds in zip(("warmup", "measure"), counts, strict=True)
-                for cohort in range(1, rounds + 1) for name in NAMES]
-    assert [(row["phase"], row["cohort"], row["name"]) for row in raw] == schedule
-    expected = {}
-    failure = []
-    measurements = {name: [] for name in NAMES}
-    for row in raw:
-        name = row["name"]
-        try:
-            result = validate(row, cases[name], expected.get(name))
-            expected.setdefault(name, result["output_ids"])
-            if row["phase"] == "measure":
-                measurements[name].append(result)
-        except Exception as error:
-            failure.append({"name": name, "phase": row["phase"], "cohort": row["cohort"],
-                            "error": f"{type(error).__name__}: {error}"})
-    report = {"failures": failure, "rows": {}}
-    if counts == SINGLE_ROUND_COUNTS:
-        report["protocol"] = SINGLE_ROUND_PROTOCOL
-    _, measured = counts
-    for name in NAMES:
-        samples = measurements[name]
-        if len(samples) == measured and not any(item["name"] == name for item in failure):
-            report["rows"][name] = summarize(samples, expected[name], counts)
-    return report
-
-
-def measure(url, output):
-    output.mkdir()
-    state, _ = json_post(url, "/collective_rpc", {"method": "media_snapshot", "timeout": 90})
-    write(output / "effective-worker.json", state)
-    audit(state)
-    media = state["results"][0]["media"]
-    assert media["model_class"] == "Qwen3_5ForConditionalGeneration"
-    assert media["vision_class"] == "Qwen3_VisionTransformer" and media["vision_depth"] > 0
-    assert media["vision_dtype"] == "torch.bfloat16"
-    assert media["mm_processor_cache_gb"] == 0 and media["max_num_seqs"] == 1
-    fixtures = {}
-    for name in NAMES:
-        case, raw = read_request(name)
-        fixtures[name] = (case, raw)
-        body = {key: value for key, value in json.loads(raw).items() if key in TOKENIZE_KEYS}
-        for repetition in (1, 2):
-            result, elapsed = json_post(url, "/tokenize", body)
-            write(output / f"{name}.tokenize.{repetition}.json", {
-                "body": result, "localhost_round_trip_ns": elapsed,
-            })
-            assert result["tokens"] == case["effective_input_ids"]
-            assert result["count"] == TOKEN_LIMIT
-    stream_path = output / "streams.jsonl"
-    with stream_path.open("x", encoding="utf-8") as rows:
-        for phase in ("warmup", "measure"):
-            for name, (case, raw) in fixtures.items():
-                record = request(url, phase, 1, name, raw)
-                record["protocol"] = SINGLE_ROUND_PROTOCOL
-                rows.write(json.dumps(record, separators=(",", ":")) + "\n")
-                rows.flush()
-                try:
-                    result = validate(record, case)
-                    rate = result["throughput_tps"]
-                    print(name, phase, 1, f"{rate:.2f} tok/s", flush=True)
-                except Exception as error:
-                    detail = f"{type(error).__name__}: {error}"
-                    print(name, phase, 1, "failed:", detail, flush=True)
-    report = replay(stream_path)
-    write(output / "summary.json", report)
-    if report["failures"]:
-        raise SystemExit(f"{len(report['failures'])} streams failed replay")
-    assert len(report["rows"]) == len(NAMES)
-
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("mode", choices=("verify", "measure", "replay"))
-    parser.add_argument("--url", default="http://127.0.0.1:17462")
-    parser.add_argument("--output", type=Path)
-    options = parser.parse_args()
-    if options.mode == "verify":
-        verify()
-    elif options.output is None:
-        parser.error("--output is required for measure and replay")
-    elif options.mode == "measure":
-        measure(options.url, options.output)
-    else:
-        report = replay(options.output / "streams.jsonl")
-        print(json.dumps(report, indent=2, allow_nan=False))
-        if report["failures"]:
-            raise SystemExit(1)
+    parser.add_argument("mode", choices=("verify",))
+    parser.parse_args()
+    verify()

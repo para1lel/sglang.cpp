@@ -120,6 +120,9 @@ class AnthropicCount(unittest.TestCase):
                                  ("1.0000000000000000001", 0), (1e19, 0), (0, 0), (1, "-1_000")):
             with self.subTest(total=total, remaining=remaining):
                 self.assert_invalid(budget(total, remaining))
+        self.assert_count(budget("9" * 4300, 0), 60)
+        message = "Unable to parse input string as an integer, exceeded maximum size"
+        self.assert_invalid(budget("9" * 4301, 0), f"output_config.task_budget.total: {message}")
 
     def test_count_json_float_overflow(self):
         prefix = b'{"model":"m","messages":[{"role":"user","content":"hi"}]'

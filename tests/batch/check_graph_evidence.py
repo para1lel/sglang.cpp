@@ -46,8 +46,14 @@ def count(api, prefix):
     return sum(name.startswith(prefix) for name in api)
 
 
-def lane_trace(path, require_replays=False):
-    normalized, masks, tokens = [], [], []
+def lane_trace(
+    path: Path,
+    *,
+    require_replays: bool = False,
+    mixed_replay_step: int | None = None,
+    expected_replay_steps: list[int] | None = None,
+) -> tuple[list[tuple[str, ...]], list[int], list[int]]:
+    normalized, masks, tokens, replay_steps = [], [], [], []
     step = None
     selected, graph, lanes, decoded, prefill = 0, 0, 0, 0, 0
     replayed_widths = set()
@@ -59,14 +65,17 @@ def lane_trace(path, require_replays=False):
             return
         width = decoded.bit_count()
         if graph or (require_replays and not prefill and width in replayed_widths):
-            assert graph == decoded and not prefill, (
-                path, step, f"replayed mask {graph}, expected decode mask {decoded}"
+            assert (graph, prefill) == (decoded, int(step == mixed_replay_step)), (
+                path,
+                step,
+                f"replayed mask {graph}, expected decode mask {decoded}",
             )
             masks.append(graph)
+            replay_steps.append(step)
             replayed_widths.add(width)
         step = None
 
-    for row in path.read_text().splitlines():
+    for row in path.read_text(encoding="utf-8").splitlines():
         kind, *values = row.split()
         if kind == "step":
             finish_step()
@@ -92,6 +101,8 @@ def lane_trace(path, require_replays=False):
             assert kind in metadata_fields and len(values) == metadata_fields[kind], (path, row)
         normalized.append((kind, *values))
     finish_step()
+    if expected_replay_steps is not None:
+        assert replay_steps == expected_replay_steps, (path, replay_steps)
     return normalized, masks, tokens
 
 
@@ -202,12 +213,16 @@ def verify_singleton(evidence):
     assert not masks and trace(eager.with_suffix(".cupti.tsv")) == ([], [])
     scores = eager.with_suffix(".scores").read_bytes()
     far_mask = 1 << (BATCH_MAX_SLOTS - 1)
-    expected = {"graph": [far_mask] * 6, "launch": [far_mask]}
-    for role, expected_masks in expected.items():
+    expected = {"graph": [3, 4, 5, 7, 8, 9, 13], "launch": [3]}
+    for role, replay_steps in expected.items():
         stem = evidence / f"singleton-{role}"
-        steps, masks, observed = lane_trace(stem.with_suffix(".lanes"))
+        steps, masks, observed = lane_trace(
+            stem.with_suffix(".lanes"),
+            mixed_replay_step=4 if role == "graph" else None,
+            expected_replay_steps=replay_steps,
+        )
         assert steps == baseline and observed == tokens and tokens
-        assert masks == expected_masks, (stem, masks)
+        assert masks == [far_mask] * len(replay_steps), (stem, masks)
         verify_scores(stem.with_suffix(".scores"), tokens)
         assert stem.with_suffix(".scores").read_bytes() == scores
         device, runtime = trace(stem.with_suffix(".cupti.tsv"))
@@ -296,7 +311,10 @@ def verify_operators(evidence):
     output = (evidence / "operators.log").read_text()
     assert "Rebound cache, page table and position on four device graph replays" in output
     assert "Rebound GDN history and recurrent banks on six device graph replays" in output
-    assert "Score overflow matches protected tiles at 32768 and 32769 visible tokens" in output
+    overflow_cases = ((65, 33), (32768, 17), (32769, 17), (131072, 17), (131073, 65))
+    for visible, width in overflow_cases:
+        receipt = f"Prefill overflow visible={visible} grid={width}"
+        assert f"{receipt} matched unaligned and FP64 reference" in output
     assert "Paged decode matched FP64 and eager across 24 rebound layer-lanes" in output
     assert "Paged decode recovered from finite-input overflow and value cancellation" in output
     assert "MXFP8 GQA check passed" in output
@@ -306,9 +324,7 @@ def verify_operators(evidence):
         ("cache rebinding", 4),
         ("GDN rebinding", 6),
         ("prefill causal boundary", 1),
-        ("prefill overflow at 65 visible tokens", 1),
-        ("prefill overflow at 32768 visible tokens", 1),
-        ("prefill overflow at 32769 visible tokens", 1),
+        *((f"prefill overflow at {visible} visible tokens", 1) for visible, _ in overflow_cases),
         ("paged decode rebinding", 3),
         ("paged decode overflow and cancellation", 3),
         ("ordered finite-range decode", 1),

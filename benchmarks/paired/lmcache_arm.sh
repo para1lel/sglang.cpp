@@ -53,7 +53,8 @@ launch_lmcache() {
         numactl --localalloc taskset --cpu-list "$client_cpus"
         bash "$lmcache_launcher" --socket
         "${lmcache_endpoint:-$lmcache_runtime/sglang-lmcache.sock}"
-        --namespace "${lmcache_namespace:-sglang}" --memory-gib 64 --port "$lmcache_port" "$@")
+        --namespace "${lmcache_namespace:-sglang}" --memory-gib "${lmcache_memory_gib:-64}"
+        --port "$lmcache_port" "$@")
     write_command "$run/lmcache-command.sh" "${daemon[@]}"
     sha256sum "${lmcache_sources[@]}" >"$run/lmcache-source.sha256" || return
     launch_session "$run/lmcache-pid.txt" "${daemon[@]}" >"$run/lmcache.log" 2>&1 9<&- &

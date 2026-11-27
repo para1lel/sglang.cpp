@@ -1,6 +1,5 @@
 """Exercise native tokenization HTTP routes with the Qwen checkpoint and CPU server."""
 
-import argparse
 from contextlib import closing
 from email.parser import BytesHeaderParser
 import http.client
@@ -13,7 +12,7 @@ import unittest
 from unittest.mock import patch
 
 from test_native_generate_cpu import abort, generate_client, get
-from test_sampling_routes_cpu import server
+from test_sampling_routes_cpu import control_response, run_cpu_suite, server
 
 
 TOKENIZE = ("/tokenize", "/v1/tokenize")
@@ -32,10 +31,8 @@ def packet(response):
 def post(port, path, body, headers=HEADERS):
     if not isinstance(body, bytes):
         body = json.dumps(body).encode()
-    with closing(http.client.HTTPConnection("127.0.0.1", port, timeout=5)) as connection:
-        connection.request("POST", path, body, headers)
-        with connection.getresponse() as response:
-            return packet(response)
+    with control_response(port, "POST", path, body, headers) as response:
+        return packet(response)
 
 
 class NativeTokenization(unittest.TestCase):
@@ -82,6 +79,8 @@ class NativeTokenization(unittest.TestCase):
             for request, text in cases:
                 with self.subTest(route=route, request=request):
                     self.assertEqual(post(self.port, route, request), (200, {"text": text}))
+            request = {"tokens": ["\u00a0+2_4_8_0_4_5.00\u202f", "0_8_7", "248046"]}
+            self.assertEqual(post(self.port, route, request), (200, {"text": "x"}))
         self.assertNotIn("cpu admit", self.log.read_text())
 
     def test_route_errors_and_recovery(self):
@@ -96,6 +95,9 @@ class NativeTokenization(unittest.TestCase):
                 "Content-Type": "Application/JSON; charset=utf-8"
             })[0], 200)
         for route in DETOKENIZE:
+            result = post(self.port, route, {"tokens": [["-1"], ["0__1"]]})
+            message = "Expected tokens to be integers in a flat or nested array"
+            self.check_error(result, 400, "Bad Request", message)
             self.check_error(post(self.port, route, {"tokens": [[], [248320]]}),
                              400, "BadRequestError",
                              "Invalid input: token id 248320 is out of vocabulary; "
@@ -173,15 +175,16 @@ class NativeTokenization(unittest.TestCase):
                 self.assertEqual(packet(response), (200, expected))
             self.assertEqual(post(port, overflow, overflow_body)[0], 200)
 
+    def test_ollama_context_integer_text(self) -> None:
+        payload = {"model": "Qwen3.8-27B-FP8", "prompt": "", "stream": False}
+        for value in ("0_1", "\u00a0-0_0.00\u202f", "1" * 4301):
+            status, result = post(self.port, "/api/generate", {**payload, "context": [value]})
+            self.assertEqual((status, result["response"], result["done"]), (200, "", True))
+        message = "context: Input should be a list of integers"
+        for value in ("0__1", "_1", "1_", "1.0_0", "\x1c1"):
+            result = post(self.port, "/api/generate", {**payload, "context": [value]})
+            self.check_error(result, 400, "Bad Request", message)
+
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--binary", type=Path, required=True)
-    parser.add_argument("--checkpoint", type=Path, required=True)
-    parser.add_argument("--output", type=Path, required=True)
-    args = parser.parse_args()
-    NativeTokenization.binary = args.binary.resolve()
-    NativeTokenization.checkpoint = args.checkpoint.resolve()
-    NativeTokenization.output = args.output.resolve()
-    NativeTokenization.output.mkdir(parents=True, exist_ok=True)
-    unittest.main(argv=[__file__], verbosity=2)
+    run_cpu_suite(NativeTokenization, __file__, __doc__)

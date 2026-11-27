@@ -16,6 +16,7 @@ DEFAULT_LIMITS = {
 }
 CONFIG_PATH = ".agents/gates.json"
 DATA_SUFFIXES = {".json", ".toml", ".yaml", ".yml"}
+PYTHON_SUFFIXES = {".py", ".pyi"}
 
 
 def limits(configuration=None):
@@ -64,10 +65,16 @@ def is_code(path, suffixes, configuration, root):
     )
 
 
-def function_spans(path, text, configuration):
+def function_spans(
+    path: Path,
+    text: str,
+    configuration: dict,
+    *,
+    default_adapter: list[str] | None = None,
+) -> list[tuple[str, int, int]]:
     if not function_source(path):
         return []
-    if path.suffix == ".py":
+    if path.suffix in PYTHON_SUFFIXES:
         tree = ast.parse(text, filename=str(path))
         return [
             (
@@ -79,7 +86,7 @@ def function_spans(path, text, configuration):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
         ]
     suffix = ".sh" if path.parent.name == ".githooks" else path.suffix
-    command = configuration.get("function_adapters", {}).get(suffix)
+    command = configuration.get("function_adapters", {}).get(suffix, default_adapter)
     if (
         not isinstance(command, list) or not command or "{file}" not in command
         or not all(isinstance(part, str) and part for part in command)
@@ -88,9 +95,16 @@ def function_spans(path, text, configuration):
     arguments = [str(path) if part == "{file}" else part for part in command]
     arguments = [sys.executable if part == "{python}" else part for part in arguments]
     result = subprocess.run(
-        arguments, cwd=configuration.get("_root"), capture_output=True,
-        text=True, check=True, timeout=60,
+        arguments,
+        cwd=configuration.get("_root"),
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
     )
+    if result.returncode and (diagnostic := result.stderr.strip()):
+        raise ValueError(diagnostic)
+    result.check_returncode()
     spans = json.loads(result.stdout)
     if not isinstance(spans, list):
         raise ValueError("A function adapter must return a JSON list.")
@@ -105,7 +119,14 @@ def function_spans(path, text, configuration):
     return [(span["name"], span["start"], span["end"]) for span in spans]
 
 
-def measure(root, paths, code_suffixes, configuration):
+def measure(
+    root: Path,
+    paths: list[Path],
+    code_suffixes: set[str],
+    configuration: dict,
+    *,
+    default_adapters: dict[str, list[str]],
+) -> dict:
     configuration = {**configuration, "_root": str(root)}
     maximum = dict.fromkeys(DEFAULT_LIMITS, 0)
     children = {}
@@ -119,11 +140,17 @@ def measure(root, paths, code_suffixes, configuration):
         contents = path.read_bytes()
         identity.update(relative.as_posix().encode("utf-8") + b"\0")
         identity.update(hashlib.sha256(contents).digest())
-        if not is_code(path, code_suffixes, configuration, root):
+        default_adapter = default_adapters.get(path.suffix.lower())
+        if not is_code(path, code_suffixes, configuration, root) and default_adapter is None:
             continue
         text = contents.decode("utf-8")
         maximum["code_file_lines"] = max(maximum["code_file_lines"], len(text.splitlines()))
-        for _, start, end in function_spans(path, text, configuration):
+        for _, start, end in function_spans(
+            path,
+            text,
+            configuration,
+            default_adapter=default_adapter,
+        ):
             maximum["function_lines"] = max(maximum["function_lines"], end - start + 1)
     maximum["directory_entries"] = max((len(value) for value in children.values()), default=0)
     result = subprocess.run(
@@ -152,16 +179,12 @@ def matches(name, patterns):
     return any(fnmatch.fnmatchcase(name, pattern) for pattern in patterns)
 
 
-def baseline_unchanged(root, configuration, environment):
-    result = subprocess.run(
-        ["git", "--no-replace-objects", "-C", str(root), "show", "HEAD:" + CONFIG_PATH],
-        env=environment, capture_output=True, text=True, check=False,
-    )
-    if result.returncode:
+def baseline_unchanged(configuration: dict, old_configuration: bytes) -> None:
+    if not old_configuration:
         return
     if not configuration:
         raise ValueError("A normal commit cannot remove the frozen gate configuration.")
-    previous = json.loads(result.stdout)
+    previous = json.loads(old_configuration)
     for name in ("baseline", "limits"):
         if previous.get(name) != configuration.get(name):
             raise ValueError(
@@ -213,11 +236,12 @@ def run_checks(root, configuration, changed, full):
         name = check.get("name")
         if not isinstance(name, str) or not name:
             raise ValueError("Each configured check needs a name.")
+        all_files = full and not check.get("path_only")
         patterns = check.get("paths", [])
         affected = [path for path in changed if matches(path, patterns)]
-        if not full and not affected:
+        if not all_files and not affected:
             continue
-        files = [] if full else [path for path in affected if (root / path).is_file()]
+        files = [] if all_files else [path for path in affected if (root / path).is_file()]
         command = command_arguments(check.get("command"), files)
         if "{files}" in check["command"] and not files:
             command = command_arguments(check["command"], [

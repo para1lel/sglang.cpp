@@ -1,6 +1,7 @@
 #include "sglang/runtime/cache/lmcache_group.h"
 #include "sglang/runtime/cache/prefix_cache_layout.h"
 
+#include <array>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -55,7 +56,7 @@ int main(int argc, char** argv) {
     const std::string op = argv[1];
     const int world = std::stoi(argv[2]), rank = std::stoi(argv[3]), end = std::stoi(argv[4]);
     const bool draft = std::stoi(argv[5]) != 0, swap = std::stoi(argv[6]) != 0;
-    LmCacheGroup group(ranked_lmcache_configs(world));
+    const LmCacheGroup group({default_lmcache_endpoint(), "sglang"}, world);
     Rank first(world, swap ? 1 : 0), second(world, swap ? 0 : 1);
     const auto& lane = rank ? second : first;
     std::vector<const PrefixCacheKeys*> keys{&first.keys};
@@ -81,6 +82,13 @@ int main(int argc, char** argv) {
             throw std::runtime_error("ranked STORE incomplete");
         }
     } else if (op == "ready") {
-        if (!group.ready()) throw std::runtime_error("group not ready");
+        std::vector<std::array<std::uint8_t, 16>> devices;
+        if (world == 2) {
+            devices.resize(world);
+            for (int r = 0; r < world; ++r)
+                devices[r][0] = static_cast<std::uint8_t>(r + 1);
+        }
+        if (!group.ready(devices))
+            throw std::runtime_error("group not ready");
     } else throw std::invalid_argument("unknown operation");
 }

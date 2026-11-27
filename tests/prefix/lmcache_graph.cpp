@@ -1,9 +1,14 @@
+#include "sglang/decoder_internal.h"
+#include "sglang/decoder_prefix_cache.h"
 #include "sglang/testing/prefix_fixture.h"
 #include "sglang/server/batch_service.h"
+
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
 #include <iostream>
 #include <mutex>
+#include <stdexcept>
 #include <thread>
 
 namespace {

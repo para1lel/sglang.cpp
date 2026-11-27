@@ -6,7 +6,6 @@
 #include "sglang/runtime/backend/cuda_resources.h"
 
 #include <stdexcept>
-#include <string>
 #include <string_view>
 
 namespace sglang::decoder {
@@ -41,8 +40,12 @@ CudaBackendDevice read_cuda_backend_device(int device) {
     return {CudaBackendPolicy::for_device(properties), properties.name};
 }
 
-#if !defined(SGLANG_GDN_VENDOR) || !SGLANG_GDN_VENDOR
-std::string gdn_vendor_prefill_identity_tag(const int*, int) { return {}; }
-#endif
+}
+
+namespace sglang::decoder {
+
+bool wide_mtp_width(int lanes) {
+    return lanes == wide_mtp_lanes || lanes == 2 * wide_mtp_lanes || lanes == max_wide_mtp_lanes;
+}
 
 }

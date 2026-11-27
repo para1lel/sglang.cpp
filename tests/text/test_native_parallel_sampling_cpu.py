@@ -1,10 +1,8 @@
 """Check native parallel sampling with the scripted CPU decoder."""
 
-import argparse
 from contextlib import closing
 import http.client
 import json
-from pathlib import Path
 import time
 import unittest
 from unittest.mock import patch
@@ -13,7 +11,7 @@ from uuid import UUID
 from test_native_generate_cpu import (
     ABORTED, ABORT_REQUEST, GENERATE, abort, batch_frame, generate_client, named,
 )
-from test_sampling_routes_cpu import receipts, send, server
+from test_sampling_routes_cpu import receipts, run_cpu_suite, send, server
 
 
 class NativeParallelSampling(unittest.TestCase):
@@ -321,13 +319,4 @@ class NativeParallelSampling(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--binary", type=Path, required=True)
-    parser.add_argument("--checkpoint", type=Path, required=True)
-    parser.add_argument("--output", type=Path, required=True)
-    options = parser.parse_args()
-    NativeParallelSampling.binary = options.binary.resolve()
-    NativeParallelSampling.checkpoint = options.checkpoint.resolve()
-    NativeParallelSampling.output = options.output.resolve()
-    NativeParallelSampling.output.mkdir(parents=True, exist_ok=True)
-    unittest.main(argv=[__file__], verbosity=2)
+    run_cpu_suite(NativeParallelSampling, __file__, __doc__)

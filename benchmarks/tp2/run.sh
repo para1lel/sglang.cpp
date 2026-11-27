@@ -21,17 +21,20 @@ wheel=$(realpath -e "${PAIRED_LMCACHE_WHEEL:?Provide the official LMCache wheel}
 lmcache_launcher=$project/tools/lmcache/serve.sh
 lmcache_sources=("$project"/tools/lmcache/{serve.sh,sglang_lmcache.py,sglang_gpu_transfer.py}
                  "$project"/tools/lmcache/{sglang_socket.py,requirements.txt})
-first_port=${PAIRED_LMCACHE_PORT:-17655}
-[[ $first_port =~ ^[1-9][0-9]{0,4}$ && $port =~ ^[1-9][0-9]{0,4}$ ]]
-(( first_port < 65535 && port <= 65535 ))
-daemon_ports=("$first_port" "$((first_port+1))")
-[[ $port != "${daemon_ports[0]}" && $port != "${daemon_ports[1]}" ]]
+lmcache_port=${PAIRED_LMCACHE_PORT:-17655}
+lmcache_memory_gib=128
+[[ $lmcache_port =~ ^[1-9][0-9]{0,4}$ && $port =~ ^[1-9][0-9]{0,4}$ ]]
+(( lmcache_port <= 65535 && port <= 65535 && lmcache_port != port ))
 mkdir -p -- "$6"
 base=$(realpath "$6")
 exec {campaign_lock}<"$base"
 flock -n -E 75 "$campaign_lock"
 session=$base
 if [[ -e $base/identity.json ]]; then
+    if [[ $(jq -er .protocol "$base/identity.json") != tp2-paired-v2 ]]; then
+        echo 'Use a new campaign root for the single-daemon protocol.' >&2
+        exit 1
+    fi
     [[ $mode == measure && $4 != all && ! -e $base/$4 ]]
     session=$base/session-$4
     mkdir "$session"
@@ -39,11 +42,9 @@ else
     [[ -z $(ls -A "$base") ]]
 fi
 reserve_pair "$2" "$3" "$session"
-exec 3>>"$vllm_root/loopback-${daemon_ports[0]}.lock"
-exec 4>>"$vllm_root/loopback-${daemon_ports[1]}.lock"
+exec 3>>"$vllm_root/loopback-$lmcache_port.lock"
 flock -n -E 75 3
-flock -n -E 75 4
-for lmcache_port in "${daemon_ports[@]}"; do lmcache_port_free; done
+lmcache_port_free
 "$client_python" -B "$paired_dir/tp2_corpus.py" verify "$fixtures" >"$session/corpus.json"
 lmcache_evidence verify-wheel "$wheel" "$lmcache_python" "$lmcache_pythonpath" \
     >"$session/lmcache-wheel.json"
@@ -67,17 +68,18 @@ jq -n --arg mode "$mode" --arg id "$campaign_id" --arg rev "$native_source" \
     --arg wire "$(jq -r .manifest_sha256 "$session/corpus.json")" --argjson port "$port" \
     --arg server "$server_cpus" --arg client "$client_cpus" \
     --arg dev0 "${devices[0]}" --arg dev1 "${devices[1]}" \
-    --argjson p0 "${daemon_ports[0]}" --argjson p1 "${daemon_ports[1]}" --argjson uid "$EUID" \
+    --argjson cache_port "$lmcache_port" --argjson uid "$EUID" \
+    --argjson capacity "$((lmcache_memory_gib << 30))" \
     --slurpfile lm "$session/lmcache-wheel.json" \
     --slurpfile ref "$project/benchmarks/concurrent/gpu2-reference.json" \
-    '{protocol:"tp2-paired-v1",protocol_sha256:$protocol,corpus_sha256:$wire,
+    '{protocol:"tp2-paired-v2",protocol_sha256:$protocol,corpus_sha256:$wire,
       campaign_id:$id,mode:$mode,
       native_source:$rev,binary:$binary,binary_sha256:$sha,checkpoint_path:$model,
       checkpoint_sha256:$ref[0].checkpoint_manifest_sha256,vllm_pin:$ref[0].vllm_pin,
       vllm_root:$root,
       client_python:$python,port:$port,
       server_cpus:$server,client_cpus:$client,devices:[$dev0,$dev1],
-      daemon_ports:[$p0,$p1],lmcache_uid:$uid,
+      daemon_port:$cache_port,lmcache_capacity_bytes:$capacity,lmcache_uid:$uid,
       lmcache_wire:"SLC3",lmcache_ready_version:"0.5.8+native-v3",lmcache_python:$lm[0].python,
       lmcache_pythonpath:$lm[0].pythonpath}' >"$session/identity.json"
 if [[ $session != "$base" ]]; then
@@ -88,68 +90,36 @@ if [[ $session != "$base" ]]; then
     done
 fi
 
-daemon_pids=()
-lmcache_runtime= lmcache_pid=
+lmcache_runtime= lmcache_pid= lmcache_socket_id=
 cleanup_arm() {
     stop_group
-    local pid rank endpoint socket_id
-    if [[ -n $lmcache_pid ]]; then stop_session "$lmcache_pid"; fi
-    for pid in "${daemon_pids[@]}"; do
-        [[ $pid == "$lmcache_pid" ]] || stop_session "$pid"
-    done
-    if [[ -n $lmcache_runtime ]]; then
-        for rank in 0 1; do
-            endpoint=$lmcache_runtime/sglang-lmcache-r$rank.sock
-            if [[ -S $endpoint && -s $run/daemon-$rank/lmcache-ready.json ]]; then
-                socket_id=$(jq -er '.socket_id' "$run/daemon-$rank/lmcache-ready.json")
-                "$client_python" -IB "$project/tools/lmcache/sglang_socket.py" \
-                    "$endpoint" "$socket_id"
-            fi
-        done
-        local locks=$lmcache_runtime/.sglang-lmcache-locks-$EUID
-        if [[ -d $locks && ! -L $locks && -O $locks ]]; then
-            find "$locks" -maxdepth 1 -type f -name 'sglang-lmcache-r[01].sock.lock' \
-                -uid "$EUID" -perm 0600 -links 1 -delete
-            rmdir -- "$locks"
-        fi
-        rmdir -- "$lmcache_runtime"
-    fi
-    daemon_pids=(); lmcache_pid=; lmcache_runtime=
+    stop_lmcache
 }
 trap cleanup_arm EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
 server_preflight() {
-    record_compute "$1/compute-before.csv"
-    if [[ ${#daemon_pids[@]} == 0 ]]; then pair_idle; return; fi
-    local rank
-    for rank in 0 1; do
-        lmcache_evidence owners "$1/compute-before.csv" "${devices[rank]}" "${daemon_pids[rank]}"
-    done
+    record_compute "$1/compute-before.csv" || return
+    if [[ -z $lmcache_pid ]]; then pair_idle; return; fi
+    "$client_python" -B "$tp2_dir/native.py" "$1" --preflight
 }
 
 launch_native() {
-    local run=$1 rank directory gpu_uuid lmcache_port lmcache_endpoint lmcache_namespace
+    local run=$1 directory=$1/daemon gpu_uuid=$CUDA_VISIBLE_DEVICES
     local args=("$binary" --port "$port" --tp 2 --max-active 16)
     [[ $run != */native-k4-trace ]] || args+=(--trace-batches)
     pair_idle
     record_compute "$run/compute-before-daemons.csv"
     lmcache_runtime=$(mktemp -d /tmp/sglang-tp2.XXXXXXXX)
-    for rank in 0 1; do
-        directory=$run/daemon-$rank
-        mkdir -p "$directory"/{home,cache,tmp}
-        gpu_uuid=${devices[rank]} lmcache_port=${daemon_ports[rank]}
-        lmcache_endpoint=$lmcache_runtime/sglang-lmcache-r$rank.sock lmcache_namespace=sglang-r$rank
-        launch_lmcache "$directory" --rank "$rank" 3>&- 4>&- 5<&- 6<&- 7>&- 8>&- 9>&-
-        daemon_pids+=("$lmcache_pid")
-    done
+    mkdir -p "$directory"/{home,cache,tmp}
+    launch_lmcache "$directory" 3>&- 5<&- 6<&- 7>&- 8>&- 9>&-
     mkdir "$run"/{home,cache,config,tmp}
     start_group "$run" env -i PATH=/usr/bin:/bin LANG=C.UTF-8 "XDG_RUNTIME_DIR=$lmcache_runtime" \
         "HOME=$run/home" "TMPDIR=$run/tmp" "XDG_CACHE_HOME=$run/cache" \
         "XDG_CONFIG_HOME=$run/config" "CUDA_CACHE_PATH=$run/cuda-cache" \
         "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES" CUDA_DEVICE_ORDER=PCI_BUS_ID \
-        "LD_LIBRARY_PATH=$compat" "${args[@]}" 3>&- 4>&- 5<&- 6<&- 7>&- 8>&- 9>&-
+        "LD_LIBRARY_PATH=$compat" "${args[@]}" 3>&- 5<&- 6<&- 7>&- 8>&- 9>&-
     server_receipts "$run"
     sha256sum "/proc/$server_pid/exe" >"$run/running-binary.sha256"
     curl --noproxy '*' -fsS "$url/server_info" >"$run/server-info.json"
@@ -157,12 +127,12 @@ launch_native() {
 }
 
 run_arm() {
-    local row=$1 arm=$2 rank lmcache_namespace lmcache_endpoint
+    local row=$1 arm=$2
     run=$base/$row/$arm
     mkdir -p "$run"
     cd "$run"
     if [[ $arm == vllm-k4 ]]; then
-        start_reference "$run" "$row" 3>&- 4>&-
+        start_reference "$run" "$row" 3>&-
         verify_reference "$run" "$row" "$base/reservation" --ready-only >"$run/ready.json"
     else
         launch_native "$run"
@@ -186,17 +156,13 @@ run_arm() {
         verify_reference "$run" "$row" "$base/reservation" >"$run/verified-end.json"
     else
         curl --noproxy '*' -fsS "$url/server_info" >"$run/server-info-end.json"
-        for rank in 0 1; do
-            lmcache_pid=${daemon_pids[rank]} lmcache_namespace=sglang-r$rank
-            lmcache_endpoint=$lmcache_runtime/sglang-lmcache-r$rank.sock
-            record_lmcache_peer "$run/daemon-$rank" -end
-        done
+        record_lmcache_peer "$run/daemon" -end
         "$client_python" -B "$tp2_dir/native.py" "$run" --completed >"$run/verified-end.json"
     fi
     cleanup_arm
     pair_idle
-    for lmcache_port in "${daemon_ports[@]}"; do lmcache_port_free; done
-    for number in "$port" "${daemon_ports[@]}"; do
+    lmcache_port_free
+    for number in "$port" "$lmcache_port"; do
         ss -Hltn "sport = :$number"
     done >"$run/listeners-after.txt"
     [[ ! -s $run/listeners-after.txt ]]

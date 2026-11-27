@@ -1,3 +1,4 @@
+#include "sglang/runtime/backend/cuda_resources.h"
 #include "sglang/text/decode_proj.h"
 #include "sglang/text/decode_proj_sm100.cuh"
 
@@ -29,8 +30,8 @@ void bf16_decode(const __grid_constant__ CUtensorMap weight_map,
 }
 
 cudaError_t plan_bf16(const LaunchTarget& target, int row_blocks, int chunks, SplitPlan& plan) {
-    return plan_splits(reinterpret_cast<const void*>(bf16_decode<tile_cols>), 1, target,
-                       row_blocks, chunks, stages * stage_bytes<tile_cols>, 0, plan);
+    return plan_splits(reinterpret_cast<const void*>(bf16_decode<tile_cols>), target, row_blocks,
+                       chunks, stages * stage_bytes<tile_cols>, 0, plan);
 }
 
 }
@@ -42,7 +43,7 @@ std::optional<cudaError_t> decode_proj::prepare_bf16_single_split(const LaunchTa
     if (status != cudaSuccess) return status;
     if (plan.splits != 1) return std::nullopt;
     int limit = 0;
-    return configure(reinterpret_cast<const void*>(bf16_decode<16>), 4, target.device, limit);
+    return configure(reinterpret_cast<const void*>(bf16_decode<16>), target.device, limit);
 }
 
 std::optional<cudaError_t> try_text_bf16_decode_sm100(
@@ -72,7 +73,7 @@ std::optional<cudaError_t> try_text_bf16_decode_sm100(
         kernel = columns == 16 ? reinterpret_cast<const void*>(bf16_decode<16>)
                                : reinterpret_cast<const void*>(bf16_decode<32>);
         int limit = 0;
-        status = configure(kernel, columns == 16 ? 4 : 5, target.device, limit);
+        status = configure(kernel, target.device, limit);
         if (status != cudaSuccess) {
             return status;
         }
@@ -84,14 +85,12 @@ std::optional<cudaError_t> try_text_bf16_decode_sm100(
         encoded = encode_map(target, activation_map, input, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2,
                              rows, in_width, columns);
     }
-    switch (encoded) {
-        case CUDA_SUCCESS: break;
-        case CUDA_ERROR_NOT_SUPPORTED: return std::nullopt;
-        case CUDA_ERROR_DEINITIALIZED: return cudaErrorCudartUnloading;
-        case CUDA_ERROR_INVALID_CONTEXT: return cudaErrorIncompatibleDriverContext;
-        case CUDA_ERROR_NOT_INITIALIZED: return cudaErrorInitializationError;
-        case CUDA_ERROR_OUT_OF_MEMORY: return cudaErrorMemoryAllocation;
-        default: return cudaErrorInvalidValue;
+    if (encoded != CUDA_SUCCESS) {
+        if (encoded == CUDA_ERROR_NOT_SUPPORTED) {
+            return std::nullopt;
+        }
+        const auto mapped = decoder::CudaError::from_driver(encoded);
+        return mapped == cudaErrorUnknown ? cudaErrorInvalidValue : mapped;
     }
     void* args[] = {&weight_map, &activation_map, &out_width, &rows, &chunks, &output};
     const dim3 grid(plan.splits, row_blocks, (rows - 1) / columns + 1);

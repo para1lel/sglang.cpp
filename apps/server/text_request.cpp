@@ -572,6 +572,10 @@ CompletionTokenizer::CompletionTokenizer(const std::filesystem::path& checkpoint
 
 CompletionTokenizer::~CompletionTokenizer() = default;
 
+ChatParsers CompletionTokenizer::chat_parsers() const { return chat_parsers_; }
+
+const model::ServingProfile& CompletionTokenizer::serving_profile() const { return profile_; }
+
 const ChatTemplate& CompletionTokenizer::chat_template() const {
     std::call_once(chat_loaded_, [this] {
         chat_template_ = profile_.load_chat_template(checkpoint_);
@@ -774,6 +778,10 @@ void generate_logprob_options(const GenerateInput& input, std::size_t index, Bat
 }
 
 }
+
+std::size_t GenerateInput::item_count() const { return count * samples; }
+
+bool GenerateInput::indexed() const { return batch || samples > 1; }
 
 GenerateInput parse_generate_input(std::string_view body) {
     auto parsed = parse_body(body, json::Syntax::native_generate);

@@ -215,17 +215,11 @@ std::optional<cudaError_t> setup_status(std::optional<cudaError_t> direct) {
 }
 
 std::optional<cudaError_t> tensor_map_status(CUresult status) {
-    switch (status) {
-        case CUDA_SUCCESS: return cudaSuccess;
-        case CUDA_ERROR_NOT_SUPPORTED: return std::nullopt;
-        case CUDA_ERROR_DEINITIALIZED: return cudaErrorCudartUnloading;
-        case CUDA_ERROR_INVALID_CONTEXT: return cudaErrorIncompatibleDriverContext;
-        case CUDA_ERROR_NOT_INITIALIZED: return cudaErrorInitializationError;
-        case CUDA_ERROR_OUT_OF_MEMORY: return cudaErrorMemoryAllocation;
-        case CUDA_ERROR_ILLEGAL_ADDRESS: return cudaErrorIllegalAddress;
-        case CUDA_ERROR_LAUNCH_FAILED: return cudaErrorLaunchFailure;
-        default: return cudaErrorInvalidValue;
+    if (status == CUDA_ERROR_NOT_SUPPORTED) {
+        return std::nullopt;
     }
+    const auto mapped = CudaError::from_driver(status);
+    return mapped == cudaErrorUnknown ? cudaErrorInvalidValue : mapped;
 }
 
 template<int Cols, int Stages = 2, bool Fused = false>

@@ -92,13 +92,13 @@ up to 256 UTF-8 bytes. The server validates the descriptor and compiles the
 [native JSON Schema subset](../output-constraints.md#json-schema) with the checkpoint
 tokenizer. Other formats such as `json_object`, unsupported schema keywords, text stops,
 and output budgets below the grammar minimum return HTTP 400 before SSE opens. The explicit
-budget still reserves two tokens. [Descriptor validation](../../apps/server/responses.cpp#L389)<!-- prefix: "OrderedObjec" -->
+budget still reserves two tokens. [Descriptor validation](../../apps/server/responses.cpp#L393)<!-- prefix: "OrderedObjec" -->
 
 The response echoes the descriptor in `text.format` and returns the generated JSON as an
 `output_text` string in the assistant message. The schema constrains output from the first
 generated token. Reasoning items, summaries and reasoning SSE events are unavailable with this
 format, including when `reasoning.effort` is omitted or set to `medium`.
-[Reasoning parser setup](../../src/runtime/model/qwen_serving_profile.cpp#L106)<!-- prefix: "if (request." -->
+[Reasoning parser setup](../../apps/server/qwen/qwen_serving_profile.cpp#L106)<!-- prefix: "if (request." -->
 
 For streaming, join the `response.output_text.delta` strings and parse the JSON after
 `response.completed`.

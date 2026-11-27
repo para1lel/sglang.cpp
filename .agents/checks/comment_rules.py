@@ -2,11 +2,7 @@ import io
 import re
 import tokenize
 
-from tree_sitter import Language, Parser
-
 import tree_sitter_bash
-import tree_sitter_cpp
-import tree_sitter_cuda
 import tree_sitter_go
 import tree_sitter_java
 import tree_sitter_javascript
@@ -16,8 +12,11 @@ import tree_sitter_rust
 import tree_sitter_toml
 import tree_sitter_typescript
 import tree_sitter_yaml
+from function_spans import HEADER_SUFFIXES
+from native_tokens import inspect_tokens
+from tree_sitter import Language, Parser, Query, QueryCursor
 
-C_KINDS = {".c", ".c++", ".cc", ".cpp", ".cxx", ".h", ".h++", ".hh", ".hpp", ".hxx"}
+C_KINDS = ({".c", ".c++", ".cc", ".cpp", ".cxx"} | HEADER_SUFFIXES) - {".cuh"}
 CUDA_KINDS = {".cu", ".cuh"}
 SHELL_KINDS = {".bash", ".sh"}
 JAVASCRIPT_KINDS = {".js", ".jsx", ".mjs"}
@@ -32,6 +31,7 @@ SUFFIX_KINDS = {
     ".lua": "lua",
     ".ps1": "powershell",
     ".py": "python",
+    ".pyi": "python",
     ".rs": "rust",
     ".toml": "toml",
     ".ts": "typescript",
@@ -41,8 +41,6 @@ SUFFIX_KINDS = {
 }
 GRAMMARS = {
     "bash": tree_sitter_bash.language,
-    "cpp": tree_sitter_cpp.language,
-    "cuda": tree_sitter_cuda.language,
     "go": tree_sitter_go.language,
     "java": tree_sitter_java.language,
     "javascript": tree_sitter_javascript.language,
@@ -54,8 +52,8 @@ GRAMMARS = {
     "typescript": tree_sitter_typescript.language_typescript,
     "yaml": tree_sitter_yaml.language,
 }
-COMMENT_TYPES = {
-    **dict.fromkeys(["java", "rust"], {"line_comment", "block_comment"}),
+COMMENT_QUERIES = {
+    **dict.fromkeys(("java", "rust"), "[(line_comment) (block_comment)] @comment"),
 }
 SHELL_INTERPRETERS = {
     "ash", "bash", "bsh", "dash", "ksh", "mksh", "pdksh", "posh", "sh", "yash", "zsh",
@@ -113,176 +111,24 @@ def is_shebang(node):
     )
 
 
-def skip_quoted(logical, index):
-    length = len(logical)
-    position = index + 1
-    while position < length:
-        char = logical[position]
-        if char == "\\" and position + 1 < length:
-            position += 2
-            continue
-        if char == "\n":
-            return position
-        if char == "\"":
-            return position + 1
-        position += 1
-    return position
+def c_comment_lines(source: bytes, standard: str) -> set[int]:
+    if b"/" not in source:
+        return set()
+    lines, _ = inspect_tokens(source, standard)
+    return lines
 
 
-def skip_char(logical, index):
-    length = len(logical)
-    position = index + 1
-    limit = min(length, index + 9)
-    while position < limit:
-        char = logical[position]
-        if char == "\n":
-            break
-        if char == "\\":
-            position += 2
-            continue
-        if char == "'":
-            return position + 1
-        position += 1
-    return index + 1
-
-
-def raw_prefix(logical, index):
-    start = index
-    while start > 0 and (logical[start - 1].isalnum() or logical[start - 1] == "_"):
-        start -= 1
-    return logical[start:index] in {"R", "uR", "UR", "LR", "u8R"}
-
-
-def raw_string_end(logical, index):
-    opening = logical.find("(", index + 1)
-    if opening < 0 or opening - index > 17:
-        return -1
-    delimiter = logical[index + 1:opening]
-    if any(character in " \t\n()\\" for character in delimiter):
-        return -1
-    closing = ")" + delimiter + "\""
-    end = logical.find(closing, opening + 1)
-    if end < 0:
-        return -1
-    return end + len(closing)
-
-
-def skip_literal(logical, index, raw_strings):
-    if logical[index] == "'":
-        return skip_char(logical, index)
-    if raw_strings and raw_prefix(logical, index):
-        end = raw_string_end(logical, index)
-        if end >= 0:
-            return end
-    return skip_quoted(logical, index)
-
-
-def splice_lines(fragment):
-    logical = []
-    positions = []
-    index = 0
-    length = len(fragment)
-    row = 0
-    column = 0
-    while index < length:
-        if fragment.startswith("\\\r\n", index):
-            index += 3
-            row += 1
-            column = 0
-            continue
-        if fragment.startswith("\\\n", index):
-            index += 2
-            row += 1
-            column = 0
-            continue
-        char = fragment[index]
-        logical.append(char)
-        positions.append((row, column))
-        index += 1
-        if char == "\n":
-            row += 1
-            column = 0
-        else:
-            column += 1
-    return "".join(logical), positions
-
-
-def skip_directive(logical, index):
-    length = len(logical)
-    position = index + 1
-    while position < length and logical[position] in " \t":
-        position += 1
-    if not logical.startswith("include", position):
-        return index + 1
-    position += len("include")
-    while position < length and logical[position] in " \t":
-        position += 1
-    if position >= length or logical[position] != "<":
-        return index + 1
-    end = position
-    while end < length and logical[end] not in ">\n":
-        end += 1
-    return end + 1 if end < length and logical[end] == ">" else end
-
-
-def record_comment(positions, index, base_row, base_column, found):
-    row, column = positions[index]
-    if row == 0:
-        column += base_column
-    found[(base_row + row, column)] = base_row + row + 1
-
-
-def lex_logical(logical, positions, base_row, base_column, found, raw_strings):
-    index = 0
-    length = len(logical)
-    while index < length:
-        char = logical[index]
-        if char in "\"'":
-            index = skip_literal(logical, index, raw_strings)
-            continue
-        if char == "#":
-            index = skip_directive(logical, index)
-            continue
-        if logical.startswith("//", index):
-            record_comment(positions, index, base_row, base_column, found)
-            end = logical.find("\n", index)
-            if end < 0:
-                return
-            index = end + 1
-            continue
-        if logical.startswith("/*", index):
-            record_comment(positions, index, base_row, base_column, found)
-            end = logical.find("*/", index + 2)
-            if end < 0:
-                return
-            index = end + 2
-            continue
-        index += 1
-
-
-def tree_comment_found(kind, text):
-    tree = Parser(Language(GRAMMARS[kind]())).parse(text.encode("utf-8"))
-    types = COMMENT_TYPES.get(kind, {"comment"})
-    found = {}
-    pending = [tree.root_node]
-    while pending:
-        node = pending.pop()
-        pending.extend(reversed(node.children))
-        if node.type in types and not is_shebang(node):
-            point = node.start_point
-            found[(point.row, point.column)] = point.row + 1
-    return found
-
-
-def comment_lines(kind, text, raw_strings=True):
+def comment_lines(kind: str, text: str, standard: str = "c++23") -> set[int]:
     if kind == "python":
         return python_comment_lines(text)
+    source = text.encode("utf-8")
     if kind in {"cpp", "cuda"}:
-        found = {}
-        logical, positions = splice_lines(text)
-        lex_logical(logical, positions, 0, 0, found, raw_strings)
-        return set(found.values())
-    return set(tree_comment_found(kind, text).values())
+        return c_comment_lines(source, standard)
+    grammar = Language(GRAMMARS[kind]())
+    tree = Parser(grammar).parse(source)
+    query = Query(grammar, COMMENT_QUERIES.get(kind, "(comment) @comment"))
+    comments = QueryCursor(query).captures(tree.root_node).get("comment", ())
+    return {node.start_point.row + 1 for node in comments if not is_shebang(node)}
 
 
 def comment_errors(path, code=False):
@@ -300,9 +146,5 @@ def comment_errors(path, code=False):
         text = path.read_text(encoding="utf-8")
     except UnicodeDecodeError:
         return [NOT_UTF8]
-    suffix = path.suffix.lower()
-    raw_strings = kind == "cuda" or (kind == "cpp" and suffix != ".c")
-    return [
-        COMMENT_FOUND.format(line=line)
-        for line in sorted(comment_lines(kind, text, raw_strings))
-    ]
+    standard = "c23" if path.suffix.lower() == ".c" else "c++23"
+    return [COMMENT_FOUND.format(line=line) for line in sorted(comment_lines(kind, text, standard))]

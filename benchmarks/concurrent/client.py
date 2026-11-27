@@ -81,7 +81,8 @@ def finish_record(record, completion):
     record["first_ns"], record["last_ns"] = first, last
     record["metrics"] = {
         "ttft_ms": (first - record["submit_ns"]) / 1e6,
-        "tpot_ms": (last - first) / (len(completion.ids) - 1) / 1e6,
+        "tpot_ms": (last - first) / (len(completion.ids) - 1) / 1e6
+        if len(completion.ids) > 1 else None,
         "e2e_ms": (record["done_ns"] - record["submit_ns"]) / 1e6,
     }
 
@@ -203,7 +204,7 @@ def replay_lane(source, item):
     return record
 
 
-def validate_cohort(raw, lanes, policy):
+def replay_cohort(raw, lanes, policy):
     instrumentation = raw["instrumentation"]
     if raw["errors"] or any(key in instrumentation
                             for key in ("error", "stop_error", "deadline_exceeded")):
@@ -220,11 +221,13 @@ def validate_cohort(raw, lanes, policy):
     latest_headers = max(item["headers_ns"] for item in records)
     earliest_first = min(item["first_ns"] for item in records)
     latest_first = max(item["first_ns"] for item in records)
-    if (type(raw["barrier_ns"]) is not int
-            or not max(item["connect_ns"] for item in records) <= raw["barrier_ns"] <= earliest
-            or not max(item["sent_ns"] for item in records) < earliest_first
-            or max(latest_headers, latest_first) >= earliest_done
-            or span > policy["max_submission_span_ms"]):
+    if (
+        type(raw["barrier_ns"]) is not int
+        or not max(item["connect_ns"] for item in records) <= raw["barrier_ns"] <= earliest
+        or not max(item["sent_ns"] for item in records) < earliest_first
+        or (len(records) > 1 and max(latest_headers, latest_first) >= earliest_done)
+        or span > policy["max_submission_span_ms"]
+    ):
         raise ValueError("Cohort submissions or open streams failed overlap bounds")
     duration = (latest_done - earliest) / 1e9
     prompt = sum(record["usage"]["prompt_tokens"] for record in records)
@@ -235,7 +238,12 @@ def validate_cohort(raw, lanes, policy):
             "submission_span_ms": span,
             "all_streams_overlap_ms": (earliest_done - latest_headers) / 1e6,
             "all_generating_overlap_ms": (earliest_done - latest_first) / 1e6,
-            "request_latencies": [record["metrics"] for record in records]}
+            "request_latencies": [record["metrics"] for record in records]}, records
+
+
+def validate_cohort(raw, lanes, policy):
+    report, _ = replay_cohort(raw, lanes, policy)
+    return report
 
 
 def describe(values):

@@ -2,6 +2,7 @@
 #ifdef SGLANG_TEST_BACKEND_POLICY
 #include "sglang/runtime/backend/cuda_backend_policy.h"
 #endif
+#include "sglang/runtime/backend/tp_ar_counters.h"
 #include "sglang/server/vision_completion.h"
 #include "sglang/tokenizer/tokenizer.h"
 
@@ -118,9 +119,9 @@ void record_sampling(const DecoderOptions& options, std::size_t prompt_size) {
     std::cerr << output.str();
 }
 
-std::map<std::int64_t, std::vector<int>> read_output_scripts() {
+std::map<std::int64_t, std::vector<int>> read_id_scripts(const char* variable) {
     std::map<std::int64_t, std::vector<int>> scripts;
-    const auto* path = std::getenv("SGLANG_TEST_CHAT_OUTPUT_IDS");
+    const auto* path = std::getenv(variable);
     if (!path) {
         return scripts;
     }
@@ -146,8 +147,14 @@ std::map<std::int64_t, std::vector<int>> read_output_scripts() {
 }
 
 const std::vector<int>* scripted_output(const DecoderOptions& options) {
-    static const auto scripts = read_output_scripts();
+    static const auto scripts = read_id_scripts("SGLANG_TEST_CHAT_OUTPUT_IDS");
     const auto found = scripts.find(options.seed.value_or(0));
+    return found == scripts.end() ? nullptr : &found->second;
+}
+
+const std::vector<int>* scripted_top_ids(int token) {
+    static const auto scripts = read_id_scripts("SGLANG_TEST_CHAT_TOP_IDS");
+    const auto found = scripts.find(token);
     return found == scripts.end() ? nullptr : &found->second;
 }
 
@@ -181,8 +188,13 @@ struct Lane {
         if (options.generated_top_logprobs >= 0) {
             const DecoderLogprob selected{token, -0.25f * tokens};
             std::vector<DecoderLogprob> alternatives;
+            const auto* top_ids = scripted_top_ids(token);
             for (int rank = 0; rank < options.generated_top_logprobs; ++rank) {
-                alternatives.push_back({rank == 0 ? token : rank, selected.value - rank});
+                auto id = rank == 0 ? token : rank;
+                if (top_ids != nullptr) {
+                    id = top_ids->at(static_cast<std::size_t>(rank));
+                }
+                alternatives.push_back({id, selected.value - static_cast<float>(rank)});
             }
             step.generated_logprobs = std::make_shared<const DecoderTokenLogprobs>(
                 DecoderTokenLogprobs{selected, std::move(alternatives)});
@@ -275,6 +287,10 @@ const decoder::TpRuntimeInfo* Decoder::tensor_parallel_info() const {
 
 Decoder::Decoder(const std::filesystem::path&, int, bool) {}
 Decoder::~Decoder() = default;
+
+decoder::TpArCounters Decoder::tp_ar_counters() const {
+    return {};
+}
 
 std::string_view Decoder::accelerator_name() const {
     return {};

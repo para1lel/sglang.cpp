@@ -1,39 +1,32 @@
 # Native output constraints
 
-Build `sglang-server` in Release mode. Run the commands from the repository
-root inside the project's Pixi environment. Set `build` to the build output
-directory, `checkpoint` to the Qwen3.8-27B-FP8 checkpoint directory and
-`evidence` to a directory for raw results.
+From the repository root in managed Pixi, set `build` to the Release server's build directory, `checkpoint` to Qwen3.8-27B-FP8, and `evidence` to a fresh directory for results.
 
 ```bash
 tests=tests/constraints
-g++ -std=c++17 -O2 -Wall -Wextra -Werror -Iinclude "$tests/token_probe.cpp" \
-    "$build/lib/libsglang_tokenizer.a" "$build/lib/libsglang_json.a" \
-    -o "$build/bin/token-probe"
-g++ -std=c++17 -O2 -Wall -Wextra -Werror -Iinclude \
-    -I"$CONDA_PREFIX/targets/x86_64-linux/include" "$tests/mtp_guard.cpp" \
-    -Wl,--start-group "$build/lib/"*.a -Wl,--end-group \
-    -L"$CONDA_PREFIX/lib" -lcudart -pthread -ldl -lrt \
-    -o "$build/bin/mtp-guard"
+toolkit="$CONDA_PREFIX/targets/x86_64-linux"
+nccl=$(python -I -c 'import sysconfig; print(sysconfig.get_path("purelib") + "/nvidia/nccl")')
+host_flags=(-std=c++17 -O2 -Wall -Wextra -Werror -Iinclude)
+decoder_lib=(
+    -Wl,--start-group "$build/lib/"*.a -Wl,--end-group
+    -L"$toolkit/lib" -L"$toolkit/lib/stubs" -Wl,-rpath,"$toolkit/lib" -Wl,-rpath,"$nccl/lib"
+    "$nccl/lib/libnccl.so.2" -lcuda -lcudart -pthread -ldl -lrt
+)
+g++ "${host_flags[@]}" "$tests/token_probe.cpp" \
+    "$build/lib/libsglang_tokenizer.a" "$build/lib/libsglang_json.a" -o "$build/bin/token-probe"
+g++ "${host_flags[@]}" -I"$toolkit/include" "$tests/mtp_guard.cpp" \
+    "${decoder_lib[@]}" -o "$build/bin/mtp-guard"
 "$build/bin/mtp-guard" "$checkpoint/tokenizer.json"
-g++ -std=c++17 -O2 -Wall -Wextra -Werror -Iinclude \
-    -I"$CONDA_PREFIX/targets/x86_64-linux/include" "$tests/mtp_native.cpp" \
-    -Wl,--start-group "$build/lib/"*.a -Wl,--end-group \
-    -L"$CONDA_PREFIX/lib" -lcudart -pthread -ldl -lrt \
-    -o "$build/bin/mtp-native"
+g++ "${host_flags[@]}" -I"$toolkit/include" "$tests/mtp_native.cpp" \
+    "${decoder_lib[@]}" -o "$build/bin/mtp-native"
 "$build/bin/mtp-native" "$checkpoint"
 python "$tests/token_oracle.py" "$build/bin/token-probe" \
     "$checkpoint/tokenizer.json" "$evidence/masks"
 ```
 
-The CPU oracle computes eligible checkpoint token IDs from literal byte
-languages and an independent minimum-token segmentation. It checks alternate
-segmentations, split UTF-8, overlapping repeated choices, budget and EOS,
-unsupported patterns, and agreement of the dense mask with the ID list.
+The CPU oracle independently derives eligible IDs and minimum token counts for literal byte languages. Check alternate segmentations, split UTF-8, overlapping repeats, budget, EOS, unsupported patterns, and dense mask versus ID list.
 
-The HTTP checks preserve raw JSON responses and event streams. Select an idle
-GPU before starting the server.
-Set `LMCACHE_SOCKET` to an isolated, ready [LMCache daemon on the same GPU](../../docs/serving/lmcache.md#start-the-daemon) for the cache case.
+The HTTP suite saves JSON and SSE. Select an idle GPU and set `LMCACHE_SOCKET` to an isolated, ready [daemon on that GPU](../../docs/serving/lmcache.md#start-the-daemon) for the cache case.
 
 ```bash
 server="$build/bin/sglang-server"
@@ -51,18 +44,8 @@ python "$tests/integration.py" "$server" "$checkpoint" "$evidence/prefix" \
     --width 4 --graph --lmcache-socket "$LMCACHE_SOCKET"
 ```
 
-The native probe compares serial and batched token IDs with depth-zero controls.
-Its counters cover full, partial, and zero proposal acceptance, replay, terminal
-drafts, and a batch with both positive-depth and depth-zero lanes.
+The native probe matches serial and batched IDs with depth zero. Counters cover full, partial, and zero acceptance, replay, terminal drafts, and mixed-depth lanes.
 
-The HTTP integration requires `jsonschema` 4.26.0. Each cache-off positive-depth run
-starts a matching depth-zero server and compares the full token ID lists and finish reasons.
-The trace shows draft and verification
-activity for finite-choice EBNF, regular expressions, and JSON Schema on both
-routes. At capacity four, the integration check also verifies joint verification
-and retirement after mixed requests.
+HTTP requires `jsonschema` 4.26.0. `http_contract.py --width 4 --graph --mtp 1` checks JSON, SSE, and verifier activity on one service. Each cache-off positive-depth `schema_integration.py` run matches token IDs and finish reasons with a depth-zero server. The schema runs check draft and verifier activity on both routes for finite-choice EBNF, regex, and JSON Schema. At width four, they also check joint verification and retirement after mixed requests.
 
-Append `--media-body "$media_request" --media-sha256 "$media_hash"` to a
-capacity-one command. The check sends the valid image request before and after
-it verifies that media requests with constraints are rejected. The body must be
-a valid, unconstrained chat request.
+For media rejection and recovery, append `--media-body "$media_request" --media-sha256 "$media_hash"` to a capacity-one command. The body must be a valid unconstrained chat request and must succeed before and after the rejected constrained media request.

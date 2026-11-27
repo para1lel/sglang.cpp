@@ -12,7 +12,7 @@ int blocks(int count) {
 }
 
 __device__ int2 coordinates(Grid grid, int index) {
-    const int patch = index % grid.frame();
+    const int patch = index % grid.frame;
     const int block = patch / 4;
     return make_int2(2 * (block / (grid.width / 2)) + (patch / 2) % 2,
                      2 * (block % (grid.width / 2)) + patch % 2);
@@ -58,7 +58,7 @@ __global__ void position_kernel(const Bf16* table, Bf16* output, Grid grid) {
 __global__ void rotary_kernel(float2* table, Grid grid) {
     constexpr int frequencies = rotary_width / 2;
     const int index = blockIdx.x * blockDim.x + threadIdx.x;
-    if (index >= grid.frame() * rotary_width) {
+    if (index >= grid.frame * rotary_width) {
         return;
     }
     const int2 point = coordinates(grid, index / rotary_width);
@@ -78,7 +78,7 @@ __global__ void rotate_kernel(const Bf16* qkv, const float2* table, Bf16* qk, Gr
     const int local = index % (2 * hidden);
     const int channel = local % head_width;
     const int source = row * 3 * hidden + local;
-    const float2 angle = table[(row % grid.frame()) * rotary_width + channel % rotary_width];
+    const float2 angle = table[(row % grid.frame) * rotary_width + channel % rotary_width];
     const float partner = channel < rotary_width ? -__bfloat162float(qkv[source + rotary_width])
                                                 : __bfloat162float(qkv[source - rotary_width]);
     qk[index] = __float2bfloat16_rn(__fmul_rn(__bfloat162float(qkv[source]), angle.x) +
@@ -157,7 +157,7 @@ void positions(const Bf16* table, Bf16* output, Grid grid, cudaStream_t stream) 
 }
 
 void make_rotary(float2* table, Grid grid, cudaStream_t stream) {
-    rotary_kernel<<<blocks(grid.frame() * rotary_width), threads, 0, stream>>>(table, grid);
+    rotary_kernel<<<blocks(grid.frame * rotary_width), threads, 0, stream>>>(table, grid);
     check(cudaGetLastError(), "Build vision rotary table");
 }
 
@@ -168,7 +168,7 @@ void rotate(const Bf16* qkv, const float2* table, Bf16* qk, Grid grid, cudaStrea
 
 void attend(const Bf16* qk, const Bf16* qkv, Bf16* context, Grid grid, cudaStream_t stream) {
     attention_kernel<<<dim3(grid.rows, heads), threads, 0, stream>>>(
-        qk, qkv, context, grid.frame());
+        qk, qkv, context, grid.frame);
     check(cudaGetLastError(), "Attend within vision temporal pairs");
 }
 

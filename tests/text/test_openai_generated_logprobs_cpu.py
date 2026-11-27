@@ -1,17 +1,14 @@
 """Exercise generated logprobs through the OpenAI routes with a scripted decoder."""
 
-import argparse
 from collections import defaultdict
-from contextlib import closing
-import json
 import os
-from pathlib import Path
 import unittest
 from unittest.mock import patch
 
-from test_native_chat import request
-from test_native_text import event, legacy, stream_options
-from test_sampling_routes_cpu import CHAT, TEXT, body, server
+from test_native_text import legacy, stream_options
+from test_sampling_routes_cpu import (
+    CHAT, TEXT, body, checked_body, post_response, run_cpu_suite, server, sse_frames,
+)
 
 
 class OpenAILogprobs(unittest.TestCase):
@@ -33,16 +30,10 @@ class OpenAILogprobs(unittest.TestCase):
         return body(route, **(defaults | score | options))
 
     def exchange(self, route, payload, port=None, status=200):
-        connection, response = request(port or self.port, route, payload)
-        with closing(connection), response:
+        with post_response(port or self.port, route, payload) as response:
             self.assertEqual(response.status, status, (route, payload))
-            if status == 200 and payload.get("stream"):
-                self.assertEqual(response.headers.get_content_type(), "text/event-stream")
-                frames = list(iter(lambda: event(response), "[DONE]"))
-                self.assertEqual(response.read(), b"")
-                return frames
-            self.assertEqual(response.headers.get_content_type(), "application/json")
-            return json.load(response)
+            frames = sse_frames(response) if status == 200 and payload.get("stream") else None
+            return checked_body(self, response, frames)
 
     def pair(self, route, payload, port=None):
         answer = self.exchange(route, payload, port)
@@ -248,7 +239,7 @@ class OpenAILogprobs(unittest.TestCase):
         rejected = self.exchange(TEXT, legacy([32, 33], 2, logprobs=0), status=400)
         self.assertIn("frozen benchmark", rejected["error"]["message"])
 
-    def test_implicit_mtp_falls_back_for_logprobs(self):
+    def test_implicit_mtp_scores_scalar_and_indexed_choices(self):
         log = self.output / "scores-default.log"
         with server(self.binary, self.checkpoint, log, "--max-active", "2",
                     sampling=False) as port:
@@ -256,17 +247,35 @@ class OpenAILogprobs(unittest.TestCase):
                 with self.subTest(route=route):
                     payload = self.payload(route, seed=11)
                     offset = log.stat().st_size
-                    result, _ = self.pair(route, payload, port)
+                    result, chunks = self.pair(route, payload, port)
                     choice, = result["choices"]
                     self.assertEqual(choice["token_ids"], [32, 33, 34, 35, 36])
                     self.assertEqual(self.selected(route, choice), [-0.25, -0.5, -0.75, -1, -1.25])
-                    self.assertNotIn(b"cpu scripted mtp tokens=", log.read_bytes()[offset:])
+                    self.assertEqual(sum(chunk["logprobs"] is not None for chunk in chunks[0]), 5)
+                    receipt = b"cpu scripted mtp tokens=4 terminal=1\n"
+                    self.assertEqual(log.read_bytes()[offset:].count(receipt), 2)
                     plain = payload | {"logprobs": None if route == TEXT else False}
                     result = self.exchange(route, plain, port)
                     unscored, = result["choices"]
                     self.assertEqual(unscored["token_ids"], choice["token_ids"])
                     self.assertNotIn("logprobs", unscored)
-                    self.assertIn(b"cpu scripted mtp tokens=", log.read_bytes()[offset:])
+                    self.assertEqual(log.read_bytes()[offset:].count(receipt), 3)
+                    for budget, mtp_rounds in ((5, 4), (1, 0)):
+                        with self.subTest(budget=budget):
+                            offset = log.stat().st_size
+                            batch = payload | {"n": 2, "max_tokens": budget}
+                            grouped, _ = self.pair(route, batch, port)
+                            self.assertEqual([item["index"] for item in grouped["choices"]], [0, 1])
+                            self.assertEqual(grouped["usage"]["completion_tokens"], 2 * budget)
+                            for item in grouped["choices"]:
+                                self.assertEqual(item["token_ids"], choice["token_ids"][:budget])
+                                self.assertEqual(self.selected(route, item),
+                                                 self.selected(route, choice)[:budget])
+                                self.assertEqual(item["finish_reason"], "length")
+                            log_tail = log.read_bytes()[offset:]
+                            self.assertEqual(log_tail.count(b"cpu scripted mtp tokens="),
+                                             mtp_rounds)
+                            self.assertEqual(log_tail.count(receipt), mtp_rounds)
 
     def test_explicit_speculative_boundary(self):
         log = self.output / "scores-mtp.log"
@@ -274,10 +283,23 @@ class OpenAILogprobs(unittest.TestCase):
                     sampling=False) as port:
             for route in (TEXT, CHAT):
                 with self.subTest(route=route):
-                    for stream in (False, True):
-                        error = self.exchange(route, self.payload(route, seed=11, stream=stream),
-                                              port, status=400)
-                        self.assertIn("MTP disabled", error["error"]["message"])
+                    before = log.stat().st_size
+                    invalid = self.payload(route, seed=11, stream=True, temperature=0.5)
+                    error = self.exchange(route, invalid, port, status=400)
+                    self.assertIn("greedy", error["error"]["message"])
+                    self.assertNotIn(b"cpu admit", log.read_bytes()[before:])
+                    result, chunks = self.pair(route, self.payload(route, seed=11, max_tokens=6),
+                                               port)
+                    choice, = result["choices"]
+                    self.assertEqual(choice["token_ids"], [32, 33, 34, 35, 36, 32])
+                    self.assertEqual(self.selected(route, choice),
+                                     [-0.25, -0.5, -0.75, -1, -1.25, -1.5])
+                    self.assertEqual(sum(chunk["logprobs"] is not None for chunk in chunks[0]), 6)
+                    self.assertEqual(result["usage"]["completion_tokens"], 6)
+                    self.assertEqual(choice["finish_reason"], "length")
+                    scored_log = log.read_bytes()[before:]
+                    self.assertEqual(scored_log.count(b"cpu scripted mtp tokens=4 terminal=0\n"), 2)
+                    self.assertEqual(scored_log.count(b"cpu scripted mtp tokens="), 2)
                     plain = self.payload(route, seed=11, stream=True,
                                          logprobs=None if route == TEXT else False, stop="BC")
                     chunks = [choice for frame in self.exchange(route, plain, port)
@@ -288,13 +310,4 @@ class OpenAILogprobs(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--server", type=Path, required=True)
-    parser.add_argument("--checkpoint", type=Path, required=True)
-    parser.add_argument("--output", type=Path, required=True)
-    args, tests = parser.parse_known_args()
-    OpenAILogprobs.binary = args.server.resolve(strict=True)
-    OpenAILogprobs.checkpoint = args.checkpoint.resolve(strict=True)
-    OpenAILogprobs.output = args.output.resolve()
-    OpenAILogprobs.output.mkdir(parents=True, exist_ok=True)
-    unittest.main(argv=[__file__, *tests], verbosity=2)
+    run_cpu_suite(OpenAILogprobs, __file__, __doc__, server_option=True, select_tests=True)

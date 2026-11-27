@@ -95,16 +95,19 @@ template <bool Packed, int Fragment>
 __device__ __forceinline__ void promote(const unsigned (&partial)[Fragment], const float* scales,
                                         float scale, float* result) {
     if constexpr (Packed) {
-        const auto factor = make_float2(scale, scale);
         #pragma unroll
         for (int col = 0; col < Fragment; col += 2) {
-            const auto values = make_float2(__uint_as_float(partial[col]),
-                                            __uint_as_float(partial[col + 1]));
-            const auto activation_scales = make_float2(scales[col], scales[col + 1]);
-            const auto scaled = __fmul2_rn(values, activation_scales);
-            const auto sum = __ffma2_rn(scaled, factor, make_float2(result[col], result[col + 1]));
-            result[col] = sum.x;
-            result[col + 1] = sum.y;
+            asm("{ .reg .b64 values, factors, sum;\n"
+                "mov.b64 values, {%2,%3};\n"
+                "mov.b64 factors, {%4,%5};\n"
+                "mul.rn.f32x2 values, values, factors;\n"
+                "mov.b64 factors, {%6,%6};\n"
+                "mov.b64 sum, {%0,%1};\n"
+                "fma.rn.f32x2 sum, values, factors, sum;\n"
+                "mov.b64 {%0,%1}, sum; }"
+                : "+f"(result[col]), "+f"(result[col + 1])
+                : "r"(partial[col]), "r"(partial[col + 1]), "f"(scales[col]), "f"(scales[col + 1]),
+                  "f"(scale));
         }
     } else {
         #pragma unroll
@@ -232,7 +235,7 @@ template <int Columns, typename Output, int Workers = threads>
 __device__ __noinline__ void reduce_compact(const float* partials, int splits, int row_base,
                                            int out_width, const Output* output) {
     if (out_width % 4 != 0) {
-        reduce_store(partials, splits, Columns, row_base, out_width, *output);
+        reduce_store(partials, splits, Columns, row_base, out_width, output->output);
         return;
     }
     constexpr int vectors = Columns * tile_rows / 4;
@@ -252,18 +255,16 @@ __device__ __noinline__ void reduce_compact(const float* partials, int splits, i
             sum.w += other.w;
         }
         auto* out = (*output)(index / tile_rows) + row;
-        const auto low = __floats2bfloat162_rn(sum.x, sum.y);
-        const auto high = __floats2bfloat162_rn(sum.z, sum.w);
+        uint2 packed;
+        asm("cvt.rn.bf16x2.f32 %0, %2, %1;" : "=r"(packed.x) : "f"(sum.x), "f"(sum.y));
+        asm("cvt.rn.bf16x2.f32 %0, %2, %1;" : "=r"(packed.y) : "f"(sum.z), "f"(sum.w));
         if (reinterpret_cast<std::uintptr_t>(out) % 8 == 0) {
-            const __nv_bfloat162_raw lo = low;
-            const __nv_bfloat162_raw hi = high;
-            *reinterpret_cast<uint2*>(out) = make_uint2(unsigned(lo.x) | unsigned(lo.y) << 16,
-                                                       unsigned(hi.x) | unsigned(hi.y) << 16);
+            *reinterpret_cast<uint2*>(out) = packed;
         } else {
-            out[0] = low.x;
-            out[1] = low.y;
-            out[2] = high.x;
-            out[3] = high.y;
+            out[0] = __nv_bfloat16_raw{static_cast<unsigned short>(packed.x)};
+            out[1] = __nv_bfloat16_raw{static_cast<unsigned short>(packed.x >> 16)};
+            out[2] = __nv_bfloat16_raw{static_cast<unsigned short>(packed.y)};
+            out[3] = __nv_bfloat16_raw{static_cast<unsigned short>(packed.y >> 16)};
         }
     }
 }
@@ -302,7 +303,7 @@ __device__ __forceinline__ void store_compact(const float (&result)[Columns], fl
                                                int splits, int row_base, int out_width,
                                                const Output& output) {
     if (splits == 1) {
-        store_result(result, partials, 1, Columns, row_base, out_width, output);
+        store_result(result, partials, 1, Columns, row_base, out_width, output.output);
         return;
     }
     if (threadIdx.x < tile_rows) {
@@ -328,11 +329,11 @@ __device__ __forceinline__ uint2 load_cluster_bf16x4(const __nv_bfloat16* local,
 }
 
 __device__ __forceinline__ __nv_bfloat162 swiglu_pair(unsigned gate_bits, unsigned up_bits) {
-    const __nv_bfloat162 gate = __nv_bfloat162_raw{
-        static_cast<unsigned short>(gate_bits), static_cast<unsigned short>(gate_bits >> 16)};
-    const __nv_bfloat162 up = __nv_bfloat162_raw{
-        static_cast<unsigned short>(up_bits), static_cast<unsigned short>(up_bits >> 16)};
-    return {text_kernel::swiglu(gate.x, up.x), text_kernel::swiglu(gate.y, up.y)};
+    const __nv_bfloat16 gate_lo = __nv_bfloat16_raw{static_cast<unsigned short>(gate_bits)};
+    const __nv_bfloat16 up_lo = __nv_bfloat16_raw{static_cast<unsigned short>(up_bits)};
+    const __nv_bfloat16 gate_hi = __nv_bfloat16_raw{static_cast<unsigned short>(gate_bits >> 16)};
+    const __nv_bfloat16 up_hi = __nv_bfloat16_raw{static_cast<unsigned short>(up_bits >> 16)};
+    return {text_kernel::swiglu(gate_lo, up_lo), text_kernel::swiglu(gate_hi, up_hi)};
 }
 
 __device__ void store_gate_up(const float (&result)[m10_columns], __nv_bfloat16* tile,
@@ -371,8 +372,7 @@ __device__ void init_m80_pipeline(DecodePipeline<Slots>& pipe) {
 template <int Columns, int Slots = stages, typename Job = Fp8Job>
 __global__ __launch_bounds__((std::is_same_v<Job, Fp8M80Job> ? m80_threads : threads), 1)
 void fp8_decode(const __grid_constant__ Job job) {
-    constexpr unsigned instruction =
-        ((tile_rows / 16) << 24) | ((Columns / 8) << 17) | (1u << 4);
+    constexpr unsigned instruction = fp8_instruction<Columns>;
     alignas(1024) extern __shared__ unsigned char tiles[];
     __shared__ DecodePipeline<Slots> pipe;
     constexpr bool gate_up = std::is_same_v<Job, Fp8GateUpJob>;
@@ -452,7 +452,7 @@ void fp8_decode(const __grid_constant__ Job job) {
                       job.out_width[target], job.lanes[target]);
     } else if constexpr (!std::is_same_v<Job, Fp8Job>) {
         store_result(result, reinterpret_cast<float*>(tiles), splits, active, row_base,
-                     job.out_width[target], job.lanes[target]);
+                     job.out_width[target], job.lanes[target].output);
     } else {
         store_result(result, reinterpret_cast<float*>(tiles), splits, active, row_base,
                      job.out_width[target], act_row, job.output[target]);
@@ -534,17 +534,18 @@ bool tp2_m80_shape(const TextFp8DecodeTarget* targets, int count, int in_width) 
 }
 
 cudaError_t plan_fp8_splits(const LaunchTarget& target, int blocks, int groups, SplitPlan& plan) {
-    return plan_splits(reinterpret_cast<const void*>(fp8_decode<tile_cols>), 0, target,
-                       blocks, groups, stages * stage_bytes<tile_cols>,
-                       scale_bytes<tile_cols>, plan);
+    return plan_splits(reinterpret_cast<const void*>(fp8_decode<tile_cols>), target, blocks, groups,
+                       stages * stage_bytes<tile_cols>, scale_bytes<tile_cols>, plan);
 }
 
 template <int Columns, int Slots, int Capacity, typename Job = Fp8RowJob<Capacity>>
-std::optional<cudaError_t> launch_rows(
-    const LaunchTarget& target, const TextFp8DecodeTarget* projections, int target_count,
-    TextFp8ActivationView input, int in_width, const TextFp8Projection* rows, int count,
-    int slot, cudaStream_t stream) {
+std::optional<cudaError_t>
+launch_rows(const LaunchTarget& target, const TextFp8DecodeTarget* projections, int target_count,
+            TextFp8ActivationView input, int in_width, const TextFp8Projection* rows, int count,
+            cudaStream_t stream) {
     static_assert(Capacity <= Columns);
+    if (count > Capacity || target_count > max_targets)
+        return std::nullopt;
     Job job{};
     int blocks = 0;
     if (auto encoded = encode_job(target, projections, target_count, input, in_width, count,
@@ -568,7 +569,7 @@ std::optional<cudaError_t> launch_rows(
     }
     const auto* kernel = reinterpret_cast<const void*>(fp8_decode<Columns, Slots, Job>);
     int limit = 0;
-    status = configure(kernel, slot, target.device, limit);
+    status = configure(kernel, target.device, limit);
     if (status != cudaSuccess) {
         return status;
     }
@@ -617,61 +618,61 @@ std::optional<cudaError_t> try_text_fp8_decode_sm100_rows(
     if (count == text_target_fp8_m80_rows) {
         if (tp2_m80_shape(projections, target_count, in_width)) {
             if (auto packed = compact_status(launch_rows<m80_rows, 4, m80_rows, Fp8M80Job>(
-                    target, projections, target_count, input, in_width, rows, count, 22, stream))) {
+                    target, projections, target_count, input, in_width, rows, count, stream))) {
                 return packed;
             }
         }
         return compact_status(launch_rows<text_target_fp8_m80_rows, 4, text_target_fp8_m80_rows>(
-            target, projections, target_count, input, in_width, rows, count, 17, stream));
+            target, projections, target_count, input, in_width, rows, count, stream));
     }
     if (count == text_target_fp8_m160_rows) {
         return compact_status(launch_rows<text_target_fp8_m160_rows, 3, text_target_fp8_m160_rows>(
-            target, projections, target_count, input, in_width, rows, count, 18, stream));
+            target, projections, target_count, input, in_width, rows, count, stream));
     }
     if (count == text_target_fp8_m40_rows) {
         if (in_width == hidden_width && target_count == 2 &&
             projections[0].out_width == intermediate_width &&
             projections[1].out_width == intermediate_width) {
             return launch_rows<64, mlp_slots, text_target_fp8_m40_rows>(
-                target, projections, target_count, input, in_width, rows, count, 15, stream);
+                target, projections, target_count, input, in_width, rows, count, stream);
         }
         if (!tp2_gate_up_shape(projections, target_count, in_width)) {
             if (const auto pending = cudaGetLastError(); pending != cudaSuccess) return pending;
             if (auto packed = compact_status(launch_rows<m40_columns, 4, m40_rows>(
-                    target, projections, target_count, input, in_width, rows, count, 21, stream))) {
+                    target, projections, target_count, input, in_width, rows, count, stream))) {
                 return packed;
             }
         }
         return launch_rows<64, stages, text_target_fp8_m40_rows>(
-            target, projections, target_count, input, in_width, rows, count, 16, stream);
+            target, projections, target_count, input, in_width, rows, count, stream);
     }
     if (count <= text_fp8_max_batch) {
-        return launch_rows<8, stages, text_fp8_max_batch>(
-            target, projections, target_count, input, in_width, rows, count, 9, stream);
+        return launch_rows<8, stages, text_fp8_max_batch>(target, projections, target_count, input,
+                                                          in_width, rows, count, stream);
     }
     if (count <= 8) {
-        return launch_rows<8, stages, 8>(
-            target, projections, target_count, input, in_width, rows, count, 11, stream);
+        return launch_rows<8, stages, 8>(target, projections, target_count, input, in_width, rows,
+                                         count, stream);
     }
     if (count == m10_rows && !tp2_gate_up_shape(projections, target_count, in_width) &&
         std::all_of(projections, projections + target_count, [](const auto& projection) {
             return projection.out_width > 0 && projection.out_width % group_size == 0;
         })) {
         if (auto packed = launch_rows<m10_columns, stages, m10_rows>(
-                target, projections, target_count, input, in_width, rows, count, 19, stream)) {
+                target, projections, target_count, input, in_width, rows, count, stream)) {
             return packed;
         }
     }
     if (count <= 16) {
-        return launch_rows<16, stages, 16>(
-            target, projections, target_count, input, in_width, rows, count, 12, stream);
+        return launch_rows<16, stages, 16>(target, projections, target_count, input, in_width, rows,
+                                           count, stream);
     }
     if (use_mlp_pipeline(projections, target_count, in_width, count)) {
         return launch_rows<32, mlp_slots, text_target_fp8_max_rows>(
-            target, projections, target_count, input, in_width, rows, count, 13, stream);
+            target, projections, target_count, input, in_width, rows, count, stream);
     }
-    return launch_rows<32, stages, text_target_fp8_max_rows>(
-        target, projections, target_count, input, in_width, rows, count, 14, stream);
+    return launch_rows<32, stages, text_target_fp8_max_rows>(target, projections, target_count,
+                                                             input, in_width, rows, count, stream);
 }
 
 std::optional<cudaError_t> try_target_fp8_gate_up(
@@ -743,23 +744,19 @@ std::optional<cudaError_t> try_text_fp8_decode_sm100(const TextFp8DecodeTarget* 
         return std::nullopt;
     }
     const void* kernel = full_kernel;
-    int slot = 0;
     const bool short_pipeline = use_mlp_pipeline(targets, count, in_width, rows);
     if (short_pipeline) {
         kernel = columns == 16 ? reinterpret_cast<const void*>(fp8_decode<16, mlp_slots>)
                                : reinterpret_cast<const void*>(fp8_decode<32, mlp_slots>);
-        slot = columns == 16 ? 7 : 8;
     } else if (columns == 8) {
         kernel = reinterpret_cast<const void*>(fp8_decode<8>);
-        slot = 6;
     } else if (columns != tile_cols) {
         kernel = columns == 16 ? reinterpret_cast<const void*>(fp8_decode<16>)
                                : reinterpret_cast<const void*>(fp8_decode<32>);
-        slot = columns == 16 ? 2 : 3;
     }
-    if (slot != 0) {
+    if (kernel != full_kernel) {
         int limit = 0;
-        status = configure(kernel, slot, target.device, limit);
+        status = configure(kernel, target.device, limit);
         if (status != cudaSuccess) {
             return status;
         }

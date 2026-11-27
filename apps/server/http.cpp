@@ -322,6 +322,8 @@ bool read_pending(IncomingRequest& incoming, short events,
 
 }
 
+Socket::Socket(int descriptor) : descriptor_(descriptor) {}
+
 Socket::~Socket() {
     if (descriptor_ >= 0) {
         close(descriptor_);
@@ -329,6 +331,11 @@ Socket::~Socket() {
 }
 
 Socket::Socket(Socket&& other) noexcept : descriptor_(std::exchange(other.descriptor_, -1)) {}
+
+int Socket::get() const { return descriptor_; }
+
+HttpError::HttpError(std::string_view status, const char* message)
+    : std::runtime_error(message), status(status) {}
 
 void install_shutdown_handlers() {
     struct sigaction action {};
@@ -517,7 +524,6 @@ void read_connections(const Socket& listener, int capacity,
             }
         }
         if (!stopping() && (sockets.front().revents & POLLIN)) {
-            // A readable socket may still have bytes left after its bounded read this turn.
             accept_next(listener, incoming, limit);
         }
     }
@@ -678,6 +684,11 @@ void write_generation_health(const Socket& connection, bool healthy) {
 bool write_metrics(const Socket& connection, std::string_view body) {
     return write_response(connection, "200 OK", "text/plain; version=0.0.4", body);
 }
+
+EventStream::EventStream(const Socket& connection, Format format)
+    : connection_(connection), format_(format) {}
+
+bool EventStream::started() const { return last_write_.has_value(); }
 
 bool EventStream::send(std::string_view bytes) {
     if (!send_all(connection_, bytes)) {

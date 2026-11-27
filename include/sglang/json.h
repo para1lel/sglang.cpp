@@ -28,27 +28,27 @@ enum class Syntax {
 
 class Value {
 public:
-    Value() = default;
-    Value(bool value) : data_(value) {}
-    Value(int value) : data_(std::int64_t(value)) {}
-    Value(std::int64_t value) : data_(value) {}
-    Value(std::uint64_t value) : data_(value) {}
-    Value(double value) : data_(value) {}
-    Value(const char* value) : data_(std::string(value)) {}
-    Value(std::string value) : data_(std::move(value)) {}
-    Value(Array value) : data_(std::move(value)) {}
-    Value(Object value) : data_(std::move(value)) {}
-    Value(OrderedObject value) : data_(std::move(value)) {}
-    Value(WideInteger value) : data_(std::move(value)) {}
+    Value() noexcept;
+    Value(bool value);
+    Value(int value);
+    Value(std::int64_t value);
+    Value(std::uint64_t value);
+    Value(double value);
+    Value(const char* value);
+    Value(std::string value);
+    Value(Array value);
+    Value(Object value);
+    Value(OrderedObject value);
+    Value(WideInteger value);
 
-    Object* object() { return std::get_if<Object>(&data_); }
-    const Object* object() const { return std::get_if<Object>(&data_); }
-    OrderedObject* ordered_object() { return std::get_if<OrderedObject>(&data_); }
-    const OrderedObject* ordered_object() const { return std::get_if<OrderedObject>(&data_); }
-    Array* array() { return std::get_if<Array>(&data_); }
-    const Array* array() const { return std::get_if<Array>(&data_); }
-    const WideInteger* wide_integer() const { return std::get_if<WideInteger>(&data_); }
-    bool is_null() const { return std::holds_alternative<std::monostate>(data_); }
+    Object* object();
+    const Object* object() const;
+    OrderedObject* ordered_object();
+    const OrderedObject* ordered_object() const;
+    Array* array();
+    const Array* array() const;
+    const WideInteger* wide_integer() const;
+    bool is_null() const;
     std::optional<std::string_view> string() const;
     std::optional<std::int64_t> signed_integer() const;
     std::optional<std::uint64_t> unsigned_integer() const;

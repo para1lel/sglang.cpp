@@ -13,17 +13,21 @@ gpu=$3
 output=$(realpath -m -- "$4")
 shared=${SGLANG_HOST_ROOT:-/data1/shared/dongwu.chen}
 toolkit="${CONDA_PREFIX:?Run in the managed Pixi environment}/targets/x86_64-linux"
+nccl=$(python -I -c 'import sysconfig; print(sysconfig.get_path("purelib") + "/nvidia/nccl")')
 mkdir -p "$output/cache"
 export CUDA_CACHE_PATH="$output/cache" TMPDIR="$output"
 
 "${CXX:-c++}" -std=c++23 -O2 -Wall -Wextra -Werror \
-    -I"$root/include" -isystem "$toolkit/include" \
+    -I"$root/include" -isystem "$toolkit/include" -isystem "$nccl/include" \
     "$root/tests/text/logit_bias_check.cpp" -Wl,--start-group \
     "$build/lib/libsglang_decoder.a" "$build/lib/libsglang_cuda.a" \
     "$build/lib/libsglang_prefill_fp8_sm100.a" "$build/lib/libsglang_checkpoint.a" \
-    "$build/lib/libsglang_tokenizer.a" "$build/lib/libsglang_json.a" -Wl,--end-group \
-    -L"$toolkit/lib" -Wl,-rpath,"$toolkit/lib" -Wl,-rpath,"$CONDA_PREFIX/lib" \
-    -lcudart -lpthread -ldl -o "$output/logit-bias-check"
+    "$build/lib/libsglang_tokenizer.a" "$build/lib/libsglang_json.a" \
+    "$build/lib/libsglang_cuda_support.a" \
+    "$build/lib/libsglang_mnnvl_ar.a" -Wl,--end-group \
+    -L"$toolkit/lib" -L"$toolkit/lib/stubs" -Wl,-rpath,"$toolkit/lib" \
+    -lcuda -lcudart "$nccl/lib/libnccl.so.2" -Wl,-rpath,"$nccl/lib" \
+    -Wl,-rpath,"$CONDA_PREFIX/lib" -lpthread -ldl -o "$output/logit-bias-check"
 
 exec 8<"/tmp/gpu-coord/$gpu.lock"
 exec 9<"$shared/environments/vllm-81a8cb063e62/$gpu.lock"

@@ -14,9 +14,13 @@ import native
 def campaign(base):
     identity = load(base / "identity.json")
     sources = base / "protocol.sha256"
-    require(identity["protocol"] == "tp2-paired-v1" and identity["mode"] == "measure"
-            and identity["protocol_sha256"] == digest(sources)
-            and identity["corpus_sha256"] == ADDITIONS_SHA256, "Incorrect campaign protocol")
+    require(
+        identity["protocol"] == "tp2-paired-v2"
+        and identity["mode"] == "measure"
+        and identity["protocol_sha256"] == digest(sources)
+        and identity["corpus_sha256"] == ADDITIONS_SHA256,
+        "Incorrect campaign protocol",
+    )
     project = Path(__file__).resolve().parents[2]
     for name, checksum in hash_manifest(sources).items():
         require(digest(project / name) == checksum, f"Protocol source mismatch: {name}")

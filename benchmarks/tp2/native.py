@@ -1,4 +1,4 @@
-"""Reconcile the native single-process TP2 group with its two rank-local daemons."""
+"""Reconcile the native single-process TP2 group with its shared two-device daemon."""
 
 import argparse
 import csv
@@ -13,23 +13,53 @@ from saved_evidence import UUID, command, compute_owners, hash_manifest, load, r
 
 RANK = re.compile(r"tp2 rank=(\d+) device=(\d+) uuid=([0-9a-fA-F-]+) pid=(\d+) nccl=ok "
                   r"weights=(\d+) lm_head=([01]) mtp=([01])")
+TP2_RANKS = 2
+COMPUTE_FIELDS = 4
 
 
-def owners(path, devices, daemons, server=None):
-    expected = {(gpu.lower(), str(pid)) for gpu, pid in zip(devices, daemons, strict=True)}
-    if server is not None:
-        expected.update((gpu.lower(), str(server)) for gpu in devices)
-    require(len(set(daemons)) == 2 and server not in daemons, "Rank or daemon PID collision")
+def owners(
+    path: Path,
+    devices: list[str],
+    daemon: int,
+    server: int | None = None,
+    *,
+    before_transfer: bool = False,
+) -> None:
+    processes = (daemon,) if server is None else (daemon, server)
+    require(
+        len(set(processes)) == len(processes)
+        and all(type(pid) is int and pid > 0 for pid in processes),
+        "Invalid process ownership identities",
+    )
     selected = {gpu.lower() for gpu in devices}
-    pids = {pid for _, pid in expected}
-    with path.open(newline="") as stream:
-        rows = [row for row in csv.reader(stream, skipinitialspace=True) if row]
-    require(all(len(row) == 4 and UUID.fullmatch(row[0].strip()) and row[1].strip().isdecimal()
-                for row in rows), "Malformed compute inventory")
-    found = [(row[0].strip().lower(), row[1].strip()) for row in rows
-             if row[0].strip().lower() in selected or row[1].strip() in pids]
-    require(len(found) == len(expected) and set(found) == expected,
-            f"{path}: expected rank/device ownership {expected}, observed {found}")
+    require(
+        len(devices) == len(selected) == TP2_RANKS and all(UUID.fullmatch(gpu) for gpu in selected),
+        "Invalid GPU ownership identities",
+    )
+    pids = {str(pid) for pid in processes}
+    allowed = {(gpu, pid) for gpu in selected for pid in pids}
+    required = allowed if not before_transfer else {row for row in allowed if row[1] != str(daemon)}
+    with path.open(encoding="utf-8", newline="") as stream:
+        rows = [row for row in csv.reader(stream, skipinitialspace=True, strict=True) if row]
+    require(
+        all(
+            len(row) == COMPUTE_FIELDS
+            and UUID.fullmatch(row[0].strip())
+            and re.fullmatch(r"[1-9][0-9]*", row[1].strip())
+            and row[2].strip()
+            and row[3].strip()
+            for row in rows
+        ),
+        f"{path}: malformed compute inventory",
+    )
+    observed = {(row[0].strip().lower(), row[1].strip()) for row in rows}
+    require(len(observed) == len(rows), f"{path}: duplicate compute ownership rows")
+    found = {(gpu, pid) for gpu, pid in observed if gpu in selected or pid in pids}
+    require(
+        required <= found <= allowed,
+        f"{path}: required ownership {sorted(required)}, allowed {sorted(allowed)}, "
+        f"observed {sorted(found)}",
+    )
 
 
 def rank_table(text, devices, pid):
@@ -55,32 +85,46 @@ def rank_table(text, devices, pid):
     return [ranks[0], ranks[1]]
 
 
-def verify_daemon(run, identity, rank, runtime, completed):
-    directory = run / f"daemon-{rank}"
+def verify_daemon(run: Path, identity: dict, runtime: Path, *, completed: bool) -> int:
+    directory = run / "daemon"
     daemon = load(directory / "lmcache-ready.json")
     version = identity["lmcache_ready_version"].encode()
-    namespace = f"sglang-r{rank}"
-    port = identity["daemon_ports"][rank]
+    namespace = "sglang"
+    port = identity["daemon_port"]
+    capacity = identity["lmcache_capacity_bytes"]
+    require(capacity == 128 << 30, "Wrong shared LMCache capacity")
     pid = int((directory / "lmcache-pid.txt").read_text())
-    endpoint = str(runtime / f"sglang-lmcache-r{rank}.sock")
+    endpoint = str(runtime / cache.SOCKET_NAME)
     frame = cache.FRAME.pack(identity["lmcache_wire"].encode(), 0, len(version)) + version
-    require(daemon["socket"] == endpoint and daemon["namespace"] == namespace
-            and daemon["wire"] == identity["lmcache_wire"]
-            and daemon["ready_version"].encode() == version and daemon["frame"] == frame.hex()
-            and daemon["peer_pid"] == daemon["group_pid"] == pid and daemon["peer_start_ticks"] > 0
-            and daemon["peer_uid"] == identity["lmcache_uid"], "Incorrect rank-local cache peer")
-    gpu = identity["devices"][rank]
-    require((directory / "lmcache-cuda-environment.txt").read_text() ==
-            f"CUDA_DEVICE_ORDER=PCI_BUS_ID\nCUDA_VISIBLE_DEVICES={gpu}\n",
-            "Wrong daemon GPU visibility")
-    marker = (f"sglang GPU LMCache at {endpoint}, device {gpu[4:].replace('-', '').lower()}, "
-              f"L1 capacity {64 << 30} bytes")
-    require(marker in (directory / "lmcache.log").read_text(),
-            "Wrong daemon transfer device or capacity")
-    listener, = (directory / "lmcache-listener.txt").read_text().splitlines()
-    require(listener.split()[3] == f"127.0.0.1:{port}" and f"pid={pid}," in listener,
-            "Wrong rank-local daemon listener")
-    cache.verify_process(directory, identity["lmcache_python"], port, endpoint, namespace)
+    require(
+        daemon["socket"] == endpoint
+        and daemon["namespace"] == namespace
+        and daemon["wire"] == identity["lmcache_wire"]
+        and daemon["ready_version"].encode() == version
+        and daemon["frame"] == frame.hex()
+        and daemon["peer_pid"] == daemon["group_pid"] == pid
+        and daemon["peer_start_ticks"] > 0
+        and daemon["peer_uid"] == identity["lmcache_uid"],
+        "Incorrect shared cache peer",
+    )
+    gpus = ",".join(identity["devices"])
+    require(
+        (directory / "lmcache-cuda-environment.txt").read_text()
+        == f"CUDA_DEVICE_ORDER=PCI_BUS_ID\nCUDA_VISIBLE_DEVICES={gpus}\n",
+        "Wrong daemon GPU visibility",
+    )
+    uuids = ",".join(gpu[4:].replace("-", "").lower() for gpu in identity["devices"])
+    marker = f"sglang GPU LMCache at {endpoint}, devices {uuids}, L1 capacity {capacity} bytes"
+    require(
+        marker in (directory / "lmcache.log").read_text(),
+        "Wrong shared daemon transfer devices or capacity",
+    )
+    (listener,) = (directory / "lmcache-listener.txt").read_text().splitlines()
+    require(
+        listener.split()[3] == f"127.0.0.1:{port}" and f"pid={pid}," in listener,
+        "Wrong shared daemon listener",
+    )
+    cache.verify_process(directory, identity["lmcache_python"], port, endpoint, memory_gib=128)
     sources = hash_manifest(directory / "lmcache-source.sha256")
     project = Path(__file__).resolve().parents[2]
     manifest = hash_manifest(run.parent.parent / "protocol.sha256")
@@ -144,23 +188,33 @@ def verify(run, completed=False):
             [identity["binary_sha256"], f"/proc/{pid}/exe"], "Native running binary mismatch")
     cache.wheel_receipt(base, identity)
     ranks = rank_table((run / "server.log").read_text(), devices, pid)
-    daemons = [verify_daemon(run, identity, rank, Path(env["XDG_RUNTIME_DIR"]), completed)
-               for rank in range(2)]
+    daemon = verify_daemon(run, identity, Path(env["XDG_RUNTIME_DIR"]), completed=completed)
     for gpu in devices:
         compute_owners(run / "compute-before-daemons.csv", gpu, ())
-    owners(run / "compute-before.csv", devices, daemons)
-    owners(run / "compute-ready.csv", devices, daemons, pid)
+    owners(run / "compute-before.csv", devices, daemon, before_transfer=True)
+    owners(run / "compute-ready.csv", devices, daemon, pid, before_transfer=True)
     if completed:
-        owners(run / "compute-measurement-end.csv", devices, daemons, pid)
+        owners(run / "compute-measurement-end.csv", devices, daemon, pid)
         require((run / "live-environment-end.bin").read_bytes() == raw,
                 "Native environment changed")
-    return {"stage": "completed" if completed else "ready", "ranks": ranks, "daemon_pids": daemons,
-            "config": required}
+    return {
+        "stage": "completed" if completed else "ready",
+        "ranks": ranks,
+        "daemon_pid": daemon,
+        "config": required,
+    }
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("run", type=Path)
-    parser.add_argument("--completed", action="store_true")
+    phases = parser.add_mutually_exclusive_group()
+    phases.add_argument("--preflight", action="store_true")
+    phases.add_argument("--completed", action="store_true")
     args = parser.parse_args()
-    print(json.dumps(verify(args.run, args.completed), indent=2))
+    if args.preflight:
+        devices = load(args.run.parent.parent / "identity.json")["devices"]
+        daemon = int((args.run / "daemon/lmcache-pid.txt").read_text(encoding="utf-8"))
+        owners(args.run / "compute-before.csv", devices, daemon, before_transfer=True)
+    else:
+        print(json.dumps(verify(args.run, args.completed), indent=2))

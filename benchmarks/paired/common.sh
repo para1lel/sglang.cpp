@@ -268,6 +268,12 @@ start_vllm() {
         for name in "${names[@]}"; do
             environment+=("$name=${!name}")
         done
+        local proxy=${PAIRED_VLLM_HTTP_PROXY:-}
+        if [[ -n $proxy ]]; then
+            environment+=("http_proxy=$proxy" "https_proxy=$proxy" "all_proxy=$proxy"
+                "HTTP_PROXY=$proxy" "HTTPS_PROXY=$proxy" "ALL_PROXY=$proxy"
+                no_proxy=localhost,127.0.0.1,::1 NO_PROXY=localhost,127.0.0.1,::1)
+        fi
         printf '%s\n' "${environment[@]:2}" >"$run/effective-environment.txt"
     else
         env | LC_ALL=C sort | sed -nE "/^($env_prefixes)/p" >"$run/effective-environment.txt"

@@ -1,5 +1,3 @@
-"""Check live single-round qualification and archived schedule dispatch."""
-
 import gzip
 import json
 import os
@@ -61,6 +59,29 @@ def test_profiles_still_reach_shared_round_validation(tmp_path, profile, row):
                             capture_output=True, text=True)
     assert result.returncode == 2 and "exactly one warmup" in result.stderr
     assert not output.exists()
+
+
+@pytest.mark.parametrize(("index", "overrides", "expected"), [
+    ("0", {}, "0-9 10-11"),
+    ("0", {"PAIRED_SERVER_CPUS": "18-23,36-39", "PAIRED_CLIENT_CPUS": "44-45"},
+     "18-23,36-39 44-45"),
+    ("7", {"PAIRED_CLIENT_CPUS": "44-45"}, "84-93 44-45"),
+])
+def test_k4_launcher_preserves_explicit_cpu_sets(tmp_path, index, overrides, expected):
+    manifest = tmp_path / "manifest"
+    manifest.touch()
+    driver = tmp_path / "run_k4.sh"
+    driver.write_bytes((ROOT / "benchmarks/paired/run_k4.sh").read_bytes())
+    (tmp_path / "common.sh").write_text(
+        'printf "%s %s\\n" "$PAIRED_SERVER_CPUS" "$PAIRED_CLIENT_CPUS"\nexit 0\n')
+    environment = {key: value for key, value in os.environ.items()
+                   if not key.startswith("PAIRED_")}
+    environment.update(PAIRED_NATIVE_SOURCE="1" * 40, PAIRED_NATIVE_SHA256="2" * 64,
+                       PAIRED_CHECKPOINT_MANIFEST=str(manifest), **overrides)
+    result = subprocess.run(["bash", str(driver), "/usr/bin/true", index,
+                             str(tmp_path / "out"), "W1"], env=environment,
+                            check=True, capture_output=True, text=True, timeout=15)
+    assert result.stdout.strip() == expected
 
 
 @pytest.mark.parametrize("different_ids", [False, True])

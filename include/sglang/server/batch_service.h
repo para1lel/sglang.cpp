@@ -1,9 +1,9 @@
 #pragma once
 
 #include "sglang/decoder_media.h"
-#include "sglang/runtime/server/batch_executor.h"
-#include "sglang/runtime/backend/tensor_parallel.h"
+#include "sglang/runtime/backend/tp_ar_counters.h"
 #include "sglang/runtime/server/batch_cache.h"
+#include "sglang/runtime/server/batch_executor.h"
 
 #include <array>
 #include <atomic>
@@ -47,59 +47,16 @@ struct BatchProfile {
 
 class BatchRequestId {
 public:
-    explicit BatchRequestId(std::string value) : value(std::move(value)) {}
+    explicit BatchRequestId(std::string value);
 
-    bool dispatch() {
-        auto expected = State::waiting;
-        return state_.compare_exchange_strong(expected, State::dispatched);
-    }
-
-    bool abort(bool dispatched_only = false) {
-        auto expected = state_.load();
-        while (expected == State::dispatched ||
-               (!dispatched_only && expected == State::waiting)) {
-            const auto target = expected == State::waiting ? State::aborted_waiting :
-                                                             State::aborted_running;
-            if (state_.compare_exchange_weak(expected, target)) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    bool claim_completion() {
-        auto expected = State::dispatched;
-        return state_.compare_exchange_strong(expected, State::finishing);
-    }
-
-    bool finish() {
-        auto expected = state_.load();
-        while (expected == State::dispatched || expected == State::finishing) {
-            if (state_.compare_exchange_weak(expected, State::finished)) return true;
-        }
-        return false;
-    }
-
-    void finish_abort() {
-        const auto state = state_.load();
-        state_.store(state == State::aborted_waiting ? State::finished_waiting_abort :
-                                                       State::finished_running_abort);
-    }
-
-    bool finished() const {
-        const auto state = state_.load();
-        return state == State::finished || state == State::finished_waiting_abort ||
-               state == State::finished_running_abort;
-    }
-    bool aborted() const {
-        const auto state = state_.load();
-        return state == State::aborted_waiting || state == State::aborted_running ||
-               state == State::finished_waiting_abort || state == State::finished_running_abort;
-    }
-    bool aborted_waiting() const {
-        const auto state = state_.load();
-        return state == State::aborted_waiting || state == State::finished_waiting_abort;
-    }
+    bool dispatch();
+    bool abort(bool dispatched_only = false);
+    bool claim_completion();
+    bool finish();
+    void finish_abort();
+    bool finished() const;
+    bool aborted() const;
+    bool aborted_waiting() const;
 
     const std::string value;
 
@@ -122,7 +79,7 @@ struct BatchPrompt {
     std::vector<DecoderMedia> media = {};
     std::size_t expanded_tokens = 0;
 
-    std::size_t prompt_tokens() const { return media.empty() ? prompt.size() : expanded_tokens; }
+    std::size_t prompt_tokens() const;
 };
 
 struct BatchCallbacks {

@@ -149,9 +149,7 @@ void append_completion_scores(std::string& output, const Tokenizer& tokenizer,
 void append_chat_score(std::string& output, const Tokenizer& tokenizer,
                        const DecoderLogprob& score) {
     const auto bytes = tokenizer.piece(score.token_id, false);
-    Utf8Stream utf8;
-    auto text = utf8.push(bytes);
-    text += utf8.finish();
+    const auto text = repair_utf8(bytes);
     output += R"({"token":)";
     json::append_quoted(output, text);
     output += R"(,"bytes":[)";

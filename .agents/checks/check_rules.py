@@ -1,5 +1,4 @@
 import argparse
-import ast
 from html.parser import HTMLParser
 import json
 import os
@@ -16,6 +15,7 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import comment_rules
+import function_spans
 import gate_config
 
 
@@ -24,6 +24,7 @@ CODE_SUFFIXES = {
     ".hxx", ".java", ".js", ".json", ".jsx", ".lua", ".mjs", ".ps1", ".py", ".rs", ".sh",
     ".toml", ".ts", ".tsx", ".yaml", ".yml",
 }
+CODE_SUFFIXES.update(function_spans.HEADER_SUFFIXES | gate_config.PYTHON_SUFFIXES)
 DOCUMENT_SUFFIXES = {".md", ".rst", ".txt", ".html"}
 MARKDOWN = MarkdownIt("commonmark", {"html": True}).enable("table")
 REFERENCE_MARKDOWN = MarkdownIt("commonmark", {"html": True}).enable("table")
@@ -71,12 +72,11 @@ def rendered_text(text, suffix):
     return text
 
 
-def repository_files(root):
-    result = subprocess.run(
-        ["git", "-C", str(root), "ls-files", "--cached", "--others", "--exclude-standard", "-z"],
-        capture_output=True,
-        check=True,
-    )
+def repository_files(root, *, tracked=False):
+    command = ["git", "-C", str(root), "ls-files", "--cached", "-z"]
+    if not tracked:
+        command.extend(("--others", "--exclude-standard"))
+    result = subprocess.run(command, capture_output=True, check=True)
     paths = sorted(set(result.stdout.decode("utf-8").split("\0")) - {""})
     return [root / relative for relative in paths if (root / relative).is_file()]
 
@@ -96,7 +96,7 @@ def package_files(root):
     return paths
 
 
-def code_errors(path, text, configuration=None):
+def code_errors(path, text, configuration=None, header_spans=None):
     errors = []
     lines = text.splitlines()
     limits = gate_config.limits(configuration)
@@ -105,28 +105,20 @@ def code_errors(path, text, configuration=None):
     for number, line in enumerate(lines, 1):
         if len(line) > 100:
             errors.append(f"Line {number} has more than 100 characters.")
-    if path.suffix == ".py":
+    if path.suffix in gate_config.PYTHON_SUFFIXES or (
+        configuration and gate_config.function_source(path) and lines
+    ):
         try:
-            tree = ast.parse(text, filename=str(path))
+            spans = header_spans
+            if spans is None:
+                spans = gate_config.function_spans(path, text, configuration)
+            for name, start, end in spans:
+                if end - start + 1 > limits["function_lines"]:
+                    errors.append(f"Function {name} at line {start} exceeds the function limit.")
+        except (ValueError, subprocess.SubprocessError) as error:
+            errors.append(str(error))
         except SyntaxError as error:
-            return [*errors, f"The Python syntax is invalid at line {error.lineno}."]
-        for node in ast.walk(tree):
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                start = min([node.lineno, *[item.lineno for item in node.decorator_list]])
-                if node.end_lineno - start + 1 > limits["function_lines"]:
-                    errors.append(
-                        f"Function {node.name} at line {start} exceeds the function limit."
-                    )
-    elif configuration and gate_config.function_source(path):
-        if lines:
-            try:
-                for name, start, end in gate_config.function_spans(path, text, configuration):
-                    if end - start + 1 > limits["function_lines"]:
-                        errors.append(
-                            f"Function {name} at line {start} exceeds the function limit."
-                        )
-            except (ValueError, subprocess.SubprocessError) as error:
-                errors.append(str(error))
+            errors.append(f"The Python syntax is invalid at line {error.lineno}.")
     try:
         if path.suffix == ".json":
             json.loads(text)
@@ -330,16 +322,56 @@ def incremental_paths(root, paths, changed):
         selected.update(incoming)
 
 
-def check(root, paths=None, all_paths=None, changed=None, configuration=None, policy=None):
+def check_headers(root, paths):
+    parsers = {}
+    measured = {}
+    failures = []
+    for path in paths:
+        suffix = path.suffix.lower()
+        if suffix not in function_spans.HEADER_SUFFIXES or not path.is_file():
+            continue
+        relative = path.relative_to(root)
+        if not path.resolve().is_relative_to(root):
+            failures.append(f"{relative}: The file leaves the repository.")
+            continue
+        grammar = function_spans.GRAMMARS[suffix]
+        if grammar not in parsers:
+            parsers[grammar] = function_spans.parser_for(path)
+        definitions, spans, error = function_spans.scan_header(path, parsers[grammar], root)
+        for line in sorted(set(definitions)):
+            failures.append(
+                f"{relative}: Line {line} contains a function definition. "
+                "Move it to a .cpp or .cu translation unit."
+            )
+        if error is not None:
+            failures.append(
+                f"{relative}: Line {error} has unsupported or invalid {grammar} syntax."
+            )
+        measured[path] = [(item["name"], item["start"], item["end"]) for item in spans]
+    return failures, measured
+
+
+def check(root, paths=None, all_paths=None, changed=None, configuration=None, policy=None,
+          project_headers=True):
     failures = []
     documents = 0
     skills = 0
     maximum = 0
     policy = set() if policy is None else set(policy)
-    paths = repository_files(root) if paths is None else paths
+    header_paths = all_paths
+    if paths is None:
+        paths = repository_files(root)
+        if all_paths is None and project_headers:
+            header_paths = repository_files(root, tracked=True)
     all_paths = paths if all_paths is None else all_paths
     configuration = gate_config.load(root) if configuration is None else configuration
     failures.extend(directory_errors(root, all_paths, changed, configuration))
+    header_spans = {}
+    if project_headers:
+        header_failures, header_spans = check_headers(
+            root, all_paths if header_paths is None else header_paths,
+        )
+        failures.extend(header_failures)
     for path in paths:
         relative = path.relative_to(root)
         if not path.resolve().is_relative_to(root):
@@ -347,14 +379,19 @@ def check(root, paths=None, all_paths=None, changed=None, configuration=None, po
             continue
         if not path.is_file():
             continue
-        is_code = gate_config.is_code(path, CODE_SUFFIXES, configuration, root)
+        is_code = path in header_spans or gate_config.is_code(
+            path, CODE_SUFFIXES, configuration, root,
+        )
         selected = relative.as_posix() in policy
         if path.suffix not in DOCUMENT_SUFFIXES and not is_code and not selected:
             continue
         errors = []
         if path.suffix in DOCUMENT_SUFFIXES or is_code:
             text = path.read_text(encoding="utf-8")
-            errors = code_errors(path, text, configuration) if is_code else []
+            adapter = configuration.get("function_adapters", {}).get(path.suffix)
+            standard = ["{python}", ".agents/checks/function_spans.py", "{file}"]
+            spans = header_spans.get(path) if adapter in (None, standard) else None
+            errors = code_errors(path, text, configuration, spans) if is_code else []
             if path.suffix in DOCUMENT_SUFFIXES:
                 documents += 1
                 count = len(re.findall(r"\S+", rendered_text(text, path.suffix)))
@@ -464,14 +501,22 @@ def main():
                 configuration["function_adapters"] = json.loads(
                     arguments.adapters.read_text(encoding="utf-8")
                 )
-            result = gate_config.measure(root, repository_files(root), CODE_SUFFIXES, configuration)
+            header_adapter = ["{python}", function_spans.__file__, "{file}"]
+            result = gate_config.measure(
+                root,
+                repository_files(root),
+                CODE_SUFFIXES,
+                configuration,
+                default_adapters=dict.fromkeys(function_spans.HEADER_SUFFIXES, header_adapter),
+            )
             print(json.dumps(result, indent=2))
             return 0
         if arguments.command == "package":
             configuration = (
                 gate_config.load(arguments.policy_root.resolve()) if arguments.policy_root else None
             )
-            return check(root, package_files(root), configuration=configuration)
+            return check(root, package_files(root), configuration=configuration,
+                         project_headers=False)
         if arguments.command == "check" and arguments.selection:
             selection = json.loads(arguments.selection.read_text(encoding="utf-8"))
             paths = [root / name for name in selection["files"]]

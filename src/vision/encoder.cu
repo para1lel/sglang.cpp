@@ -2,10 +2,65 @@
 
 #include "sglang/checkpoint.h"
 
+#include <cstdio>
+#include <stdexcept>
+#include <string>
+
+namespace sglang::vision_detail {
+
+void check(cudaError_t status, std::string_view operation) {
+    if (status != cudaSuccess) {
+        throw std::runtime_error(std::string(operation) + ": " + cudaGetErrorString(status));
+    }
+}
+
+bool cleanup(cudaError_t status, const char* operation) noexcept {
+    if (status == cudaSuccess) {
+        return true;
+    }
+    std::fprintf(stderr, "%s: %s\n", operation, cudaGetErrorString(status));
+    return false;
+}
+
+}
+
 namespace sglang {
 namespace {
 
 using namespace vision_detail;
+
+template <typename Element>
+class DeviceBuffer {
+public:
+    explicit DeviceBuffer(std::size_t count) {
+        check(cudaGetDevice(&device_), "Get vision allocation device");
+        void* storage = nullptr;
+        check(cudaMalloc(&storage, count * sizeof(Element)), "Allocate vision buffer");
+        data_ = static_cast<Element*>(storage);
+    }
+    ~DeviceBuffer() {
+        int previous = 0;
+        if (!cleanup(cudaGetDevice(&previous), "Get current device for vision cleanup")) {
+            return;
+        }
+        const bool changed = previous != device_;
+        if (changed && !cleanup(cudaSetDevice(device_), "Select vision allocation device")) {
+            return;
+        }
+        cleanup(cudaFree(data_), "Free vision buffer");
+        if (changed) {
+            cleanup(cudaSetDevice(previous), "Restore device after vision cleanup");
+        }
+    }
+
+    DeviceBuffer(const DeviceBuffer&) = delete;
+    DeviceBuffer& operator=(const DeviceBuffer&) = delete;
+    Element* get() const { return data_; }
+
+private:
+    int device_;
+    Element* data_ = nullptr;
+};
 
 Grid checked_grid(VisionGrid grid) {
     const auto [time, height, width] = grid;
@@ -16,7 +71,7 @@ Grid checked_grid(VisionGrid grid) {
         throw std::invalid_argument("Unsupported preprocessed vision grid");
     }
     return {static_cast<int>(time * height * width), static_cast<int>(height),
-            static_cast<int>(width)};
+            static_cast<int>(width), static_cast<int>(height * width)};
 }
 
 template <typename Element>
@@ -68,7 +123,7 @@ struct Workspace {
         : patches(grid.rows * vision_patch_width), residual(grid.rows * hidden),
           norm(grid.rows * hidden), qkv(grid.rows * 3 * hidden), qk(grid.rows * 2 * hidden),
           context(grid.rows * hidden), projected(grid.rows * hidden),
-          intermediate(grid.rows * feedforward), rotary(grid.frame() * (head_width / 2)) {}
+          intermediate(grid.rows * feedforward), rotary(grid.frame * (head_width / 2)) {}
 
     DeviceBuffer<Bf16> patches;
     DeviceBuffer<Bf16> residual;

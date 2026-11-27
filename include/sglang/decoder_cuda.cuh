@@ -1,6 +1,7 @@
 #pragma once
 
 #include "sglang/multimodal_prompt.h"
+#include "sglang/text/gqa/geometry.cuh"
 #include "sglang/text_attention.h"
 #include "sglang/text_ops.h"
 
@@ -10,11 +11,6 @@
 namespace sglang::decoder {
 
 struct Fp8Weight;
-
-#ifdef __CUDACC__
-__device__ inline int position_value(int position) { return position; }
-__device__ inline int position_value(const int* position) { return *position; }
-#endif
 
 cudaError_t decode_embedding(const __nv_bfloat16* embedding, int vocab_size, int width,
                              const TextLogitCandidate* previous, __nv_bfloat16* output,
@@ -298,15 +294,7 @@ inline constexpr int paged_decode_max_visible = 16384;
 inline constexpr std::size_t paged_decode_scratch_bytes =
     paged_decode_partitions * mxfp8_query_heads * (mxfp8_head_dim + 4) * sizeof(float);
 
-#ifdef __CUDACC__
-__host__ __device__ inline constexpr bool paged_decode_position(int position) {
-    return position >= paged_decode_min_visible - 1 && position < paged_decode_max_visible;
-}
-#else
-inline constexpr bool paged_decode_position(int position) {
-    return position >= paged_decode_min_visible - 1 && position < paged_decode_max_visible;
-}
-#endif
+SGLANG_GQA_HOST_DEVICE bool paged_decode_position(int position);
 
 struct PagedDecodeBuffers {
     const __nv_bfloat16* queries;
@@ -333,16 +321,8 @@ inline constexpr int target_split_first_position = 2047;
 inline constexpr int target_split_end_position = 4096;
 inline constexpr int target_split_eager_max_rows = 4 * text_gdn_max_verify_rows;
 
-#ifdef __CUDACC__
-__host__ __device__ inline constexpr bool target_split_position(
-    int position, int end = target_split_end_position) {
-    return position >= target_split_first_position && position < end;
-}
-#else
-inline constexpr bool target_split_position(int position, int end = target_split_end_position) {
-    return position >= target_split_first_position && position < end;
-}
-#endif
+SGLANG_GQA_HOST_DEVICE bool target_split_position(int position,
+                                                  int end = target_split_end_position);
 
 cudaError_t target_split_gqa(PagedDecodeLane lane, cudaStream_t stream,
                             int end = target_split_end_position);
@@ -390,11 +370,7 @@ struct CompactGdnVerificationBatch {
     GdnVerificationLane entries[lanes];
 };
 
-__host__ __device__ constexpr int compact_gdn_row(int lane, int row) {
-    constexpr int packet_lanes = GdnVerificationBatch::lanes;
-    constexpr int packet_rows = packet_lanes * GdnVerificationBatch::rows;
-    return (lane / packet_lanes) * packet_rows + row * packet_lanes + lane % packet_lanes;
-}
+__host__ __device__ int compact_gdn_row(int lane, int row);
 
 struct CompactGdnFp8Rows {
     std::uint8_t* values;

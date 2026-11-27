@@ -1,9 +1,9 @@
 import copy
-import gzip
 import json
 import statistics
 import threading
 from contextlib import contextmanager
+from http.client import HTTPResponse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
@@ -11,25 +11,27 @@ import pytest
 
 from benchmarks.concurrent import client
 from benchmarks.concurrent.client import (
-    capture_cohort, gate, summarize, thresholds, validate_cohort,
+    capture_cohort,
+    gate,
+    summarize,
+    thresholds,
+    validate_cohort,
 )
-from benchmarks.concurrent.profile import GDN_DECODE, GDN_PREFILL_PREFIX, inspect_events
 from benchmarks.concurrent.reference import ROWS, digest, goldens, lane_manifest, reference
-from benchmarks.concurrent.replay import replay_cohort
 from benchmarks.streaming.client import json_bytes, request_body
 
 
-def wire_fixture():
+def wire_fixture(output_tokens=3):
     lanes = []
     for lane in range(2):
-        case = {"prompt_token_ids": [100 + lane, 200], "output_tokens": 3}
+        case = {"prompt_token_ids": [100 + lane, 200], "output_tokens": output_tokens}
         body = json_bytes(request_body(case))
         lanes.append(({"lane": lane, "request_sha256": digest(body)}, body, case))
     return lanes
 
 
 @contextmanager
-def loopback(lanes, status_oom=False):
+def loopback(lanes, status_oom=False, *, cached_tokens=0):
     submitted = threading.Barrier(len(lanes), timeout=3)
     emitted = threading.Barrier(len(lanes), timeout=3)
     received = []
@@ -41,7 +43,9 @@ def loopback(lanes, status_oom=False):
         def do_POST(self):
             body = self.rfile.read(int(self.headers["Content-Length"]))
             received.append((self.path, body))
-            prompt = json.loads(body)["prompt"]
+            request = json.loads(body)
+            prompt = request["prompt"]
+            output = list(range(1, request["max_tokens"] + 1))
             lane = prompt[0] - 100
             submitted.wait()
             if status_oom and lane == 0:
@@ -53,7 +57,7 @@ def loopback(lanes, status_oom=False):
             meta = {"id": f"lane-{lane}", "model": "benchmark", "object": "text_completion"}
             echo = {"index": 0, "token_ids": [], "prompt_token_ids": prompt,
                     "text": "", "finish_reason": None}
-            first = {"index": 0, "token_ids": [1, 2], "text": "é", "finish_reason": None}
+            first = {"index": 0, "token_ids": output[:2], "text": "é", "finish_reason": None}
             frames = b"".join(b"data: " + json_bytes(meta | {"choices": [choice]}) + b"\r\n\r\n"
                               for choice in (echo, first))
             split = frames.index("é".encode()) + 1
@@ -64,9 +68,10 @@ def loopback(lanes, status_oom=False):
             if not status_oom:
                 emitted.wait()
                 threading.Event().wait(.025)
-            last = {"index": 0, "token_ids": [3], "text": "", "finish_reason": "length"}
-            usage = {"prompt_tokens": len(prompt), "completion_tokens": 3, "total_tokens": 5,
-                     "prompt_tokens_details": {"cached_tokens": 0}}
+            last = {"index": 0, "token_ids": output[2:], "text": "", "finish_reason": "length"}
+            usage = {"prompt_tokens": len(prompt), "completion_tokens": len(output),
+                     "total_tokens": len(prompt) + len(output),
+                     "prompt_tokens_details": {"cached_tokens": cached_tokens}}
             last_choice = json_bytes(meta | {"choices": [last]})
             usage_frame = json_bytes(meta | {"choices": [], "usage": usage})
             self.wfile.write(b"data: " + last_choice + b"\n\n"
@@ -96,8 +101,8 @@ def captured():
     return raw, lanes, [[1, 2, 3]] * 2, policy
 
 
-def test_overlapping_streams_and_round_replay(captured, tmp_path):
-    raw, lanes, expected, policy = captured
+def test_overlapping_streams_and_timing(captured):
+    raw, lanes, _, policy = captured
     report = validate_cohort(raw, lanes, policy)
     assert report["submission_span_ms"] < 50
     assert report["all_streams_overlap_ms"] > 0
@@ -109,17 +114,41 @@ def test_overlapping_streams_and_round_replay(captured, tmp_path):
     for record in records:
         assert [count for _, count in record["token_chunks"]] == [2, 1]
         assert record["metrics"]["tpot_ms"] == (record["last_ns"] - record["first_ns"]) / 2e6
-    (tmp_path / "W3").mkdir()
-    path = "W3/measured-01.json.gz"
-    compressed = gzip.compress(json_bytes(raw), mtime=0)
-    (tmp_path / path).write_bytes(compressed)
-    _, replay = replay_cohort(tmp_path, {path: digest(compressed)}, "W3", "measured-01",
-                              lanes, expected, policy)
-    assert replay == report
-    (tmp_path / path).write_bytes(compressed[:-1])
-    with pytest.raises(ValueError, match="evidence digest"):
-        replay_cohort(tmp_path, {path: digest(compressed)}, "W3", "measured-01",
-                      lanes, expected, policy)
+
+
+@pytest.fixture
+def coalesced_reads(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(HTTPResponse, "read1", HTTPResponse.read)
+
+
+@pytest.mark.usefixtures("coalesced_reads")
+def test_prefix_cohort_replays_one_token_and_checks_cache_range() -> None:
+    identity, body, case = wire_fixture(output_tokens=1)[0]
+    lanes = [(identity, body, case | {"cached_token_range": (1, 2)})]
+    policy = reference()["policy"]
+    with loopback(lanes, cached_tokens=2) as (url, _):
+        raw = capture_cohort(url, "W3", lanes, "prime", policy)
+    assert {event["read"] for event in raw["requests"][0]["events"]} == {1}
+    report, records = client.replay_cohort(raw, lanes, policy)
+    record, = records
+    assert record["output_ids"] == [1]
+    assert record["usage"]["prompt_tokens_details"]["cached_tokens"] == 2
+    assert report["request_latencies"][0]["tpot_ms"] is None
+    assert report["all_generating_overlap_ms"] == 0
+    with pytest.raises(ValueError, match="Unexpected cached prompt rows"):
+        validate_cohort(raw, [(identity, body, case | {"cached_token_range": (0, 0)})], policy)
+
+
+@pytest.mark.usefixtures("coalesced_reads")
+def test_coalesced_reads_do_not_satisfy_multi_lane_overlap() -> None:
+    lanes, policy = wire_fixture(output_tokens=1), reference()["policy"]
+    with loopback(lanes) as (url, _):
+        raw = capture_cohort(url, "W3", lanes, "measured-01", policy)
+    for record, lane in zip(raw["requests"], lanes, strict=True):
+        assert {event["read"] for event in record["events"]} == {1}
+        client.replay_lane(record, lane)
+    with pytest.raises(ValueError, match="overlap bounds"):
+        validate_cohort(raw, lanes, policy)
 
 
 def test_oom_records_failed_and_successful_requests():
@@ -144,6 +173,8 @@ def mutate_payload(record, event, field, value):
     ((0, "prompt_token_ids", [999]), "Prompt IDs"),
     ((1, "id", "different"), "Completion ID changed"),
     ((2, "stop_reason", 13), "stop reason"),
+    ((2, "finish_reason", "stop"), "Expected length completion"),
+    ((2, "token_ids", []), "Expected length completion"),
     ((3, "prompt_tokens_details", {"cached_tokens": 1}), "zero reused"),
     ((3, "total_tokens", 6), "Usage total"),
 ])
@@ -164,20 +195,15 @@ def test_rejects_missing_done_and_submission_skew(captured):
         validate_cohort(raw, lanes, policy | {"max_submission_span_ms": -1})
 
 
-def test_cross_engine_wire_accepts_different_ids_and_vllm_replay_rejects(captured, tmp_path):
+def test_cross_engine_wire_accepts_different_ids_but_same_engine_rejects(captured):
     raw, lanes, expected, policy = captured
     original = validate_cohort(raw, lanes, policy)
     first = raw["requests"][0]
     mutate_payload(first, 1, "token_ids", [1, 99])
     first["output_ids"][1] = 99
     assert validate_cohort(raw, lanes, policy) == original
-    (tmp_path / "W3").mkdir()
-    path = "W3/measured-01.json.gz"
-    compressed = gzip.compress(json_bytes(raw), mtime=0)
-    (tmp_path / path).write_bytes(compressed)
-    with pytest.raises(ValueError, match="greedy mismatch at output index 1"):
-        replay_cohort(tmp_path, {path: digest(compressed)}, "W3", "measured-01",
-                      lanes, expected, policy)
+    with pytest.raises(ValueError, match="output 1 differs from warmup"):
+        client.verify_round_ids(raw, expected)
 
 
 def test_wire_accepts_optional_openai_envelope(captured):
@@ -216,37 +242,6 @@ def test_rate_margin_and_independent_latency_budgets():
     assert gate(stats, limits) == {
         "throughput": False, "latency": {"ttft_ms": True, "tpot_ms": True, "e2e_ms": True},
     }
-
-
-def trace_event(category, name):
-    return {"ph": "X", "cat": category, "name": name}
-
-
-@pytest.mark.parametrize("phase", ["prefill", "decode"])
-def test_profile_route_and_negative_controls(phase):
-    trt = "fmhaSm100aKernel_QBfloat16KvE4m3OBfloat16H256PagedKvCausalP64ForGen"
-    fa2 = ("void flashinfer::BatchPrefillWithPagedKVCacheKernel<1, __nv_bfloat16,"
-           " __nv_fp8_e4m3, __nv_bfloat16, float, int, 2>")
-    prefill = phase == "prefill"
-    label = "execute_context_1(8192)_generation_0(0)" if prefill else (
-        "execute_context_0(0)_generation_4(4)"
-    )
-    attention, gdn = (fa2, GDN_PREFILL_PREFIX + ">") if prefill else (trt, GDN_DECODE)
-    events = ([trace_event("user_annotation", label)] * 4
-              + [trace_event("cuda_runtime", "cudaGraphLaunch")] * 4
-              + [trace_event("kernel", attention)] * 64 + [trace_event("kernel", gdn)] * 192)
-    assert inspect_events(events, phase, 4, 8192)["graph_launches"] == 4
-    wrong = attention.replace("__nv_fp8_e4m3", "__nv_bfloat16").replace("KvE4m3", "KvBF16")
-    with pytest.raises(ValueError, match="Unrecognized attention"):
-        inspect_events(events + [trace_event("kernel", wrong)], phase, 4, 8192)
-    with pytest.raises(ValueError, match="CUDA graph activity"):
-        inspect_events([event for event in events if event["cat"] != "cuda_runtime"],
-                       phase, 4, 8192)
-    with pytest.raises(ValueError, match="kernel counts"):
-        inspect_events(events[:-1], phase, 4, 8192)
-    if not prefill:
-        with pytest.raises(ValueError, match="full batch"):
-            inspect_events(events, phase, 16, 8192)
 
 
 def test_portable_goldens_and_condition_identity():

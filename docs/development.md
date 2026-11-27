@@ -1,41 +1,57 @@
 # Native development guide
 
-The supported deployment uses one physical NVIDIA B200 and the Qwen3.8-27B-FP8 checkpoint. The checkpoint investigation records the model and tensor identities and the pinned SGLang sources. [Checkpoint investigation](research/checkpoint.md)
+Qwen3.8-27B-FP8 serves on one or two NVIDIA B200s. Defaults and acceptance depend on tensor-parallel width. [Checkpoint identity](research/checkpoint.md) · [TP2 serving](serving/tp2.md)
 
 <a id="scope-at-adoption"></a>
 ## Current architecture and scope
 
-The CUDA backend accepts `sm_100` devices. The exact `NVIDIA B200` name enables the B200 operator set. Project headers belong in `include/sglang/`. [Device resolution](../src/runtime/backend/cuda_backend_policy.cpp#L14)<!-- prefix: "CudaBackendP" --> · [Repository rules](../AGENTS.md)
+The CUDA backend accepts `sm_100` devices. The exact `NVIDIA B200` name enables the B200 operator set. Keep tracked project headers declaration-only, including internal headers, `.ipp`, and `.tpp`. Put function definitions in compiled sources. A deleted function uses `= delete` on its first declaration. [Device resolution](../src/runtime/backend/cuda_backend_policy.cpp#L13)<!-- prefix: "CudaBackendP" --> · [Repository rules](../AGENTS.md#integrating-changes)
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| Model | `QwenTextModel` defines checkpoint identity, geometry, and layer types. The Qwen serving profile owns tokenizer identity, chat templates, and parser selection. | [Model descriptor](../include/sglang/runtime/model/qwen_text_model.h#L7)<!-- prefix: "struct QwenT" --> · [Serving profile](../src/runtime/model/qwen_serving_profile.cpp#L134)<!-- prefix: "const Servin" --> |
-| Backend | `CudaBackendPolicy` resolves device capabilities. The CUDA backend owns allocation, stream, graph, and deferred cleanup primitives. `DecoderExecutionPolicy` selects operators within request limits. | [Backend capabilities](../include/sglang/runtime/backend/cuda_backend_policy.h#L24)<!-- prefix: "struct CudaB" --> · [Execution policy](../include/sglang/runtime/execution/decoder_execution_policy.h#L7)<!-- prefix: "struct Decod" --> |
-| Service | Startup supplies the executor to the scheduler. The scheduler owns admission and output publication. The executor owns the worker session and reports topology. | [Executor contract](../include/sglang/runtime/server/batch_executor.h#L9)<!-- prefix: "class BatchE" --> · [Session contract](../include/sglang/runtime/server/batch_session.h#L18)<!-- prefix: "class BatchS" --> · [Topology](../include/sglang/server/batch_service.h#L166)<!-- prefix: "BatchTopolog" --> |
+| Model | `QwenTextModel` defines checkpoint identity, geometry, and layers. | [Model descriptor](../include/sglang/runtime/model/qwen_text_model.h#L7)<!-- prefix: "struct QwenT" --> |
+| Backend | `CudaBackendPolicy` resolves device capabilities. The CUDA backend owns allocation, stream, graph, and deferred cleanup primitives. `DecoderExecutionPolicy` selects operators within request limits. | [Backend capabilities](../include/sglang/runtime/backend/cuda_backend_policy.h#L22)<!-- prefix: "struct CudaB" --> · [Execution policy](../include/sglang/runtime/execution/decoder_execution_policy.h#L7)<!-- prefix: "struct Decod" --> |
+| Service | Startup supplies the executor to the scheduler. The scheduler owns admission and output publication. The executor owns the worker session and reports topology. | [Executor contract](../include/sglang/runtime/server/batch_executor.h#L9)<!-- prefix: "class BatchE" --> · [Session contract](../include/sglang/runtime/server/batch_session.h#L17)<!-- prefix: "class BatchS" --> · [Topology](../include/sglang/server/batch_service.h#L123)<!-- prefix: "BatchTopolog" --> |
+| HTTP | The Qwen serving profile selects the tokenizer, templates, parser, and tool constraints. The scheduler's state, trace serialization, and output mailbox are private to HTTP. | [Serving profile](../apps/server/qwen/qwen_serving_profile.cpp#L134)<!-- prefix: "const Servin" --> · [Service state](../include/sglang/server/detail/batch_service_state.h#L86)<!-- prefix: "struct Batch" --> |
 | Prefix cache | `KvResidencyPolicy` sizes native GPU reservations. The cache client sends allocation views and prefix identities. LMCache owns data movement and retention. | [Prefix cache](prefix-cache.md) · [Request residency](../include/sglang/runtime/cache/kv_residency_policy.h#L15)<!-- prefix: "class KvResi" --> |
 | Build | Use XMake, default Pixi, user CUDA 13.4 compatibility libraries, and the host driver. Use private output and cache directories for concurrent work. | [Host build](../README.md#build-on-the-project-host) · [Isolated XMake builds](serving/isolated-builds.md) |
 
-Implement production CUDA operators in this project. Implementations may use CUTLASS primitives and templates or components from the CUDA Toolkit. Keep ready-made external operators such as FlashInfer FMHA outside the native execution path. The native runtime excludes cuBLAS, cuBLASLt, and cuDNN. Reference engines may use their own operators, and tests may use PyTorch as a numerical reference. Record the justification, license, version, and execution path of HTTP, JSON, tokenizer, media, and system dependencies. Record verified failures and preventive checks in [development lessons](lessons.md). Project code files carry no comments. The pre-commit hook inspects the entire staged content of every added or changed code file, including comments already present. Shebangs, compiler directives, and string literals are preserved. Untouched legacy files are not cleaned up. Explanations live in these documents, not in code.
+Keep production CUDA operators in this project. Use CUDA and NVIDIA open-source building blocks such as CUTLASS. Reference engines may use their own operators, and tests may use PyTorch as a numerical reference. Record the license, version, and execution path of host dependencies. Keep explanations in the docs and record verified failures in [development lessons](lessons.md). [Repository rules](../AGENTS.md)
+
+Production C/C++/CUDA grew from 67,153 physical lines at the baseline to 68,714 at the declaration-only cutover, then fell to 68,663 after prefill and dependency consolidation. Internal include directives changed from 704 to 757 to 743. Upward directives fell from 85 across 16 layer pairs to 74 across 14, then to 66 across the same 14 pairs. The last cut removed three backend-to-execution, three kernel-to-execution, and two cache-to-execution directives. Model and runtime server together went from 14 direct HTTP includes and 13 transitively reachable HTTP files to zero. [Baseline source](https://github.com/para1lel/sglang.cpp/tree/a5974ba4eb99bd8e8f890c2e7262a27dbc3aace1)
+
+Count physical lines in `.c`, `.cc`, `.cpp`, `.cxx`, `.cu`, `.h`, `.hh`, `.hpp`, `.cuh`, `.inl`, and `.ipp` files under `apps/`, `src/`, and `include/sglang/`, excluding `include/sglang/testing/`. Count repeated and conditional literal includes. Resolve quoted paths beside the including file first, then resolve both forms under `include/`. Count targets among the measured files. A directive is upward when its source layer precedes its target. The layer order is utility, tokenizer, backend, media, kernels, cache, model, execution, runtime server, HTTP server, application.
+
+Assign `runtime/` files to their named layer and `apps/server/` and `include/sglang/server/` to HTTP. Other `apps/` files are application. Under `src/` and `include/sglang/`, assign `json.*` and `utf8.*` to utility, `tokenizer/` to tokenizer, `media*`, `multimodal_prompt.*`, `vision*`, and `decoder_media.*` to media, and `checkpoint.*` to model. `text/`, `text_*`, `mxfp8_*`, `prefill_fp8*`, `decoder_cuda.*`, `decoder_sampling.*`, and `decoder_constraint_cuda.*` are kernels. The remaining `decoder*` files are execution.
+
+The cutover and consolidation were measured on canonical Git trees `6a745945d81ecdd78102b5f0a6cd3bb9cf3a9fac` and `2e18e98c29ab0cc35c5de645fc625da9bc834caf`, respectively. The consolidated production trees are `6e4b41639ba24254a426d76103f92863592c0f40` for `apps/`, `37929c2c714603ab3694f100443eb72683241653` for `src/`, and `9d8f3e3b2498176820bbae8289a71cd88a7d3027` for `include/sglang/`.
 
 ## Current matched K4 status
 
-Use a verified Release executable and run one row at a time on the same reserved B200. The benchmark agreement sets the acceptance gate and records the archived evidence. Use the driver recipe for launch and evidence capture. [Benchmark agreement](performance.md#matched-k4-evidence) · [Matched K4 driver](../benchmarks/paired/README.md#matched-k4-timing-protocol)
+Use a verified Release build and run one matched row at a time on the same reserved B200 device or pair for both arms. [Gates and frozen evidence](performance.md) · [TP1 driver](../benchmarks/paired/README.md#matched-k4-timing-protocol) · [TP2 driver](serving/tp2.md#acceptance-target)
 
 <a id="p2-gqa-cache-contract"></a>
 ## CUDA operator contracts
 
 K and V use four 256-channel E4M3 heads and one E8M0 scale per 32 contiguous channels. E4M3 weights use BF16 inverse scales per 128×128 block. [Checkpoint investigation](research/checkpoint.md)
 
-Each 128-token page holds 131,072 payload bytes and 4,096 scale bytes per tensor. The device table maps logical pages to distinct physical pages. [Cache layout](../include/sglang/mxfp8_gqa.h#L31)<!-- prefix: "struct Mxfp8" --> · [Page table](../include/sglang/mxfp8_gqa.h#L40)<!-- prefix: "struct Mxfp8" -->
+Each 128-token page holds 131,072 payload bytes and 4,096 scale bytes per tensor. The device table maps logical pages to distinct physical pages. [Cache layout](../include/sglang/mxfp8_gqa.h#L28)<!-- prefix: "struct Mxfp8" --> · [Page table](../include/sglang/mxfp8_gqa.h#L37)<!-- prefix: "struct Mxfp8" -->
 
-Link `sglang_cuda`. Apply RoPE to Q and K. Append contiguous BF16 K and V `[tokens, 4, 256]`. Pass the ready prefix length and first query position to `mxfp8_gqa_attention`. BF16 Q and output are `[queries, 24, 256]`. Row `r` sees through `first_query_position + r` inclusive. Check launch status. Retain storage through stream completion. [Library](../xmake.lua#L65)<!-- prefix: "target(\"sgla" --> · [Append](../include/sglang/mxfp8_gqa.h#L53)<!-- prefix: "cudaError_t " --> · [Attention](../include/sglang/mxfp8_gqa.h#L58)<!-- prefix: "cudaError_t " -->
+`gqa_geometry_valid` and `gqa_geometry_matches` are runtime predicates. For compile-time checks, use the fields of a `constexpr GqaGeometry` directly. Check geometry against the live cache with `gqa_geometry_matches` at runtime. [Geometry constants](../include/sglang/mxfp8_gqa.h#L23)<!-- prefix: "inline const" --> · [Runtime predicates](../src/text/gqa/geometry.cpp#L9)<!-- prefix: "bool gqa_geo" -->
 
-For group maximum magnitude `amax`, clamp `ceil(log2(max(amax, 1e-30) / 448)) + 127` to `[0, 254]`. See the [scratch-free reader](singleton-gqa-decode.md#scratch-free-ordered-attention) for direct attention. [Scale calculation](../src/mxfp8_gqa.cu#L43)<!-- prefix: "__device__ i" -->
+```cpp
+constexpr auto geometry = sglang::gqa_rank_geometry;
+static_assert(geometry.kv_heads == sglang::mxfp8_kv_heads / 2);
+static_assert(geometry.query_heads == sglang::mxfp8_queries_per_kv_head * geometry.kv_heads);
+```
 
-Exact scoring reduces eight groups in FP32, sums in group order, and scales by `1/16`. Ordered replay uses token-ordered FMAs and divides in FP32 before BF16 rounding. [Score](../src/mxfp8_gqa.cu#L228)<!-- prefix: "__device__ f" --> · [Replay](../include/sglang/text/gqa/ordered_gqa_vector.cuh#L153)<!-- prefix: "__device__ _" -->
+Link `sglang_cuda`. Apply RoPE to Q and K. Append contiguous BF16 K and V `[tokens, 4, 256]`. Pass the ready prefix length and first query position to `mxfp8_gqa_attention`. BF16 Q and output are `[queries, 24, 256]`. Row `r` sees through `first_query_position + r` inclusive. Check launch status. Retain storage through stream completion. [Library](../xmake.lua#L136)<!-- prefix: "target(\"sgla" --> · [Append](../include/sglang/mxfp8_gqa.h#L45)<!-- prefix: "cudaError_t " --> · [Attention](../include/sglang/mxfp8_gqa.h#L50)<!-- prefix: "cudaError_t " -->
 
-[Singleton](batch-graphs.md#page-parallel-gqa-decode) and [legacy narrow decode](batch-graphs.md#legacy-narrow-paged-gqa-decode) group softmax and value reductions by KV pages.
-[Fused packed decode](long-paged-decode.md#fused-packed-gqa) groups reductions by 64-token chunks. [Legacy wide eager decode](long-paged-decode.md#legacy-wide-eager-decode) selects its split after compaction.
+For group maximum magnitude `amax`, clamp `ceil(log2(max(amax, 1e-30) / 448)) + 127` to `[0, 254]`. See the [scratch-free reader](singleton-gqa-decode.md#scratch-free-ordered-attention) for direct attention. [Scale calculation](../src/text/gqa/kv_append.cu#L15)<!-- prefix: "__device__ i" -->
+
+Exact scoring reduces eight groups in FP32, sums in group order, and scales by `1/16`. Ordered replay uses token-ordered FMAs and divides in FP32 before BF16 rounding. [Score](../src/mxfp8_gqa.cu#L52)<!-- prefix: "__device__ _" --> · [Replay](../src/mxfp8_gqa.cu#L230)<!-- prefix: "__device__ v" -->
+
+See [singleton and grouped split decode](singleton-gqa-decode.md) for current routes, and [archived packed decode](long-paged-decode.md#fused-packed-gqa) for the former K0 implementation.
 
 ### Ordered multirow GQA prefill
 
@@ -62,7 +78,7 @@ regular Flash, split graph nodes, and ordered replay. The [verifier](../tests/mx
 
 The [ordered decode check](../tests/mxfp8_gqa_check.cu#L541)<!-- prefix: "void check_e" --> covers BF16 parity, tile and page boundaries, graph and eager execution, input preservation, and validation.
 
-Check [exponents 0 and 255](../tests/mxfp8_gqa_prefill_check.cu#L931)<!-- prefix: "void check_t" -->, [remaps and graphs](../tests/mxfp8_gqa_check.cu#L872)<!-- prefix: "void check_o" -->, [chunk edges and tails](../tests/mxfp8_gqa_prefill_check.cu#L698)<!-- prefix: "void check_o" -->, [rounding](../tests/mxfp8_gqa_prefill_check.cu#L746)<!-- prefix: "void check_o" -->, and [masked-score recovery](../tests/mxfp8_gqa_check.cu#L935)<!-- prefix: "void check_o" -->.
+Check [exponents 0 and 255](../tests/mxfp8_gqa_prefill_check.cu#L932)<!-- prefix: "void check_t" -->, [remaps and graphs](../tests/mxfp8_gqa_check.cu#L872)<!-- prefix: "void check_o" -->, [chunk edges and tails](../tests/mxfp8_gqa_prefill_check.cu#L697)<!-- prefix: "void check_o" -->, [rounding](../tests/mxfp8_gqa_prefill_check.cu#L745)<!-- prefix: "void check_o" -->, and [masked-score recovery](../tests/mxfp8_gqa_check.cu#L935)<!-- prefix: "void check_o" -->.
 
 Use the [ordered prefill replay checks](ordered-gqa-prefill.md#verification) for staged tails and overflow controls.
 
@@ -72,9 +88,9 @@ The [checkpoint loader](../include/sglang/checkpoint.h#L24)<!-- prefix: "class C
 
 ### Runtime path
 
-The shared layer loop uses the model layout to select each layer's KV or GDN bank. Tile and row adapters supply buffers and operator dispatch. The outer paths own embedding, draft seeding, and scoring. [Layer mapping](../include/sglang/runtime/model/qwen_text_model.h#L40)<!-- prefix: "constexpr La" --> · [Execution bank selection](../include/sglang/runtime/model/qwen_layers.h#L96)<!-- prefix: "const auto [" --> · [Tile adapter](../src/decoder_prefill.cpp#L638)<!-- prefix: "execute_laye" --> · [Row adapter](../src/decoder_forward.cpp#L83)<!-- prefix: "void Decoder" -->
+The shared layer loop uses the model layout to select each layer's KV or GDN bank. Tile and row adapters supply buffers and operator dispatch. The outer paths own embedding, draft seeding, and scoring. [Layer mapping](../src/runtime/model/qwen_text_model.cpp#L13)<!-- prefix: "QwenTextMode" --> · [Execution bank selection](../src/decoder_prefill.cpp#L32)<!-- prefix: "const auto r" --> · [Tile adapter](../src/decoder_prefill.cpp#L624)<!-- prefix: "run_layers(l" --> · [Row adapter](../src/decoder_forward.cpp#L75)<!-- prefix: "void Decoder" -->
 
-Serial K0 reuses its stream and grows storage on demand. Prefill rebuilds [MXFP8 pages](#p2-gqa-cache-contract) with an identity page table. Reset clears BF16 convolution history and FP32 recurrent state across the GDN layers. The final prompt row supplies the initial logits. Overlapping calls use private eager storage. [Generation loop](../src/decoder.cpp#L685)<!-- prefix: "void Decoder" --> · [State reset](../src/runtime/model/qwen_request.cpp#L316)<!-- prefix: "void Request" -->
+Serial K0 reuses its stream and grows storage on demand. Prefill rebuilds [MXFP8 pages](#p2-gqa-cache-contract) with an identity page table. Reset clears BF16 convolution history and FP32 recurrent state across the GDN layers. The final prompt row supplies the initial logits. Overlapping calls use private eager storage. [Generation loop](../src/decoder.cpp#L721)<!-- prefix: "void Decoder" --> · [State reset](../src/runtime/model/qwen_request.cpp#L321)<!-- prefix: "void Request" -->
 
 Use the feature contracts for dispatch and numerical details.
 
@@ -87,15 +103,13 @@ Use the feature contracts for dispatch and numerical details.
 
 ### Constraints and failure behavior
 
-Pass one nonempty prompt with `--prompt-ids` or `--prompt-file`. Separate decimal IDs with commas or ASCII whitespace. Prompt and stop IDs must be in `[0, 248320)`. Prompt length plus budget must fit 262,144 tokens. The default budget is one. Zero budget returns no tokens and `length`. [CLI options](../apps/sglang-generate.cpp#L57)<!-- prefix: "void usage(s" --> · [Request validation](../src/decoder.cpp#L62)<!-- prefix: "void validat" -->
+Use the [generator contract](native-generate.md) for token validation, budgets, sampling, stops, and exit status. The checkpoint has 248,320 vocabulary IDs and a 262,144-token context.
 
-The CLI defaults to greedy selection, with ties going to the lowest ID. It uses the [K4 default](mtp.md#runtime-path). `--stop-token` emits a match and returns `stop`, even at the budget. Exhaustion returns `length`. There is no implicit EOS. Failures print to stderr and exit 1. See [sampling](text-serving.md#sampling) and [C++ and HTTP constraints](text-serving.md#finite-choice-constraints). [Greedy selection](../src/text_ops.cu#L377)<!-- prefix: "__device__ T" -->
-
-The decoder retains CUDA resources and transfer buffers while completion is uncertain. Model and request setup retry cleanup on the same device. Persistent errors block setup. Terminal errors and ambiguous frees quarantine resources until exit. [Deferred cleanup](../src/runtime/backend/cuda_resources.cpp#L130)<!-- prefix: "static void " --> · [Destructor diagnostics](../src/runtime/backend/cuda_resources.cpp#L476)<!-- prefix: "Allocations:" -->
+The decoder retains CUDA resources and transfer buffers while completion is uncertain. Model and request setup retry cleanup on the same device. Persistent errors block setup. Terminal errors and ambiguous frees quarantine resources until exit. [Deferred cleanup](../src/runtime/backend/cuda_resources.cpp#L129)<!-- prefix: "static void " --> · [Destructor diagnostics](../src/runtime/backend/cuda_resources.cpp#L468)<!-- prefix: "Allocations:" -->
 
 Workspace sizing, row-wise fallback, and pool retention are documented with the prefill allocation contract. [Prefill workspace](native-prefill-workspace.md#constraints-and-failure-behavior)
 
-`--top-logits N` reports up to `N` raw scores per token, sorted by descending score then ascending ID. The range is 0–248,320 and defaults to 0. [Logit output](../apps/sglang-generate.cpp#L273)<!-- prefix: "void write_r" -->
+Use `--top-logits N` for raw scores sorted by descending score then ascending ID. [Logit output](../apps/sglang-generate.cpp#L273)<!-- prefix: "void write_r" -->
 
 ### Verification
 
@@ -105,9 +119,7 @@ Use the [operator qualification procedure](performance.md#operator-qualification
 
 Use the [P2 verifier](#p2-gqa-verification) for MXFP8 encoding, causal attention, and page reuse. Check KV positions and ownership through append and decode. Check BF16 convolution history and FP32 recurrent state. Compare supported cache restores and continuations with fresh native execution under the same precision policy. [Independent GDN check](../tests/decoder/gdn_check.cu#L239)<!-- prefix: "void verify_" -->
 
-Build the [host generator](../README.md#build-on-the-project-host). Set `SGLANG_GENERATE` to its path and `GPU_UUID` to the reserved B200 UUID. CUDA exposes it as ordinal 0. The default checkpoint is `/data0/shared/Qwen3.8-27B-FP8`. [Generator build](../tools/build-probe.sh#L110)<!-- prefix: "\"$xmake\" bui" -->
-
-The optional vendor GDN prefill kernel is provisioned ahead of time. `tools/aot_build_vendor_gdn.py` compiles the pinned CuTe kernel into `libgdn_cute_bf16_8_24.a`. The build links that archive when it exists, unless `SGLANG_GDN_VENDOR_BUILD` is `0`. [AOT provisioning](../tools/aot_build_vendor_gdn.py#L1)<!-- prefix: "\"\"\"Reproduci" --> · [Build gate](../xmake.lua#L519)<!-- prefix: "if os.getenv" -->
+Build the [host generator](../README.md#build-on-the-project-host). Set `SGLANG_GENERATE` to its path and `GPU_UUID` to the reserved B200 UUID. CUDA exposes it as ordinal 0. The default checkpoint is `/data0/shared/Qwen3.8-27B-FP8`. [Generator build](../tools/build-probe.sh#L119)<!-- prefix: "\"$xmake\" bui" -->
 
 ```bash
 CUDA_VISIBLE_DEVICES="${GPU_UUID:?set the reserved B200 UUID}" \
@@ -127,21 +139,19 @@ Run the [prefill checks](../tests/prefill/README.md). Compare exact scoring and 
 
 ## Native streaming server
 
-Use `--max-active` for the 1–32 HTTP lane limit and `--max-num-batched-tokens` for the 1–32,768 aggregate step budget. Verify the effective values at `/health` and the resolved graph and MTP settings at `/server_info`. See the transport guide for admission, overload, readiness, and shutdown. [CLI limits](../apps/sglang-server.cpp#L180)<!-- prefix: "} else if (o" --> · [HTTP transport](http-server.md) · [Server information](native-model-info.md#server-information)
+Use `--max-active` for the 1–32 HTTP lane limit and `--max-num-batched-tokens` for the 1–32,768 aggregate step budget. Verify the effective values at `/health` and the resolved graph and MTP settings at `/server_info`. See the transport guide for admission, overload, readiness, and shutdown. [CLI limits](../apps/sglang-server.cpp#L179)<!-- prefix: "} else if (o" --> · [HTTP transport](http-server.md) · [Server information](native-model-info.md#server-information)
 
-Server startup selects the Qwen serving profile and passes a single-device executor to `BatchService`. The executor creates and destroys `DecoderBatch` on its worker thread. Startup waits for the first cache snapshot and propagates initialization failures. On shutdown the service marks the queue closed and wakes the worker before joining. [Composition](../apps/sglang-server.cpp#L356)<!-- prefix: "auto executo" --> · [Executor lifecycle](../src/runtime/server/single_device_batch_executor.cpp#L81)<!-- prefix: "void SingleD" --> · [Startup handshake](../apps/server/batch_service.cpp#L47)<!-- prefix: "void BatchSe" --> · [Shutdown](../apps/server/batch_service.cpp#L59)<!-- prefix: "BatchService" -->
+Startup injects the Qwen serving profile and a batch executor into `BatchService`. The worker owns the batch and topology. Startup waits for the first cache snapshot. Shutdown closes the queue and wakes the worker before joining. [Composition](../apps/sglang-server.cpp#L355)<!-- prefix: "auto executo" --> · [Executor lifecycle](../src/runtime/server/single_device_batch_executor.cpp#L81)<!-- prefix: "void SingleD" --> · [Startup handshake](../apps/server/batch_service.cpp#L47)<!-- prefix: "void BatchSe" -->
 
 The scheduler uses the session for admission, cancellation, and whole batch steps. The [batch planner](batch-graphs.md#runtime-path) allocates rows. Operator dispatch runs within each planned step. Lanes share device weights and own request KV, GDN state, and output. The [resident-memory limit](batch-graphs.md#resident-memory-admission) applies separately from row and lane limits. [Scheduler loop](../apps/server/batch_service.cpp#L333)<!-- prefix: "void BatchSe" -->
+
+Call `BatchSession` operations on the worker thread that owns the session. `admit()` returns the number of prompt positions restored. After an admission exception, the scheduler checks `available()` to see whether the session can continue. If it can, the scheduler ends the affected request. Otherwise, the scheduler rethrows the exception. [Worker session](../src/runtime/server/single_device_batch_executor.cpp#L81)<!-- prefix: "void SingleD" --> · [Admission and failure](../apps/server/batch_service.cpp#L230)<!-- prefix: "job->cached_" -->
 
 Use the serving contracts for [native generation](native-generate.md), [text](text-serving.md), [chat](chat-serving.md), [benchmark token-ID streams](../benchmarks/streaming/README.md#wire-contract), and [launch migration](native-model-info.md#migrate-old-launch-commands).
 
 ### Streaming verification
 
-Run the [CPU transport checks](http-server.md#verification).
-
-Run the [scheduler admission checks](batch-graphs.md#verification) on a reserved B200.
-
-Build `sglang-server` in Release mode and use the locked Pixi environment with the pinned checkpoint and Nsight Systems (`nsys`) on `PATH`. Set `GPU_UUID` to the reserved B200 UUID. From the repository root, run with a fresh evidence directory and substitute the path to your Release binary if needed.
+Run the [CPU transport checks](http-server.md#verification) and [admission checks](batch-graphs.md#verification). Use the locked Pixi environment, a Release server, the pinned checkpoint, `nsys` on `PATH`, the reserved B200 UUID, and a fresh evidence directory.
 
 ```bash
 CUDA_VISIBLE_DEVICES="${GPU_UUID:?set the reserved B200 UUID}" \
@@ -149,7 +159,7 @@ CUDA_VISIBLE_DEVICES="${GPU_UUID:?set the reserved B200 UUID}" \
     --checkpoint /data0/shared/Qwen3.8-27B-FP8 --evidence artifacts/native-batch-check
 ```
 
-Require `"result": "passed"` in `status.json`. The runner checks streamed output parity at widths one, two, and four, with one Nsight Systems graph launch per eligible width-one decode step. At widths two and four, it checks full decode width with mixed stops, KV page transitions, and queueing and reset recovery. Require remaining peers to stay readable, replacements to match their serial outputs, and retired request bytes to reach zero. Keep `identity.json` and the raw evidence. [Live batch regression](../tests/batch/run_native.py#L1)<!-- prefix: "\"\"\"Opt-in li" -->
+Require `"result": "passed"` in `status.json`. Check widths one, two, and four, eligible singleton graph launches, mixed stops, KV transitions, queueing, reset, and zero retired request bytes. Keep `identity.json` and raw evidence. [Live batch regression](../tests/batch/run_native.py#L1)<!-- prefix: "\"\"\"Opt-in li" -->
 
 After the runner exits, start a separate server on the same reserved B200 using the same Release binary and checkpoint. Use a free loopback port and `--max-active 1` to exercise single-slot queueing and disconnect recovery.
 
@@ -165,7 +175,7 @@ Use the batch runbook for graph and eager parity at widths one through four and 
 
 ## Runtime and state ownership
 
-Design one execution path for all supported feature combinations, including a batch of one. Put specialized behavior at the smallest applicable boundary, such as operator parameters or launch configuration. Consolidate existing duplicate end-to-end logic into the shared path. Base dispatch on computation shapes and hardware resource limits. Verify several valid shapes. Keep benchmark identity, fixed prompt contents, and scenario labels out of dispatch decisions.
+Share one execution path across supported features and batch sizes. Specialize by shape and resource limits at the operator boundary. Keep fixture IDs and scenario names out of dispatch.
 
 Verify [prefix checkpoints](prefix-cache.md#verification), [MTP state](mtp.md#verification), and stream completion before storage reuse.
 
@@ -173,6 +183,39 @@ Verify [prefix checkpoints](prefix-cache.md#verification), [MTP state](mtp.md#ve
 
 Start with source and checkpoint identity and an [isolated Release build](serving/isolated-builds.md). Run the applicable [GQA](#gqa-verification), [decoder](#verification), [chunked prefill](#chunked-prefill-verification), [MTP](mtp.md#verification), and [streaming checks](#streaming-verification) before measuring end to end. Keep raw evidence in ignored `artifacts/` and accepted procedures in maintained documentation.
 
-Profile slow paths in a separate diagnostic run. Compare native operators with those the pinned vLLM build actually runs at matching row counts, visible context, precision, and fusion boundaries. Rank the gaps by their impact on request completion. Inspect the closest public implementation, such as DeepGEMM, FlashQLA, or FlashInfer. Record its source and revision before adapting applicable techniques in native code. Validate the operator and the full execution step. Reprofile the same workload on the same device and checkpoint with the same launch settings to choose the next target. Use the [benchmark agreement](performance.md#measurement) for acceptance.
+Profile separately from timing. Match the pinned vLLM dispatch by shape, visible length, precision, and fusion boundary. Record reference source and revision. Validate changes at the operator and execution-step boundaries, then repeat on the same hardware and workload. [Acceptance gate](performance.md#measurement)
 
 Recover the [previous guide](https://github.com/para1lel/sglang.cpp/blob/4dd8c887c278c67744ed80e7feb2a825a92197a2/docs/development.md) for the detailed decoder operator notes and historical diagnostic inputs.
+
+### Check and format staged source
+
+Use the [installed hooks in default Pixi](../AGENTS.md#integrating-changes). To reproduce pre-commit checks without committing, run this command from the repository root.
+
+```bash
+.githooks/pre-commit
+```
+
+The hook checks the selected index against `HEAD` and ignores unstaged and untracked files. Check or tool failures return a nonzero status. The hook leaves the index and working tree unchanged.
+
+Clang-format covers C, C++, CUDA, and their headers. Ruff covers Python and stubs. Format checks use staged additions and replacements. New files, renamed files, and files whose type changes are checked in full.
+
+Clang-tidy checks changed lines and new critical analyzer findings. CUDA analysis covers host and `sm_100` or `sm_100a` device code, with extra device-only passes for selected sources. A deleted header can trigger analysis of its surviving consumers. Parse and dependency errors also fail the check.
+
+Ruff checks changed-line and newly introduced diagnostics, including annotation and type-only import rules. Syntax errors also fail the check. Test assertions and script output have scoped exceptions.
+
+Selected XMake builds run offline. For a missing CUTLASS archive, set `SGLANG_CUTLASS_ARCHIVE` to a verified archive or run `bash tools/build.sh` to populate the cache.
+
+Run the formatter command printed by the hook on working-tree content that matches the staged ranges. Stage the intended edits and repeat the check. Omit range options to format a full file.
+
+```bash
+clang-format --style=file:.clang-format -i ./path/to/file.cu
+ruff format --config=ruff.toml --no-cache ./path/to/file.py
+```
+
+To replay the historical handoff proof, use a disposable clone and follow the original README's pinned Python and toolchain setup at this revision. Write the JSONL outside the checkout. [Original setup and proof](https://github.com/para1lel/sglang.cpp/blob/569818d31ee2d54b21dc41e8381e99b81762c97f/README.md#L42-L63)
+
+```bash
+git switch --detach 569818d31ee2d54b21dc41e8381e99b81762c97f
+git config --local core.hooksPath .githooks
+python -B tests/prove_handoff.py --revision 569818d31ee2d54b21dc41e8381e99b81762c97f > /outside/checkout/handoff.jsonl
+```

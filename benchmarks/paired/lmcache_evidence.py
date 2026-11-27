@@ -187,28 +187,46 @@ def verify_gpu(run, identity, daemon, argv, launch_log):
     require(source == {str(launcher.with_name(name)): expected.get(f"tools/lmcache/{name}")
                        for name in sources},
             "LMCache daemon sources differ from the campaign source manifest")
-    verify_process(run, identity["lmcache_python"], identity["lmcache_port"],
-                   daemon["socket"], "sglang")
+    verify_process(run, identity["lmcache_python"], identity["lmcache_port"], daemon["socket"])
     compute_owners(run / "compute-before-daemon.csv", gpu, ())
     compute_owners(run / "compute-before.csv", gpu, (pid,))
     compute_owners(run / "compute-ready.csv", gpu, (native_pid, pid))
 
 
-def verify_process(run, python, port, endpoint, namespace):
+def verify_process(
+    run: Path, python: str, port: int, endpoint: str, *, memory_gib: int = 64
+) -> None:
     process = (run / "lmcache-live-argv.bin").read_bytes().split(b"\0")
     args = list(map(os.fsdecode, process[:-1]))
     require(process[-1] == b"" and args[:4] == [python, "-m",
                                                "lmcache.v1.multiprocess.server", "--host"],
             "LMCache daemon is not running the official multiprocess server")
-    expected_flags = ["127.0.0.1", "--port", str(port),
-                      "--supported-transfer-mode", "lmcache_driven", "--no-run-script-api-enabled",
-                      "--disable-metrics", "--l1-size-gb", "64", "--l1-init-size-gb", "64",
-                      "--eviction-policy", "LRU", "--l1-read-ttl-seconds", "60",
-                      "--l1-write-ttl-seconds", "60", "--server-module"]
-    require(args[4:-1] == expected_flags and json.loads(args[-1]) == {
-        "module_path": "sglang_lmcache",
-        "config": {"socket": endpoint, "namespace": namespace}},
-        "Unexpected official LMCache daemon arguments")
+    expected_flags = [
+        "127.0.0.1",
+        "--port",
+        str(port),
+        "--supported-transfer-mode",
+        "lmcache_driven",
+        "--no-run-script-api-enabled",
+        "--disable-metrics",
+        "--l1-size-gb",
+        str(memory_gib),
+        "--l1-init-size-gb",
+        str(memory_gib),
+        "--eviction-policy",
+        "LRU",
+        "--l1-read-ttl-seconds",
+        "60",
+        "--l1-write-ttl-seconds",
+        "60",
+        "--server-module",
+    ]
+    require(
+        args[4:-1] == expected_flags
+        and json.loads(args[-1])
+        == {"module_path": "sglang_lmcache", "config": {"socket": endpoint, "namespace": "sglang"}},
+        "Unexpected official LMCache daemon arguments",
+    )
 
 
 def completed(run, identity):

@@ -24,6 +24,11 @@ bool TargetVerification::can_begin(int position, int count, cudaStream_t stream)
            count <= request_.pages.page_count * mxfp8_page_size - position;
 }
 
+template <>
+VerificationGraphBinding* Allocations::allocate<VerificationGraphBinding>(std::size_t count) {
+    return static_cast<VerificationGraphBinding*>(
+        allocate_elements(count, sizeof(VerificationGraphBinding)));
+}
 
 VerificationGraphScratch::VerificationGraphScratch(int device)
     : memory(device), workspace(memory, k1_verification_rows),
@@ -509,39 +514,6 @@ void TargetVerification::enqueue_results() {
     }
 }
 
-void TargetVerification::commit(int count, TextGdnReplayBatch* gdn_batch) {
-    if (!ready_ || count < 0 || count > pending_rows_) {
-        throw std::logic_error("Invalid target verification commit");
-    }
-    if (count > 0 && count < pending_rows_) {
-        const bool batched = try_fill_gdn_replay_batch(
-            gdn_batch, count, gdn_layers, [&](int layer) {
-                const auto& saved = workspace().replay[layer];
-                return TextGdnReplayEntry{saved.inputs, saved.weights, request_.states[layer],
-                                          tail_[layer], count};
-            });
-        if (!batched) {
-            for (int layer = 0; layer < gdn_layers; ++layer) {
-                const auto& saved = workspace().replay[layer];
-                const auto status = rank_local_gdn_
-                    ? text_gdn_replay_prefix_local(count, saved.inputs, saved.weights,
-                                                   request_.states[layer], tail_[layer],
-                                                   stream_)
-                    : text_gdn_replay_prefix(count, saved.inputs, saved.weights,
-                                             request_.states[layer], tail_[layer], stream_);
-                check(status, "Replay committed target GDN prefix");
-            }
-        }
-    }
-    if (count > 0) {
-        request_.states.swap(tail_);
-        valid_prefix_ += count;
-    }
-    ready_ = false;
-    pending_rows_ = 0;
-    active_workspace_ = nullptr;
-}
-
 int TargetVerification::winner(int index, bool sampled, bool constrained) const {
     return validate_winner(host_winners_[index].token_id, sampled, constrained);
 }
@@ -750,11 +722,32 @@ void gather_tp_packet(const VerificationSequence* sequences,
     }
 }
 
+void gather_vocab_rows(const VerificationRow* input, TcVocabRow* output, TcVocabRmsRows& rms) {
+    for (int index = 0; index < tc_vocab_wide_rows; ++index) {
+        const auto& work = *input[index].work;
+        output[index] = {work.normalized, work.argmax};
+        rms.rows[index] = {work.hidden, work.residual, work.normalized};
+    }
+}
+
 bool score_tp_rows(const auto& tc_vocab, const auto& final_norm, const VerificationRow* rows,
                    int total, const TcVocabScratch* vocabulary, cudaStream_t stream,
                    const auto& score_packet) {
     bool packed = true;
     static_assert(tc_vocab_wide_rows == 2 * verification_packet_rows);
+    constexpr int paired_rows = 2 * tc_vocab_wide_rows;
+    if (vocabulary && total == paired_rows) {
+        std::array<TcVocabRow, paired_rows> projection{};
+        TcVocabRmsRows rms[2];
+        for (int half = 0; half < 2; ++half) {
+            const int start = half * tc_vocab_wide_rows;
+            gather_vocab_rows(rows + start, projection.data() + start, rms[half]);
+        }
+        if (try_tc_vocab_final_pair(*tc_vocab, *vocabulary, projection.data(), rms, final_norm,
+                                    stream)) {
+            return true;
+        }
+    }
     for (int first = 0; first < total;) {
         const auto* packet = rows + first;
         if (vocabulary && total - first >= tc_vocab_wide_rows &&
@@ -765,11 +758,7 @@ bool score_tp_rows(const auto& tc_vocab, const auto& final_norm, const Verificat
                          })) {
             std::array<TcVocabRow, tc_vocab_wide_rows> projection;
             TcVocabRmsRows rms;
-            for (int index = 0; index < tc_vocab_wide_rows; ++index) {
-                const auto& work = *packet[index].work;
-                projection[index] = {work.normalized, work.argmax};
-                rms.rows[index] = {work.hidden, work.residual, work.normalized};
-            }
+            gather_vocab_rows(packet, projection.data(), rms);
             if (try_tc_vocab_final(*tc_vocab, *vocabulary, projection.data(), rms,
                                    final_norm, stream)) {
                 first += tc_vocab_wide_rows;

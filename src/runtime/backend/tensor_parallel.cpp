@@ -514,9 +514,10 @@ bool TensorParallel::try_allreduce_rms_quantize(
 #endif
 }
 
-bool TensorParallel::try_allreduce_rms_quantize_m40(
+template <int Width>
+bool TensorParallel::try_allreduce_rms_quantize_wide(
     [[maybe_unused]] __nv_bfloat16* const buffers[], [[maybe_unused]] const cudaStream_t streams[],
-    [[maybe_unused]] const MnnvlRmsQuantizeRows40 rows[],
+    [[maybe_unused]] const MnnvlWideRmsQuantizeRows<Width> rows[],
     [[maybe_unused]] const __nv_bfloat16* const gains[]) {
 #if SGLANG_USE_MNNVL_AR
     ensure_healthy();
@@ -525,15 +526,25 @@ bool TensorParallel::try_allreduce_rms_quantize_m40(
     if (validate_collective_streams(state_->devices, streams, 2).status !=
         cudaStreamCaptureStatusNone) return false;
     if (!state_->submit_vendor([&] {
-        return state_->mnnvl->try_allreduce_rms_quantize_m40(buffers, streams, rows, gains);
-    })) return false;
-    constexpr std::size_t count = MnnvlRmsQuantizeRows40::size * mnnvl_ar_hidden_width;
+            return state_->mnnvl->try_allreduce_rms_quantize_wide(buffers, streams, rows, gains);
+        }))
+        return false;
+    constexpr std::size_t count = Width * mnnvl_ar_hidden_width;
     state_->record_vendor_success(count, count * sizeof(__nv_bfloat16), false);
     return true;
 #else
     return false;
 #endif
 }
+
+template bool
+TensorParallel::try_allreduce_rms_quantize_wide<40>(__nv_bfloat16* const[], const cudaStream_t[],
+                                                    const MnnvlWideRmsQuantizeRows<40>[],
+                                                    const __nv_bfloat16* const[]);
+template bool
+TensorParallel::try_allreduce_rms_quantize_wide<80>(__nv_bfloat16* const[], const cudaStream_t[],
+                                                    const MnnvlWideRmsQuantizeRows<80>[],
+                                                    const __nv_bfloat16* const[]);
 
 void TensorParallel::snapshot_transport(TpArCounters& out) const {
     out = TpArCounters{};

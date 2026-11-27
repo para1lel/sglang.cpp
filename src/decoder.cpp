@@ -264,6 +264,23 @@ void AdjustedLogitsWorkspace::select_repetition(
           "Select from repetition-adjusted logits");
 }
 
+int RequestProgress::capacity(int prompt, const DecoderOptions& options) {
+    return prompt + std::max(options.max_new_tokens,
+                             int(options.score_prompt || options.label_token_ids)) - 1;
+}
+
+int RequestProgress::remaining_prompt(int prompt) const {
+    return position < prompt ? prompt - position : 0;
+}
+
+int RequestProgress::remaining_output(const DecoderOptions& options) const {
+    return options.max_new_tokens - generated;
+}
+
+void RequestProgress::advance(int rows) {
+    position += rows;
+}
+
 void RequestProgress::select(Request& request, Workspace& work, const DecoderOptions& options,
                              const ConstraintWorkspace& scratch, const SamplingParameters* sampling,
                              void* sampling_workspace, cudaStream_t stream,
@@ -440,6 +457,14 @@ SerialOutput::SerialOutput(const DecoderCallbacks& callbacks, int top_count, Dec
     }
 }
 
+const std::function<bool()>& SerialOutput::cancel_probe() const {
+    return callbacks_.is_cancelled;
+}
+
+bool SerialOutput::cancelled() const {
+    return cancel_probe() && cancel_probe()();
+}
+
 bool SerialOutput::emit(int token, const Bf16* logits, const float* adjusted_logits,
                         const std::vector<DecoderLogit>* repetition_logits) {
     result_.output_token_ids.push_back(token);
@@ -454,6 +479,9 @@ bool SerialOutput::emit(int token, const Bf16* logits, const float* adjusted_log
     }
     return keep_running;
 }
+
+Decoder::Decoder(const std::filesystem::path& checkpoint, int cuda_device)
+    : Decoder(checkpoint, cuda_device, false) {}
 
 Decoder::Decoder(const std::filesystem::path& checkpoint, int cuda_device, bool enable_mtp)
     : Decoder(checkpoint, cuda_device, enable_mtp, 1) {}
@@ -589,6 +617,14 @@ decoder::TpArCounters Decoder::tp_ar_counters() const {
 }
 
 Decoder::~Decoder() = default;
+
+bool Decoder::Model::is_b200() const {
+    return backend.uses_b200_operators;
+}
+
+int Decoder::Model::target_split_end() const {
+    return backend.target_split_end;
+}
 
 const CudaBackendPolicy& Decoder::backend_policy() const {
     return model_->backend;

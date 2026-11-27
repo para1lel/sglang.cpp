@@ -53,8 +53,8 @@ struct GeneratedLogprobReadback;
 class SerialOutput {
 public:
     SerialOutput(const DecoderCallbacks& callbacks, int top_count, DecoderResult& result);
-    const std::function<bool()>& cancel_probe() const { return callbacks_.is_cancelled; }
-    bool cancelled() const { return cancel_probe() && cancel_probe()(); }
+    const std::function<bool()>& cancel_probe() const;
+    bool cancelled() const;
     bool emit(int token, const Bf16* logits, const float* adjusted_logits,
               const std::vector<DecoderLogit>* repetition_logits);
 
@@ -112,15 +112,10 @@ struct RequestProgress {
     int last_token = -1;
     ConstraintCursor constraint{};
 
-    static int capacity(int prompt, const DecoderOptions& options) {
-        return prompt + std::max(options.max_new_tokens,
-                                 int(options.score_prompt || options.label_token_ids)) - 1;
-    }
-    int remaining_prompt(int prompt) const { return position < prompt ? prompt - position : 0; }
-    int remaining_output(const DecoderOptions& options) const {
-        return options.max_new_tokens - generated;
-    }
-    void advance(int rows) { position += rows; }
+    static int capacity(int prompt, const DecoderOptions& options);
+    int remaining_prompt(int prompt) const;
+    int remaining_output(const DecoderOptions& options) const;
+    void advance(int rows);
     void select(Request& request, Workspace& work, const DecoderOptions& options,
                 const ConstraintWorkspace& scratch, const SamplingParameters* sampling,
                 void* sampling_workspace, cudaStream_t stream,
@@ -164,6 +159,9 @@ struct BatchDecodeBinding {
     TextModelStateRow final_state;
 };
 
+template <>
+BatchDecodeBinding* Allocations::allocate<BatchDecodeBinding>(std::size_t count);
+
 struct BatchGraphLane {
     Workspace* work;
     const BatchDecodeBinding* binding;
@@ -197,8 +195,8 @@ struct Decoder::Model {
     Model(const std::filesystem::path& checkpoint, int cuda_device,
           const decoder::WeightSharding& sharding = decoder::WeightSharding{});
 
-    bool is_b200() const { return backend.uses_b200_operators; }
-    int target_split_end() const { return backend.target_split_end; }
+    bool is_b200() const;
+    int target_split_end() const;
     void forward(const decoder::ForwardLane* lanes, int count, cudaStream_t stream) const;
     void forward_tp(const Model& peer, const decoder::ForwardLane* primary_lanes,
                     const decoder::ForwardLane* peer_lanes, int count, cudaStream_t stream,

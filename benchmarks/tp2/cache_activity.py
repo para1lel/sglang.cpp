@@ -1,4 +1,4 @@
-"""Reconcile each native daemon's acknowledged cold transfers with the joint receipt."""
+"""Reconcile both ranked cold transfer receipts with the joint receipt."""
 
 import cold_cache
 from saved_evidence import require
@@ -23,8 +23,10 @@ def replay(receipt, aggregate, previous):
     expected = aggregate["after"][stores] - aggregate["cleared"][stores]
     delta = {name: after[name] - cleared[name] for name in names}
     for rank in (0, 1):
-        require(expected > 0 and delta[rank_name(rank, "stores")] == expected,
-                f"Rank {rank} daemon did not acknowledge every checkpoint store")
+        require(
+            expected > 0 and delta[rank_name(rank, "stores")] == expected,
+            f"Rank {rank} did not acknowledge every checkpoint store",
+        )
         require(delta[rank_name(rank, "restores")] == 0, f"Rank {rank} restored a cold checkpoint")
     for family in FAMILIES:
         for direction in ("read", "written"):

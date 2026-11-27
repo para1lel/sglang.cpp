@@ -69,14 +69,14 @@ public:
     PrefillWorkspace(const PrefillWorkspace&) = delete;
     PrefillWorkspace& operator=(const PrefillWorkspace&) = delete;
 
-    std::size_t bytes() const { return bytes_; }
-    std::size_t layout_bytes() const { return layout_bytes_; }
+    std::size_t bytes() const;
+    std::size_t layout_bytes() const;
     void close();
 
-    cudaStream_t stream() const { return stream_; }
-    int capacity() const { return capacity_; }
-    void* data() const { return data_; }
-    PairedPrefillScratch long_gqa_staging() const { return staging_; }
+    cudaStream_t stream() const;
+    int capacity() const;
+    void* data() const;
+    PairedPrefillScratch long_gqa_staging() const;
 
 private:
     friend class PrefillPeerNorm;
@@ -96,7 +96,7 @@ private:
 
 class PrefillPeerNorm {
 public:
-    PrefillPeerNorm() = default;
+    PrefillPeerNorm() noexcept;
     ~PrefillPeerNorm();
     PrefillPeerNorm(const PrefillPeerNorm&) = delete;
     PrefillPeerNorm& operator=(const PrefillPeerNorm&) = delete;
@@ -117,27 +117,8 @@ private:
 
 std::size_t prefill_workspace_bytes(int rows);
 
-inline bool full_tile_prefill_grants(const PrefillGrant* grants, int count) {
-    if (count < 2 || grants[0].rows < batch_prefill_tile_rows) {
-        return false;
-    }
-    for (int index = 0; index < count; ++index) {
-        const auto& grant = grants[index];
-        if (grant.tile_rows != batch_prefill_tile_rows || grant.rows != grants[0].rows ||
-            grant.rows % batch_prefill_tile_rows != 0) {
-            return false;
-        }
-    }
-    return true;
-}
-
-inline PrefillGrant prefill_tile(PrefillGrant grant, int offset) {
-    grant.tokens += offset;
-    grant.position += offset;
-    grant.prompt_remaining -= offset;
-    grant.rows = batch_prefill_tile_rows;
-    return grant;
-}
+bool full_tile_prefill_grants(const PrefillGrant* grants, int count);
+PrefillGrant prefill_tile(PrefillGrant grant, int offset);
 
 bool try_prefill_projection_groups(const DecoderModel& model, const PrefillGrant* grants,
                                    int count, cudaStream_t stream, DecoderBatchStepStats& stats);

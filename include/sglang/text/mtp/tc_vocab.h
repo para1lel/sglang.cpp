@@ -45,5 +45,7 @@ bool try_tc_vocab_short(const TcVocabWeights& weights, const TcVocabScratch& scr
 bool try_tc_vocab_final(const TcVocabWeights& weights, const TcVocabScratch& scratch,
                         const TcVocabRow* batch, const TcVocabRmsRows& rms,
                         const __nv_bfloat16* gain, cudaStream_t stream);
-
+bool try_tc_vocab_final_pair(const TcVocabWeights& weights, const TcVocabScratch& scratch,
+                             const TcVocabRow* batch, const TcVocabRmsRows (&rms)[2],
+                             const __nv_bfloat16* gain, cudaStream_t stream);
 }

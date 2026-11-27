@@ -1,15 +1,12 @@
 """Check native score metadata through the HTTP worker with scripted decoder scores."""
 
-import argparse
-from contextlib import closing
-import json
 from pathlib import Path
 import unittest
 from unittest.mock import patch
 
-from test_native_chat import request, tokenizer_pieces
-from test_native_generate_cpu import ABORTED, ABORT_REQUEST, GENERATE, batch_frame
-from test_sampling_routes_cpu import receipts, server
+from test_native_chat import tokenizer_pieces
+from test_native_generate_cpu import ABORTED, ABORT_REQUEST, GENERATE, batch_frame, batch_frames
+from test_sampling_routes_cpu import checked_body, post_response, receipts, run_cpu_suite, server
 
 
 def prompts(budget, **parameters):
@@ -40,21 +37,12 @@ class NativeGeneratedLogprobs(unittest.TestCase):
                                                "--max-active", "2", "--mtp-steps", "0"))
 
     def exchange(self, payload, expected=200, *, port=None):
-        connection, response = request(port or self.port, GENERATE, payload)
-        with closing(connection), response:
+        with post_response(port or self.port, GENERATE, payload) as response:
             self.assertEqual(response.status, expected,
                              response.read() if response.status != expected else None)
-            if expected != 200 or not payload.get("stream"):
-                self.assertEqual(response.headers.get_content_type(), "application/json")
-                return json.load(response)
-            self.assertEqual(response.headers.get_content_type(), "text/event-stream")
-            frames = []
-            while (frame := batch_frame(response)) != "[DONE]":
-                self.assertIsNotNone(frame, "Stream ended before DONE")
-                if frame != "keepalive":
-                    frames.append(frame)
-            self.assertEqual(response.read(), b"")
-            return frames
+            streamed = expected == 200 and payload.get("stream")
+            frames = batch_frames(response, "Stream ended before DONE") if streamed else None
+            return checked_body(self, response, frames)
 
     def scores(self, frame, top, text=False, prompt=(), start=0):
         meta = frame["meta_info"]
@@ -211,15 +199,12 @@ class NativeGeneratedLogprobs(unittest.TestCase):
             "rid": "scored-abort", "return_logprob": True, "top_logprobs_num": 2, "stream": True,
             "input_ids": [33, 34, 35], "logprob_start_len": 1,
         }
-        connection, response = request(self.port, GENERATE, payload)
-        with closing(connection), response:
+        with post_response(self.port, GENERATE, payload) as response:
             self.assertEqual(response.status, 200)
             first = batch_frame(response)
             self.assertEqual(first["output_ids"], [32])
             self.scores(first, 2, prompt=payload["input_ids"], start=1)
-            abort_connection, abort_reply = request(
-                self.port, ABORT_REQUEST, {"rid": "scored-abort"})
-            with closing(abort_connection), abort_reply:
+            with post_response(self.port, ABORT_REQUEST, {"rid": "scored-abort"}) as abort_reply:
                 self.assertEqual(abort_reply.status, 200)
                 self.assertEqual(abort_reply.read(), b"")
             final = batch_frame(response)
@@ -233,33 +218,58 @@ class NativeGeneratedLogprobs(unittest.TestCase):
         self.assertEqual(reused["output_ids"], [self.hello])
         self.scores(reused, 2, prompt=payload["input_ids"], start=1)
 
-    def test_implicit_mtp_falls_back_for_logprobs(self):
+    def check_scored_stream(self, frames, ids, lengths, prompt, *, index=None):
+        self.assertEqual([len(frame["output_ids"]) for frame in frames], lengths)
+        for frame, length in zip(frames, lengths):
+            if index is None:
+                self.assertNotIn("index", frame)
+            else:
+                self.assertEqual(frame["index"], index)
+            self.assertEqual(frame["output_ids"], ids[:length])
+            self.assertEqual(frame["meta_info"]["finish_reason"],
+                             None if length < len(ids) else {"type": "length", "length": length})
+            self.scores(frame, 2, prompt=prompt)
+
+    def test_implicit_mtp_scores_scalar_and_mixed_batch(self):
         log = self.output / "generated-logprobs-default.log"
-        payload = prompts(5) | {"input_ids": [32, 33], "return_logprob": True,
+        prompt = [32, 33]
+        ids = [self.hello, *self.snow, self.stop_id]
+        payload = prompts(5) | {"input_ids": prompt, "return_logprob": True,
                                 "top_logprobs_num": 2, "logprob_start_len": 0}
+        receipt = b"cpu scripted mtp tokens=4 terminal=1\n"
         with server(self.binary, self.checkpoint, log, "--max-active", "2") as port:
             final = self.exchange(payload, port=port)
-            self.assertEqual(final["output_ids"], [self.hello, *self.snow, self.stop_id])
-            self.scores(final, 2, prompt=payload["input_ids"])
+            self.assertEqual(final["output_ids"], ids)
+            self.scores(final, 2, prompt=prompt)
             frames = self.exchange(payload | {"stream": True}, port=port)
-            self.assertEqual([len(frame["output_ids"]) for frame in frames], [1, 2, 3, 4, 5])
-            for frame in frames:
-                self.scores(frame, 2, prompt=payload["input_ids"])
-            self.assertNotIn("cpu scripted mtp tokens=", log.read_text())
+            self.check_scored_stream(frames, ids, [1, 5], prompt)
+            self.assertEqual(log.read_bytes().count(receipt), 2)
             plain = self.exchange(payload | {"return_logprob": False}, port=port)
-            self.assertEqual(plain["output_ids"], final["output_ids"])
+            self.assertEqual(plain["output_ids"], ids)
             self.scores(plain, None)
-            self.assertIn("cpu scripted mtp tokens=", log.read_text())
+            self.assertEqual(log.read_bytes().count(receipt), 3)
             offset = log.stat().st_size
-            mixed = self.exchange(payload | {
-                "input_ids": [payload["input_ids"], payload["input_ids"]],
-                "return_logprob": [True, False],
-            }, port=port)
-            self.assertEqual([result["output_ids"] for result in mixed],
-                             [final["output_ids"], final["output_ids"]])
-            self.scores(mixed[0], 2, prompt=payload["input_ids"])
+            batch = payload | {
+                "input_ids": [prompt, prompt], "return_logprob": [True, False],
+                "sampling_params": [prompts(length)["sampling_params"] for length in (5, 1)],
+            }
+            mixed = self.exchange(batch, port=port)
+            self.assertEqual([result["output_ids"] for result in mixed], [ids, ids[:1]])
+            self.scores(mixed[0], 2, prompt=prompt)
             self.scores(mixed[1], None)
-            self.assertEqual(log.read_bytes()[offset:].count(b"cpu scripted mtp tokens="), 1)
+            grouped = {0: [], 1: []}
+            for frame in self.exchange(batch | {"stream": True}, port=port):
+                grouped[frame["index"]].append(frame)
+            self.check_scored_stream(grouped[0], ids, [1, 5], prompt, index=0)
+            short, = grouped[1]
+            self.assertEqual(short["output_ids"], ids[:1])
+            self.assertEqual(short["meta_info"]["finish_reason"], {"type": "length", "length": 1})
+            self.scores(short, None)
+            self.assertEqual(len({frame["meta_info"]["id"] for frame in grouped[0]}), 1)
+            self.assertNotEqual(grouped[0][0]["meta_info"]["id"], short["meta_info"]["id"])
+            log_tail = log.read_bytes()[offset:]
+            self.assertEqual(log_tail.count(b"cpu scripted mtp tokens="), 2)
+            self.assertEqual(log_tail.count(receipt), 2)
 
     def test_validation_before_any_admission(self):
         start = len(receipts(self.log))
@@ -288,19 +298,24 @@ class NativeGeneratedLogprobs(unittest.TestCase):
         mtp_log = self.output / "generated-logprobs-mtp.log"
         with server(self.binary, self.checkpoint, mtp_log, "--max-active", "1",
                     "--mtp-steps", "1") as port:
-            result = self.exchange(scalar, 400, port=port)
-            self.assertIn("MTP disabled", result["error"]["message"])
+            error = self.exchange(scalar | {"sampling_params": {"max_new_tokens": 5}},
+                                  400, port=port)
+            self.assertIn("greedy", error["error"]["message"])
             self.assertEqual(receipts(mtp_log), [])
+            prompt = [32, 33]
+            ids = [self.hello, *self.snow, self.stop_id]
+            scored = prompts(5) | {"input_ids": prompt, "return_logprob": True,
+                                   "top_logprobs_num": 2, "logprob_start_len": 0}
+            result = self.exchange(scored, port=port)
+            self.assertEqual(result["output_ids"], ids)
+            self.scores(result, 2, prompt=prompt)
+            frames = self.exchange(scored | {"stream": True}, port=port)
+            self.check_scored_stream(frames, ids, [1, 3, 5], prompt)
+            self.assertEqual(
+                mtp_log.read_bytes().count(b"cpu scripted mtp tokens=2 terminal=0\n"), 2)
+            self.assertEqual(
+                mtp_log.read_bytes().count(b"cpu scripted mtp tokens=2 terminal=1\n"), 2)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--binary", type=Path, required=True)
-    parser.add_argument("--checkpoint", type=Path, required=True)
-    parser.add_argument("--output", type=Path, required=True)
-    arguments, remaining = parser.parse_known_args()
-    NativeGeneratedLogprobs.binary = arguments.binary.resolve()
-    NativeGeneratedLogprobs.checkpoint = arguments.checkpoint.resolve()
-    NativeGeneratedLogprobs.output = arguments.output.resolve()
-    NativeGeneratedLogprobs.output.mkdir(parents=True, exist_ok=True)
-    unittest.main(argv=[__file__, *remaining])
+    run_cpu_suite(NativeGeneratedLogprobs, __file__, __doc__, select_tests=True, verbosity=1)

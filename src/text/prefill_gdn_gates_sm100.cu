@@ -43,8 +43,7 @@ template <int Channels>
 __global__ __launch_bounds__(threads) void project_gdn_gate_partials(
     const __grid_constant__ CUtensorMap weight_b, const __grid_constant__ CUtensorMap weight_a,
     const __grid_constant__ CUtensorMap input, int rows, float* partials) {
-    constexpr unsigned instruction = ((tile_rows / 16) << 24) | ((columns / 8) << 17) |
-                                     (1u << 10) | (1u << 7) | (1u << 4);
+    constexpr unsigned instruction = bf16_instruction<columns>;
     constexpr int channels = Channels;
     constexpr int gates = 2 * channels;
 
@@ -136,24 +135,14 @@ cudaError_t take_launch_status(cudaError_t direct) {
 }
 
 std::optional<cudaError_t> descriptor_error(CUresult result) {
-    switch (result) {
-        case CUDA_ERROR_NOT_SUPPORTED: {
-            const auto recorded = cudaGetLastError();
-            if (recorded == cudaSuccess || recorded == cudaErrorNotSupported) return std::nullopt;
-            return recorded;
+    if (result == CUDA_ERROR_NOT_SUPPORTED) {
+        const auto recorded = cudaGetLastError();
+        if (recorded == cudaSuccess || recorded == cudaErrorNotSupported) {
+            return std::nullopt;
         }
-        case CUDA_ERROR_INVALID_VALUE: return take_launch_status(cudaErrorInvalidValue);
-        case CUDA_ERROR_INVALID_CONTEXT:
-            return take_launch_status(cudaErrorIncompatibleDriverContext);
-        case CUDA_ERROR_CONTEXT_IS_DESTROYED:
-            return take_launch_status(cudaErrorContextIsDestroyed);
-        case CUDA_ERROR_OUT_OF_MEMORY: return take_launch_status(cudaErrorMemoryAllocation);
-        case CUDA_ERROR_NOT_INITIALIZED: return take_launch_status(cudaErrorInitializationError);
-        case CUDA_ERROR_DEINITIALIZED: return take_launch_status(cudaErrorCudartUnloading);
-        case CUDA_ERROR_ILLEGAL_ADDRESS: return take_launch_status(cudaErrorIllegalAddress);
-        case CUDA_ERROR_LAUNCH_FAILED: return take_launch_status(cudaErrorLaunchFailure);
-        default: return take_launch_status(cudaErrorUnknown);
+        return recorded;
     }
+    return take_launch_status(CudaError::from_driver(result));
 }
 
 template <int Channels>
@@ -180,12 +169,11 @@ std::optional<cudaError_t> prefill_bf16_gdn_gates_sm100(
     if (*prepared != cudaSuccess) return take_launch_status(*prepared);
     constexpr int shared_bytes = copy_stages * stage_bytes<columns>;
     int shared_limit = 0;
-    constexpr int smem_slot = Channels == text_gdn_value_heads ? 19 : 18;
     const void* kernel = reinterpret_cast<const void*>(project_gdn_gate_partials<Channels>);
-    const auto configured = configure(kernel, smem_slot, target.device, shared_limit);
+    const auto configured = configure(kernel, target.device, shared_limit);
     if (configured != cudaSuccess) return take_launch_status(configured);
     if (shared_limit < shared_bytes) return std::nullopt;
-    alignas(64) CUtensorMap maps[3];
+    CUtensorMap maps[3];
     auto encoded = encode_gate_map(target, maps[0], weight_b, Channels, tile_rows / 2);
     if (encoded == CUDA_SUCCESS) {
         encoded = encode_gate_map(target, maps[1], weight_a, Channels, tile_rows / 2);

@@ -2,7 +2,6 @@
 #include "sglang/server/responses.h"
 
 #include "sglang/json.h"
-#include "sglang/runtime/model/qwen_parser.h"
 #include "sglang/server/batch_service.h"
 #include "sglang/server/completions.h"
 #include "sglang/server/flush_cache.h"
@@ -11,6 +10,7 @@
 #include "sglang/server/native_generate.h"
 #include "sglang/server/ollama_discovery.h"
 #include "sglang/server/parse_function_call.h"
+#include "sglang/server/serving/qwen_parser.h"
 #include "sglang/utf8.h"
 
 #include <algorithm>
@@ -783,7 +783,6 @@ std::optional<Completion> ConnectionQueue::take(Lease& lease) {
 
 void ConnectionQueue::run(int slot) {
     for (;;) {
-        // Destroy the socket before releasing the active slot.
         Lease lease{*this};
         auto work = take(lease);
         if (!work) {
@@ -932,38 +931,23 @@ void serve_connections(const Socket& listener, BatchService& service, int max_ac
         }
         stop_serving();
     };
+    const auto start_worker = [&](auto member, auto... args) {
+        workers.emplace_back([&, member, args...] {
+            try {
+                (queue.*member)(args...);
+            } catch (...) {
+                stop_on_error();
+            }
+        });
+    };
     try {
-        workers.emplace_back([&] {
-            try {
-                queue.run_health();
-            } catch (...) {
-                stop_on_error();
-            }
-        });
-        workers.emplace_back([&] {
-            try {
-                queue.run_flushes();
-            } catch (...) {
-                stop_on_error();
-            }
-        });
+        start_worker(&ConnectionQueue::run_health);
+        start_worker(&ConnectionQueue::run_flushes);
         if (abort) {
-            workers.emplace_back([&] {
-                try {
-                    queue.run_aborted();
-                } catch (...) {
-                    stop_on_error();
-                }
-            });
+            start_worker(&ConnectionQueue::run_aborted);
         }
         for (int slot = 0; slot < max_active; ++slot) {
-            workers.emplace_back([&, slot] {
-                try {
-                    queue.run(slot);
-                } catch (...) {
-                    stop_on_error();
-                }
-            });
+            start_worker(&ConnectionQueue::run, slot);
         }
         queue.read(listener);
     } catch (...) {

@@ -172,15 +172,6 @@ void check_terminal(Outcome outcome, bool scored) {
 
 namespace sglang {
 
-struct Decoder::Model {};
-#define SGLANG_TEST_TP_HEADER "sglang/runtime/execution/decoder_tp.h"
-#if __has_include(SGLANG_TEST_TP_HEADER)
-struct Decoder::TpRuntime {};
-const decoder::TpRuntimeInfo* Decoder::tensor_parallel_info() const { return nullptr; }
-#endif
-Decoder::Decoder(const std::filesystem::path&, int, bool) {}
-Decoder::~Decoder() = default;
-
 struct DecoderBatch::State {
     std::array<DecoderOptions, width> options{};
     std::array<int, width> produced{};
@@ -216,11 +207,7 @@ void DecoderBatch::cancel(int slot) {
 }
 
 bool DecoderBatch::available() const { return true; }
-std::size_t DecoderBatch::request_device_allocation_bytes() const { return 0; }
-DecoderPrefixCacheStats DecoderBatch::prefix_cache_stats() const { return {}; }
-DecoderBatchPrefixUpdate DecoderBatch::poll_prefix(int) { std::abort(); }
 void DecoderBatch::reset_prefix_cache() {}
-void DecoderBatch::release_retired_allocations() {}
 
 Steps DecoderBatch::advance_chunked(const Selection& selected, DecoderBatchStepStats*) {
     Steps steps{};

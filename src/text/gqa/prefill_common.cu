@@ -1,0 +1,404 @@
+#include "sglang/text/mxfp8_gqa_prefill_common.cuh"
+
+#if defined(__CUDA_ARCH__) || !defined(SGLANG_GQA_DEVICE_ONLY)
+
+namespace sglang::gqa_prefill {
+
+__device__ __inline_hint__ std::size_t row_offset(int query_heads, int row, int head) {
+    return (static_cast<std::size_t>(row) * query_heads + head) * channels;
+}
+
+template <int Bytes>
+__device__ __forceinline__ void flash_copy(std::uint8_t* destination,
+                                          const std::uint8_t* source, bool active) {
+    const auto address = static_cast<Word>(__cvta_generic_to_shared(destination));
+    const int source_bytes = active ? Bytes : 0;
+    if constexpr (Bytes == 16) {
+        asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;"
+            :: "r"(address), "l"(source), "r"(source_bytes) : "memory");
+    } else {
+        static_assert(Bytes == 8);
+        asm volatile("cp.async.ca.shared.global [%0], [%1], 8, %2;"
+            :: "r"(address), "l"(source), "r"(source_bytes) : "memory");
+    }
+}
+
+template <int Tokens, int Threads>
+__device__ __inline_hint__ void prefetch_payload(PrefillPayload<Tokens>& raw, Attention request,
+                                                  int first, int visible, int kv_head) {
+    const int channel = (threadIdx.x % flash_token_lanes) * flash_vector_elements;
+    const int page = request.pages[first / mxfp8_page_size];
+    const auto cache = request.cache;
+    #pragma unroll
+    for (int index = threadIdx.x / flash_token_lanes; index < Tokens;
+         index += Threads / flash_token_lanes) {
+        const int token = (first + index) % mxfp8_page_size;
+        const auto payload =
+            payload_offset(request.cache.kv_heads, page, token, kv_head) + channel;
+        flash_copy<16>(&raw.key[index][channel], cache.key_payload + payload, index < visible);
+        flash_copy<16>(&raw.value[index][channel], cache.value_payload + payload, index < visible);
+        if (channel == 0) {
+            const auto scale = scale_offset(request.cache.kv_heads, page, token, kv_head);
+            flash_copy<8>(raw.key_scale[index], cache.key_scales + scale, index < visible);
+            flash_copy<8>(raw.value_scale[index], cache.value_scales + scale, index < visible);
+        }
+    }
+    asm volatile("cp.async.commit_group;" ::: "memory");
+}
+
+__device__ __inline_hint__ float ordered_decode(std::uint8_t payload, std::uint8_t exponent) {
+    __nv_fp8_e4m3 value;
+    value.__x = payload;
+    if (exponent == 255) {
+        return ldexpf(static_cast<float>(value), static_cast<int>(exponent) - 127);
+    }
+    const auto scale_bits = exponent == 0 ? 0x00400000u :
+                                           static_cast<Word>(exponent) << 23;
+    return __fmul_rn(static_cast<float>(value), __uint_as_float(scale_bits));
+}
+
+template <typename Real>
+__device__ Real warp_sum(Real value) {
+    for (int delta = mxfp8_group_size / 2; delta > 0; delta /= 2) {
+        value += __shfl_down_sync(warp_mask, value, delta);
+    }
+    return value;
+}
+
+template <typename Real>
+__device__ __inline_hint__ Real ordered_prefix(Real prefix, int lane) {
+    #pragma unroll
+    for (int offset = 1; offset < keys_per_tile; offset *= 2) {
+        const Real earlier = __shfl_up_sync(warp_mask, prefix, offset);
+        if (lane >= offset) {
+            prefix = fmax(earlier, prefix);
+        }
+    }
+    return prefix;
+}
+
+__device__ int store_ordered(Attention request, std::size_t row, int channel,
+                             const float (&values)[ordered_heads],
+                             const float (&denominators)[ordered_heads], int) {
+    int invalid = 0;
+    #pragma unroll
+    for (int head = 0; head < ordered_heads; ++head) {
+        const float output = values[head] / denominators[head];
+        request.output[row + head * channels + channel] = __float2bfloat16_rn(output);
+        invalid |= static_cast<int>(!isfinite(output)) << head;
+    }
+    return invalid;
+}
+
+__device__ int store_ordered(Attention request, std::size_t row, int channel,
+                             const double (&values)[ordered_heads],
+                             const double (&denominators)[ordered_heads], int invalid) {
+    #pragma unroll
+    for (int head = 0; head < ordered_heads; ++head) {
+        const double output = values[head] / denominators[head];
+        if ((invalid & (1 << head)) && isfinite(output)) {
+            request.output[row + head * channels + channel] = __double2bfloat16(output);
+        }
+    }
+    return 0;
+}
+
+template <int Heads>
+__device__ __inline_hint__ int score_recovery_mask(int warp, int lane, bool invalid_score) {
+    __shared__ int failed[Heads];
+    if (warp < Heads) {
+        const int failed_head = __any_sync(warp_mask, invalid_score);
+        if (lane == 0) {
+            failed[warp] = failed_head << warp;
+        }
+    }
+    __syncthreads();
+    int mask = 0;
+    #pragma unroll
+    for (int head = 0; head < Heads; ++head) {
+        mask |= failed[head];
+    }
+    return mask;
+}
+
+template <bool recover_scores, typename Real>
+__device__ __forceinline__ void ordered_weights(OrderedTile<Real>& shared, int warp, int lane,
+                                               int count, Real& maximum, bool& invalid_score) {
+    const Real prior_maximum = maximum;
+    const Real score = lane < count ? shared.scores[warp][lane] : -CUDART_INF_F;
+    const Real prefix = ordered_prefix(fmax(prior_maximum, score), lane);
+    const Real previous = __shfl_up_sync(warp_mask, prefix, 1);
+    maximum = __shfl_sync(warp_mask, prefix, count - 1);
+    if (lane < count) {
+        if constexpr (recover_scores) {
+            invalid_score |= !isfinite(score);
+        }
+        shared.history_weight[warp][lane] =
+            exp((lane == 0 ? prior_maximum : previous) - prefix);
+        shared.token_weight[warp][lane] = exp(score - prefix);
+    }
+}
+
+template <typename Real, bool recover_scores>
+__device__ __inline_hint__ int ordered_attention(OrderedTile<Real>& shared, Attention request,
+                                                  int row_index, int query_head, int invalid) {
+    const int channel = threadIdx.x;
+    const bool active = channel < channels;
+    const int warp = channel / mxfp8_group_size;
+    const int lane = channel % mxfp8_group_size;
+    const int kv_head = query_head / ratio;
+    const auto row = row_offset(gqa_query_heads(request.cache.kv_heads), row_index, query_head);
+    const int last = request.position + row_index;
+    const auto cache = request.cache;
+    float query[ordered_heads][mxfp8_groups];
+    if (active) {
+    #pragma unroll
+        for (int head = 0; head < ordered_heads; ++head) {
+    #pragma unroll
+            for (int group = 0; group < mxfp8_groups; ++group) {
+                const int query_channel = (head * channels) + (group * mxfp8_group_size) + lane;
+                query[head][group] = __bfloat162float(request.queries[row + query_channel]);
+            }
+        }
+    }
+    Real maximum = -CUDART_INF_F;
+    Real mass = 0;
+    Real weighted_value[ordered_heads]{};
+    bool invalid_score = false;
+    for (int first = 0;; first += keys_per_tile) {
+        const int count = min(keys_per_tile, last - first + 1);
+        const int page = request.pages[first / mxfp8_page_size];
+        const int token = first % mxfp8_page_size;
+        const auto payload = payload_offset(cache.kv_heads, page, token, kv_head);
+        const auto scale = scale_offset(cache.kv_heads, page, token, kv_head);
+        const int payload_stride = cache.kv_heads * channels;
+        constexpr int scale_stride = (mxfp8_page_size / mxfp8_group_size) * mxfp8_groups;
+        for (int index = warp; active && index < count; index += channels / mxfp8_group_size) {
+            Real dot[ordered_heads]{};
+            #pragma unroll
+            for (int group = 0; group < mxfp8_groups; ++group) {
+                const auto key_index =
+                    payload + index * payload_stride + group * mxfp8_group_size;
+                const auto key_exponent = cache.key_scales[scale + index * scale_stride + group];
+                const Real key = ordered_decode(cache.key_payload[key_index + lane], key_exponent);
+                #pragma unroll
+                for (int head = 0; head < ordered_heads; ++head) {
+                    const Real product = warp_sum(query[head][group] * key);
+                    if (lane == 0) {
+                        dot[head] += product;
+                    }
+                }
+            }
+            if (lane == 0) {
+                #pragma unroll
+                for (int head = 0; head < ordered_heads; ++head) {
+                    shared.scores[head][index] = dot[head] * softmax_scale;
+                }
+            }
+        }
+        __syncthreads();
+        if (warp < ordered_heads) {
+            ordered_weights<recover_scores>(shared, warp, lane, count, maximum, invalid_score);
+        }
+        __syncthreads();
+        if (active) {
+    #pragma unroll 4
+            for (int index = 0; index < count; ++index) {
+                const int value_index = (index * payload_stride) + channel;
+                const int scale_index = (index * scale_stride) + warp;
+                const Real value = ordered_decode(cache.value_payload[payload + value_index],
+                                                  cache.value_scales[scale + scale_index]);
+    #pragma unroll
+                for (int head = 0; head < ordered_heads; ++head) {
+                    weighted_value[head] =
+                        fma(shared.token_weight[head][index], value,
+                            shared.history_weight[head][index] * weighted_value[head]);
+                }
+            }
+        }
+        if (warp < ordered_heads && lane == 0) {
+            for (int index = 0; index < count; ++index) {
+                mass = fma(shared.history_weight[warp][index], mass,
+                           shared.token_weight[warp][index]);
+            }
+            shared.denominator[warp] = mass;
+        }
+        __syncthreads();
+        if (last - first < keys_per_tile) {
+            break;
+        }
+    }
+    int failed =
+        active ? store_ordered(request, row, channel, weighted_value, shared.denominator, invalid)
+               : 0;
+    if constexpr (recover_scores) {
+        failed |= score_recovery_mask<ordered_heads>(warp, lane, invalid_score);
+    }
+    return failed;
+}
+
+__device__ void recover_wide(
+    OrderedTile<double>& shared, Attention request, int row, int head, int invalid) {
+    ordered_attention(shared, request, row, head, invalid);
+}
+
+__device__ __inline_hint__ void protected_attention(
+    OrderedScratch& shared, Attention request, int row, int head) {
+    const int invalid = ordered_attention<float, true>(shared.ordered, request, row, head);
+    if (__syncthreads_or(invalid != 0)) {
+        recover_wide(shared.wide, request, row, head, invalid);
+    }
+}
+
+__device__ __inline_hint__ int PagedAttentionBatch::locate(int tile) const {
+    int first = 0;
+    int last = count - 1;
+    while (first < last) {
+        const int middle = (first + last) / 2;
+        if (tile < tile_end[middle]) {
+            last = middle;
+        } else {
+            first = middle + 1;
+        }
+    }
+    return first;
+}
+
+__device__ __inline_hint__ int PagedAttentionBatch::row(int tile, int index, int tile_rows) const {
+    return (tile - (index ? tile_end[index - 1] : 0)) * tile_rows;
+}
+
+__device__ __forceinline__ unsigned flash_decode_half(unsigned bits, int scale, bool& bad) {
+    const int exponent = (bits >> 10) & 31;
+    const int scaled = exponent + scale - 15;
+    const unsigned sign = bits & 0x8000u;
+    const unsigned fraction = (bits >> 3) & 127u;
+    const bool invalid = exponent == 31 ||
+        (exponent != 0 && (scaled < 1 || scaled > 157 || (scaled == 157 && fraction)));
+    bad |= invalid;
+    return exponent == 0 || invalid ? sign : sign | (scaled << 7) | fraction;
+}
+
+template <bool CommonScale>
+__device__ __forceinline__ Word flash_decode_pair(Word packed, int scale, bool& bad) {
+    Word halves;
+    asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(halves) : "h"(static_cast<short>(packed)));
+    if constexpr (CommonScale) {
+        constexpr Word sign = 0x80008000u;
+        const Word magnitude = halves & ~sign;
+        const Word nonzero = (magnitude + 0x7fff7fffu) & sign;
+        const Word nonfinite = (magnitude + 0x04000400u) & sign;
+        const Word keep = ((nonzero ^ nonfinite) >> 15) * 0xffffu;
+        const Word bias = static_cast<Word>(scale - 15) * 0x00800080u;
+        bad |= nonfinite != 0;
+        const Word bfloat = (magnitude & 0x7ff87ff8u) >> 3;
+        return (halves & sign) | ((bfloat + bias) & keep);
+    } else {
+        const auto lo = flash_decode_half(halves & 0xffffu, scale, bad);
+        const auto hi = flash_decode_half(halves >> 16, scale, bad);
+        return lo | (hi << 16);
+    }
+}
+
+template <bool CommonScale>
+__device__ __inline_hint__ void flash_store_vector(std::uint16_t* destination, uint4 payload,
+                                                  int scale, bool& bad) {
+    auto* output = reinterpret_cast<uint4*>(destination);
+    output[0] = make_uint4(flash_decode_pair<CommonScale>(payload.x, scale, bad),
+                           flash_decode_pair<CommonScale>(payload.x >> 16, scale, bad),
+                           flash_decode_pair<CommonScale>(payload.y, scale, bad),
+                           flash_decode_pair<CommonScale>(payload.y >> 16, scale, bad));
+    output[1] = make_uint4(flash_decode_pair<CommonScale>(payload.z, scale, bad),
+                           flash_decode_pair<CommonScale>(payload.z >> 16, scale, bad),
+                           flash_decode_pair<CommonScale>(payload.w, scale, bad),
+                           flash_decode_pair<CommonScale>(payload.w >> 16, scale, bad));
+}
+
+template __device__ int ordered_attention<float, false>(
+    OrderedTile<float>&, Attention, int, int, int);
+template __device__ float ordered_prefix(float, int);
+template __device__ int score_recovery_mask<2>(int, int, bool);
+template __device__ int score_recovery_mask<4>(int, int, bool);
+template __device__ int score_recovery_mask<8>(int, int, bool);
+template __device__ void flash_store_vector<true>(std::uint16_t*, uint4, int, bool&);
+template __device__ void flash_store_vector<false>(std::uint16_t*, uint4, int, bool&);
+template __device__ void prefetch_payload<keys_per_tile, channels>(
+    PrefillPayload<keys_per_tile>&, Attention, int, int, int);
+template __device__ void prefetch_payload<flash_keys, channels>(
+    PrefillPayload<flash_keys>&, Attention, int, int, int);
+template __device__ void prefetch_payload<flash_keys, 352>(
+    PrefillPayload<flash_keys>&, Attention, int, int, int);
+
+#ifndef SGLANG_GQA_DEVICE_ONLY
+bool raw_pipeline_before_flash(Mxfp8KvCache cache, int rows, int visible) {
+    return rows >= min_flash_rows && rows < 4 * flash_rows &&
+        visible >= default_ragged_min_position &&
+        (reinterpret_cast<std::uintptr_t>(cache.key_scales) |
+         reinterpret_cast<std::uintptr_t>(cache.value_scales)) % 8 == 0;
+}
+
+bool default_ragged_prefill(Mxfp8KvCache cache, int position, int rows) {
+    return rows >= 256 && rows <= 512 && position >= default_ragged_min_position &&
+        (reinterpret_cast<std::uintptr_t>(cache.key_scales) |
+         reinterpret_cast<std::uintptr_t>(cache.value_scales)) % 8 == 0;
+}
+
+int long_flash_tile_rows(int rows, int tiles_per_head) {
+    if (rows <= tiles_per_head * flash_short_rows) {
+        return flash_short_rows;
+    }
+    if (rows <= tiles_per_head * flash_medium_rows) {
+        return flash_medium_rows;
+    }
+    if (rows > tiles_per_head * flash_rows && rows <= tiles_per_head * flash_wide_rows) {
+        return flash_wide_rows;
+    }
+    return flash_rows;
+}
+
+std::optional<cudaError_t> flash_setup_error(cudaError_t status, bool unavailable) {
+    if (!unavailable) {
+        return status;
+    }
+    const auto pending = cudaGetLastError();
+    if (pending != cudaSuccess && pending != status) {
+        return pending;
+    }
+    return std::nullopt;
+}
+
+bool paired_kernel_unavailable(cudaError_t status) {
+    return status == cudaErrorInvalidDeviceFunction || status == cudaErrorNoKernelImageForDevice ||
+           status == cudaErrorNotSupported;
+}
+
+bool valid_paged_prefill_sequence(const decoder::PagedPrefillSequence& sequence,
+                                        int min_rows, int max_visible) {
+    const auto& cache = sequence.cache;
+    if (sequence.rows < min_rows || sequence.rows >= flash_chunk ||
+        sequence.position < 0 || sequence.position > max_visible - sequence.rows ||
+        !sequence.pages.device_pages || !sequence.queries || !sequence.output ||
+        !cache.key_payload || !cache.value_payload || !cache.key_scales || !cache.value_scales ||
+        reinterpret_cast<std::uintptr_t>(cache.key_payload) % alignof(uint4) ||
+        reinterpret_cast<std::uintptr_t>(cache.value_payload) % alignof(uint4) ||
+        reinterpret_cast<std::uintptr_t>(cache.key_scales) % alignof(std::uint64_t) ||
+        reinterpret_cast<std::uintptr_t>(cache.value_scales) % alignof(std::uint64_t)) {
+        return false;
+    }
+    const int last_page = (sequence.position + sequence.rows - 1) / mxfp8_page_size;
+    return last_page < sequence.pages.page_count && last_page < cache.page_count;
+}
+
+bool default_ragged_prefill_tail(const decoder::PagedPrefillSequence& sequence,
+                                       int max_visible) {
+    constexpr int min_rows = 3 * flash_rows / 2;
+    constexpr int max_rows = 2 * flash_rows;
+    constexpr int min_visible = 28672;
+    return sequence.rows >= min_rows && sequence.rows <= max_rows &&
+        valid_paged_prefill_sequence(sequence, min_rows, max_visible) &&
+        sequence.position + sequence.rows >= min_visible;
+}
+#endif
+
+}
+#endif

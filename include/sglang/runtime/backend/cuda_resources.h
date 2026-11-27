@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cuda.h>
 #include <cuda_runtime_api.h>
 
 #include <cstddef>
@@ -17,54 +18,23 @@ struct TransferBuffers;
 void check(cudaError_t status, const char* operation);
 struct CudaError : std::runtime_error {
     CudaError(cudaError_t status, const char* operation);
-    static bool terminal(cudaError_t error) {
-        switch (error) {
-            case cudaErrorCudartUnloading:
-            case cudaErrorECCUncorrectable:
-            case cudaErrorIllegalAddress:
-            case cudaErrorLaunchTimeout:
-            case cudaErrorContextIsDestroyed:
-            case cudaErrorAssert:
-            case cudaErrorHardwareStackError:
-            case cudaErrorIllegalInstruction:
-            case cudaErrorMisalignedAddress:
-            case cudaErrorInvalidAddressSpace:
-            case cudaErrorInvalidPc:
-            case cudaErrorLaunchFailure:
-                return true;
-            default:
-                return false;
-        }
-    }
+    static cudaError_t from_driver(CUresult status) noexcept;
+    static bool terminal(cudaError_t error);
     cudaError_t status;
 };
 
 std::size_t available_device_bytes();
 
-// The caller has fenced all uses of this cudaMalloc allocation before releasing it.
-inline cudaError_t release_cuda_block(void* pointer, cudaStream_t stream,
-                                      bool wait_for_release = false) noexcept {
-    const auto status = cudaFreeAsync(pointer, stream);
-    if (status == cudaSuccess && wait_for_release) return cudaStreamSynchronize(stream);
-    if (status != cudaErrorNotSupported) return status;
-    const auto pending = cudaGetLastError();
-    if (pending != cudaSuccess && pending != cudaErrorNotSupported) return pending;
-    return cudaFree(pointer);
-}
+cudaError_t release_cuda_block(void* pointer, cudaStream_t stream,
+                                      bool wait_for_release = false) noexcept;
 
-inline void copy_cuda_async(void* destination, const void* source, std::size_t bytes,
-                            cudaMemcpyKind kind, cudaStream_t stream, const char* operation) {
-    check(cudaMemcpyAsync(destination, source, bytes, kind, stream), operation);
-}
+void copy_cuda_async(void* destination, const void* source, std::size_t bytes,
+                            cudaMemcpyKind kind, cudaStream_t stream, const char* operation);
 
-inline void zero_cuda_async(void* destination, std::size_t bytes, cudaStream_t stream,
-                            const char* operation) {
-    check(cudaMemsetAsync(destination, 0, bytes, stream), operation);
-}
+void zero_cuda_async(void* destination, std::size_t bytes, cudaStream_t stream,
+                            const char* operation);
 
-inline void synchronize_cuda(cudaStream_t stream, const char* operation) {
-    check(cudaStreamSynchronize(stream), operation);
-}
+void synchronize_cuda(cudaStream_t stream, const char* operation);
 
 class DeviceScope {
 public:
@@ -100,13 +70,9 @@ public:
     Allocations& operator=(const Allocations&) = delete;
 
     template <typename Element>
-    Element* allocate(std::size_t count) {
-        if (count > std::numeric_limits<std::size_t>::max() / sizeof(Element)) {
-            throw std::overflow_error("CUDA allocation size overflow");
-        }
-        return static_cast<Element*>(allocate_bytes(count * sizeof(Element)));
-    }
+    Element* allocate(std::size_t count);
 
+    void* allocate_elements(std::size_t count, std::size_t element_size);
     std::size_t bytes() const;
     TransferBuffers& transfers();
     GeneratedLogprobReadback* prepare_generated_logprobs();

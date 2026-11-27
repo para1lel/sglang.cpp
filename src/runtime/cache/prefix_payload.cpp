@@ -37,6 +37,8 @@ bool DecoderMediaCacheIdentity::matches(const DecoderMedia& media) const {
         layout_.video_timestamp_tokens == other.video_timestamp_tokens;
 }
 
+std::string_view DecoderMediaCacheIdentity::patches_digest() const { return patches_digest_; }
+
 namespace decoder {
 namespace {
 
@@ -106,8 +108,10 @@ std::size_t prefix_payload_bytes(PrefixPayloadKind kind, int begin, int end,
 PrefixCacheKeys::PrefixCacheKeys(const std::vector<int>& prompt, std::string_view salt,
                                   const std::vector<DecoderMedia>* media,
                                   const PrefixCacheLayout* layout) {
-    std::string domain =
-        prefix_cache_domain(layout ? *layout : tp1_prefix_cache_layout);
+    const auto& geometry = layout != nullptr ? *layout : tp1_prefix_cache_layout;
+    world_size_ = geometry.world_size;
+    rank_ = geometry.rank;
+    std::string domain = prefix_cache_domain(geometry);
     domain.append(salt);
     if (!media || media->empty()) {
         keys_.reserve(prompt.size() + 1);
@@ -142,6 +146,10 @@ PrefixCacheKeys::PrefixCacheKeys(const std::vector<int>& prompt, std::string_vie
     }
 }
 
+bool PrefixCacheKeys::matches_rank(int world_size, int rank) const {
+    return world_size_ == world_size && rank_ == rank;
+}
+
 std::string PrefixCacheKeys::key(int end) const {
     if (end < 0 || end > cacheable_tokens()) return {};
     return tokenizer::format_sha256(keys_[end]);
@@ -170,4 +178,12 @@ void PrefixCacheKeys::append_row(int token, MropePosition position, std::string_
 }
 
 }
+}
+
+namespace sglang::decoder {
+
+int PrefixCacheKeys::tokens() const { return tokens_; }
+
+int PrefixCacheKeys::cacheable_tokens() const { return static_cast<int>(keys_.size()) - 1; }
+
 }

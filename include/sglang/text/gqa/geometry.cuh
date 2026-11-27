@@ -4,22 +4,20 @@
 
 #include <cstddef>
 
-#include <cuda_runtime.h>
+#if defined(__CUDACC__) && defined(SGLANG_GQA_DEVICE_ONLY)
+#define SGLANG_GQA_HOST_DEVICE __device__
+#elif defined(__CUDACC__)
+#define SGLANG_GQA_HOST_DEVICE __host__ __device__
+#else
+#define SGLANG_GQA_HOST_DEVICE
+#endif
 
 namespace sglang {
 
 inline constexpr int mxfp8_queries_per_kv_head = mxfp8_query_heads / mxfp8_kv_heads;
 
-__host__ __device__ constexpr int gqa_query_heads(int kv_heads) {
-    return mxfp8_queries_per_kv_head * kv_heads;
-}
-
-__host__ __device__ constexpr std::size_t gqa_payload_bytes_per_page(int kv_heads) {
-    return static_cast<std::size_t>(kv_heads) * mxfp8_page_size * mxfp8_head_dim;
-}
-
-__host__ __device__ constexpr std::size_t gqa_scale_bytes_per_page(int kv_heads) {
-    return static_cast<std::size_t>(kv_heads) * mxfp8_page_size * mxfp8_groups;
-}
+SGLANG_GQA_HOST_DEVICE int gqa_query_heads(int kv_heads);
+SGLANG_GQA_HOST_DEVICE std::size_t gqa_payload_bytes_per_page(int kv_heads);
+SGLANG_GQA_HOST_DEVICE std::size_t gqa_scale_bytes_per_page(int kv_heads);
 
 }

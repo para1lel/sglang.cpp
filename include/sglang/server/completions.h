@@ -1,6 +1,6 @@
 #pragma once
 
-#include "sglang/runtime/model/serving_profile.h"
+#include "sglang/server/serving/serving_profile.h"
 #include "sglang/tokenizer/tokenizer.h"
 
 #include <list>
@@ -37,8 +37,8 @@ public:
     const Tokenizer& get() const;
     const ChatTemplate& chat_template() const;
     const DecoderOptions& chat_sampling_defaults() const;
-    ChatParsers chat_parsers() const { return chat_parsers_; }
-    const model::ServingProfile& serving_profile() const { return profile_; }
+    ChatParsers chat_parsers() const;
+    const model::ServingProfile& serving_profile() const;
     std::shared_ptr<const TokenConstraint> tool_constraint(const ChatTools& tools,
                                                            bool prompt_has_open_think) const;
 

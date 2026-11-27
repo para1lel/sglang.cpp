@@ -24,9 +24,12 @@ __device__ float gemma_norm(float value, float inverse_rms, __nv_bfloat16 weight
                                             * (1.0f + __bfloat162float(weight))));
 }
 
-template <typename Position>
-__device__ int rotary_position(Position first_position, std::size_t row, int) {
-    return decoder::position_value(first_position) + static_cast<int>(row);
+__device__ int rotary_position(int first_position, std::size_t row, int) {
+    return first_position + static_cast<int>(row);
+}
+
+__device__ int rotary_position(const int* first_position, std::size_t row, int) {
+    return *first_position + static_cast<int>(row);
 }
 
 __device__ int rotary_position(const MropePosition* positions, std::size_t row, int channel) {

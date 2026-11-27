@@ -1,4 +1,5 @@
 #include "sglang/text/decode_proj.h"
+#include "sglang/runtime/backend/cuda_resources.h"
 
 #include <cuda.h>
 #include <cuda_bf16.h>
@@ -224,14 +225,11 @@ std::optional<cudaError_t> try_seed_fc_sm100(const __nv_bfloat16* weight,
     if (encoded == CUDA_SUCCESS) {
         encoded = encode(target.encode, activation, input, height, rows);
     }
-    switch (encoded) {
-        case CUDA_SUCCESS: break;
-        case CUDA_ERROR_NOT_SUPPORTED: return std::nullopt;
-        case CUDA_ERROR_INVALID_VALUE: return cudaErrorInvalidValue;
-        case CUDA_ERROR_INVALID_CONTEXT: return cudaErrorIncompatibleDriverContext;
-        case CUDA_ERROR_NOT_INITIALIZED: return cudaErrorInitializationError;
-        case CUDA_ERROR_OUT_OF_MEMORY: return cudaErrorMemoryAllocation;
-        default: return cudaErrorUnknown;
+    if (encoded != CUDA_SUCCESS) {
+        if (encoded == CUDA_ERROR_NOT_SUPPORTED) {
+            return std::nullopt;
+        }
+        return CudaError::from_driver(encoded);
     }
     status = cudaFuncSetAttribute(seed_tc_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                   shared);

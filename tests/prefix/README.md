@@ -14,7 +14,9 @@ mkdir -p "$out"
     apps/server/{prefix_controls,flush_cache,http,loads,completions,ollama_discovery}.cpp \
     apps/server/{parse_function_call,native_sessions,responses,native_generate,ollama_generate}.cpp \
     apps/server/{text_request,text_completion,tokenization_validation,tool_literal,tool_union}.cpp \
-    src/runtime/model/{qwen_chat_output,qwen_tool_output,qwen_chat_template}.cpp \
+    apps/server/detail/{batch_state,text_stop}.cpp \
+    apps/server/qwen/{qwen_chat_output,qwen_tool_output,qwen_tool_syntax,qwen_chat_template}.cpp \
+    src/runtime/server/batch_executor.cpp src/runtime/execution/decoder_options.cpp \
     src/tokenizer/*.cpp src/{json,utf8}.cpp \
     -Wl,--gc-sections \
     -Wl,--wrap=accept4 -o "$out/reader-queue"
@@ -53,11 +55,11 @@ GPU_UUID="$GPU_UUID" LMCACHE_SOCKET="$LMCACHE_SOCKET" \
     bash tests/prefix/run_lmcache_state.sh "${release_build:?set the Release build directory}" "$checkpoint" "$evidence"
 ```
 
-Require exit zero and `PASS` in both `state.log` and `graph.log`. The runner bounds each binary, including its STORE worker and receipt waits. `LMCACHE_TEST_TIMEOUT` defaults to `5m`. At the deadline GNU `timeout` sends SIGTERM, then SIGKILL if the process survives another five seconds. A timeout fails the run. [Device runner](run_lmcache_state.sh#L32)<!-- prefix: "CUDA_VISIBLE" -->
+Require exit zero and `PASS` in both `state.log` and `graph.log`. The runner bounds each binary, including its STORE worker and receipt waits. `LMCACHE_TEST_TIMEOUT` defaults to `5m`. At the deadline GNU `timeout` sends SIGTERM, then SIGKILL if the process survives another five seconds. A timeout fails the run. [Device runner](run_lmcache_state.sh#L39)<!-- prefix: "CUDA_VISIBLE" -->
 
-The state check compares payloads and scores, counts KV writes with imported GQA, and covers unequal GQA and GDN coverage, a hole in GQA, and K4 continuation. It checks periodic views across allocation growth and a failed store. Terminal views retain their source blocks after retirement without copying them. The fixture queues a periodic copy before cancelling and replacing its source request, and injects allocation, copy, and event failures. [Periodic view](lmcache_state.cpp#L579)<!-- prefix: "void check_d" --> · [Terminal view](lmcache_state.cpp#L602)<!-- prefix: "void check_t" --> · [Delayed copy](lmcache_state.cpp#L714)<!-- prefix: "void check_d" --> · [Copy failure](lmcache_state.cpp#L767)<!-- prefix: "void check_c" -->
+The state check compares payloads and scores, counts KV writes with imported GQA, and covers unequal GQA and GDN coverage, a hole in GQA, and K4 continuation. It checks periodic views across allocation growth and a failed store. Terminal views retain their source blocks after retirement without copying them. The fixture queues a periodic copy before cancelling and replacing its source request, and injects allocation, copy, and event failures. [Periodic view](lmcache_state.cpp#L583)<!-- prefix: "void check_d" --> · [Terminal view](lmcache_state.cpp#L606)<!-- prefix: "void check_t" --> · [Delayed copy](lmcache_state.cpp#L718)<!-- prefix: "void check_d" --> · [Copy failure](lmcache_state.cpp#L771)<!-- prefix: "void check_c" -->
 
-For a private GDN allocation, the test observes the STORE worker enqueue one free and synchronize the same stream. A second case injects a recoverable synchronization error after the real release and requires one diagnostic. For detached blocks, the test requires the attempted `cudaFreeAsync` pointer to match the injected pointer. `cudaErrorNotSupported` permits a synchronous free and clears the charge. `cudaErrorInvalidValue` retains the charge and skips the synchronous free. [STORE worker](lmcache_state.cpp#L802)<!-- prefix: "void check_w" --> · [Detached release](lmcache_state.cpp#L683)<!-- prefix: "void check_f" --> · [Accounting](lmcache_state.cpp#L646)<!-- prefix: "void check_d" -->
+For a private GDN allocation, the test observes the STORE worker enqueue one free and synchronize the same stream. A second case injects a recoverable synchronization error after the real release and requires one diagnostic. For detached blocks, the test requires the attempted `cudaFreeAsync` pointer to match the injected pointer. `cudaErrorNotSupported` permits a synchronous free and clears the charge. `cudaErrorInvalidValue` retains the charge and skips the synchronous free. [STORE worker](lmcache_state.cpp#L806)<!-- prefix: "void check_w" --> · [Detached release](lmcache_state.cpp#L687)<!-- prefix: "void check_f" --> · [Accounting](lmcache_state.cpp#L650)<!-- prefix: "void check_d" -->
 
 The graph check advances a K0 or K1 peer while a checkpoint transfer is held, then compares native state and continuation scores with the control. For direct K1 generation, it checks a restored hit and a cold restart after an exceptional GET. Both must match cache-off output IDs and produce a deferred terminal STORE receipt. A failed STORE must surface through its receipt and leave the successful-store count at zero.
 

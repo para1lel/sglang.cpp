@@ -28,7 +28,7 @@ struct RetiredBlockReclaimer::State {
             std::size_t released = 0;
             std::size_t quarantined = 0;
             cudaError_t enqueue_error = cudaSuccess;
-            for (const auto block : active) {
+            for (const auto& block : active) {
                 if (!usable || enqueue_error != cudaSuccess) {
                     quarantined += block.bytes;
                     continue;

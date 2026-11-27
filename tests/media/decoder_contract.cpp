@@ -4,9 +4,11 @@
 #include "sglang/testing/media/decoder_fixture.h"
 #include "sglang/testing/media/decoder_trace.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <stdexcept>
 #include <string_view>
 #include <limits>
 
@@ -85,7 +87,7 @@ std::vector<DecoderMedia> fixtures() {
 }
 
 void check_embedding(const MultimodalPrompt& plan, const std::vector<DecoderMedia>& media) {
-    decoder::MultimodalInput input{nullptr, plan, {}, {}};
+    decoder::MultimodalInput input{nullptr, plan, {}};
     for (const auto& item : media) {
         input.features.push_back(item.features);
     }

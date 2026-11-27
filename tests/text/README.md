@@ -86,15 +86,7 @@ UTF-8 scalar at both short budgets and requires U+FFFD on both public routes.
 
 ## Normal server entrypoint
 
-The integration runner starts the candidate and the Unit 18 reference on
-loopback. Use commit `7a3b85164588173c0b9ba3aa97acf887b360c862` for the
-reference. Its tree is `d4c12ddb4f2f04d4ef0dd32cabedff486ff73502`, and it
-contains the LLVM-linked CPU helper used by the control.
-
-Run from the candidate source root in the managed Pixi `default` environment
-with Python 3.11 or newer. Point `parent` to an existing checkout of the
-reference commit. Build both Release servers and choose a fresh evidence
-directory for each run.
+The loopback runner compares the candidate with Unit 18, commit `7a3b85164588173c0b9ba3aa97acf887b360c862`, tree `d4c12ddb4f2f04d4ef0dd32cabedff486ff73502`, which provides the LLVM-linked CPU helper. From the candidate root in managed Pixi `default` with Python 3.11+, set `UNIT18_SOURCE` to that checkout. Build both Release servers and use fresh evidence.
 
 ```bash
 candidate="$PWD"
@@ -102,10 +94,10 @@ parent="${UNIT18_SOURCE:?Set UNIT18_SOURCE to the absolute Unit 18 source path}"
 test "$(git -C "$parent" rev-parse HEAD)" = 7a3b85164588173c0b9ba3aa97acf887b360c862
 candidate_build="$candidate/build/chat-release"
 parent_build="$parent/build/chat-release"
-xmake f -P "$candidate" -o "$candidate_build" -p linux -a x86_64 -m release
-xmake build -P "$candidate" sglang-server
-xmake f -P "$parent" -o "$parent_build" -p linux -a x86_64 -m release
-xmake build -P "$parent" sglang-server
+for src in "$candidate" "$parent"; do
+    xmake f -P "$src" -o "$src/build/chat-release" -p linux -a x86_64 -m release
+    xmake build -P "$src" sglang-server
+done
 checkpoint=/data0/shared/Qwen3.8-27B-FP8
 out="$candidate_build/chat-evidence"
 mkdir -p "$out"
@@ -116,17 +108,9 @@ CUDA_VISIBLE_DEVICES='' python3 -B tests/text/run_chat_layer1.py --mode cpu \
     --checkpoint "$checkpoint" --output "$out/cpu"
 ```
 
-The CPU link uses the production HTTP entrypoint, scheduler, JSON, and
-tokenizer. It replaces the decoder with deterministic token pieces and emits
-a link map. Build each control with its own checkout's helper so it uses the
-JSON dependency of that revision. The reset case checks an incomplete UTF-8
-scalar, cancellation before reuse of the same slot, and three peers that
-finish without changes to their streams.
+Each checkout's helper links that revision's production HTTP entrypoint, scheduler, JSON, and tokenizer with deterministic decoding and emits a link map. The reset case checks an incomplete UTF-8 scalar, cancellation before same-slot reuse, and three peers with unchanged streams.
 
-For the GPU run, hold the shared UUID lock on an idle B200. Build the graph
-observer from `tests/batch/graph_activity.cpp` with the CUDA toolkit and
-`libcupti`, as in `tests/batch/run_batch_graph.sh`. Set `observer` to the
-resulting shared library and `GPU_UUID` to the reserved device.
+For GPU, hold the shared UUID lock on an idle B200. Set `observer` to the shared CUPTI observer built from `tests/batch/graph_activity.cpp` with the toolkit and `libcupti`. [Observer build](../batch/README.md#wide-k0-serving)
 
 ```bash
 CUDA_VISIBLE_DEVICES="${GPU_UUID:?Set the reserved GPU UUID}" \
@@ -146,9 +130,7 @@ slot and checks greedy parity, including the explicit legacy stop fixture.
 
 ## Qwen chat output
 
-Build the Release server and use the managed Pixi environment with Python 3.11
-or newer. Set `build` to the absolute XMake output directory containing the
-server and static libraries. Use a fresh evidence directory for each run.
+Use the Release build directory and managed Pixi with Python 3.11+. Use fresh evidence.
 
 ```bash
 build="$PWD/build"
@@ -168,13 +150,11 @@ closed parameters containing literal wrappers from unclosed parameters
 followed by another call. They cover invalid sibling fields, JSON quotes,
 stray closing tags, the token limit, and explicit stops.
 
-Compile the direct parser check against the same tokenizer and JSON libraries.
-It verifies whole input, single bytes, checkpoint tokenizer pieces, every
-split into two chunks, and seeded random chunks. It also checks cancellation.
+The direct parser probe uses the same tokenizer and JSON libraries. Check whole input, single bytes, tokenizer pieces, every two-way split, seeded chunks, and cancellation.
 
 ```bash
 "${CXX:-c++}" -std=c++17 -O2 -pthread -Iinclude \
-    tests/text/chat_output_chunks.cpp src/runtime/model/qwen_chat_output.cpp \
+    tests/text/chat_output_chunks.cpp apps/server/qwen/{qwen_chat_output,qwen_tool_syntax}.cpp \
     "$build/lib/libsglang_tokenizer.a" "$build/lib/libsglang_json.a" \
     -o "$out/chat-output-chunks"
 "$out/chat-output-chunks" "$checkpoint/tokenizer.json"

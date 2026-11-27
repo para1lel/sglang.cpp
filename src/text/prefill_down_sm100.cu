@@ -134,17 +134,6 @@ std::optional<cudaError_t> prepare_kernel(cudaStream_t stream, int& device) {
                                 Kernel::SharedStorageSize);
 }
 
-cudaError_t tensor_map_status(CUresult status) {
-    switch (status) {
-        case CUDA_ERROR_NOT_SUPPORTED: return cudaErrorNotSupported;
-        case CUDA_ERROR_INVALID_VALUE: return cudaErrorInvalidValue;
-        case CUDA_ERROR_INVALID_CONTEXT: return cudaErrorIncompatibleDriverContext;
-        case CUDA_ERROR_NOT_INITIALIZED: return cudaErrorInitializationError;
-        case CUDA_ERROR_OUT_OF_MEMORY: return cudaErrorMemoryAllocation;
-        default: return cudaErrorUnknown;
-    }
-}
-
 }
 
 std::optional<cudaError_t> try_prefill_scaled_sm100(
@@ -178,7 +167,7 @@ std::optional<cudaError_t> try_prefill_scaled_sm100(
     try {
         params = Kernel::to_underlying_arguments(args, nullptr);
     } catch (const TensorMapError& error) {
-        return submit_status(tensor_map_status(error.status));
+        return submit_status(decoder::CudaError::from_driver(error.status));
     }
     const int groups = input_width / scale_group;
     dim3 scale_grid((groups + scale_tile - 1) / scale_tile, row_count / scale_tile);

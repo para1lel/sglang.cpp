@@ -201,6 +201,11 @@ ExactGqaWorkspace Workspace::gqa_scores(int capacity) const {
     return {reinterpret_cast<float*>(logits), std::min(capacity, score_pages * mxfp8_page_size)};
 }
 
+template <>
+BatchDecodeBinding* Allocations::allocate<BatchDecodeBinding>(std::size_t count) {
+    return static_cast<BatchDecodeBinding*>(allocate_elements(count, sizeof(BatchDecodeBinding)));
+}
+
 BatchGraphScratch::BatchGraphScratch(int device)
     : memory(device), device_bindings(memory.allocate<BatchDecodeBinding>(work.size())) {
     for (auto& workspace : work) {
@@ -321,5 +326,11 @@ void Request::reset(cudaStream_t stream) {
 void Request::reset() {
     reset(memory.stream());
 }
+
+}
+
+namespace sglang::decoder {
+
+Workspace::Workspace() noexcept = default;
 
 }

@@ -26,6 +26,43 @@ void require(bool condition, const char* description) {
     }
 }
 
+void check_driver_statuses() {
+    using sglang::decoder::CudaError;
+    struct Case {
+        CUresult driver;
+        cudaError_t expected;
+        bool terminal;
+    };
+    constexpr std::array cases{
+        Case{CUDA_SUCCESS, cudaSuccess, false},
+        Case{CUDA_ERROR_INVALID_VALUE, cudaErrorInvalidValue, false},
+        Case{CUDA_ERROR_OUT_OF_MEMORY, cudaErrorMemoryAllocation, false},
+        Case{CUDA_ERROR_NOT_INITIALIZED, cudaErrorInitializationError, false},
+        Case{CUDA_ERROR_DEINITIALIZED, cudaErrorCudartUnloading, true},
+        Case{CUDA_ERROR_INVALID_CONTEXT, cudaErrorIncompatibleDriverContext, false},
+        Case{CUDA_ERROR_ECC_UNCORRECTABLE, cudaErrorECCUncorrectable, true},
+        Case{CUDA_ERROR_INVALID_HANDLE, cudaErrorInvalidResourceHandle, false},
+        Case{CUDA_ERROR_ILLEGAL_ADDRESS, cudaErrorIllegalAddress, true},
+        Case{CUDA_ERROR_LAUNCH_TIMEOUT, cudaErrorLaunchTimeout, true},
+        Case{CUDA_ERROR_CONTEXT_IS_DESTROYED, cudaErrorContextIsDestroyed, true},
+        Case{CUDA_ERROR_ASSERT, cudaErrorAssert, true},
+        Case{CUDA_ERROR_HARDWARE_STACK_ERROR, cudaErrorHardwareStackError, true},
+        Case{CUDA_ERROR_ILLEGAL_INSTRUCTION, cudaErrorIllegalInstruction, true},
+        Case{CUDA_ERROR_MISALIGNED_ADDRESS, cudaErrorMisalignedAddress, true},
+        Case{CUDA_ERROR_INVALID_ADDRESS_SPACE, cudaErrorInvalidAddressSpace, true},
+        Case{CUDA_ERROR_INVALID_PC, cudaErrorInvalidPc, true},
+        Case{CUDA_ERROR_LAUNCH_FAILED, cudaErrorLaunchFailure, true},
+        Case{CUDA_ERROR_NOT_SUPPORTED, cudaErrorNotSupported, false},
+        Case{CUDA_ERROR_UNKNOWN, cudaErrorUnknown, false},
+        Case{CUDA_ERROR_NOT_FOUND, cudaErrorUnknown, false},
+    };
+    for (const auto& test : cases) {
+        const auto status = CudaError::from_driver(test.driver);
+        require(status == test.expected, "Wrong CUDA status for Driver result");
+        require(CudaError::terminal(status) == test.terminal, "Wrong CUDA terminal classification");
+    }
+}
+
 template <typename Handle>
 Handle handle(std::uintptr_t value) {
     return reinterpret_cast<Handle>(value);
@@ -56,6 +93,14 @@ cudaError_t cudaMalloc(void** address, std::size_t bytes) {
 cudaError_t cudaFree(void* address) {
     require(runtime.live.erase(address) == 1, "Invalid or duplicate release");
     return cudaSuccess;
+}
+
+cudaError_t cudaFreeHost(void*) {
+    throw std::runtime_error("Unexpected pinned host release");
+}
+
+cudaError_t cudaFreeAsync(void*, cudaStream_t) {
+    throw std::runtime_error("Unexpected asynchronous release");
 }
 
 cudaError_t cudaStreamCreateWithFlags(cudaStream_t* stream, unsigned int) {
@@ -166,6 +211,7 @@ void binding_rejection(int failed_lane) {
 }
 
 int main() {
+    check_driver_statuses();
     capacity_bounds();
     require(runtime.live.empty(), "Capacity test leaked allocations");
     for (int slot = 0; slot < 4; ++slot) {

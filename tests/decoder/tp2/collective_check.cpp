@@ -1,5 +1,6 @@
 #include "sglang/runtime/backend/tensor_parallel.h"
 
+#include <cuda.h>
 #include <cuda_runtime.h>
 
 #include <array>
@@ -21,6 +22,11 @@ constexpr int row = 5120;
 constexpr int wide = 80 * row;
 constexpr int capacity = 81 * row + 8;
 constexpr auto bytes = capacity * sizeof(__nv_bfloat16);
+
+bool& nccl_only() {
+    static bool enabled = false;
+    return enabled;
+}
 
 void check(cudaError_t status, const char* operation) {
     if (status != cudaSuccess) {
@@ -282,9 +288,25 @@ void check_capture(TensorParallel& group, bool joined, int count, RankCounter tr
 
 }
 
+extern "C" decltype(cuMulticastGetGranularity)
+    real_multicast_granularity asm("__real_cuMulticastGetGranularity");
+extern "C" decltype(cuMulticastGetGranularity)
+    wrapped_multicast_granularity asm("__wrap_cuMulticastGetGranularity");
+
+CUresult wrapped_multicast_granularity(std::size_t* granularity,
+                                       const CUmulticastObjectProp* properties,
+                                       CUmulticastGranularity_flags option) {
+    if (nccl_only())
+        return CUDA_ERROR_NOT_SUPPORTED;
+    return real_multicast_granularity(granularity, properties, option);
+}
+
 int main(int argc, char** argv) try {
-    const bool require_mnnvl = argc == 2 && std::string_view(argv[1]) == "--require-mnnvl";
-    require(argc == 1 || require_mnnvl, "invalid collective check arguments");
+    const std::string_view mode = argc == 2 ? argv[1] : "";
+    const bool require_mnnvl = mode == "--require-mnnvl";
+    const bool require_nccl = mode == "--require-nccl";
+    nccl_only() = require_nccl;
+    require(argc == 1 || require_mnnvl || require_nccl, "invalid collective check arguments");
     const int caller = require_mnnvl ? 0 : 1;
     const std::array<int, ranks> devices{caller, 1 - caller};
     int visible = 0;
@@ -298,6 +320,7 @@ int main(int argc, char** argv) try {
     const auto counters = snapshot(*group);
     const bool vendor = counters.mnnvl_active;
     require(!require_mnnvl || vendor, "MNNVL is required for this run");
+    require(!require_nccl || !vendor, "NCCL is required for this run");
     const auto unavailable = counters.mnnvl_built
                                  ? &TpArRankCounters::ar_fallback_setup_unavailable_total
                                  : &TpArRankCounters::ar_fallback_disabled_total;

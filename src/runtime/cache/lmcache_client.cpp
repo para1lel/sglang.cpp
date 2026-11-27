@@ -428,34 +428,6 @@ std::string default_lmcache_endpoint() {
     return "/tmp/sglang-lmcache-" + std::to_string(geteuid()) + ".sock";
 }
 
-namespace {
-
-std::string insert_rank_suffix(std::string endpoint, int rank) {
-    if (rank < 0) throw std::invalid_argument("Invalid LMCache rank");
-    const auto suffix = "-r" + std::to_string(rank);
-    constexpr std::string_view extension = ".sock";
-    const auto tail = endpoint.size() > extension.size()
-                          ? std::string_view(endpoint).substr(
-                                endpoint.size() - extension.size())
-                          : std::string_view();
-    if (tail == extension) {
-        endpoint.insert(endpoint.size() - extension.size(), suffix);
-    } else {
-        endpoint += suffix;
-    }
-    return endpoint;
-}
-
-}   
-
-std::string rank_lmcache_endpoint(int rank) {
-    return insert_rank_suffix(default_lmcache_endpoint(), rank);
-}
-
-std::string rank_lmcache_endpoint(const std::string& endpoint, int rank) {
-    return insert_rank_suffix(endpoint, rank);
-}
-
 LmCacheClient::LmCacheClient(LmCacheConfig config) : config_(std::move(config)) {
     constexpr std::string_view namespace_characters =
         "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-";
@@ -469,9 +441,18 @@ LmCacheClient::LmCacheClient(LmCacheConfig config) : config_(std::move(config)) 
 }
 
 bool LmCacheClient::ready() const {
+    return ready({});
+}
+
+bool LmCacheClient::ready(const std::vector<std::array<std::uint8_t, 16>>& devices) const {
     const Connection connection(config_);
-    connection.request(Operation::ready, request_prefix(config_));
+    auto metadata = request_prefix(config_);
+    for (const auto& device : devices)
+        append_bytes(metadata, device);
+    connection.request(Operation::ready, metadata);
     const auto [status, size] = connection.response_header();
+    if (!devices.empty() && status == 3 && size == 0)
+        return false;
     if (status != 0 || size != daemon_version.size()) transport_error("unsupported daemon version");
     std::string version(daemon_version.size(), '\0');
     connection.read_all(version.data(), version.size());
@@ -596,3 +577,9 @@ void LmCacheClient::reset() const {
 }
 
 }   
+
+namespace sglang::decoder {
+
+const LmCacheConfig& LmCacheClient::config() const { return config_; }
+
+}

@@ -229,8 +229,9 @@ void singleton(const Decoder& decoder, std::string_view role) {
             "Expected singleton replay at 1536 visible tokens");
     run.admit(0, 1, 6);
     const auto mixed = run.step(pair);
-    require(run.graph_slots == 0 && mixed[far_slot].decode &&
-            mixed[0].token && !mixed[0].decode, "Mixed prefill and singleton decode used a graph");
+    require(run.graph_slots == singleton_mask && mixed[far_slot].decode && mixed[0].token &&
+                !mixed[0].decode,
+            "Mixed step lost prefill or singleton replay");
     run.admit(2, 1, 0);
     const auto zero = run.step(far_mask | 4u);
     require(run.graph_slots == singleton_mask && zero[far_slot].decode &&

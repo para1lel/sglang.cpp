@@ -30,10 +30,8 @@ struct ChatOutputOptions {
     bool parallel_tool_calls = true;
     std::map<std::string, ChatToolSchema, std::less<>> tools;
 
-    bool enabled() const { return separate_reasoning || !tools.empty(); }
-    bool accepts_tool_calls(std::size_t calls) const {
-        return !tools.empty() && (parallel_tool_calls || calls == 0);
-    }
+    bool enabled() const;
+    bool accepts_tool_calls(std::size_t calls) const;
 };
 
 void read_chat_tools(ChatOutputOptions& options, const json::Array& tools);
@@ -54,7 +52,6 @@ struct SeparatedReasoning {
     std::string text;
 };
 
-// An event's views are valid for the duration of the callback.
 using ChatOutputSink = std::function<bool(const ChatOutputEvent&)>;
 class ChatToolFrame;
 
@@ -64,7 +61,7 @@ public:
     ~ChatOutputParser();
     bool push(std::string_view text, const ChatOutputSink& sink);
     bool finish(ChatEnd end, const ChatOutputSink& sink);
-    std::size_t calls() const { return calls_; }
+    std::size_t calls() const;
 
 private:
     enum class Phase { opening, reasoning, content };

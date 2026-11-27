@@ -1,6 +1,7 @@
 #include "sglang/server/tokenization_validation.h"
 
 #include "sglang/tokenizer/tokenizer.h"
+#include "sglang/utf8.h"
 
 #include <algorithm>
 #include <charconv>
@@ -15,6 +16,42 @@ using namespace std::string_view_literals;
 using json::get;
 using json::OrderedObject;
 using json::Value;
+
+bool integer_space(std::string_view scalar) {
+    if (scalar.size() == 1) {
+        const char character = scalar.front();
+        return character == ' ' || (character >= '\t' && character <= '\r');
+    }
+    if (scalar.size() == 2)
+        return scalar == u8"\u0085" || scalar == u8"\u00a0";
+    constexpr std::string_view spaces = u8"\u1680\u2000\u2001\u2002\u2003\u2004\u2005"
+                                        u8"\u2006\u2007\u2008\u2009\u200a\u2028\u2029"
+                                        u8"\u202f\u205f\u3000";
+    return scalar.size() == 3 && spaces.find(scalar) != std::string_view::npos;
+}
+
+std::string_view trim_integer_text(std::string_view text) {
+    while (!text.empty()) {
+        const auto size = utf8_lead(static_cast<unsigned char>(text.front())).size;
+        if (!integer_space(text.substr(0, size)))
+            break;
+        text.remove_prefix(size);
+    }
+    while (!text.empty()) {
+        auto start = text.size() - 1;
+        while (start > 0 && (static_cast<unsigned char>(text[start]) & 0xc0) == 0x80) {
+            --start;
+        }
+        if (!integer_space(text.substr(start)))
+            break;
+        text.remove_suffix(text.size() - start);
+    }
+    return text;
+}
+
+bool digit(char character) {
+    return character >= '0' && character <= '9';
+}
 
 const Value* present(const OrderedObject& fields, std::string_view key) {
     const auto* value = get(fields, key);
@@ -187,6 +224,41 @@ Value schema_tree(const Value& value) {
     return result;
 }
 
+}
+
+std::optional<detail::IntegerText> detail::scan_integer_text(std::string_view text,
+                                                             IntegerSeparators separators) {
+    text = trim_integer_text(text);
+    const bool negative = !text.empty() && text.front() == '-';
+    if (!text.empty() && (negative || text.front() == '+'))
+        text.remove_prefix(1);
+    if (text.empty() || !digit(text.front()))
+        return std::nullopt;
+
+    std::size_t start = std::string_view::npos;
+    std::size_t digit_count = 0;
+    std::size_t end = 0;
+    bool separator = false;
+    for (; end < text.size() && text[end] != '.'; ++end) {
+        const char character = text[end];
+        if (digit(character)) {
+            if (start == std::string_view::npos && character != '0')
+                start = end;
+            if (start != std::string_view::npos)
+                ++digit_count;
+        } else if (character != '_' || (separator && separators == IntegerSeparators::single)) {
+            return std::nullopt;
+        }
+        separator = character == '_';
+    }
+    if (separator ||
+        (end < text.size() && (end + 1 == text.size() ||
+                               text.find_first_not_of('0', end + 1) != std::string_view::npos))) {
+        return std::nullopt;
+    }
+    if (digit_count == 0)
+        return IntegerText{{}, 0, false};
+    return IntegerText{text.substr(start, end - start), digit_count, negative};
 }
 
 bool chat_truthy(const Value& value) {

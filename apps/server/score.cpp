@@ -11,6 +11,13 @@
 #include <set>
 
 namespace sglang::server {
+
+bool score_detail::consume(std::size_t& remaining, std::size_t count, std::size_t repetitions) {
+    if (repetitions && count > remaining / repetitions) return false;
+    remaining -= count * repetitions;
+    return true;
+}
+
 namespace {
 
 using json::Array;

@@ -75,7 +75,7 @@ class NativeDecisions(unittest.TestCase):
                    "return_prompt_token_ids": True}
         baseline = self.exchange(payload)
         self.assertEqual(baseline["prompt_format_version"], 1)
-        for value in (1, None, True, 1.0, "1", "+0_1.000", "\u00a01\u202f"):
+        for value in (1, None, True, 1.0, "1", "0_1", "0__1", "+0_1.000", "\u00a01\u202f"):
             with self.subTest(value=value):
                 self.assertEqual(self.exchange({**payload, "prompt_format_version": value}),
                                  baseline)

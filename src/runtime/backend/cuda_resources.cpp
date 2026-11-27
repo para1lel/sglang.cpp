@@ -11,7 +11,6 @@
 #include <cstdio>
 #include <mutex>
 #include <optional>
-#include <string>
 #include <utility>
 #include <vector>
 
@@ -333,16 +332,6 @@ CleanupError Allocations::State::release(std::shared_ptr<const void>& drained_ow
     }
     return error;
 }
-
-void check(cudaError_t status, const char* operation) {
-    if (status != cudaSuccess) {
-        throw CudaError(status, operation);
-    }
-}
-
-CudaError::CudaError(cudaError_t status, const char* operation)
-    : std::runtime_error(std::string(operation) + ": " + cudaGetErrorString(status)),
-      status(status) {}
 
 std::size_t available_device_bytes() {
     std::size_t free = 0;
@@ -771,5 +760,55 @@ void* Allocations::allocate_bytes(std::size_t bytes) {
     state_->bytes += bytes;
     return pointer;
 }
+
+}
+
+namespace sglang::decoder {
+
+cudaError_t release_cuda_block(void* pointer, cudaStream_t stream,
+                                      bool wait_for_release) noexcept {
+    const auto status = cudaFreeAsync(pointer, stream);
+    if (status == cudaSuccess && wait_for_release) return cudaStreamSynchronize(stream);
+    if (status != cudaErrorNotSupported) return status;
+    const auto pending = cudaGetLastError();
+    if (pending != cudaSuccess && pending != cudaErrorNotSupported) return pending;
+    return cudaFree(pointer);
+}
+
+void copy_cuda_async(void* destination, const void* source, std::size_t bytes,
+                            cudaMemcpyKind kind, cudaStream_t stream, const char* operation) {
+    check(cudaMemcpyAsync(destination, source, bytes, kind, stream), operation);
+}
+
+void zero_cuda_async(void* destination, std::size_t bytes, cudaStream_t stream,
+                            const char* operation) {
+    check(cudaMemsetAsync(destination, 0, bytes, stream), operation);
+}
+
+void synchronize_cuda(cudaStream_t stream, const char* operation) {
+    check(cudaStreamSynchronize(stream), operation);
+}
+
+void* Allocations::allocate_elements(std::size_t count, std::size_t element_size) {
+    if (element_size == 0 || count > std::numeric_limits<std::size_t>::max() / element_size) {
+        throw std::overflow_error("CUDA allocation size overflow");
+    }
+    return allocate_bytes(count * element_size);
+}
+
+template <typename Element>
+Element* Allocations::allocate(std::size_t count) {
+    return static_cast<Element*>(allocate_elements(count, sizeof(Element)));
+}
+
+template Bf16* Allocations::allocate<Bf16>(std::size_t);
+template float* Allocations::allocate<float>(std::size_t);
+template int* Allocations::allocate<int>(std::size_t);
+template std::uint8_t* Allocations::allocate<std::uint8_t>(std::size_t);
+template std::uint32_t* Allocations::allocate<std::uint32_t>(std::size_t);
+template std::byte* Allocations::allocate<std::byte>(std::size_t);
+template TextLogitCandidate* Allocations::allocate<TextLogitCandidate>(std::size_t);
+template DecoderLogitBias* Allocations::allocate<DecoderLogitBias>(std::size_t);
+template MropePosition* Allocations::allocate<MropePosition>(std::size_t);
 
 }

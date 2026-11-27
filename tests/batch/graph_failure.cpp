@@ -30,8 +30,8 @@ bool inject(std::string_view boundary) {
 }
 
 extern "C" cudaError_t cudaMallocHost(void** address, std::size_t bytes) {
-    static const auto real =
-        reinterpret_cast<decltype(&cudaMallocHost)>(dlsym(RTLD_NEXT, "cudaMallocHost"));
+    using Function = cudaError_t (*)(void**, std::size_t);
+    static const auto real = reinterpret_cast<Function>(dlsym(RTLD_NEXT, "cudaMallocHost"));
     if (bytes == sizeof(sglang::decoder::VerificationGraphBinding) && inject("prepare")) {
         return cudaErrorMemoryAllocation;
     }
@@ -40,8 +40,8 @@ extern "C" cudaError_t cudaMallocHost(void** address, std::size_t bytes) {
 
 extern "C" cudaError_t cudaMemcpyAsync(void* destination, const void* source, std::size_t bytes,
                                        cudaMemcpyKind kind, cudaStream_t stream) {
-    static const auto real =
-        reinterpret_cast<decltype(&cudaMemcpyAsync)>(dlsym(RTLD_NEXT, "cudaMemcpyAsync"));
+    using Function = cudaError_t (*)(void*, const void*, std::size_t, cudaMemcpyKind, cudaStream_t);
+    static const auto real = reinterpret_cast<Function>(dlsym(RTLD_NEXT, "cudaMemcpyAsync"));
     if (launches == 1 && kind == cudaMemcpyHostToDevice &&
         bytes == sizeof(sglang::decoder::VerificationGraphBinding) && inject("upload")) {
         return cudaErrorInvalidValue;
@@ -60,8 +60,8 @@ extern "C" cudaError_t cudaStreamBeginCapture(cudaStream_t stream, cudaStreamCap
 
 extern "C" cudaError_t cudaGraphInstantiate(cudaGraphExec_t* executable,
                                             cudaGraph_t graph, unsigned long long flags) {
-    static const auto real = reinterpret_cast<decltype(&cudaGraphInstantiate)>(
-        dlsym(RTLD_NEXT, "cudaGraphInstantiate"));
+    using Function = cudaError_t (*)(cudaGraphExec_t*, cudaGraph_t, unsigned long long);
+    static const auto real = reinterpret_cast<Function>(dlsym(RTLD_NEXT, "cudaGraphInstantiate"));
     if (inject("instantiate")) {
         return cudaErrorNotSupported;
     }

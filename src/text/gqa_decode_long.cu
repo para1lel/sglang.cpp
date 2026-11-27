@@ -1,15 +1,110 @@
 #include "sglang/text/gqa/gqa_decode_long.cuh"
 #include "sglang/runtime/backend/cuda_resources.h"
-#include "sglang/text/mxfp8_gqa_prefill_tmem_kv.cuh"
+#include "sglang/text/gqa/tmem_ops.cuh"
 
 #include <cuda.h>
 #include <cudaTypedefs.h>
-#include "sglang/text/prefill_attn_tcgen05.cuh"
 
 namespace sglang::gqa_decode {
 namespace {
 
-using namespace prefill_attn;
+using gqa_prefill::tmem::tmem_decode;
+using gqa_prefill::tmem::tmem_swizzle;
+using gqa_prefill::tmem::tmem_swizzled;
+
+using Bits = std::uint32_t;
+
+__device__ __forceinline__ Bits shared_address(const void* pointer) {
+    return static_cast<Bits>(__cvta_generic_to_shared(pointer));
+}
+
+__device__ __forceinline__ void barrier_init(Bits barrier, int count) {
+    asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" :: "r"(barrier), "r"(count) : "memory");
+}
+
+__device__ __forceinline__ void barrier_arrive(Bits barrier) {
+    asm volatile("mbarrier.arrive.release.cta.shared::cta.b64 _, [%0];"
+                 :: "r"(barrier) : "memory");
+}
+
+__device__ __forceinline__ void tensor_alloc(Bits destination, int columns) {
+    asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;\n"
+                 "tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;"
+                 :: "r"(destination), "r"(columns) : "memory");
+}
+
+__device__ __forceinline__ void tensor_dealloc(Bits address, int columns) {
+    asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;"
+                 :: "r"(address), "r"(columns) : "memory");
+}
+
+__device__ __forceinline__ std::uint64_t smem_descriptor(const void* pointer, Bits leading) {
+    constexpr auto swizzle = std::uint64_t{2} << 61;
+    constexpr auto version = std::uint64_t{1} << 46;
+    constexpr auto stride = std::uint64_t{1024 >> 4} << 32;
+    return swizzle | version | stride | (std::uint64_t{leading} << 16) |
+           (shared_address(pointer) >> 4);
+}
+
+template <int Columns, bool ValueMajor, int Rows = 128>
+__host__ __device__ constexpr Bits mma_instruction() {
+    constexpr Bits format = (1u << 4) | (1u << 7) | (1u << 10);
+    return (Bits{Rows / 16} << 24) | (Bits{Columns / 8} << 17) |
+           (Bits{ValueMajor} << 16) | format;
+}
+
+__device__ __forceinline__ void mma_shared(Bits destination, std::uint64_t lhs,
+                                           std::uint64_t rhs, Bits instruction,
+                                           bool accumulate) {
+    asm volatile("{ .reg .pred accum;\n"
+                 "setp.ne.u32 accum, %4, 0;\n"
+                 "tcgen05.mma.cta_group::1.kind::f16 [%0], %1, %2, %3, accum; }"
+                 :: "r"(destination), "l"(lhs), "l"(rhs), "r"(instruction),
+                    "r"(static_cast<Bits>(accumulate)) : "memory");
+}
+
+__device__ __forceinline__ void mma_commit(Bits barrier) {
+    asm volatile("tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64 [%0];"
+                 :: "r"(barrier) : "memory");
+}
+
+__device__ __forceinline__ void tensor_load(Bits address, float* values) {
+    asm volatile("tcgen05.ld.sync.aligned.32x32b.x32.b32 {%0,%1,%2,%3,%4,%5,%6,%7,"
+                 "%8,%9,%10,%11,%12,%13,%14,%15,%16,%17,%18,%19,%20,%21,%22,%23,"
+                 "%24,%25,%26,%27,%28,%29,%30,%31}, [%32];"
+                 : "=f"(values[0]), "=f"(values[1]), "=f"(values[2]), "=f"(values[3]),
+                   "=f"(values[4]), "=f"(values[5]), "=f"(values[6]), "=f"(values[7]),
+                   "=f"(values[8]), "=f"(values[9]), "=f"(values[10]), "=f"(values[11]),
+                   "=f"(values[12]), "=f"(values[13]), "=f"(values[14]), "=f"(values[15]),
+                   "=f"(values[16]), "=f"(values[17]), "=f"(values[18]), "=f"(values[19]),
+                   "=f"(values[20]), "=f"(values[21]), "=f"(values[22]), "=f"(values[23]),
+                   "=f"(values[24]), "=f"(values[25]), "=f"(values[26]), "=f"(values[27]),
+                   "=f"(values[28]), "=f"(values[29]), "=f"(values[30]), "=f"(values[31])
+                 : "r"(address) : "memory");
+}
+
+__device__ __forceinline__ void tensor_load_wait() {
+    asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+}
+
+__device__ __forceinline__ void tensor_store(Bits address, const Bits* bits) {
+    asm volatile("tcgen05.st.sync.aligned.32x32b.x32.b32 [%0], {%1,%2,%3,%4,%5,%6,%7,%8,"
+                 "%9,%10,%11,%12,%13,%14,%15,%16,%17,%18,%19,%20,%21,%22,%23,%24,"
+                 "%25,%26,%27,%28,%29,%30,%31,%32};"
+                 :: "r"(address), "r"(bits[0]), "r"(bits[1]), "r"(bits[2]), "r"(bits[3]),
+                    "r"(bits[4]), "r"(bits[5]), "r"(bits[6]), "r"(bits[7]), "r"(bits[8]),
+                    "r"(bits[9]), "r"(bits[10]), "r"(bits[11]), "r"(bits[12]),
+                    "r"(bits[13]), "r"(bits[14]), "r"(bits[15]), "r"(bits[16]),
+                    "r"(bits[17]), "r"(bits[18]), "r"(bits[19]), "r"(bits[20]),
+                    "r"(bits[21]), "r"(bits[22]), "r"(bits[23]), "r"(bits[24]),
+                    "r"(bits[25]), "r"(bits[26]), "r"(bits[27]), "r"(bits[28]),
+                    "r"(bits[29]), "r"(bits[30]), "r"(bits[31]) : "memory");
+}
+
+__device__ __forceinline__ void tensor_store_release() {
+    asm volatile("tcgen05.wait::st.sync.aligned;\n"
+                 "tcgen05.fence::before_thread_sync;" ::: "memory");
+}
 
 __device__ __forceinline__ void init(std::uint64_t* barrier, int count) {
     barrier_init(shared_address(barrier), count);
@@ -327,7 +422,6 @@ __device__ __forceinline__ void store_tensor(unsigned address, const float* valu
     tensor_store(address, bits);
 }
 
-
 __device__ void soften_chunk(Shared& shared, int slot, int visible, int member,
                              int phase, Online& state) {
     float values[keys / 4];
@@ -551,7 +645,7 @@ std::optional<cudaError_t> encode_maps(const LongBatch& batch, int requests, Bat
                 return std::nullopt;
             }
             if (result != CUDA_SUCCESS) {
-                const auto status = static_cast<cudaError_t>(result);
+                const auto status = decoder::CudaError::from_driver(result);
                 return long_decode_status(decoder::CudaError::terminal(status)
                     ? status : cudaErrorUnknown);
             }

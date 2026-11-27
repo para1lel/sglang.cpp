@@ -4,8 +4,8 @@
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| Request options | Validate the wire values and populate `DecoderOptions`. | [HTTP validation](../apps/server/text_request.cpp#L174)<!-- prefix: "double sampl" --> · [Native defaults](../apps/server/text_request.cpp#L646)<!-- prefix: "const auto* " --> · [C++ options](../include/sglang/decoder.h#L76)<!-- prefix: "double frequ" --> |
-| Decoder | Keep each item's history and choose its execution path. | [Batch depth](../src/decoder_batch.cpp#L148)<!-- prefix: "if (options." --> · [Direct execution](../src/decoder.cpp#L682)<!-- prefix: "return !opti" --> |
+| Request options | Validate the wire values and populate `DecoderOptions`. | [HTTP validation](../apps/server/text_request.cpp#L174)<!-- prefix: "double sampl" --> · [Native defaults](../apps/server/text_request.cpp#L650)<!-- prefix: "const auto* " --> · [C++ options](../include/sglang/decoder.h#L76)<!-- prefix: "double frequ" --> |
+| Decoder | Keep each item's history and choose its execution path. | [Batch depth](../src/decoder_batch.cpp#L148)<!-- prefix: "if (options." --> · [Direct execution](../src/decoder.cpp#L718)<!-- prefix: "return !opti" --> |
 | CUDA score adjustment | Update history and rank the adjusted scores. | [History update](../src/decoder_sampling.cu#L414)<!-- prefix: "__device__ f" --> · [Repetition selection](../src/decoder_sampling.cu#L871)<!-- prefix: "cudaError_t " --> |
 
 ## Runtime path
@@ -16,7 +16,7 @@ For a seen ID, CUDA then multiplies a negative score by `repetition_penalty` or 
 
 Repetition scaling uses FP64 and preserves a zero score. Ordinary rows rank the adjusted FP32 scores and use FP64 score differences for normalization. Extreme rows keep a separate exponent, a low-order arithmetic residual, and small bias differences alongside large values. CUDA ranks these scores before subtracting the row maximum for probability calculations. Greedy selection breaks equal represented scores by token ID.
 
-CUDA applies any output constraint mask and then adds [logit bias](serving/openai-logprobs.md#logit-bias). For extreme rows, ranking and normalization subtract the repetition-adjusted bases before applying the bias difference. This preserves a small bias between equal large scores. Direct C++ `top_logits` reports ranked scores before constraint masking. For extreme rows with a finite maximum, the readback subtracts that maximum and limits the reported difference to the finite FP32 range. Reported logprobs also use a finite FP32 lower bound. Selection and normalization use the scores before either reporting limit. [Direct score readback](../src/decoder.cpp#L303)<!-- prefix: "if (adjusted" -->
+CUDA applies any output constraint mask and then adds [logit bias](serving/openai-logprobs.md#logit-bias). For extreme rows, ranking and normalization subtract the repetition-adjusted bases before applying the bias difference. This preserves a small bias between equal large scores. Direct C++ `top_logits` reports ranked scores before constraint masking. For extreme rows with a finite maximum, the readback subtracts that maximum and limits the reported difference to the finite FP32 range. Reported logprobs also use a finite FP32 lower bound. Selection and normalization use the scores before either reporting limit. [Direct score readback](../src/decoder.cpp#L320)<!-- prefix: "if (adjusted" -->
 
 An item with an active penalty uses target-only decoding. Eligible peers in the same batch can use MTP. Batch adjustment runs after eager scoring or eligible K0 graph replay. Direct C++ generation with an active penalty uses eager decoding. A neutral repetition value leaves the ordinary path eligible. [Batch selection](../src/decoder_batch.cpp#L250)<!-- prefix: "auto* adjust" -->
 

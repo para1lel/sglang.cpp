@@ -10,9 +10,9 @@ prompt for the configured Qwen checkpoint.
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| HTTP transport | Match the routes, validate the media type, and admit requests to the shared queue. | [Route aliases](../apps/server/http.cpp#L389)<!-- prefix: "Tokenization" --> · [Media type](../apps/server/http.cpp#L208)<!-- prefix: "if ((tokeniz" --> · [Queue admission](../apps/server/prefix_controls.cpp#L617)<!-- prefix: "void Connect" --> |
-| Tokenization worker | Validate inputs and encode or decode with the checkpoint tokenizer. | [Request handler](../apps/server/tokenization.cpp#L900)<!-- prefix: "void serve_t" --> · [Tokenizer load](../apps/server/text_completion.cpp#L20)<!-- prefix: "const Tokeni" --> |
-| Chat renderer | Render the Qwen3.8 checkpoint format before encoding chat. | [Chat tokenization](../apps/server/tokenization.cpp#L598)<!-- prefix: "std::vector<" --> · [Renderer](../src/runtime/model/qwen_chat_template.cpp#L554)<!-- prefix: "std::string " --> |
+| HTTP transport | Match the routes, validate the media type, and admit requests to the shared queue. | [Route aliases](../apps/server/http.cpp#L396)<!-- prefix: "Tokenization" --> · [Media type](../apps/server/http.cpp#L208)<!-- prefix: "if ((tokeniz" --> · [Queue admission](../apps/server/prefix_controls.cpp#L617)<!-- prefix: "void Connect" --> |
+| Tokenization worker | Validate inputs and encode or decode with the checkpoint tokenizer. | [Request handler](../apps/server/tokenization.cpp#L863)<!-- prefix: "void serve_t" --> · [Tokenizer load](../apps/server/text_completion.cpp#L20)<!-- prefix: "const Tokeni" --> |
+| Chat renderer | Render the Qwen3.8 checkpoint format before encoding chat. | [Chat tokenization](../apps/server/tokenization.cpp#L598)<!-- prefix: "std::vector<" --> · [Renderer](../apps/server/qwen/qwen_chat_template.cpp#L560)<!-- prefix: "std::string " --> |
 
 ## Runtime path
 
@@ -113,7 +113,7 @@ of ID arrays for an ordered array of strings. An empty flat array returns
 `{"text":""}` without loading the tokenizer, and `[[]]` returns
 `{"text":[""]}`. `skip_special_tokens` defaults to `true`. Set it to `false`
 to retain special tokens as text. Unmapped padding IDs from 248077 through
-248319 contribute no text. [ID validation](../apps/server/tokenization.cpp#L775)<!-- prefix: "TokenId chec" --> · [Decoding and response](../apps/server/tokenization.cpp#L833)<!-- prefix: "void detoken" -->
+248319 contribute no text. [ID validation](../apps/server/tokenization.cpp#L738)<!-- prefix: "TokenId chec" --> · [Decoding and response](../apps/server/tokenization.cpp#L796)<!-- prefix: "void detoken" -->
 
 ```bash
 curl --fail-with-body http://127.0.0.1:17384/v1/detokenize \
@@ -151,7 +151,7 @@ does no media I/O, tool execution, or decoder work. `tool_choice` accepts
 `auto`, `any`, `tool`, or `none`. Built-in server tool declarations contribute
 no prompt tokens and cannot be selected. `betas` accepts strings and has no
 prompt effect. In this request, `stream` has no effect.
-[Anthropic conversion](../apps/server/anthropic_count.cpp#L693)<!-- prefix: "AnthropicCou" --> ·
+[Anthropic conversion](../apps/server/anthropic_count.cpp#L678)<!-- prefix: "AnthropicCou" --> ·
 [Render and count](../apps/server/tokenization.cpp#L625)<!-- prefix: "void serve_a" -->
 
 The Qwen template enables thinking by default. With `--reasoning-parser qwen3`,
@@ -161,7 +161,7 @@ rejects those two explicit modes. For the example, `thinking: {"type":"disabled"
 returns 20 with `qwen3` and 60 with the default parser setting.
 `output_config.effort` can change the count. Redacted assistant thinking and
 tool references forwarded from tool results fail validation for this checkpoint.
-[Thinking options](../apps/server/anthropic_count.cpp#L621)<!-- prefix: "bool thinkin" -->
+[Thinking options](../apps/server/anthropic_count.cpp#L606)<!-- prefix: "bool thinkin" -->
 
 The route requires `Content-Type: application/json`. A supported request to
 the trailing-slash form receives HTTP 307. Other methods on the canonical
@@ -169,7 +169,7 @@ path receive HTTP 405 with `Allow: POST`. Malformed content or invalid fields
 receive HTTP 400 with an `invalid_request_error`. For example, omit `model`
 to receive this body.
 [Method check](../apps/server/prefix_controls.cpp#L674)<!-- prefix: "if ((count |" --> ·
-[Anthropic error body](../apps/server/http.cpp#L652)<!-- prefix: "void write_a" -->
+[Anthropic error body](../apps/server/http.cpp#L658)<!-- prefix: "void write_a" -->
 
 ```json
 {"type":"error","error":{"type":"invalid_request_error","message":"model: Field required"}}
@@ -198,7 +198,7 @@ In chat tokenization bodies, decimal and exponent numbers can round to signed
 zero. For example, `1e-999` and `-1e-999` produce `0.0` and `-0.0`, as in
 pinned Python. The chat body parser rejects overflow. Raw prompt tokenization,
 detokenization, and legacy chat completions reject both underflow to zero and
-overflow. [Chat body parsing](../apps/server/tokenization.cpp#L885)<!-- prefix: "json::Value " --> ·
+overflow. [Chat body parsing](../apps/server/tokenization.cpp#L848)<!-- prefix: "json::Value " --> ·
 [Number parsing](../src/json.cpp#L195)<!-- prefix: "Value Parser" -->
 
 Send at least one user query. If you include a system turn, put it first.
@@ -207,7 +207,7 @@ audio, message-level tools, `input_ids`, request-supplied templates,
 other model adapters, and generation grammars. Native normalizes tool schema
 aliases such as `varchar` and checks selected keywords such as `type` and
 `required`. Pinned Python performs full JSON Schema Draft 2020-12 validation.
-[Native tool schema validation](../apps/server/tokenization_validation.cpp#L276)<!-- prefix: "Value normal" --> ·
+[Native tool schema validation](../apps/server/tokenization_validation.cpp#L348)<!-- prefix: "Value normal" --> ·
 [Python tool schema validation](https://github.com/sgl-project/sglang/blob/f04d886bf79aa3d6237cbb12a3311838eb9f9bd8/python/sglang/srt/entrypoints/openai/serving_chat.py#L1101)<!-- prefix: "normalize_js" -->
 
 Chat checks the form of messages, including media metadata and assistant
@@ -216,12 +216,12 @@ also checks the completion token budget and selected `response_format` schemas.
 It requires `return_meta_info: true` when `return_sampling_mask` is enabled.
 Native supports the template options described in [Encode chat](#encode-chat).
 Validation diagnostics can differ from pinned Python.
-[Chat input](../apps/server/tokenization.cpp#L524)<!-- prefix: "ChatTokeniza" --> · [Generation field checks](../apps/server/tokenization_validation.cpp#L244)<!-- prefix: "void validat" -->
+[Chat input](../apps/server/tokenization.cpp#L524)<!-- prefix: "ChatTokeniza" --> · [Generation field checks](../apps/server/tokenization_validation.cpp#L316)<!-- prefix: "void validat" -->
 
 Encode and decode route errors return a JSON object with `object: "error"`, `message`, `type`,
 `param: null`, and an integer `code` matching the HTTP status. For example,
 detokenizing `{"tokens":[248320]}` returns HTTP 400 with this body.
-[Error writer](../apps/server/http.cpp#L631)<!-- prefix: "void write_t" -->
+[Error writer](../apps/server/http.cpp#L637)<!-- prefix: "void write_t" -->
 
 ```json
 {"object":"error","message":"Invalid input: token id 248320 is out of vocabulary; valid range is [0, 248320).","type":"BadRequestError","param":null,"code":400}

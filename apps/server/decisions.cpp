@@ -81,28 +81,12 @@ std::u32string_view stripped(std::u32string_view value) {
     return value;
 }
 
-bool version_one_string(std::string_view value) {
-    const auto scalars = read_utf8(value);
-    constexpr auto separators = U"\t\n\v\f\r \u0085\u00a0\u1680\u2000\u2001\u2002\u2003"
-                                U"\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029"
-                                U"\u202f\u205f\u3000"sv;
-    const auto start = scalars.find_first_not_of(separators);
-    if (start == std::u32string::npos) return false;
-    const auto end = scalars.find_last_not_of(separators);
-    auto body = std::u32string_view(scalars).substr(start, end - start + 1);
-    if (body.front() == U'+') body.remove_prefix(1);
-    const auto dot = body.find(U'.');
-    const auto integer = body.substr(0, dot);
-    if (integer.empty() || integer.back() != U'1' || integer.front() == U'_') return false;
-    const auto leading = integer.substr(0, integer.size() - 1);
-    return leading.find_first_not_of(U"0_") == std::u32string_view::npos &&
-        (dot == std::u32string_view::npos ||
-         (dot + 1 < body.size() && body.find_first_not_of(U'0', dot + 1) == body.npos));
-}
-
 bool supported_version(const Value& value) {
     if (value.is_null()) return true;
-    if (const auto field = value.string()) return version_one_string(*field);
+    if (const auto field = value.string()) {
+        const auto number = detail::scan_integer_text(*field, detail::IntegerSeparators::repeated);
+        return number && !number->negative && number->significant == "1";
+    }
     return value.number() == version || value.boolean().value_or(false);
 }
 

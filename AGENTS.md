@@ -33,19 +33,41 @@ Keep Python packages in Pixi, executables under the user's `bin`, runtimes in `s
 configuration in `config` and disposable output in `cache` or ignored project `artifacts/`.
 Use the configured centralized directory for additional Pixi environments and the existing npm
 prefix for global Node tools. Use the host driver and user CUDA 13.4 compatibility libraries.
-Use the local HTTP proxy at `127.0.0.1:12233` for network operations.
+Use the local HTTP proxy at `127.0.0.1:7890` for network operations.
 Keep weights at `/data0/shared/Qwen3.8-27B-FP8`.
 
 ## Integrating changes
 
-Install local hooks with `git config --local core.hooksPath .githooks` and install
-`.agents/checks/requirements.txt` with the default Pixi Python. Hooks check the selected
-index and commit message. Keep comments out of project code files: the pre-commit hook
-rejects any added or changed code file whose staged content contains a comment, including
-comments that predate the change. Shebangs, preprocessor directives, quoted literals, and
-here-documents are not comments. Remove comments only from code files you actually touch;
+Install the hook dependencies from the repository root with the default Pixi Python.
+
+```bash
+PIP_CONFIG_FILE=/dev/null NO_PROXY= no_proxy= \
+    /data1/shared/dongwu.chen/.pixi/envs/default/bin/python -I -m pip --isolated \
+    --disable-pip-version-check --proxy http://127.0.0.1:7890 \
+    install --index-url https://pypi.org/simple -r .agents/checks/requirements.txt
+git config --local core.hooksPath .githooks
+```
+
+Git hooks use the installed default Pixi tools, including `clang++` and `clang-tidy`.
+CUDA checks use the CUDA 13.4 SDK and NCCL headers from Pixi.
+For CUTLASS sources, the hook reads the verified archive at
+`$SGLANG_HOST_ROOT/cache/cutlass/<sha256>/cutlass-<version>.tar.gz`.
+Set `SGLANG_CUTLASS_ARCHIVE` for an archive elsewhere, or `SGLANG_LINT_CUTLASS_INCLUDE`
+for an installed include directory. The host root defaults to `/data1/shared/dongwu.chen`.
+For FFmpeg or libpng headers outside standard paths, set `SGLANG_LINT_MEDIA_INCLUDE` to the
+absolute include path.
+
+Hooks check the selected index and commit message. Keep comments out of project code files.
+The pre-commit hook rejects added or changed code files whose staged content contains comments,
+including comments that predate the change. Shebangs, preprocessor directives, quoted literals,
+and here-documents are not comments. Remove comments only from code files you actually touch;
 do not clean up untouched legacy files. Perform semantic and English review separately.
 Keep raw results in `artifacts/`.
+
+The declaration-only function rule applies to every tracked project header, including
+private headers and `.ipp` and `.tpp` files. Put function bodies, lambdas, and `= default`
+definitions in compiled `.cpp` or `.cu` files. The sole exception is a deleted function
+written `= delete` on its first declaration.
 
 Run tests only when concrete evidence strongly supports the expected outcome.
 Prioritize operator and framework tuning and focused local measurements.

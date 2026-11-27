@@ -19,8 +19,9 @@ case "$#:${1:-}" in
             mkdir -p -- "$(dirname -- "$program")"
             bundle=$(mktemp "${program}.XXXXXXXX")
             trap 'rm -f -- "$bundle"' EXIT
+            proxy=${all_proxy:-${ALL_PROXY:-http://127.0.0.1:7890}}
             curl --fail --location --silent --show-error --retry 2 --proto '=https' \
-                --proxy http://127.0.0.1:12233 --noproxy '' --output "$bundle" \
+                --proxy "${https_proxy:-${HTTPS_PROXY:-$proxy}}" --noproxy '' --output "$bundle" \
                 "$upstream/$version/xmake-bundle-$version.linux.x86_64"
             verify "$bundle"
             chmod 755 "$bundle"

@@ -4,6 +4,17 @@
 #include <exception>
 #include <stdexcept>
 
+namespace sglang::decoder {
+
+template <>
+tp_verify_graph::DeviceBinding*
+Allocations::allocate<tp_verify_graph::DeviceBinding>(std::size_t count) {
+    return static_cast<tp_verify_graph::DeviceBinding*>(
+        allocate_elements(count, sizeof(tp_verify_graph::DeviceBinding)));
+}
+
+}
+
 namespace sglang::decoder::tp_verify_graph {
 
 thread_local HostBinding* active[2] = {};
@@ -380,6 +391,15 @@ void record_regular(cudaStream_t stream) {
         for (auto* rank : active) ++rank->regular_calls;
     }
 }
+
+void Forward::operator()(const Input& input) const { call(state, input); }
+
+HostBinding* binding(cudaStream_t stream) {
+    for (auto* rank : active) {
+        if (rank && rank->stream == stream) return rank;
+    }
+    return nullptr;
+}
 }
 
 namespace sglang {
@@ -404,7 +424,10 @@ tp_verify_graph::Graph* Decoder::Model::forward_verification_tp(
         tp->verification_capture_stream = stream;
         if (tp_verify_graph::replay(tp->verification_capture, tp->verification_capture_disabled,
                                    input, {device, peer.device}, {stream, peer_stream}, group,
-                                   tp_verify_graph::Forward{&forward})) {
+                                   {&forward, [](const void* state,
+                                                 const tp_verify_graph::Input& live) {
+            (*static_cast<const decltype(forward)*>(state))(live);
+        }})) {
             return tp->verification_capture.get();
         }
     }

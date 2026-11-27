@@ -8,7 +8,6 @@
 #include "sglang/runtime/execution/verification_row_copy.h"
 #include "sglang/text/mtp/tc_vocab.h"
 
-#include <algorithm>
 #include <type_traits>
 
 namespace sglang {
@@ -89,10 +88,10 @@ struct TpReduceNorm {
     }
 };
 
-struct TpReduceNorm40 {
+template <int Width> struct TpWideReduceNorm {
     TensorParallel& group;
-    cudaStream_t streams[2];
-    MnnvlRmsQuantizeRows40 rows[2];
+    cudaStream_t streams[2]{};
+    MnnvlWideRmsQuantizeRows<Width> rows[2];
     bool fused = true;
     int fused_calls = 0;
     int ordinary_calls = 0;
@@ -106,26 +105,30 @@ struct TpReduceNorm40 {
     bool operator()(Bf16* const buffers[], const Bf16* gain, const Bf16* peer_gain) {
         if (fused && gain) {
             const Bf16* gains[] = {gain, peer_gain};
-            fused = group.try_allreduce_rms_quantize_m40(buffers, streams, rows, gains);
+            fused = group.try_allreduce_rms_quantize_wide(buffers, streams, rows, gains);
             if (fused) {
                 ++fused_calls;
                 return true;
             }
         }
-        const auto route = group.allreduce_bf16(buffers, streams,
-                                                MnnvlRmsQuantizeRows40::size * hidden_size);
-        ordinary_calls += route == TpAllReduceRoute::mnnvl_one_shot;
+        const auto route = group.allreduce_bf16(buffers, streams, std::size_t{Width} * hidden_size);
+        constexpr auto ordinary = Width == wide_mtp_rows ? TpAllReduceRoute::mnnvl_one_shot
+                                                         : TpAllReduceRoute::mnnvl_two_shot;
+        ordinary_calls += static_cast<int>(route == ordinary);
         return false;
     }
 };
 
-template <typename Run>
-[[gnu::noinline]] bool tp_run_m40(TensorParallel& group,
-                                  const LayerBatch<VerificationRow>& primary,
-                                  const LayerBatch<VerificationRow>& peer, const Run& run) {
-    TpReduceNorm40 reduce{group, {primary.stream, peer.stream},
-        {tp_mnnvl_rms_rows<MnnvlRmsQuantizeRows40>(primary),
-         tp_mnnvl_rms_rows<MnnvlRmsQuantizeRows40>(peer)}};
+template <int Width, typename Run>
+[[gnu::noinline]] bool tp_run_wide(TensorParallel& group,
+                                   const LayerBatch<VerificationRow>& primary,
+                                   const LayerBatch<VerificationRow>& peer, const Run& run) {
+    using Rows = MnnvlWideRmsQuantizeRows<Width>;
+    TpWideReduceNorm<Width> reduce{
+        group,
+        {primary.stream, peer.stream},
+        {tp_mnnvl_rms_rows<Rows>(primary), tp_mnnvl_rms_rows<Rows>(peer)},
+    };
     run(reduce);
     return reduce.replicated();
 }
@@ -134,11 +137,15 @@ template <typename Lane, typename Run>
 bool tp_run_reductions(TensorParallel& group, const LayerBatch<Lane>& primary,
                        const LayerBatch<Lane>& peer, const Run& run) {
     if constexpr (std::is_same_v<Lane, VerificationRow>) {
-        static_assert(MnnvlRmsQuantizeRows40::size == wide_mtp_rows);
-        if (primary.count == wide_mtp_rows && primary.packed_activation &&
-            peer.packed_activation && primary.packs_projection_activation(hidden_size) &&
+        if (primary.packed_activation && peer.packed_activation &&
+            primary.packs_projection_activation(hidden_size) &&
             peer.packs_projection_activation(hidden_size)) {
-            return tp_run_m40(group, primary, peer, run);
+            if (primary.count == wide_mtp_rows) {
+                return tp_run_wide<wide_mtp_rows>(group, primary, peer, run);
+            }
+            if (primary.count == 2 * wide_mtp_rows) {
+                return tp_run_wide<2 * wide_mtp_rows>(group, primary, peer, run);
+            }
         }
     }
     TpReduceNorm reduce{group, {primary.stream, peer.stream},
@@ -147,52 +154,6 @@ bool tp_run_reductions(TensorParallel& group, const LayerBatch<Lane>& primary,
     run(reduce);
     return reduce.all_replicated;
 }
-
-template <typename Lane, typename Residuals>
-void tp_normalize(LayerBatch<Lane>& batch, int count, const Bf16* weight, const char* operation,
-                  const Residuals& residuals) {
-    const auto stream = batch.stream;
-    if (batch.fuse_verify_activation()) {
-        VerifyRmsQuantizeRows rows{};
-        for (int index = 0; index < count; ++index) {
-            auto& work = workspace(batch.lanes[index]);
-            const auto residual_pair = residuals(index, work);
-            rows.entries[index] = {
-                residual_pair.branch, residual_pair.residual, work.normalized,
-                batch.projection_activation(index, hidden_size)};
-        }
-        const auto status = count == fused_verify_rows
-            ? verify_rms_quantize(rows, weight, stream)
-            : verify_rms_quantize_partial(rows, count, weight, stream);
-        check(status, operation);
-        return;
-    }
-    if (batch.fuse_wide_verify_norm()) {
-        const int capacity = batch.packed_activation ? WideVerifyRmsQuantizeRows::capacity
-                                                     : verification_packet_rows;
-        for (int first = 0; first < count; first += capacity) {
-            WideVerifyRmsQuantizeRows rows{};
-            const int size = std::min(count - first, capacity);
-            for (int index = 0; index < size; ++index) {
-                auto& work = workspace(batch.lanes[first + index]);
-                const auto residual_pair = residuals(first + index, work);
-                rows.entries[index] = {
-                    residual_pair.branch, residual_pair.residual, work.normalized,
-                    batch.projection_activation(first + index, hidden_size)};
-            }
-            check(verify_rms_quantize_wide(rows, size, weight, stream), operation);
-        }
-        return;
-    }
-    for (int index = 0; index < count; ++index) {
-        auto& work = workspace(batch.lanes[index]);
-        const auto residual_pair = residuals(index, work);
-        check(text_rms_norm(residual_pair.branch, residual_pair.residual, weight, hidden_size,
-                            work.normalized, residual_pair.residual, stream),
-              operation);
-    }
-}
-
 
 template <typename Lane>
 void tp_scatter(LayerBatch<Lane>& batch, int count, cudaStream_t lane_stream,
@@ -224,31 +185,10 @@ void Decoder::Model::forward_tp(
     if (!primary_lanes || !peer_lanes || count < 1 || count > decoder_batch_max_lanes) {
         throw std::invalid_argument("Invalid decoder batch width");
     }
-    for (int index = 0; index < count; ++index) {
-        const auto& lane = primary_lanes[index];
-        auto* residual = lane.request->work.residual;
-        if (lane.feature) {
-            copy_cuda_async(residual, lane.feature, hidden_size * sizeof(Bf16),
-                            cudaMemcpyDeviceToDevice, stream, "Substitute visual embedding");
-        } else {
-            check(text_embedding(embedding, vocab_size, hidden_size, lane.token_id, residual,
-                                 stream),
-                  "Look up token embedding");
-        }
-    }
+    embed_forward_lanes(embedding, primary_lanes, count, stream, "Look up token embedding");
     decoder::DeviceScope peer_scope(peer.device);
-    for (int index = 0; index < count; ++index) {
-        const auto& lane = peer_lanes[index];
-        auto* residual = lane.request->work.residual;
-        if (lane.feature) {
-            copy_cuda_async(residual, lane.feature, hidden_size * sizeof(Bf16),
-                            cudaMemcpyDeviceToDevice, peer_stream, "Substitute visual embedding");
-        } else {
-            check(text_embedding(peer.embedding, vocab_size, hidden_size, lane.token_id, residual,
-                                 peer_stream),
-                  "Look up peer token embedding");
-        }
-    }
+    embed_forward_lanes(peer.embedding, peer_lanes, count, peer_stream,
+                        "Look up peer token embedding");
     peer_scope.restore();
     forward_layers_tp(peer, primary_lanes, peer_lanes, count, stream, peer_stream, group,
                       primary_partials, peer_partials);
@@ -291,13 +231,6 @@ bool Decoder::Model::forward_layers_tp(
     Bf16* attention_reduce[2] = {primary_partials.attention, peer_partials.attention};
     Bf16* hidden_reduce[2] = {primary_partials.hidden, peer_partials.hidden};
     const auto run = [&](auto& reduce_norm) {
-        const auto normalize = [&](LayerBatch<Lane>& batch, const Bf16* weight,
-                                   const char* operation, Bf16* const* branches) {
-            tp_normalize(batch, count, weight, operation, [&](int lane, Workspace& work) {
-                return branches ? LayerResidual{branches[lane], work.residual}
-                                : LayerResidual{work.residual, nullptr};
-            });
-        };
         bool input_fused = false;
 
         for (int index = 0; index < layer_count; ++index) {
@@ -306,14 +239,14 @@ bool Decoder::Model::forward_layers_tp(
             const auto& peer_layer = peer.layers[index];
             const bool first = index == 0;
             if (!input_fused) {
-                normalize(primary, layer.input_norm, "Normalize layer input",
-                          first ? nullptr : primary_hidden.data());
+                primary.normalize(layer.input_norm, "Normalize layer input",
+                                  first ? nullptr : &Workspace::hidden);
             }
             {
                 decoder::DeviceScope peer_scope(peer.device);
                 if (!input_fused) {
-                    normalize(peer_batch, peer_layer.input_norm, "Normalize peer layer input",
-                              first ? nullptr : peer_hidden.data());
+                    peer_batch.normalize(peer_layer.input_norm, "Normalize peer layer input",
+                                         first ? nullptr : &Workspace::hidden);
                 }
                 if (full_attention) {
                     run_gqa(peer_layer.gqa, peer_batch, bank);
@@ -329,14 +262,15 @@ bool Decoder::Model::forward_layers_tp(
             const bool attention_fused = reduce_norm(attention_reduce, layer.attention_norm,
                                                      peer_layer.attention_norm);
             if (!attention_fused) {
-                normalize(primary, layer.attention_norm, "Normalize attention output",
-                          primary_attention.data());
+                primary.normalize(layer.attention_norm, "Normalize attention output",
+                                  &Workspace::projected_attention);
             }
             {
                 decoder::DeviceScope peer_scope(peer.device);
                 if (!attention_fused) {
-                    normalize(peer_batch, peer_layer.attention_norm,
-                              "Normalize peer attention output", peer_attention.data());
+                    peer_batch.normalize(peer_layer.attention_norm,
+                                         "Normalize peer attention output",
+                                         &Workspace::projected_attention);
                 }
                 run_mlp(peer_layer, peer_batch);
             }

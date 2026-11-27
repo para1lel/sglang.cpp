@@ -54,8 +54,6 @@ struct LmCacheReceipt {
 };
 
 std::string default_lmcache_endpoint();
-std::string rank_lmcache_endpoint(int rank);
-std::string rank_lmcache_endpoint(const std::string& endpoint, int rank);
 
 struct LmCacheConfig {
     std::string endpoint = default_lmcache_endpoint();
@@ -68,8 +66,9 @@ class LmCacheClient {
 public:
     explicit LmCacheClient(LmCacheConfig config);
 
-    const LmCacheConfig& config() const { return config_; }
+    const LmCacheConfig& config() const;
     bool ready() const;
+    bool ready(const std::vector<std::array<std::uint8_t, 16>>& devices) const;
     std::vector<bool> lookup(const std::vector<LmCacheKey>& keys) const;
     LmCachePrefix lookup_prefix(const PrefixCacheKeys& keys, int max_restore, bool draft) const;
     LmCachePrefixDetail lookup_prefix_detail(const PrefixCacheKeys& keys, int max_restore,

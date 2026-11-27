@@ -48,7 +48,7 @@ toolkit="$CONDA_PREFIX/targets/x86_64-linux"
 c++ -std=c++17 -O3 -I include -isystem "$toolkit/include" \
     tests/prefill/tensor_core_check.cpp \
     -Wl,--start-group build/lib/libsglang_prefill_fp8_sm100.a \
-    build/lib/libsglang_cuda.a -Wl,--end-group \
+    build/lib/libsglang_cuda.a build/lib/libsglang_cuda_support.a -Wl,--end-group \
     -L "$toolkit/lib" -Wl,-rpath,"$toolkit/lib" -lcudart -o build/tensor-core-check
 build/tensor-core-check
 ```

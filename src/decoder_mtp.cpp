@@ -6,9 +6,11 @@
 #include "sglang/runtime/model/qwen_weight_upload.h"
 #include "sglang/text/mtp/draft_depth.h"
 #include "sglang/text/mtp/draft_projection.h"
+#include "sglang/text/mtp/draft_stream.h"
 #include "sglang/text/mtp/tc_vocab.h"
 #include "sglang/runtime/cache/kv_residency_policy.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <functional>
@@ -38,6 +40,10 @@ DraftWorkspace::DraftWorkspace(Allocations& memory)
                  memory.allocate<float>(text_fp8_group_count(intermediate_size))},
       argmax_scratch(memory.allocate<TextLogitCandidate>(text_argmax_scratch_count(vocab_size))),
       argmax(memory.allocate<TextLogitCandidate>(1)) {}
+
+ExactGqaWorkspace DraftWorkspace::attention_scores() const {
+    return {score_storage, score_storage_count / mxfp8_query_heads};
+}
 
 namespace {
 

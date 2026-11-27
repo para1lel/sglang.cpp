@@ -3,7 +3,9 @@
 #include "sglang/json.h"
 #include "sglang/utf8.h"
 
+#include <algorithm>
 #include <map>
+#include <stdexcept>
 #include <string>
 
 namespace sglang {
@@ -77,6 +79,100 @@ std::vector<std::string> choices(std::string_view text) {
     return values;
 }
 
+}
+
+TokenConstraint::TokenConstraint() = default;
+
+int TokenConstraint::minimum_tokens() const {
+    const int minimum = nodes_.front().minimum;
+    return is_triggered() && minimum != std::numeric_limits<int>::max() ? 0 : minimum;
+}
+
+bool TokenConstraint::is_triggered() const { return kind_ == Kind::triggered; }
+bool TokenConstraint::uses_wide_mask() const { return uses_wide_mask_; }
+bool TokenConstraint::is_regex() const { return kind_ == Kind::regex; }
+
+const char* TokenConstraint::budget_error() const {
+    switch (kind_) {
+        case Kind::regex: return "max_tokens is too small to complete the regex";
+        case Kind::json_schema: return "max_tokens is too small to complete the JSON Schema";
+        case Kind::ebnf: return "max_tokens is too small to complete an ebnf choice";
+        case Kind::triggered: return "max_tokens is too small to complete a tool call";
+    }
+    throw std::logic_error("Unknown output constraint");
+}
+
+int TokenConstraint::target(const Node& node, int token) const {
+    const auto edge = std::lower_bound(node.edges.begin(), node.edges.end(), token,
+        [](const auto& entry, int id) { return static_cast<int>(entry.token) < id; });
+    return edge != node.edges.end() && static_cast<int>(edge->token) == token
+        ? edge->next : node.fallback;
+}
+
+bool constraint_eos(int token) {
+    return token == end_of_text || token == end_of_message;
+}
+
+void ConstraintCursor::candidates(const TokenConstraint& constraint, int remaining,
+                                  bool force_mask) {
+    candidates_.clear();
+    const auto& node = constraint.nodes_[node_];
+    const int limit = constraint.is_triggered() ? std::numeric_limits<int>::max() : remaining;
+    const auto allowed = [&](int next) {
+        return next >= 0 && constraint.nodes_[next].minimum < limit;
+    };
+    if (node.fallback < 0) {
+        for (const auto& edge : node.edges) {
+            if (allowed(edge.next)) {
+                candidates_.push_back(edge.token);
+            }
+        }
+    } else {
+        auto edge = node.edges.begin();
+        for (int token = 0; token < static_cast<int>(model_vocab_size); ++token) {
+            int next = node.fallback;
+            if (edge != node.edges.end() && static_cast<int>(edge->token) == token) {
+                next = (edge++)->next;
+            }
+            if (allowed(next)) {
+                candidates_.push_back(token);
+            }
+        }
+    }
+    if (node.accepting) {
+        candidates_.insert(std::lower_bound(candidates_.begin(), candidates_.end(),
+                                            end_of_text), end_of_text);
+        candidates_.insert(std::lower_bound(candidates_.begin(), candidates_.end(),
+                                            end_of_message), end_of_message);
+    }
+    mask_.clear();
+    if (force_mask || candidates_.size() > constraint_max_candidates) {
+        mask_.assign(constraint_mask_words, 0);
+        for (const int id : candidates_) {
+            mask_[id / 32] |= std::uint32_t{1} << (id % 32);
+        }
+    }
+}
+
+const std::vector<int>& ConstraintCursor::ids() const { return candidates_; }
+const std::vector<std::uint32_t>& ConstraintCursor::mask() const { return mask_; }
+
+void ConstraintCursor::reset_to(const ConstraintCursor& other) { node_ = other.node_; }
+
+bool ConstraintCursor::commit(const TokenConstraint& constraint, int token, int remaining) {
+    const auto& node = constraint.nodes_[node_];
+    if (constraint_eos(token) && node.accepting) {
+        return true;
+    }
+    const int target = constraint.target(node, token);
+    if (target < 0 || constraint.nodes_[target].minimum >
+            (constraint.is_triggered() ? std::numeric_limits<int>::max() - 1 : remaining)) {
+        throw std::logic_error("Selected token violates the output constraint");
+    }
+    node_ = target;
+    const auto& next = constraint.nodes_[node_];
+    return !constraint.is_triggered() && next.accepting &&
+           (remaining == 0 || (next.edges.empty() && next.fallback < 0));
 }
 
 std::shared_ptr<const TokenConstraint> TokenConstraint::compile(const Tokenizer& tokenizer,

@@ -12,7 +12,7 @@ public:
     AnthropicMessages(const Socket& connection, EventStream& stream, bool streaming,
                       std::size_t prompt_tokens);
 
-    void admit(std::size_t cached_tokens) { cached_tokens_ = cached_tokens; }
+    void admit(std::size_t cached_tokens);
     bool accept(const ChatOutputEvent& delta);
     void finish(std::string_view reason, std::size_t output_tokens, std::size_t cached_tokens);
     void fail(std::string_view type, const char* message);

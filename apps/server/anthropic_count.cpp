@@ -75,34 +75,19 @@ double integer(const Value& value, std::string_view field) {
     return *number;
 }
 
-int task_budget_text_sign(std::string_view text, std::string_view field) {
-    const auto invalid_text = [&] {
-        invalid(field, "Input should be a valid integer, unable to parse string as an integer");
-    };
-    if (text.find_first_of("\x1c\x1d\x1e\x1f") != text.npos) invalid_text();
-    text = trim_chat_text(text);
-    const bool negative = !text.empty() && text.front() == '-';
-    if (negative || (!text.empty() && text.front() == '+')) text.remove_prefix(1);
-    const auto digit = [](char value) { return value >= '0' && value <= '9'; };
-    if (text.empty() || !digit(text.front())) invalid_text();
-    std::size_t significant = 0;
-    while (!text.empty() && digit(text.front())) {
-        if (significant || text.front() != '0') ++significant;
-        text.remove_prefix(1);
-        if (text.size() >= 2 && text.front() == '_' && digit(text[1])) text.remove_prefix(1);
-    }
-    if (!text.empty() &&
-        (text.front() != '.' || text.size() == 1 || text.find_first_not_of('0', 1) != text.npos)) {
-        invalid_text();
-    }
-    if (significant > 4300) {
-        invalid(field, "Unable to parse input string as an integer, exceeded maximum size");
-    }
-    return significant == 0 ? 0 : negative ? -1 : 1;
-}
-
 int task_budget_sign(const Value& value, std::string_view field) {
-    if (const auto text = value.string()) return task_budget_text_sign(*text, field);
+    if (const auto text = value.string()) {
+        const auto number = detail::scan_integer_text(*text);
+        if (!number) {
+            invalid(field, "Input should be a valid integer, unable to parse string as an integer");
+        }
+        if (number->digit_count > 4300) {
+            invalid(field, "Unable to parse input string as an integer, exceeded maximum size");
+        }
+        if (number->negative)
+            return -1;
+        return static_cast<int>(number->digit_count != 0);
+    }
     if (const auto* wide = value.wide_integer()) return wide->digits.front() == '-' ? -1 : 1;
     if (const auto flag = value.boolean()) return *flag;
     if (const auto number = value.number()) {

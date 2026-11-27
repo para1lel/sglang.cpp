@@ -6,12 +6,7 @@
 
 namespace sglang::decoder {
 
-inline bool use_streaming_projection(bool supported, cudaStream_t stream) {
-    if (!supported) return false;
-    cudaStreamCaptureStatus status;
-    check(cudaStreamIsCapturing(stream, &status), "Check draft projection capture status");
-    return status == cudaStreamCaptureStatusNone;
-}
+bool use_streaming_projection(bool supported, cudaStream_t stream);
 
 struct MtpDraftWeights::State {
     State(const std::filesystem::path& directory, int device,
@@ -46,9 +41,7 @@ struct DraftWorkspace {
 
     explicit DraftWorkspace(Allocations& memory);
 
-    ExactGqaWorkspace attention_scores() const {
-        return {score_storage, score_storage_count / mxfp8_query_heads};
-    }
+    ExactGqaWorkspace attention_scores() const;
 
     Bf16* embedding;
     Bf16* concatenated;

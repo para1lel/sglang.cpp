@@ -6,13 +6,17 @@ mkdir -p "$output"
 toolkit=${CUDA_HOME:-${CONDA_PREFIX:?Use the managed Pixi default environment}}
 "${CXX:-c++}" -std=c++17 -O1 -pthread -Iinclude -I"$toolkit/targets/x86_64-linux/include" \
     tests/prefix/lmcache_rank_client.cpp src/runtime/cache/{lmcache_client,lmcache_group}.cpp \
-    src/runtime/cache/{lmcache_prefix,prefix_payload}.cpp src/media/multimodal_prompt.cpp \
+    src/runtime/cache/{lmcache_prefix,prefix_cache_layout,prefix_payload}.cpp \
+    src/runtime/model/qwen_text_model.cpp src/media/multimodal_prompt.cpp \
     src/tokenizer/digest.cpp -o "$output/lmcache-rank-client"
 CUDA_VISIBLE_DEVICES='' "${LMCACHE_PYTHON:-python3}" -B tests/prefix/lmcache_rank_roundtrip.py \
     "$output/lmcache-rank-client"
 "${CXX:-c++}" -std=c++17 -O1 -pthread -Iinclude -I"$toolkit/targets/x86_64-linux/include" \
     tests/prefix/lmcache_service_client.cpp apps/server/batch_cache.cpp \
-    src/runtime/cache/{lmcache_client,lmcache_group,lmcache_prefix,prefix_payload}.cpp \
+    src/runtime/cache/{lmcache_client,lmcache_group,lmcache_prefix}.cpp \
+    src/runtime/cache/{prefix_cache_layout,prefix_payload}.cpp \
+    src/runtime/model/qwen_text_model.cpp \
+    src/runtime/server/{batch_restore_join,cache_identity}.cpp \
     src/media/multimodal_prompt.cpp src/tokenizer/digest.cpp -o "$output/lmcache-service-client"
 tests/batch/run_indexed_admission.sh "$PWD" "$output/indexed-admission"
 CUDA_VISIBLE_DEVICES='' "${LMCACHE_PYTHON:-python3}" -B tests/prefix/lmcache_service_workers.py \

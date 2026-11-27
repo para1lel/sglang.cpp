@@ -16,11 +16,7 @@ inline constexpr std::size_t max_score_prompt_tokens = 4 * checkpoint_context;
 inline constexpr std::size_t max_score_text_bytes = 8 * 1024 * 1024;
 inline constexpr std::size_t max_score_response_values = checkpoint_context;
 
-inline bool consume(std::size_t& remaining, std::size_t count, std::size_t repetitions = 1) {
-    if (repetitions && count > remaining / repetitions) return false;
-    remaining -= count * repetitions;
-    return true;
-}
+bool consume(std::size_t& remaining, std::size_t count, std::size_t repetitions = 1);
 
 std::vector<double> probabilities(const std::vector<double>& logprobs, double temperature,
                                   bool normalize);

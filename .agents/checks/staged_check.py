@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 
+
 def git(root, arguments, environment, required=True, input_data=None):
     result = subprocess.run(
         ["git", "--no-replace-objects", "--no-optional-locks", "-C", str(root), *arguments],
@@ -19,6 +20,28 @@ def git(root, arguments, environment, required=True, input_data=None):
     return result.stdout
 
 
+def read_tree(
+    root: Path,
+    revision: str,
+    environment: dict[str, str],
+) -> dict[str, tuple[bytes, bytes, bytes]]:
+    listing = git(root, ["ls-tree", "-r", "-z", revision], environment)
+    entries = {}
+    for record in listing.split(b"\0"):
+        if not record:
+            continue
+        metadata, raw_path = record.split(b"\t", 1)
+        mode, kind, object_id = metadata.split()
+        name = os.fsdecode(raw_path)
+        parts = PurePosixPath(name).parts
+        if PurePosixPath(name).is_absolute() or PureWindowsPath(name).drive:
+            raise ValueError("An indexed path is absolute.")
+        if ".." in parts or ".git" in parts or "\\" in name:
+            raise ValueError(f"An indexed path is unsafe: {name!r}")
+        entries[name] = (mode, kind, object_id)
+    return entries
+
+
 def freeze(root, temporary):
     environment = os.environ.copy()
     if environment.get("GIT_INDEX_FILE"):
@@ -26,6 +49,8 @@ def freeze(root, temporary):
         environment["GIT_INDEX_FILE"] = str(selected if selected.is_absolute() else root / selected)
     environment["GIT_OPTIONAL_LOCKS"] = "0"
     environment["GIT_NO_REPLACE_OBJECTS"] = "1"
+    head = git(root, ["rev-parse", "--verify", "HEAD"], environment, required=False)
+    head = head.strip().decode("ascii")
     value = git(root, ["rev-parse", "--git-path", "index"], environment)
     path = Path(os.fsdecode(value).rstrip("\n"))
     index = path if path.is_absolute() else root / path
@@ -44,25 +69,20 @@ def freeze(root, temporary):
     )
     environment["GIT_OBJECT_DIRECTORY"] = str(objects)
     tree = git(root, ["write-tree"], environment).strip()
-    listing = git(root, ["ls-tree", "-r", "-z", tree.decode("ascii")], environment)
-    entries = {}
-    for record in listing.split(b"\0"):
-        if not record:
-            continue
-        metadata, raw_path = record.split(b"\t", 1)
-        mode, kind, object_id = metadata.split()
-        name = os.fsdecode(raw_path)
-        parts = PurePosixPath(name).parts
-        if PurePosixPath(name).is_absolute() or PureWindowsPath(name).drive:
-            raise ValueError("An indexed path is absolute.")
-        if ".." in parts or ".git" in parts or "\\" in name:
-            raise ValueError(f"An indexed path is unsafe: {name!r}")
-        entries[name] = (mode, kind, object_id)
+    entries = read_tree(root, tree.decode("ascii"), environment)
+    base = head or git(
+        root,
+        ["hash-object", "-t", "tree", "-w", "--stdin"],
+        environment,
+        input_data=b"",
+    ).strip().decode("ascii")
     changed = git(
-        root, ["diff", "--cached", "--name-only", "--no-renames", "-z"], environment,
+        root,
+        ["diff", "--cached", "--name-only", "--no-renames", "-z", base, "--"],
+        environment,
     )
     changed = [os.fsdecode(name) for name in changed.split(b"\0") if name]
-    return entries, changed, environment, index, original
+    return entries, changed, environment, index, original, head
 
 
 def read_blob(reader, destination, size, expected):
@@ -166,18 +186,30 @@ def snapshot_repository(root, snapshot, entries, environment, head):
         for name, (mode, _, identity) in entries.items()
     )
     git(snapshot, ["update-index", "-z", "--index-info"], clean, input_data=listing)
-    if head.strip():
-        git(snapshot, ["update-ref", "HEAD", head.strip().decode("ascii")], clean)
+    if head:
+        git(snapshot, ["update-ref", "HEAD", head], clean)
 
 
-def check_header_layout(entries):
-    suffixes = {".h", ".hh", ".hpp", ".hxx", ".h++", ".cuh"}
-    for name in entries:
-        if (
-            PurePosixPath(name).suffix.lower() in suffixes
-            and not name.startswith("include/sglang/")
-        ):
-            raise ValueError(f"Move project header {name!r} under include/sglang/.")
+def prepare_checker(root: Path, snapshot: Path, temporary: Path) -> Path:
+    source = Path(__file__).resolve().parent
+    helpers = (
+        ("check_rules.py", "the rule checker"),
+        ("function_spans.py", "function_spans.py"),
+        ("comment_rules.py", "the comment rules"),
+        ("native_tokens.py", "native_tokens.py"),
+        ("tool_process.py", "tool_process.py"),
+        ("gate_config.py", "the gate's helper"),
+    )
+    if source.is_relative_to(root):
+        directory = snapshot / source.relative_to(root)
+        for name, label in helpers:
+            if not (directory / name).is_file():
+                raise ValueError(f"Stage {label} before using the repository gate.")
+    else:
+        directory = temporary
+        for name, _ in helpers:
+            shutil.copyfile(source / name, directory / name)
+    return directory / "check_rules.py"
 
 
 def run(root):
@@ -185,37 +217,23 @@ def run(root):
         temporary = Path(directory).resolve()
         if not temporary.is_relative_to(Path(tempfile.gettempdir()).resolve()):
             raise ValueError("The temporary snapshot leaves its selected directory.")
-        entries, changed, environment, index, original = freeze(root, temporary)
-        check_header_layout(entries)
-        if not changed:
-            print("Passed: the selected index has no changed files.")
-            return 0
-        head = git(root, ["rev-parse", "--verify", "HEAD"], environment, required=False)
+        entries, changed, environment, index, original, head = freeze(root, temporary)
         snapshot = temporary / "source"
         snapshot.mkdir()
         materialize(root, snapshot, entries, environment)
         gate_config = selected_helpers(root, snapshot)
         configuration = gate_config.load(snapshot)
-        gate_config.baseline_unchanged(root, configuration, environment)
+        if head:
+            previous = git(
+                root,
+                ["show", f"{head}:{gate_config.CONFIG_PATH}"],
+                environment,
+                required=False,
+            )
+            gate_config.baseline_unchanged(configuration, previous)
         clean_environment = snapshot_environment()
         snapshot_repository(root, snapshot, entries, environment, head)
-        checker = Path(__file__).resolve().with_name("check_rules.py")
-        if checker.is_relative_to(root):
-            selected_checker = snapshot / checker.relative_to(root)
-            if not selected_checker.is_file():
-                raise ValueError("Stage the rule checker before using the repository gate.")
-            comments = checker.with_name("comment_rules.py")
-            if not (snapshot / comments.relative_to(root)).is_file():
-                raise ValueError("Stage the comment rules before using the repository gate.")
-        else:
-            selected_checker = temporary / "check_rules.py"
-            selected_checker.write_bytes(checker.read_bytes())
-            selected_checker.with_name("gate_config.py").write_bytes(
-                checker.with_name("gate_config.py").read_bytes()
-            )
-            selected_checker.with_name("comment_rules.py").write_bytes(
-                checker.with_name("comment_rules.py").read_bytes()
-            )
+        selected_checker = prepare_checker(root, snapshot, temporary)
         full = any(
             shared_change(name) or gate_config.matches(
                 name, configuration.get("shared_paths", [])
@@ -246,7 +264,8 @@ def run(root):
         current = index.read_bytes() if index.exists() else None
         if current != original:
             raise ValueError("The caller's index changed during verification.")
-        if git(root, ["rev-parse", "--verify", "HEAD"], environment, required=False) != head:
+        current_head = git(root, ["rev-parse", "--verify", "HEAD"], environment, required=False)
+        if current_head.strip().decode("ascii") != head:
             raise ValueError("HEAD changed during verification.")
         return result.returncode
 

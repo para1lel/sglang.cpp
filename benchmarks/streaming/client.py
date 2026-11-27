@@ -127,7 +127,12 @@ class Completion:
         usage = self.usage or {}
         if (usage.get("prompt_tokens"), usage.get("completion_tokens")) != counts:
             raise ValueError("Server usage counts differ from the fixture")
-        if usage.get("prompt_tokens_details", {}).get("cached_tokens") != 0:
+        cached = usage.get("prompt_tokens_details", {}).get("cached_tokens")
+        if "cached_token_range" in case:
+            lower, upper = case["cached_token_range"]
+            if type(cached) is not int or not lower <= cached <= upper:
+                raise ValueError(f"Unexpected cached prompt rows {cached} for {lower}..{upper}")
+        elif cached != 0:
             raise ValueError("Server must report zero reused prompt tokens")
 
 

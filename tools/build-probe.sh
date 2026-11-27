@@ -5,6 +5,7 @@ base=${SGLANG_HOST_ROOT:?Use tools/build.sh to activate Pixi}
 prefix=${CONDA_PREFIX:?Missing Pixi prefix}
 host=${CXX:?Missing Pixi C++ compiler}
 xmake="$base/bin/xmake"
+offline=${SGLANG_BUILD_OFFLINE:-n}
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 
 if [[ ${PIXI_PROJECT_MANIFEST:-} != "$base/pixi.toml" || ${PIXI_ENVIRONMENT_NAME:-} != default ]];
@@ -26,6 +27,9 @@ if [[ -n "$SGLANG_BUILD_DIR" ]]; then
     identity=$(printf '%s' "$inputs" | sha256sum)
     work="$SGLANG_BUILD_DIR/${identity%% *}"
     mkdir -p -- "$work"
+elif [[ "$offline" == y ]]; then
+    work=$(mktemp -d "${TMPDIR:-/tmp}/sglang-build.XXXXXXXX")
+    trap 'rm -rf -- "$work"' EXIT
 else
     work=$(mktemp -d "$base/cache/sglang-build.XXXXXXXX")
     trap 'rm -rf -- "$work"' EXIT
@@ -39,7 +43,17 @@ cached_cutlass_archive() (
     commit=f8acf1aa78f96ff2f1ba7662fe495e5535c461bf
     checksum=773d01d7a901646dd9efff90c6bff183399e7330eefb03684ef0c7a984cb42f2
     directory="$base/cache/cutlass/$checksum"
-    archive="$directory/cutlass-$version.tar.gz"
+    archive=${SGLANG_CUTLASS_ARCHIVE:-$directory/cutlass-$version.tar.gz}
+    if [[ "$offline" == y ]]; then
+        if [[ ! -f "$archive" ]] ||
+            ! printf '%s  %s\n' "$checksum" "$archive" | sha256sum --check --status; then
+            echo "Offline build requires a verified CUTLASS archive at $archive." >&2
+            echo "Set SGLANG_CUTLASS_ARCHIVE or run tools/build.sh to populate the cache." >&2
+            exit 1
+        fi
+        realpath -- "$archive"
+        exit 0
+    fi
     mkdir -p -- "$directory"
     exec 9>"$directory/download.lock"
     flock -w 90 9
@@ -71,15 +85,10 @@ if [[ "$check" == y && ! -f tests/mxfp8_gqa_check.cu ]]; then
     echo "The optional MXFP8 check requires tests/mxfp8_gqa_check.cu." >&2
     exit 1
 fi
-if [[ -z ${SGLANG_CUTLASS_ARCHIVE:-} ]]; then
+if [[ "$offline" == y || -z ${SGLANG_CUTLASS_ARCHIVE:-} ]]; then
     SGLANG_CUTLASS_ARCHIVE=$(cached_cutlass_archive)
 fi
 export SGLANG_CUTLASS_ARCHIVE
-gdn_vendor_object_dir="$SGLANG_HOST_ROOT/environments/vllm-81a8cb063e62/gdn_vendor_object"
-gdn_vendor_archive="$gdn_vendor_object_dir/libgdn_cute_bf16_8_24.a"
-if [[ ${SGLANG_GDN_VENDOR_BUILD:-} != 0 && -f "$gdn_vendor_archive" ]]; then
-    sha256sum "$gdn_vendor_archive"
-fi
 "$xmake" g --network=private
 "$xmake" f -y -P . -o "$work/build" -p linux -a x86_64 -m release --mxfp8-gqa-check="$check"
 "$xmake" build -P . -v toolchain-probe
@@ -111,7 +120,9 @@ sha256sum "$nvrtc_probe" "$nvrtc"
 generator="$work/build/bin/sglang-generate"
 echo "Native generator: $generator"
 sha256sum "$generator" "$work/build/lib/libsglang_checkpoint.a" \
-    "$work/build/lib/libsglang_cuda.a" "$work/build/lib/libsglang_decoder.a"
+    "$work/build/lib/libsglang_cuda.a" "$work/build/lib/libsglang_decoder.a" \
+    "$work/build/lib/libsglang_prefill_fp8_sm100.a" "$work/build/lib/libsglang_mnnvl_ar.a" \
+    "$work/build/lib/libsglang_cuda_support.a"
 if [[ "$check" == y ]]; then
     "$xmake" build -P . -v mxfp8-gqa-check
     sha256sum "$work/build/bin/mxfp8-gqa-check"

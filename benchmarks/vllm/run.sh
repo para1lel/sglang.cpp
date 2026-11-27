@@ -24,8 +24,10 @@ finish() {
 }
 trap finish EXIT
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
-export http_proxy=http://127.0.0.1:12233 https_proxy=http://127.0.0.1:12233
-export HTTP_PROXY=$http_proxy HTTPS_PROXY=$https_proxy ALL_PROXY=$https_proxy
+proxy=${all_proxy:-${ALL_PROXY:-http://127.0.0.1:7890}}
+export http_proxy=${http_proxy:-${HTTP_PROXY:-$proxy}}
+export https_proxy=${https_proxy:-${HTTPS_PROXY:-$proxy}}
+export HTTP_PROXY=$http_proxy HTTPS_PROXY=$https_proxy ALL_PROXY=$proxy all_proxy=$proxy
 export no_proxy=localhost,127.0.0.1,::1 NO_PROXY=localhost,127.0.0.1,::1
 export VLLM_NO_USAGE_STATS=1 HF_HUB_OFFLINE=1 OMP_NUM_THREADS=2 MAX_JOBS=2
 mkdir cache config tmp

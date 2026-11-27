@@ -1,0 +1,18 @@
+BasedOnStyle: LLVM
+ColumnLimit: 100
+IndentWidth: 4
+ContinuationIndentWidth: 4
+PointerAlignment: Left
+ReferenceAlignment: Left
+SortIncludes: Never
+FixNamespaceComments: false
+IndentPPDirectives: BeforeHash
+AllowShortFunctionsOnASingleLine: None
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+AttributeMacros:
+  - __host__
+  - __device__
+  - __global__
+  - __forceinline__
+  - __inline_hint__

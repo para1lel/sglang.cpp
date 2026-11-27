@@ -1,0 +1,47 @@
+required-version = "==0.17.6"
+target-version = "py310"
+line-length = 100
+indent-width = 4
+include = ["*.py", "*.pyi"]
+
+[lint]
+select = ["ALL"]
+preview = true
+explicit-preview-rules = true
+typing-extensions = false
+extend-select = [
+    "ASYNC119", "ASYNC401", "B909", "PT029",
+    "PLE0211", "PLE1141", "PLE4703", "PLW0244", "PLW1514", "PLW3201",
+    "UP051", "UP052", "RUF045", "RUF052", "RUF066", "RUF072", "RUF074", "RUF075", "RUF077",
+]
+ignore = [
+    "CPY001", "D100", "D101", "D102", "D103", "D104", "D105", "D106", "D107",
+    "COM812", "COM819", "D203", "D206", "D207", "D208", "D213", "D300",
+    "ISC001", "ISC003",
+    "Q000", "Q001", "Q002", "Q003", "Q004", "W191",
+    "INP001",
+    "EM101", "EM102", "EM103", "TRY003",
+    "PT009", "PT027",
+]
+allowed-confusables = ["×", "–", "−"]
+
+[lint.flake8-type-checking]
+strict = true
+
+[lint.per-file-ignores]
+"tests/**" = ["S101", "T201"]
+"benchmarks/**" = ["T201"]
+"benchmarks/**/test_*.py" = ["S101"]
+".agents/checks/*.py" = ["T201"]
+".agents/skills/main-mode/scripts/session_review.py" = ["T201"]
+".agents/checks/tool_process.py" = ["S603"]
+"tests/test_gate_contract.py" = ["S603", "S607"]
+"tests/test_anthropic_count_cpu.py" = ["RUF001"]
+
+[format]
+preview = false
+indent-style = "space"
+quote-style = "double"
+line-ending = "lf"
+skip-magic-trailing-comma = false
+docstring-code-format = false

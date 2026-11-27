@@ -1,5 +1,4 @@
 import argparse
-import ast
 from html.parser import HTMLParser
 import json
 import os
@@ -25,7 +24,7 @@ CODE_SUFFIXES = {
     ".hxx", ".java", ".js", ".json", ".jsx", ".lua", ".mjs", ".ps1", ".py", ".rs", ".sh",
     ".toml", ".ts", ".tsx", ".yaml", ".yml",
 }
-CODE_SUFFIXES.update(function_spans.HEADER_SUFFIXES)
+CODE_SUFFIXES.update(function_spans.HEADER_SUFFIXES | gate_config.PYTHON_SUFFIXES)
 DOCUMENT_SUFFIXES = {".md", ".rst", ".txt", ".html"}
 MARKDOWN = MarkdownIt("commonmark", {"html": True}).enable("table")
 REFERENCE_MARKDOWN = MarkdownIt("commonmark", {"html": True}).enable("table")
@@ -106,19 +105,9 @@ def code_errors(path, text, configuration=None, header_spans=None):
     for number, line in enumerate(lines, 1):
         if len(line) > 100:
             errors.append(f"Line {number} has more than 100 characters.")
-    if path.suffix == ".py":
-        try:
-            tree = ast.parse(text, filename=str(path))
-        except SyntaxError as error:
-            return [*errors, f"The Python syntax is invalid at line {error.lineno}."]
-        for node in ast.walk(tree):
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                start = min([node.lineno, *[item.lineno for item in node.decorator_list]])
-                if node.end_lineno - start + 1 > limits["function_lines"]:
-                    errors.append(
-                        f"Function {node.name} at line {start} exceeds the function limit."
-                    )
-    elif configuration and gate_config.function_source(path) and lines:
+    if path.suffix in gate_config.PYTHON_SUFFIXES or (
+        configuration and gate_config.function_source(path) and lines
+    ):
         try:
             spans = header_spans
             if spans is None:
@@ -128,6 +117,8 @@ def code_errors(path, text, configuration=None, header_spans=None):
                     errors.append(f"Function {name} at line {start} exceeds the function limit.")
         except (ValueError, subprocess.SubprocessError) as error:
             errors.append(str(error))
+        except SyntaxError as error:
+            errors.append(f"The Python syntax is invalid at line {error.lineno}.")
     try:
         if path.suffix == ".json":
             json.loads(text)

@@ -20,6 +20,28 @@ def git(root, arguments, environment, required=True, input_data=None):
     return result.stdout
 
 
+def read_tree(
+    root: Path,
+    revision: str,
+    environment: dict[str, str],
+) -> dict[str, tuple[bytes, bytes, bytes]]:
+    listing = git(root, ["ls-tree", "-r", "-z", revision], environment)
+    entries = {}
+    for record in listing.split(b"\0"):
+        if not record:
+            continue
+        metadata, raw_path = record.split(b"\t", 1)
+        mode, kind, object_id = metadata.split()
+        name = os.fsdecode(raw_path)
+        parts = PurePosixPath(name).parts
+        if PurePosixPath(name).is_absolute() or PureWindowsPath(name).drive:
+            raise ValueError("An indexed path is absolute.")
+        if ".." in parts or ".git" in parts or "\\" in name:
+            raise ValueError(f"An indexed path is unsafe: {name!r}")
+        entries[name] = (mode, kind, object_id)
+    return entries
+
+
 def freeze(root, temporary):
     environment = os.environ.copy()
     if environment.get("GIT_INDEX_FILE"):
@@ -45,20 +67,7 @@ def freeze(root, temporary):
     )
     environment["GIT_OBJECT_DIRECTORY"] = str(objects)
     tree = git(root, ["write-tree"], environment).strip()
-    listing = git(root, ["ls-tree", "-r", "-z", tree.decode("ascii")], environment)
-    entries = {}
-    for record in listing.split(b"\0"):
-        if not record:
-            continue
-        metadata, raw_path = record.split(b"\t", 1)
-        mode, kind, object_id = metadata.split()
-        name = os.fsdecode(raw_path)
-        parts = PurePosixPath(name).parts
-        if PurePosixPath(name).is_absolute() or PureWindowsPath(name).drive:
-            raise ValueError("An indexed path is absolute.")
-        if ".." in parts or ".git" in parts or "\\" in name:
-            raise ValueError(f"An indexed path is unsafe: {name!r}")
-        entries[name] = (mode, kind, object_id)
+    entries = read_tree(root, tree.decode("ascii"), environment)
     changed = git(
         root, ["diff", "--cached", "--name-only", "--no-renames", "-z"], environment,
     )
@@ -171,6 +180,27 @@ def snapshot_repository(root, snapshot, entries, environment, head):
         git(snapshot, ["update-ref", "HEAD", head.strip().decode("ascii")], clean)
 
 
+def prepare_checker(root: Path, snapshot: Path, temporary: Path) -> Path:
+    source = Path(__file__).resolve().parent
+    helpers = (
+        ("check_rules.py", "the rule checker"),
+        ("function_spans.py", "function_spans.py"),
+        ("comment_rules.py", "the comment rules"),
+        ("tool_process.py", "tool_process.py"),
+        ("gate_config.py", "the gate's helper"),
+    )
+    if source.is_relative_to(root):
+        directory = snapshot / source.relative_to(root)
+        for name, label in helpers:
+            if not (directory / name).is_file():
+                raise ValueError(f"Stage {label} before using the repository gate.")
+    else:
+        directory = temporary
+        for name, _ in helpers:
+            shutil.copyfile(source / name, directory / name)
+    return directory / "check_rules.py"
+
+
 def run(root):
     with tempfile.TemporaryDirectory(prefix="meta-harness-staged-") as directory:
         temporary = Path(directory).resolve()
@@ -186,29 +216,7 @@ def run(root):
         gate_config.baseline_unchanged(root, configuration, environment)
         clean_environment = snapshot_environment()
         snapshot_repository(root, snapshot, entries, environment, head)
-        checker = Path(__file__).resolve().with_name("check_rules.py")
-        if checker.is_relative_to(root):
-            selected_checker = snapshot / checker.relative_to(root)
-            if not selected_checker.is_file():
-                raise ValueError("Stage the rule checker before using the repository gate.")
-            comments = checker.with_name("comment_rules.py")
-            functions = checker.with_name("function_spans.py")
-            if not (snapshot / functions.relative_to(root)).is_file():
-                raise ValueError("Stage function_spans.py before using the repository gate.")
-            if not (snapshot / comments.relative_to(root)).is_file():
-                raise ValueError("Stage the comment rules before using the repository gate.")
-        else:
-            selected_checker = temporary / "check_rules.py"
-            selected_checker.write_bytes(checker.read_bytes())
-            selected_checker.with_name("gate_config.py").write_bytes(
-                checker.with_name("gate_config.py").read_bytes()
-            )
-            selected_checker.with_name("comment_rules.py").write_bytes(
-                checker.with_name("comment_rules.py").read_bytes()
-            )
-            selected_checker.with_name("function_spans.py").write_bytes(
-                checker.with_name("function_spans.py").read_bytes()
-            )
+        selected_checker = prepare_checker(root, snapshot, temporary)
         full = any(
             shared_change(name) or gate_config.matches(
                 name, configuration.get("shared_paths", [])

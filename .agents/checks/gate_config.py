@@ -16,6 +16,7 @@ DEFAULT_LIMITS = {
 }
 CONFIG_PATH = ".agents/gates.json"
 DATA_SUFFIXES = {".json", ".toml", ".yaml", ".yml"}
+PYTHON_SUFFIXES = {".py", ".pyi"}
 
 
 def limits(configuration=None):
@@ -67,7 +68,7 @@ def is_code(path, suffixes, configuration, root):
 def function_spans(path, text, configuration):
     if not function_source(path):
         return []
-    if path.suffix == ".py":
+    if path.suffix in PYTHON_SUFFIXES:
         tree = ast.parse(text, filename=str(path))
         return [
             (
@@ -88,9 +89,16 @@ def function_spans(path, text, configuration):
     arguments = [str(path) if part == "{file}" else part for part in command]
     arguments = [sys.executable if part == "{python}" else part for part in arguments]
     result = subprocess.run(
-        arguments, cwd=configuration.get("_root"), capture_output=True,
-        text=True, check=True, timeout=60,
+        arguments,
+        cwd=configuration.get("_root"),
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
     )
+    if result.returncode and (diagnostic := result.stderr.strip()):
+        raise ValueError(diagnostic)
+    result.check_returncode()
     spans = json.loads(result.stdout)
     if not isinstance(spans, list):
         raise ValueError("A function adapter must return a JSON list.")
@@ -213,11 +221,12 @@ def run_checks(root, configuration, changed, full):
         name = check.get("name")
         if not isinstance(name, str) or not name:
             raise ValueError("Each configured check needs a name.")
+        all_files = full and not check.get("path_only")
         patterns = check.get("paths", [])
         affected = [path for path in changed if matches(path, patterns)]
-        if not full and not affected:
+        if not all_files and not affected:
             continue
-        files = [] if full else [path for path in affected if (root / path).is_file()]
+        files = [] if all_files else [path for path in affected if (root / path).is_file()]
         command = command_arguments(check.get("command"), files)
         if "{files}" in check["command"] and not files:
             command = command_arguments(check["command"], [

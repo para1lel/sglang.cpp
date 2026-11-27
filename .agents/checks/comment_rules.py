@@ -1,12 +1,11 @@
 import io
+import os
 import re
+import tempfile
 import tokenize
-
-from tree_sitter import Language, Parser
+from pathlib import Path
 
 import tree_sitter_bash
-import tree_sitter_cpp
-import tree_sitter_cuda
 import tree_sitter_go
 import tree_sitter_java
 import tree_sitter_javascript
@@ -16,8 +15,9 @@ import tree_sitter_rust
 import tree_sitter_toml
 import tree_sitter_typescript
 import tree_sitter_yaml
-
 from function_spans import HEADER_SUFFIXES
+from tool_process import invoke
+from tree_sitter import Language, Parser, Query, QueryCursor
 
 C_KINDS = ({".c", ".c++", ".cc", ".cpp", ".cxx"} | HEADER_SUFFIXES) - {".cuh"}
 CUDA_KINDS = {".cu", ".cuh"}
@@ -34,6 +34,7 @@ SUFFIX_KINDS = {
     ".lua": "lua",
     ".ps1": "powershell",
     ".py": "python",
+    ".pyi": "python",
     ".rs": "rust",
     ".toml": "toml",
     ".ts": "typescript",
@@ -43,8 +44,6 @@ SUFFIX_KINDS = {
 }
 GRAMMARS = {
     "bash": tree_sitter_bash.language,
-    "cpp": tree_sitter_cpp.language,
-    "cuda": tree_sitter_cuda.language,
     "go": tree_sitter_go.language,
     "java": tree_sitter_java.language,
     "javascript": tree_sitter_javascript.language,
@@ -56,8 +55,8 @@ GRAMMARS = {
     "typescript": tree_sitter_typescript.language_typescript,
     "yaml": tree_sitter_yaml.language,
 }
-COMMENT_TYPES = {
-    **dict.fromkeys(["java", "rust"], {"line_comment", "block_comment"}),
+COMMENT_QUERIES = {
+    **dict.fromkeys(("java", "rust"), "[(line_comment) (block_comment)] @comment"),
 }
 SHELL_INTERPRETERS = {
     "ash", "bash", "bsh", "dash", "ksh", "mksh", "pdksh", "posh", "sh", "yash", "zsh",
@@ -71,6 +70,24 @@ UNSUPPORTED = (
 )
 COMMENT_FOUND = "Line {line} contains a comment. Remove it or express it as data."
 NOT_UTF8 = "The staged content is not valid UTF-8, so its comments cannot be examined."
+SPLICE = rb"\\[ \t]*\n"
+COMMENT_START = re.compile(rb"(?:" + SPLICE + rb")*(/)(?:" + SPLICE + rb")*[/*]")
+DIRECTIVE_SPACE = rb"(?:[ \t\v\f]|" + SPLICE + rb"|/\*.*?\*/)*"
+HEADER_NAME = re.compile(
+    rb"(?:#|%:)"
+    + DIRECTIVE_SPACE
+    + rb"(?P<directive>[a-z_]+(?:"
+    + SPLICE
+    + rb"[a-z_]+)*)"
+    + DIRECTIVE_SPACE
+    + rb"<(?P<name>(?:"
+    + SPLICE
+    + rb"|[^>\n])*)>",
+    re.DOTALL,
+)
+HEADER_CHARACTER = re.compile(rb"(" + SPLICE + rb")|[^\n]")
+HEADER_QUOTING = re.compile(rb"[\"']|//|/\*")
+HEADER_DIRECTIVES = {b"include", b"include_next", b"import", b"embed"}
 
 
 def classify(path, prefix):
@@ -115,176 +132,76 @@ def is_shebang(node):
     )
 
 
-def skip_quoted(logical, index):
-    length = len(logical)
-    position = index + 1
-    while position < length:
-        char = logical[position]
-        if char == "\\" and position + 1 < length:
-            position += 2
-            continue
-        if char == "\n":
-            return position
-        if char == "\"":
-            return position + 1
-        position += 1
-    return position
+def raw_token_starts(source: bytes, standard: str) -> list[tuple[int, int]]:
+    with tempfile.NamedTemporaryFile() as handle:
+        handle.write(source)
+        handle.flush()
+        language = "c" if standard == "c23" else "c++"
+        result = invoke(
+            [
+                "clang++",
+                "-cc1",
+                "-x",
+                language,
+                "-std=" + standard,
+                "-dump-raw-tokens",
+                handle.name,
+            ],
+            Path.cwd(),
+        )
+        result.check_returncode()
+        location = rb"Loc=<" + re.escape(os.fsencode(handle.name)) + rb":(\d+):(\d+)>"
+    starts = [0, *(match.end() for match in re.finditer(rb"\n", source))]
+    return [
+        (int(row), starts[int(row) - 1] + int(column) - 1)
+        for row, column in re.findall(location, result.stderr)
+    ]
 
 
-def skip_char(logical, index):
-    length = len(logical)
-    position = index + 1
-    limit = min(length, index + 9)
-    while position < limit:
-        char = logical[position]
-        if char == "\n":
-            break
-        if char == "\\":
-            position += 2
-            continue
-        if char == "'":
-            return position + 1
-        position += 1
-    return index + 1
+def c_comment_lines(source: bytes, standard: str) -> set[int]:
+    if b"/" not in source:
+        return set()
+    while True:
+        tokens = raw_token_starts(source, standard)
+        normalized = bytearray(source)
+        lines = set()
+        at_start = True
+        for index, (row, offset) in enumerate(tokens):
+            end = tokens[index + 1][1] if index + 1 < len(tokens) else len(source)
+            token = source[offset:end]
+            comment = COMMENT_START.match(token)
+            if comment:
+                lines.add(row + token[: comment.start(1)].count(b"\n"))
+                continue
+            if at_start and (header := HEADER_NAME.match(source, offset)):
+                directive = re.sub(SPLICE, b"", header["directive"])
+                name = re.sub(SPLICE, b"", header["name"])
+                if directive in HEADER_DIRECTIVES and HEADER_QUOTING.search(name):
+                    start, stop = header.span("name")
+                    normalized[start:stop] = HEADER_CHARACTER.sub(
+                        lambda character: character[1] or b" ",
+                        header["name"],
+                    )
+            if not token.strip() or token.startswith(b"\\"):
+                at_start = at_start or b"\n" in re.sub(SPLICE, b"", token)
+            else:
+                at_start = False
+        if normalized == source:
+            return lines
+        source = bytes(normalized)
 
 
-def raw_prefix(logical, index):
-    start = index
-    while start > 0 and (logical[start - 1].isalnum() or logical[start - 1] == "_"):
-        start -= 1
-    return logical[start:index] in {"R", "uR", "UR", "LR", "u8R"}
-
-
-def raw_string_end(logical, index):
-    opening = logical.find("(", index + 1)
-    if opening < 0 or opening - index > 17:
-        return -1
-    delimiter = logical[index + 1:opening]
-    if any(character in " \t\n()\\" for character in delimiter):
-        return -1
-    closing = ")" + delimiter + "\""
-    end = logical.find(closing, opening + 1)
-    if end < 0:
-        return -1
-    return end + len(closing)
-
-
-def skip_literal(logical, index, raw_strings):
-    if logical[index] == "'":
-        return skip_char(logical, index)
-    if raw_strings and raw_prefix(logical, index):
-        end = raw_string_end(logical, index)
-        if end >= 0:
-            return end
-    return skip_quoted(logical, index)
-
-
-def splice_lines(fragment):
-    logical = []
-    positions = []
-    index = 0
-    length = len(fragment)
-    row = 0
-    column = 0
-    while index < length:
-        if fragment.startswith("\\\r\n", index):
-            index += 3
-            row += 1
-            column = 0
-            continue
-        if fragment.startswith("\\\n", index):
-            index += 2
-            row += 1
-            column = 0
-            continue
-        char = fragment[index]
-        logical.append(char)
-        positions.append((row, column))
-        index += 1
-        if char == "\n":
-            row += 1
-            column = 0
-        else:
-            column += 1
-    return "".join(logical), positions
-
-
-def skip_directive(logical, index):
-    length = len(logical)
-    position = index + 1
-    while position < length and logical[position] in " \t":
-        position += 1
-    if not logical.startswith("include", position):
-        return index + 1
-    position += len("include")
-    while position < length and logical[position] in " \t":
-        position += 1
-    if position >= length or logical[position] != "<":
-        return index + 1
-    end = position
-    while end < length and logical[end] not in ">\n":
-        end += 1
-    return end + 1 if end < length and logical[end] == ">" else end
-
-
-def record_comment(positions, index, base_row, base_column, found):
-    row, column = positions[index]
-    if row == 0:
-        column += base_column
-    found[(base_row + row, column)] = base_row + row + 1
-
-
-def lex_logical(logical, positions, base_row, base_column, found, raw_strings):
-    index = 0
-    length = len(logical)
-    while index < length:
-        char = logical[index]
-        if char in "\"'":
-            index = skip_literal(logical, index, raw_strings)
-            continue
-        if char == "#":
-            index = skip_directive(logical, index)
-            continue
-        if logical.startswith("//", index):
-            record_comment(positions, index, base_row, base_column, found)
-            end = logical.find("\n", index)
-            if end < 0:
-                return
-            index = end + 1
-            continue
-        if logical.startswith("/*", index):
-            record_comment(positions, index, base_row, base_column, found)
-            end = logical.find("*/", index + 2)
-            if end < 0:
-                return
-            index = end + 2
-            continue
-        index += 1
-
-
-def tree_comment_found(kind, text):
-    tree = Parser(Language(GRAMMARS[kind]())).parse(text.encode("utf-8"))
-    types = COMMENT_TYPES.get(kind, {"comment"})
-    found = {}
-    pending = [tree.root_node]
-    while pending:
-        node = pending.pop()
-        pending.extend(reversed(node.children))
-        if node.type in types and not is_shebang(node):
-            point = node.start_point
-            found[(point.row, point.column)] = point.row + 1
-    return found
-
-
-def comment_lines(kind, text, raw_strings=True):
+def comment_lines(kind: str, text: str, standard: str = "c++23") -> set[int]:
     if kind == "python":
         return python_comment_lines(text)
+    source = text.encode("utf-8")
     if kind in {"cpp", "cuda"}:
-        found = {}
-        logical, positions = splice_lines(text)
-        lex_logical(logical, positions, 0, 0, found, raw_strings)
-        return set(found.values())
-    return set(tree_comment_found(kind, text).values())
+        return c_comment_lines(source, standard)
+    grammar = Language(GRAMMARS[kind]())
+    tree = Parser(grammar).parse(source)
+    query = Query(grammar, COMMENT_QUERIES.get(kind, "(comment) @comment"))
+    comments = QueryCursor(query).captures(tree.root_node).get("comment", ())
+    return {node.start_point.row + 1 for node in comments if not is_shebang(node)}
 
 
 def comment_errors(path, code=False):
@@ -302,9 +219,5 @@ def comment_errors(path, code=False):
         text = path.read_text(encoding="utf-8")
     except UnicodeDecodeError:
         return [NOT_UTF8]
-    suffix = path.suffix.lower()
-    raw_strings = kind == "cuda" or (kind == "cpp" and suffix != ".c")
-    return [
-        COMMENT_FOUND.format(line=line)
-        for line in sorted(comment_lines(kind, text, raw_strings))
-    ]
+    standard = "c23" if path.suffix.lower() == ".c" else "c++23"
+    return [COMMENT_FOUND.format(line=line) for line in sorted(comment_lines(kind, text, standard))]

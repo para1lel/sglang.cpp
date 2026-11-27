@@ -38,12 +38,29 @@ Keep weights at `/data0/shared/Qwen3.8-27B-FP8`.
 
 ## Integrating changes
 
-Install local hooks with `git config --local core.hooksPath .githooks` and install
-`.agents/checks/requirements.txt` with the default Pixi Python. Hooks check the selected
-index and commit message. Keep comments out of project code files: the pre-commit hook
-rejects any added or changed code file whose staged content contains a comment, including
-comments that predate the change. Shebangs, preprocessor directives, quoted literals, and
-here-documents are not comments. Remove comments only from code files you actually touch;
+Install the hook dependencies from the repository root with the default Pixi Python.
+
+```bash
+PIP_CONFIG_FILE=/dev/null NO_PROXY= no_proxy= \
+    /data1/shared/dongwu.chen/.pixi/envs/default/bin/python -I -m pip --isolated \
+    --disable-pip-version-check --proxy http://127.0.0.1:7890 \
+    install --index-url https://pypi.org/simple -r .agents/checks/requirements.txt
+git config --local core.hooksPath .githooks
+```
+
+Git hooks use the installed default Pixi tools, including `clang++` and `clang-tidy`.
+CUDA checks use the CUDA 13.4 SDK and NCCL headers from Pixi.
+For CUTLASS sources, the hook reads the verified archive at
+`$SGLANG_HOST_ROOT/cache/cutlass/<sha256>/cutlass-<version>.tar.gz`.
+Set `SGLANG_CUTLASS_ARCHIVE` for an archive elsewhere, or `SGLANG_LINT_CUTLASS_INCLUDE`
+for an installed include directory. The host root defaults to `/data1/shared/dongwu.chen`.
+For FFmpeg or libpng headers outside standard paths, set `SGLANG_LINT_MEDIA_INCLUDE` to the
+absolute include path.
+
+Hooks check the selected index and commit message. Keep comments out of project code files.
+The pre-commit hook rejects added or changed code files whose staged content contains comments,
+including comments that predate the change. Shebangs, preprocessor directives, quoted literals,
+and here-documents are not comments. Remove comments only from code files you actually touch;
 do not clean up untouched legacy files. Perform semantic and English review separately.
 Keep raw results in `artifacts/`.
 

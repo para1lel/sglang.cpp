@@ -18,6 +18,7 @@
     ".sh": ["{python}", ".agents/checks/function_spans.py", "{file}"],
     ".bash": ["{python}", ".agents/checks/function_spans.py", "{file}"],
     ".lua": ["{python}", ".agents/checks/function_spans.py", "{file}"],
+    ".c": ["{python}", ".agents/checks/function_spans.py", "{file}"],
     ".cc": ["{python}", ".agents/checks/function_spans.py", "{file}"],
     ".cpp": ["{python}", ".agents/checks/function_spans.py", "{file}"],
     ".cxx": ["{python}", ".agents/checks/function_spans.py", "{file}"],
@@ -30,14 +31,28 @@
   "code_paths": [],
   "checks": [
     {
+      "name": "Staged source lint and formatting",
+      "kind": "static",
+      "path_only": true,
+      "paths": [
+        ".clang-format", ".clang-tidy", "ruff.toml", "*.py", "*.pyi", "*.c", "*.cc", "*.cpp",
+        "*.cxx", "*.cu", "*.h", "*.hh", "*.hpp", "*.hxx", "*.h++", "*.cuh", "*.inl", "*.ipp",
+        "*.tpp"
+      ],
+      "command": ["{python}", "-B", ".agents/checks/source_style.py"],
+      "timeout": 1200
+    },
+    {
       "name": "XMake host and SM100 build",
       "kind": "static",
+      "path_only": true,
       "paths": [
-        "xmake.lua", "tools/*", "src/*", "include/*", "*.cpp", "*.cc", "*.cxx",
-        "*.h", "*.hpp", "*.cu", "*.cuh"
+        "xmake.lua", "tools/build.sh", "tools/build-probe.sh", "tools/toolchain-xmake.sh",
+        "src/*", "include/*", "*.c", "*.cc", "*.cpp", "*.cxx", "*.cu", "*.h", "*.hh",
+        "*.hpp", "*.hxx", "*.h++", "*.cuh", "*.inl", "*.ipp", "*.tpp"
       ],
-      "command": ["/bin/bash", "tools/build.sh"],
-      "timeout": 180
+      "command": ["/bin/bash", "tools/build.sh", "--offline"],
+      "timeout": 480
     },
     {
       "name": "maintenance contract",

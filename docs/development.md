@@ -111,7 +111,7 @@ Use the [operator qualification procedure](performance.md#operator-qualification
 
 Use the [P2 verifier](#p2-gqa-verification) for MXFP8 encoding, causal attention, and page reuse. Check KV positions and ownership through append and decode. Check BF16 convolution history and FP32 recurrent state. Compare supported cache restores and continuations with fresh native execution under the same precision policy. [Independent GDN check](../tests/decoder/gdn_check.cu#L239)<!-- prefix: "void verify_" -->
 
-Build the [host generator](../README.md#build-on-the-project-host). Set `SGLANG_GENERATE` to its path and `GPU_UUID` to the reserved B200 UUID. CUDA exposes it as ordinal 0. The default checkpoint is `/data0/shared/Qwen3.8-27B-FP8`. [Generator build](../tools/build-probe.sh#L105)<!-- prefix: "\"$xmake\" bui" -->
+Build the [host generator](../README.md#build-on-the-project-host). Set `SGLANG_GENERATE` to its path and `GPU_UUID` to the reserved B200 UUID. CUDA exposes it as ordinal 0. The default checkpoint is `/data0/shared/Qwen3.8-27B-FP8`. [Generator build](../tools/build-probe.sh#L119)<!-- prefix: "\"$xmake\" bui" -->
 
 ```bash
 CUDA_VISIBLE_DEVICES="${GPU_UUID:?set the reserved B200 UUID}" \
@@ -176,3 +176,28 @@ Start with source and checkpoint identity and an [isolated Release build](servin
 Profile separately from timing. Match the pinned vLLM dispatch by shape, visible length, precision, and fusion boundary. Record reference source and revision. Validate changes at the operator and execution-step boundaries, then repeat on the same hardware and workload. [Acceptance gate](performance.md#measurement)
 
 Recover the [previous guide](https://github.com/para1lel/sglang.cpp/blob/4dd8c887c278c67744ed80e7feb2a825a92197a2/docs/development.md) for the detailed decoder operator notes and historical diagnostic inputs.
+
+### Check and format staged source
+
+Use the [installed hooks in default Pixi](../AGENTS.md#integrating-changes). To reproduce pre-commit checks without committing, run this command from the repository root.
+
+```bash
+.githooks/pre-commit
+```
+
+The hook checks the selected index against `HEAD` and ignores unstaged and untracked files. Check or tool failures return a nonzero status. The hook leaves the index and working tree unchanged.
+
+Clang-format covers C, C++, CUDA, and their headers. Ruff covers Python and stubs. Format checks use staged additions and replacements. New files, renamed files, and files whose type changes are checked in full.
+
+Clang-tidy checks changed lines and new critical analyzer findings. CUDA analysis covers host and `sm_100` or `sm_100a` device code, with extra device-only passes for selected sources. A deleted header can trigger analysis of its surviving consumers. Parse and dependency errors also fail the check.
+
+Ruff checks changed-line and newly introduced diagnostics, including annotation and type-only import rules. Syntax errors also fail the check. Test assertions and script output have scoped exceptions.
+
+Selected XMake builds run offline. For a missing CUTLASS archive, set `SGLANG_CUTLASS_ARCHIVE` to a verified archive or run `bash tools/build.sh` to populate the cache.
+
+Run the formatter command printed by the hook on working-tree content that matches the staged ranges. Stage the intended edits and repeat the check. Omit range options to format a full file.
+
+```bash
+clang-format --style=file:.clang-format -i ./path/to/file.cu
+ruff format --config=ruff.toml --no-cache ./path/to/file.py
+```

@@ -29,17 +29,17 @@ struct Segments {
     Segment values[decoder::max_gdn_prefill_segments];
 };
 
+enum class Recurrence { unstaged, staged, two_frames, three_frames };
+
 template <typename S = GdnFull>
 bool eligible(int count, const void* scratch, std::size_t bytes);
 
 template <typename S = GdnFull>
-cudaError_t configure(bool& enabled, bool grouped = false, bool* staged_values = nullptr,
-                      bool* pipelined = nullptr);
+cudaError_t configure(bool& enabled, bool grouped = false, Recurrence* recurrence = nullptr);
 
 template <typename S = GdnFull>
-cudaError_t launch(int count, const Bf16* convolved, const float2* gates,
-                   void* scratch, float* recurrent, Bf16* observable,
-                   cudaStream_t stream, bool staged_values, bool pipelined);
+cudaError_t launch(int count, const Bf16* convolved, const float2* gates, void* scratch,
+                   float* recurrent, Bf16* observable, cudaStream_t stream, Recurrence recurrence);
 
 template <typename S = GdnFull>
 cudaError_t launch_segments(Segments segments, int count, int max_rows, cudaStream_t stream);

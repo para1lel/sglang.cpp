@@ -561,10 +561,10 @@ cudaError_t prefill_gdn(
     void* chunk_scratch, std::size_t chunk_bytes) {
     constexpr int conv_blocks_per_token = S::qkv_width / conv_threads;
     bool chunked = gdn_chunk::eligible<S>(rows, chunk_scratch, chunk_bytes);
-    bool staged_values = std::is_same_v<S, GdnLocal> && rows >= 1024;
-    bool pipelined = false;
+    auto recurrence = std::is_same_v<S, GdnLocal> && rows >= 1024 ? gdn_chunk::Recurrence::staged
+                                                                  : gdn_chunk::Recurrence::unstaged;
     if (chunked) {
-        const auto status = gdn_chunk::configure<S>(chunked, false, &staged_values, &pipelined);
+        const auto status = gdn_chunk::configure<S>(chunked, false, &recurrence);
         if (status != cudaSuccess) {
             return status;
         }
@@ -580,9 +580,8 @@ cudaError_t prefill_gdn(
     }
     auto* observable = workspace + static_cast<std::size_t>(rows) * S::qkv_width;
     if (chunked) {
-        status = gdn_chunk::launch<S>(rows, workspace, gates, chunk_scratch,
-                                      state.recurrent, observable, stream, staged_values,
-                                      pipelined);
+        status = gdn_chunk::launch<S>(rows, workspace, gates, chunk_scratch, state.recurrent,
+                                      observable, stream, recurrence);
     } else {
         status = gdn_prefill::launch_recur<S>(rows, workspace, gates, state.recurrent,
                                              observable, stream);

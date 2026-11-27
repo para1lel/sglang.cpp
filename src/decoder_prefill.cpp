@@ -830,9 +830,9 @@ bool try_prefill_paired_tiles_tp(const DecoderModel& model, const DecoderModel& 
                                 const PrefillGrant* grants, const PrefillGrant* peer_grants,
                                 int count, cudaStream_t stream, cudaStream_t peer_stream,
                                 TensorParallel& group, DecoderBatchStepStats& stats) {
-    if (!can_pack_paired_tiles(grants, count) || !can_pack_paired_tiles(peer_grants, count) ||
-        gdn_vendor_prefill_enabled() ||
-        on_device(peer.device, [] { return gdn_vendor_prefill_enabled(); })) return false;
+    if (!can_pack_paired_tiles(grants, count) || !can_pack_paired_tiles(peer_grants, count)) {
+        return false;
+    }
     constexpr auto retention = PrefillWorkspace::Retention::transient;
     PrefillWorkspace workspace(stream, paired_tile_group.rows, retention);
     if (!workspace.data()) return false;

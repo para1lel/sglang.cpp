@@ -4,7 +4,7 @@
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| Decoder | Select target prefill and append uncovered KV before attention. | [Policy](../src/decoder_prefill.cpp#L626)<!-- prefix: "const bool t" --> · [Attention call](../include/sglang/runtime/execution/decoder_prefill_tiles.h#L333)<!-- prefix: "const auto s" --> |
+| Decoder | Select target prefill and append uncovered KV before attention. | [Policy](../src/decoder_prefill.cpp#L626)<!-- prefix: "const bool t" --> · [Attention call](../include/sglang/runtime/execution/decoder_prefill_tiles.h#L315)<!-- prefix: "const auto s" --> |
 | Native CUDA operator | Select TMEM Flash, regular Flash, staged or direct ordered tiles, or protected single-row attention. | [Dispatch](../include/sglang/text/gqa/multirow_prefill.cuh#L12)<!-- prefix: "cudaError_t " --> |
 | Long-tile TMEM | Scan the visible prefix in order or merge three partitions. | [Paired attention](../src/text/mxfp8_gqa_prefill_tmem.cu#L662)<!-- prefix: "__global__ v" --> · [Single-CTA attention](../src/text/mxfp8_gqa_prefill_tmem.cu#L556)<!-- prefix: "__global__ v" --> · [Split merge](../src/text/mxfp8_gqa_prefill_tmem.cu#L759)<!-- prefix: "__global__ v" --> |
 | Serving | Select actual tile rows before dispatch. | [Serial prefill](text-serving.md#serial-prefill) · [Batch planner](batch-graphs.md#runtime-path) |
@@ -72,11 +72,11 @@ Split TMEM uses three contiguous partitions per query block and head pair. Its 7
 
 ### Same-request causal GQA
 
-On B200, the [causal projection path](native-prefill-workspace.md#causal-segments-within-one-grant) can stage four consecutive 1,024-row text tiles from one request. The first tile starts on a 1,024-row boundary, including zero. The decoder preserves native Q/K normalization and RoPE across the group and appends only uncovered KV. One KV predecode and one reader launch cover all 4,096 queries. For TP2 ranks with 12 query heads and two KV heads, the native 128-key page reader starts at 8,192 visible tokens. Other head layouts use it above 32,768 visible tokens. The page reader supports up to 131,072 visible tokens. [Decoder guard](../include/sglang/runtime/execution/decoder_prefill_tiles.h#L658)<!-- prefix: "inline bool " --> · [Launcher](../include/sglang/text/mxfp8_gqa_prefill_paired.cuh#L880)<!-- prefix: "std::optiona" --> · [Combined preparation](../include/sglang/runtime/execution/decoder_prefill_tiles.h#L676)<!-- prefix: "auto combine" -->
+On B200, the [causal projection path](native-prefill-workspace.md#causal-segments-within-one-grant) can stage four consecutive 1,024-row text tiles from one request. The first tile starts on a 1,024-row boundary, including zero. The decoder preserves native Q/K normalization and RoPE across the group and appends only uncovered KV. One KV predecode and one reader launch cover all 4,096 queries. For TP2 ranks with 12 query heads and two KV heads, the native 128-key page reader starts at 8,192 visible tokens. Other head layouts use it above 32,768 visible tokens. The page reader supports up to 131,072 visible tokens. [Decoder guard](../include/sglang/runtime/execution/decoder_prefill_tiles.h#L640)<!-- prefix: "inline bool " --> · [Launcher](../include/sglang/text/mxfp8_gqa_prefill_paired.cuh#L880)<!-- prefix: "std::optiona" --> · [Combined preparation](../include/sglang/runtime/execution/decoder_prefill_tiles.h#L658)<!-- prefix: "auto combine" -->
 
 The TP2 group issues the next page’s scores into a separate slot before waiting for the current page’s first V and probability operands. Softmax, BF16 rounding, value update order, causal cutoffs, and FP64 repair stay the same. [Score issue](../include/sglang/text/mxfp8_gqa_prefill_page.cuh#L85)<!-- prefix: "__device__ v" -->
 
-Through 32,768 visible tokens, the launcher retries the single-CTA staged reader if page setup declines. A tensor-map descriptor allocation failure can cause this decline. The single-CTA path can also decline on an allowlisted predecode or attention launch rejection. If staging declines, the per-segment reader reuses appended KV on the same stream. Page submission errors and unexpected CUDA failures propagate without another attention launch. [Descriptor setup](../include/sglang/text/mxfp8_gqa_prefill_paired.cuh#L669)<!-- prefix: "if (const au" --> · [Reader fallback](../include/sglang/runtime/execution/decoder_prefill_tiles.h#L687)<!-- prefix: "each_prefill" --> · [Page submission](../include/sglang/text/mxfp8_gqa_prefill_paired.cuh#L765)<!-- prefix: "if constexpr" -->
+Through 32,768 visible tokens, the launcher retries the single-CTA staged reader if page setup declines. A tensor-map descriptor allocation failure can cause this decline. The single-CTA path can also decline on an allowlisted predecode or attention launch rejection. If staging declines, the per-segment reader reuses appended KV on the same stream. Page submission errors and unexpected CUDA failures propagate without another attention launch. [Descriptor setup](../include/sglang/text/mxfp8_gqa_prefill_paired.cuh#L669)<!-- prefix: "if (const au" --> · [Reader fallback](../include/sglang/runtime/execution/decoder_prefill_tiles.h#L669)<!-- prefix: "each_prefill" --> · [Page submission](../include/sglang/text/mxfp8_gqa_prefill_paired.cuh#L765)<!-- prefix: "if constexpr" -->
 
 Hold grants and projection policy fixed. Use the segment-by-segment path as the control. Compare full BF16 vocabulary rows, sampled token scores, output IDs, saved hidden and residual rows, target and draft KV, and GDN state. Check start zero, the 8,192 and 32,768 transitions, and the 131,072 limit. Include unequal ready grants and a clean setup decline. Check that unexpected launch failures propagate. See the [B200 operator replay](native-prefill-workspace.md#tp2-causal-gqa-operator-replay).
 
@@ -130,17 +130,11 @@ Time raw paired graph replay in A/B/B/A order. Weight starts by launch count. Se
 
 Check raw dispatch at zero and the singleton staging boundary at starts 31,744 and 32,768. For grouped staging, check starts 1,024, 7,168, and 8,192, both visible-length subgroup transitions, start 130,048, and off-grid starts. For one- and two-lane long subgroups, compare all BF16 outputs with the paired reader on identical staged inputs. Check that a clean setup decline preserves the paired path. Check that page submission errors propagate. For 256- and 512-row grants, see the [partial-grant checks](ordered-gqa-prefill.md#verification).
 
-On B200, the mixed-start fixture ran one 8,192-row grant, then six steps with four 8,192-row grants each. Rotating grant order and remapping pages preserved all 25 full-vocabulary BF16 rows, GDN state, hidden and residual rows, final target KV, and draft lengths against the parent. The candidate executed 1,152 singleton predecode and page-reader pairs. Forcing 16 clean declines preserved the same outputs.
-
-At starts 32,768, 40,960, and 130,048, all 6,291,456 BF16 output values per case matched raw paired attention. Mutating visible V left the masked prefix intact and changed the live suffix. Independent FP64 checks sampled 12,800 values per run. Across these cases, the largest absolute error was 0.042160236 and the largest normalized RMSE was 0.0008262025. The retained evidence manifest is `resume-uneven-proof-WcSDa7zv/singleton.sha256` (SHA-256 `23de3a9f9eb11a500d0f7f02e92a4e769baca2afb38ca7e531123c3b24d32d52`).
-
-A second fixture exercised four owners with mixed starts, distinct prompts, and permuted pages. Across 41 snapshots, full BF16 vocabulary rows, greedy IDs, GDN state, last hidden and residual rows, draft valid lengths, and teacher-forced proposal IDs matched the control. Final target KV matched byte for byte. The candidate ran 832 paired and 1,792 singleton predecode and reader launches each. Sixteen forced pair declines produced 32 singleton reads. An injected error after pair predecode reached the caller as `cudaErrorInvalidValue`.
-
-At starts 8,192, 32,768, and 64,512 the paired operator matched the reference BF16 output and respected each owner’s causal limit. For 230,400 sampled FP64 comparisons, the largest absolute error was 0.042611107 and the largest normalized RMSE was 0.0010461163. The evidence manifest is `resume-uneven-proof-WcSDa7zv/pairs/count2.sha256` (SHA-256 `363f0a413e7b1228a3c9737dd13a74981beb2cbc5c504fecb47b2a0fbd52f478`).
+Rotate grant order and remap pages with distinct prompts and mixed starts. Compare full BF16 scores, IDs, GDN, hidden and residual state, target KV, and draft continuation. Require parity on clean pair decline. Propagate errors after predecode. For staged readers, mutate visible V, check masked outputs and causal limits, and compare with an independent FP64 sample. [Frozen mixed-start operator and caller receipts](https://github.com/para1lel/sglang.cpp/blob/a5974ba4eb99bd8e8f890c2e7262a27dbc3aace1/docs/flash-prefill.md#paired-ordered-tmem-verification)
 
 ### Ordered TMEM operator verification
 
-Archived remapped operator replays matched wide Flash bitwise. For ordered changes, repeat remaps and causal boundaries. Compare behavior with visible KV NaNs and query infinity. Keep operator parity and timing separate from checkpoint and serving measurements.
+Repeat remaps and causal boundaries with visible KV NaNs and query infinity. Compare BF16 against wide Flash. Measure operator, checkpoint, and serving separately.
 
 ### Split TMEM operator verification
 
@@ -148,12 +142,4 @@ Verify graph replay, output guards, and causal invariance at 65,536, 98,304, and
 
 ### TMEM checkpoint verification
 
-The historical split TMEM checkpoint probe changed greedy first tokens at
-65,536 and 98,304 prompt tokens. Repeated captures matched within each arm.
-The source of the drift remains unresolved. Keep split TMEM operator evidence
-separate from full-checkpoint quality and the serving gate. [Archived Flash and TMEM verification and reproduction](https://github.com/para1lel/sglang.cpp/blob/f6c74b50d57dff48137d2e4a19c0a9c99a15bd20/docs/flash-prefill.md#tmem-checkpoint-verification) · [Previous guide with exact operator results](https://github.com/para1lel/sglang.cpp/blob/4dd8c887c278c67744ed80e7feb2a825a92197a2/docs/flash-prefill.md#ordered-tmem-operator-verification) · [Serving gate](performance.md#measurement)
-
-The retired page-128 TMA study matched the prior split producer bitwise and
-reduced operator latency. It changed first tokens from wide Flash at 16,384
-and 32,768 prompt tokens and left serving qualification open. The archived
-study retains its selector, fallback rules, and reproduction checks. [Page-128 study](https://github.com/para1lel/sglang.cpp/blob/4dd8c887c278c67744ed80e7feb2a825a92197a2/docs/sm100-page128-prefill.md) · [Measured selector source](https://github.com/para1lel/sglang.cpp/tree/93648269d852e0fee78f7af4d1c3ffe4897aa361)
+The archived split TMEM checkpoint probe changed greedy first tokens at 65,536 and 98,304 tokens. The retired page-128 study changed first tokens at 16,384 and 32,768 tokens. [Frozen TMEM verification and reproduction](https://github.com/para1lel/sglang.cpp/blob/f6c74b50d57dff48137d2e4a19c0a9c99a15bd20/docs/flash-prefill.md#tmem-checkpoint-verification) · [Page-128 study](https://github.com/para1lel/sglang.cpp/blob/4dd8c887c278c67744ed80e7feb2a825a92197a2/docs/sm100-page128-prefill.md) · [Serving gate](performance.md#measurement)

@@ -214,11 +214,7 @@ target("sglang-server")
               "apps/server/tokenization.cpp",
               "apps/server/tokenization_validation.cpp", "apps/server/tool_literal.cpp",
               "apps/server/tool_union.cpp")
-    add_files("src/runtime/model/qwen_chat_template.cpp",
-              "src/runtime/model/qwen_chat_output.cpp",
-              "src/runtime/model/qwen_tool_constraints.cpp",
-              "src/runtime/model/qwen_serving_profile.cpp",
-              "src/runtime/model/qwen_tool_output.cpp")
+    add_files("apps/server/qwen/*.cpp")
     add_media_codecs()
 
 option("text-tokenizer-check")
@@ -472,74 +468,20 @@ if has_config("tp2-verification-row-copy-check") then
     target_end()
 end
 
-local flashinfer_root = os.getenv("SGLANG_FLASHINFER_ROOT")
-if not flashinfer_root or flashinfer_root == "" then
-    local host_root = os.getenv("SGLANG_HOST_ROOT") or "/data1/shared/dongwu.chen"
-    flashinfer_root = path.join(host_root,
-        "environments/vllm-81a8cb063e62/venv/lib/python3.12/site-packages/flashinfer")
-end
-local mnnvl_vendor_header =
-    path.join(flashinfer_root, "data/include/flashinfer/comm/trtllm_mnnvl_allreduce.cuh")
-local mnnvl_spdlog_header =
-    path.join(flashinfer_root, "data/spdlog/include/spdlog/spdlog.h")
-if os.isfile(mnnvl_vendor_header) and os.isfile(mnnvl_spdlog_header)
-    and os.isfile("include/sglang/runtime/backend/mnnvl_ar.h")
-    and os.isfile("src/runtime/backend/mnnvl_ar.cu") then
-    target("sglang_mnnvl_ar")
-        set_kind("static")
-        set_toolchains("host-pixi")
-        set_targetdir("$(builddir)/lib")
-        set_values("cuda.rdc", false)
-        add_cugencodes("sm_100a")
-        add_cuflags("--dependency-target-name=", {force = true})
-        add_cuflags("--expt-relaxed-constexpr", {force = true})
-        add_includedirs("include", path.join(toolkit, "include"))
-        add_sysincludedirs(path.join(flashinfer_root, "data/include"),
-                           path.join(flashinfer_root, "data/spdlog/include"))
-        add_syslinks("cuda", {public = true})
-        add_files("src/runtime/backend/mnnvl_ar.cu")
-    target_end()
-    target("sglang_decoder")
-        add_deps("sglang_mnnvl_ar")
-        add_defines("SGLANG_MNNVL_AR=1")
-    target_end()
-end
+target("sglang_mnnvl_ar")
+    set_kind("static")
+    set_toolchains("host-pixi")
+    set_targetdir("$(builddir)/lib")
+    set_values("cuda.rdc", false)
+    add_cugencodes("sm_100a")
+    add_cuflags("--dependency-target-name=", {force = true})
+    add_cuflags("--expt-relaxed-constexpr", {force = true})
+    add_includedirs("include", path.join(toolkit, "include"))
+    add_syslinks("cuda", {public = true})
+    add_files("src/runtime/backend/mnnvl_ar.cu")
+target_end()
 
-local host_root_default = os.getenv("SGLANG_HOST_ROOT") or "/data1/shared/dongwu.chen"
-local gdn_vendor_dir = path.join(host_root_default, "environments",
-                                 "vllm-81a8cb063e62", "gdn_vendor_object")
-local gdn_vendor_archive = path.join(gdn_vendor_dir, "libgdn_cute_bf16_8_24.a")
-local site_packages = path.directory(flashinfer_root)
-local tvm_ffi_include = path.join(site_packages, "tvm_ffi", "include")
-local tvm_ffi_lib = path.join(site_packages, "tvm_ffi", "lib")
-local cute_dsl_lib = path.join(site_packages, "nvidia_cutlass_dsl", "cu13", "lib")
-local tvm_ffi_header = path.join(tvm_ffi_include, "tvm", "ffi", "c_api.h")
-local tvm_ffi_so = path.join(tvm_ffi_lib, "libtvm_ffi.so")
-local cute_dsl_so = path.join(cute_dsl_lib, "libcute_dsl_runtime.so")
-if os.getenv("SGLANG_GDN_VENDOR_BUILD") ~= "0"
-    and os.isfile(gdn_vendor_archive)
-    and os.isfile(tvm_ffi_header) and os.isfile(tvm_ffi_so) and os.isfile(cute_dsl_so)
-    and os.isfile("include/sglang/runtime/backend/gdn_vendor_prefill.h")
-    and os.isfile("src/runtime/backend/gdn_vendor_prefill.cu") then
-    print("vendor GDN prefill: enabled (archive " .. gdn_vendor_archive .. ")")
-    target("sglang_gdn_vendor")
-        set_kind("static")
-        set_toolchains("host-pixi")
-        set_targetdir("$(builddir)/lib")
-        set_values("cuda.rdc", false)
-        add_cugencodes("sm_100a")
-        add_cuflags("--expt-relaxed-constexpr", {force = true})
-        add_defines("SGLANG_GDN_VENDOR=1")
-        add_includedirs("include", path.join(toolkit, "include"))
-        add_sysincludedirs(tvm_ffi_include)
-        add_linkdirs(tvm_ffi_lib, cute_dsl_lib, gdn_vendor_dir)
-        add_links("tvm_ffi", "cute_dsl_runtime", "gdn_cute_bf16_8_24",
-                  {public = true})
-        add_rpathdirs(tvm_ffi_lib, cute_dsl_lib, {public = true})
-        add_files("src/runtime/backend/gdn_vendor_prefill.cu")
-    target_end()
-    target("sglang_decoder")
-        add_deps("sglang_gdn_vendor")
-        add_defines("SGLANG_GDN_VENDOR=1")
-    target_end()
-end
+target("sglang_decoder")
+    add_deps("sglang_mnnvl_ar")
+    add_defines("SGLANG_MNNVL_AR=1")
+target_end()

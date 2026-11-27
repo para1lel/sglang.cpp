@@ -1,5 +1,5 @@
-#include "sglang/runtime/server/batch_service_state.h"
-#include "sglang/server/batch_trace.h"
+#include "sglang/server/detail/batch_service_state.h"
+#include "sglang/server/detail/batch_trace.h"
 
 #include <algorithm>
 #include <atomic>

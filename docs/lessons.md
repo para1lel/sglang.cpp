@@ -4,11 +4,7 @@ Record verified failures from [session review](../.agents/skills/main-mode/refer
 
 ## L001 · Header placement
 
-**Corrected.** The prefix change put `decoder_prefix_cache.h` in `src/`. Eight other headers were already outside `include/sglang/`. Local includes let the build succeed despite the [documented layout](development.md#scope-at-adoption).
-
-The relocation moved all nine headers under `include/sglang/`. The first gate let an unchanged misplaced header pass when only Markdown was staged.
-
-The [commit gate](../.agents/checks/staged_check.py#L173)<!-- prefix: "def check_he" --> now checks every entry in the selected index. It rejects project headers outside `include/sglang/`. The [retained-header regression](../tests/test_gate_contract.py#L140)<!-- prefix: "def test_hea" --> passed.
+Local includes hid nine project headers outside `include/sglang/`. The first gate missed misplaced headers left unchanged. The current gate checks every indexed entry, even in a doc-only change. [Commit gate](../.agents/checks/staged_check.py#L173)<!-- prefix: "def check_he" --> · [Retained-header regression](../tests/test_gate_contract.py#L140)<!-- prefix: "def test_hea" -->
 
 ## L002 · Remapped KV pages
 
@@ -20,9 +16,7 @@ Keep independent source and destination permutations in KV-copy tests. Compare a
 
 ## L003 · Patch and anchor provenance
 
-**Corrected.** The first prefix candidate left 53 stale or blank code anchors. The prefix docs also needed rebasing after finite EBNF changed their source preimage. Earlier checks covered a different file layout.
-
-Record the exact base, ordered patch hashes, and resulting tree in the handoff. Replay patches on that base and compare the result with the selected tree. Check incoming code links again after overlapping source edits. The selected prefix tree passed the staged maintenance checks after anchor repair.
+A composed patch left stale and blank code anchors after source and layout changes. Record base, ordered patch digests, and resulting tree. Compare the composed tree before qualification and recheck incoming anchors after overlapping source edits. [Frozen review](https://github.com/para1lel/sglang.cpp/blob/a5974ba4eb99bd8e8f890c2e7262a27dbc3aace1/docs/lessons.md#l003--patch-and-anchor-provenance)
 
 ## L004 · Finite-input NaNs in page-parallel GQA
 
@@ -32,11 +26,7 @@ The [merge guard](batch-graphs.md#page-parallel-gqa-decode) sends an affected he
 
 ## L005 · HTTP request parsing on the accept thread
 
-**Corrected.** The cache-enabled listener accepted and parsed requests on one thread. A stalled body held that thread until the read deadline and delayed unrelated controls and completions.
-
-The initial correction used a reader pool. At width one, a CPU loopback regression paused one reader after parsing a complete request. Separate health and completion requests returned HTTP 200. Shutdown joined a held reader and discarded its request. The loopback suite also passed checks for queue overflow, busy reset, cancellation, and cache accounting.
-
-The [current HTTP reader](http-server.md#http-admission-and-shutdown) advances multiple incomplete requests from one poll loop.
+A stalled HTTP body previously blocked health and completions on the accept thread. Check independent HTTP 200 replies with one held reader, then verify shutdown joins the reader and discards its request. The current reader progresses incomplete requests from one poll loop. [Reader contract](http-server.md#http-admission-and-shutdown) · [Frozen regression](https://github.com/para1lel/sglang.cpp/blob/a5974ba4eb99bd8e8f890c2e7262a27dbc3aace1/docs/lessons.md#l005--http-request-parsing-on-the-accept-thread)
 
 ## L006 · FP16 operand loss in split GQA
 
@@ -66,9 +56,7 @@ GPU_UUID="${GPU_UUID:?Set the reserved B200 UUID}" \
 python3 -IB tests/batch/check_graph_evidence.py "$out/singleton" --singleton-only
 ```
 
-Check slot 31, replacement, and injected graph launch failure. The initial Candidate B verifier saw 13 of 17 BF16 rows per arm because it missed four packed-pair rows. The fixed observer recorded packed winner rows and checked subsequent width-two replay. The final verifier matched all 17 complete BF16 rows across eager, graph, and launch-rejection arms. The checkpoint route rerun separately observed zero fused attention launches in each singleton phase. [Historical singleton assertions](https://github.com/para1lel/sglang.cpp/blob/93648269d852e0fee78f7af4d1c3ffe4897aa361/tests/batch/check_graph_evidence.py#L406)<!-- prefix: "def verify_s" -->
-
-The source records are `artifacts/test-accept-a/report.md` for Candidate A, `artifacts/coding-fix-a/report.md` for the Candidate B rebuild and initial verifier, and `artifacts/resume-verifier/evidence/final-check.log` for the final verifier. Candidate B is based on `aa4ec04b63c381cf11fdb4a3801fb925bacb5135`. Its tracked patch SHA-256 is `ba9502803ff42da44100f1e71e4ba37485ca1b7b79b2332f6775dc646beb986d`, and its untracked archive SHA-256 is `565193d94d7a562257733ad810bbab1f60aec7e44513fe8e345cfcfcf6b5e7aa`.
+Check slot 31, replacement, launch rejection, and later width-two replay. Require all 17 complete BF16 rows per arm, including four packed pairs missed by the initial observer. [Frozen observer, checkpoint rerun, and build identities](https://github.com/para1lel/sglang.cpp/blob/a5974ba4eb99bd8e8f890c2e7262a27dbc3aace1/docs/lessons.md#l007--singleton-route-parity)
 
 ## L008 · Buffered tokens suppress SSE keepalives
 
@@ -102,7 +90,7 @@ python3 -IB tests/batch/check_graph_evidence.py "$out/packed-setup" --packed-set
 
 The eligible terminal arm requires two prefill score rows, no decode result, and rejection of later decode and admission. CUPTI must show no launches after the fault and no graph lifecycle calls. The OOM arm requires full BF16 parity with eager, sparse legacy replay after slot reuse, and zero request bytes at cleanup. Ineligible arms require full BF16 parity with their healthy controls and no injection, packed submission, or graph activity. [Terminal assertions](https://github.com/para1lel/sglang.cpp/blob/93648269d852e0fee78f7af4d1c3ffe4897aa361/tests/batch/check_graph_evidence.py#L432)<!-- prefix: "def verify_p" --> · [Eligibility assertions](https://github.com/para1lel/sglang.cpp/blob/93648269d852e0fee78f7af4d1c3ffe4897aa361/tests/batch/check_graph_evidence.py#L453)<!-- prefix: "def verify_p" -->
 
-The independent `artifacts/resume-verifier/packed-fix-accept/report.md` records the terminal, OOM, and eligibility failures and controls. The OOM arm replayed sparse masks `0x5` and `0x6` after cleanup and retired with zero request bytes. The corrected eligibility reruns are in `artifacts/resume-packed-repair/eligibility-fix/report.md`. They identify the corrected source by SHA-256 `05b30ab632f7cd615379ea485126675774dda197b6b767c7ae332135f4460cef`.
+[Frozen terminal, OOM, and eligibility receipts](https://github.com/para1lel/sglang.cpp/blob/a5974ba4eb99bd8e8f890c2e7262a27dbc3aace1/docs/lessons.md#l009--terminal-error-during-first-packed-decode-setup)
 
 ## L010 · Rejected packed winner pin release
 
@@ -112,34 +100,7 @@ The `packed-setup` procedure in [L009](#l009--terminal-error-during-first-packed
 
 ## L011 · Saved benchmark counts concealed mismatched controls
 
-The paired launcher accepted a saved summary when its cohort counts matched,
-before resolving the target GPU. The review reproduced acceptance with an
-unrelated GPU and fixture. Resolve the UUID first, compare the saved process
-receipts and fixed inputs, and require native process evidence before labeling
-a completed run. Keep the published cross-cap results under their own label.
-See the [paired benchmark procedure](../benchmarks/paired/README.md).
-
-The offline regression runs with `python3 -B -m unittest discover -s tests -p test_paired_identity.py`.
-It uses saved-run receipts and the fixed streaming requests and checks that
-unchanged counts cannot hide identity differences.
-
-Archived K4 timing replay can reproduce all medians with an altered `--mtp-steps 0`
-process receipt, or with every recorded native depth-four round reduced to depth
-three. On the reviewed revision, the replay and the launcher's server-info
-predicate also accepted a copied receipt claiming the distinct long split route.
-The live argv and activity checks caught the first two controls. The formal W1
-and W2 rows retain their original live witnesses. [Paired modes and controls](../benchmarks/paired/README.md#matched-k4-timing-protocol)
-
-Record the strict native-versus-vLLM wall-time result separately from campaign
-qualification. Before publishing a new row or using it as a predecessor, bind
-the campaign, workload, frozen request, executable, physical GPU and arm to
-observed argv, dispatch policy and runtime evidence of depth-four activity in
-both engines. Check both bounded and long route state. Treat a missing long-route
-field as disabled only with an identified pre-long source or receipt contract.
-Reproduce a passing archive and keep negative controls for zero depth, missing
-fourth-position activity, wrong row or profile, and long-route substitution.
-The private reproduction and its output are retained in
-`artifacts/session-1122-batch1-review/check-offline-mode.py` and `offline-mode-negative.log`.
+Saved cohort counts and medians hid the wrong device, fixture, or depth, and an altered receipt could claim a different route. Resolve the physical UUID first. Bind row, arm, executable, request and campaign to observed argv, policy, and depth-four activity in both engines. Check bounded and long routes. Require a known pre-long source or receipt before treating an absent long-route field as disabled. Keep passing archive and wrong-row, wrong-profile, zero-depth, missing fourth-position, and long-route substitution controls. Run `python3 -B -m unittest discover -s tests -p test_paired_identity.py`. [Paired protocol](../benchmarks/paired/README.md#matched-k4-timing-protocol) · [Frozen negative controls](https://github.com/para1lel/sglang.cpp/blob/a5974ba4eb99bd8e8f890c2e7262a27dbc3aace1/docs/lessons.md#l011--saved-benchmark-counts-concealed-mismatched-controls)
 
 ## L012 · Manual CUDA launch arguments drifted from the kernel signature
 

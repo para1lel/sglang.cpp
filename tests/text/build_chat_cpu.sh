@@ -32,13 +32,9 @@ if [[ -f "$source/apps/server/batch_cache.cpp" ]]; then
     lmcache_api=(-DSGLANG_TEST_LMCACHE)
 fi
 
-for name in qwen_chat_template qwen_chat_output qwen_tool_constraints qwen_serving_profile \
-    qwen_tool_output; do
-    file="$source/src/runtime/model/$name.cpp"
-    if [[ -f "$file" ]]; then
-        sources+=("$file")
-    fi
-done
+qwen="$source/apps/server/qwen"
+sources+=("$qwen"/{qwen_chat_template,qwen_chat_output,qwen_tool_constraints}.cpp
+          "$qwen"/{qwen_serving_profile,qwen_tool_output}.cpp)
 
 if [[ -f "$source/apps/server/chat_media.cpp" ]]; then
     sources+=("$source/src/media_preprocess.cpp" "$source/src/media_resize.cpp"

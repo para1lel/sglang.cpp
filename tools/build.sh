@@ -40,8 +40,6 @@ exec /usr/bin/env -i HOME="$HOME" PATH=/usr/bin:/bin \
     SGLANG_HOST_ROOT="$base" SGLANG_BUILD_DIR="$output_dir" SGLANG_GPU_INDEX="$gpu_index" \
     SGLANG_GPU_PROBE="$gpu_probe" SGLANG_MXFP8_CHECK="$mxfp8_check" \
     SGLANG_CUTLASS_ARCHIVE="${SGLANG_CUTLASS_ARCHIVE:-}" \
-    SGLANG_FLASHINFER_ROOT="${SGLANG_FLASHINFER_ROOT:-}" \
-    SGLANG_GDN_VENDOR_BUILD="${SGLANG_GDN_VENDOR_BUILD:-}" \
     http_proxy="${http_proxy:-${HTTP_PROXY:-$proxy}}" \
     https_proxy="${https_proxy:-${HTTPS_PROXY:-$proxy}}" all_proxy="$proxy" \
     "$base/bin/pixi" run --manifest-path "$base/pixi.toml" --environment default --as-is \

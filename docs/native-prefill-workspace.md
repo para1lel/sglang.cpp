@@ -4,7 +4,7 @@
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| Decoder prefill | Lay out the arena and lend two scratch spans during GQA. | [Tile layout](../include/sglang/runtime/execution/decoder_prefill_tiles.h#L139)<!-- prefix: "TileBuffers(" --> · [Scratch view](../include/sglang/runtime/execution/decoder_prefill_tiles.h#L162)<!-- prefix: "PairedPrefil" --> |
+| Decoder prefill | Lay out the arena and lend two scratch spans during GQA. | [Tile layout](../include/sglang/runtime/execution/decoder_prefill_tiles.h#L138)<!-- prefix: "TileBuffers(" --> · [Scratch view](../include/sglang/runtime/execution/decoder_prefill_tiles.h#L161)<!-- prefix: "PairedPrefil" --> |
 | Attention dispatch | Stage eligible singleton and four-lane groups. Partial-grant groups can use staged, raw grouped, or per-lane attention. | [Singleton selection](../include/sglang/text/gqa/multirow_prefill.cuh#L35)<!-- prefix: "const bool d" --> · [Grouped dispatch](../src/decoder_prefill.cpp#L363)<!-- prefix: "void prefill" --> |
 | Paired launcher | Check bounds and capture state, then submit predecode and attention on the caller's stream. | [Staged launch](../include/sglang/text/mxfp8_gqa_prefill_paired.cuh#L784)<!-- prefix: "std::optiona" --> |
 
@@ -73,25 +73,25 @@ Each rank allocates 1,022,230,528 transient bytes before submission and frees th
 
 ### Seed scratch
 
-MTP draft seeding uses a full-geometry scratch outside the rank-local tile layout. The draft model runs full geometry on the primary rank. Paired seeding allocates `concatenated` for up to 128 rows and `keys`, `values`, and `rope_keys` for every row of one paired seed launch. Each seeding path throws `runtime_error` when the scratch does not fit the workspace. [Seed scratch](../include/sglang/runtime/execution/decoder_prefill_tiles.h#L126)<!-- prefix: "inline std::" -->
+MTP draft seeding uses a full-geometry scratch outside the rank-local tile layout. The draft model runs full geometry on the primary rank. Paired seeding allocates `concatenated` for up to 128 rows and `keys`, `values`, and `rope_keys` for every row of one paired seed launch. Each seeding path throws `runtime_error` when the scratch does not fit the workspace. [Seed scratch](../include/sglang/runtime/execution/decoder_prefill_tiles.h#L125)<!-- prefix: "inline std::" -->
 
 ### Partial-grant projection groups
 
 The partial-grant planner can pack consecutive complete grants up to 1,024 rows each. The minimum is 256 rows on one rank and 128 rows on two ranks. Each grant must fit its own native tile. A group needs at least two grants and fits at most 4,096 rows. The planner leaves grant order intact. Ungrouped grants use ordinary prefill. [Plan and dispatch](../include/sglang/runtime/execution/decoder_prefill_plan.h#L111)<!-- prefix: "bool execute" -->
 
-The group shares dense projections and MLP work. Uniform 4,096-row groups of eight 512-row or sixteen 256-row grants can also share [RMSNorm and GQA postgate preparation](fp8-prefill-projections.md#attention-output-quantization). [Grouped staged and ordered GQA](ordered-gqa-prefill.md#grouped-partial-grants) and [grouped GDN](gdn-prefill.md#grouped-partial-grants) qualify independently. Other attention and recurrence use per-lane dispatch. Each lane keeps its positions, KV pages, and recurrent state. All work uses the same stream and existing workspace. Draft seeding uses the lane's own rows where applicable. [Layer dispatch](../src/decoder_prefill.cpp#L363)<!-- prefix: "void prefill" --> · [GQA selection](../include/sglang/runtime/execution/decoder_prefill_tiles.h#L877)<!-- prefix: "} else if (p" -->
+The group shares dense projections and MLP work. Uniform 4,096-row groups of eight 512-row or sixteen 256-row grants can also share [RMSNorm and GQA postgate preparation](fp8-prefill-projections.md#attention-output-quantization). [Grouped staged and ordered GQA](ordered-gqa-prefill.md#grouped-partial-grants) and [grouped GDN](gdn-prefill.md#grouped-partial-grants) qualify independently. Other attention and recurrence use per-lane dispatch. Each lane keeps its positions, KV pages, and recurrent state. All work uses the same stream and existing workspace. Draft seeding uses the lane's own rows where applicable. [Layer dispatch](../src/decoder_prefill.cpp#L363)<!-- prefix: "void prefill" --> · [GQA selection](../include/sglang/runtime/execution/decoder_prefill_tiles.h#L822)<!-- prefix: "} else if (p" -->
 
 One arena fits the largest planned group and ordinary tile in the step. The executor reuses it across grants. Eligible TP2 tiles can add [long GQA staging](ordered-gqa-prefill.md#long-serial-tp2-tiles). If no group qualifies or its allocation is unavailable, the executor falls back before submitting grouped work. [Allocation and fallback](../include/sglang/runtime/execution/decoder_prefill_plan.h#L133)<!-- prefix: "PrefillWorks" -->
 
 With `--trace-batches`, `layerwise_prefill_groups` counts the groups,
 `rows` counts their combined rows, and `workspace_bytes` records the
 largest active prefill workspace in the step.
-[Batch trace](../include/sglang/server/batch_trace.h#L46)<!-- prefix: "if (stats.la" -->
+[Batch trace](../include/sglang/server/detail/batch_trace.h#L46)<!-- prefix: "if (stats.la" -->
 
 ### Causal segments within one grant
 
 Whole-tile pairs and complete distinct-grant groups take precedence. A Tensor Core grant with 1,024-row tiles packs four when at least four remain, or three when exactly three remain. Each layer shares projections and MLP work. GDN advances in prompt order. Eligible four-tile groups try [staged same-request GQA](flash-prefill.md#same-request-causal-gqa), even if peer grant sizes differ. Other shapes append and read GQA KV per segment. Ordinary prefill resumes at the first unprocessed row within the same grant.
-[Segment selection](../include/sglang/runtime/execution/decoder_prefill_plan.h#L40)<!-- prefix: "inline Prefi" --> · [GQA selection](../include/sglang/runtime/execution/decoder_prefill_tiles.h#L876)<!-- prefix: "if (prefill_" --> · [GDN order](../src/decoder_prefill.cpp#L437)<!-- prefix: "prefill_part" --> · [Native remainder](../include/sglang/runtime/execution/decoder_prefill_plan.h#L163)<!-- prefix: "if (offset \u003c" -->
+[Segment selection](../include/sglang/runtime/execution/decoder_prefill_plan.h#L40)<!-- prefix: "inline Prefi" --> · [GQA selection](../include/sglang/runtime/execution/decoder_prefill_tiles.h#L821)<!-- prefix: "if (prefill_" --> · [GDN order](../src/decoder_prefill.cpp#L437)<!-- prefix: "prefill_part" --> · [Native remainder](../include/sglang/runtime/execution/decoder_prefill_plan.h#L163)<!-- prefix: "if (offset \u003c" -->
 
 Causal segments reuse the same arena sizing and allocation fallback. Unexpected CUDA errors propagate.
 
@@ -103,11 +103,11 @@ Eager TP2 fuses reduction, RMSNorm, and E4M3 quantization for 4,096-row Tensor C
 
 Both streams record projection-ready events before either waits for its peer. Each rank reads both projections and rounds their sum to BF16 before residual addition, normalization, and quantization. Both streams record read-complete events before either can reuse its projection buffer. Static review confirmed that submission errors synchronize both streams and prioritize terminal CUDA status. [Event ordering](../src/runtime/execution/decoder_prefill_workspace.cpp#L335)<!-- prefix: "bool Prefill" --> · [BF16 sum](../include/sglang/text/quantization/prefill_rms_vector.cuh#L28)<!-- prefix: "__device__ _" --> · [Error handling](../src/runtime/execution/decoder_prefill_workspace.cpp#L367)<!-- prefix: "check(termin" -->
 
-A bounded HTTP audit replayed two cold 32,768-token requests to six output tokens each. Median summed prefill advance fell from 928.239 to 896.783 ms. Output IDs matched, and all 401 ranked state records matched bitwise across 1,948,759,040 bytes. A separate CUDA trace replaced 1,016 of 1,024 NCCL epochs. Median time from the last projection to both next kernels fell from 134.974 to 89.727 µs. The full W4 makespan remains unmeasured for this change. See `artifacts/tp2-resume/prefill-transport-bc6cce91/` (`serving-final-audit-comparison.json`, `serving-final-trace-comparison.json`).
+[Frozen two-lane W4 prefix and rank-state audit](https://github.com/para1lel/sglang.cpp/blob/a5974ba4eb99bd8e8f890c2e7262a27dbc3aace1/docs/native-prefill-workspace.md#tp2-causal-prefill-reduction-fusion)
 
 ## Verification
 
-The `decoder-batch-plan-check` CPU target checks decode reservations, MTP budget clipping, prompt order, slot reuse, and full occupancy. Enable it with `xmake f --decoder-batch-plan-check=y`. [Planner assertions](../tests/decoder/decoder_batch_plan_check.cpp#L24)<!-- prefix: "void check_d" --> · [Planner target](../xmake.lua#L321)<!-- prefix: "target(\"deco" -->
+The `decoder-batch-plan-check` CPU target checks decode reservations, MTP budget clipping, prompt order, slot reuse, and full occupancy. Enable it with `xmake f --decoder-batch-plan-check=y`. [Planner assertions](../tests/decoder/decoder_batch_plan_check.cpp#L24)<!-- prefix: "void check_d" --> · [Planner target](../xmake.lua#L317)<!-- prefix: "target(\"deco" -->
 
 On one reserved B200, replay checkpoint Q, MXFP8 payloads and scales, and remapped pages. Compare full BF16 output with raw paired and archived wide Flash. Cover both bounds, nonzero page offsets, a short tail, masks, invalid full- and partial-page V, and repair.
 
@@ -125,50 +125,32 @@ Check whole-tile pairs at both lane offsets, including mixed, partial, and split
 
 With the 32,768-row budget, check four 8,192-row grants and equal grants with distinct restored starts. Compare scores, target and draft KV and scales, GDN carry and history, hidden, residual, and IDs. Cover unequal grants and mixed decode. Deny 4,096-row workspace at and above the 8,192-row pair limit. Check paired fallback at the limit, causal and ordinary fallback above it, and recovery. Record groups and active and retained GPU memory.
 
-Historical K0 pairing used reduced-output W4. W3 exercised no pairs. W5 and W6 used host replay. Check grant sizes and admission/decode overlap before attributing serving gains to pairing. [Historical pairing evidence](https://github.com/para1lel/sglang.cpp/blob/4dd8c887c278c67744ed80e7feb2a825a92197a2/docs/native-prefill-workspace.md#verification)
+Check grant sizes and admission/decode overlap before attributing serving gains to pairing. [Frozen K0 pairing controls](https://github.com/para1lel/sglang.cpp/blob/4dd8c887c278c67744ed80e7feb2a825a92197a2/docs/native-prefill-workspace.md#verification)
 
 ### TP2 paired prefill replay
 
-On B200s 0/6, five warm direct trials per arm gave medians of 206.956 ms ordinary and 159.788 ms grouped. Actual pressure on either rank preserved first tokens. Transient pools used and reserved zero bytes after synchronization. See `artifacts/tp2-resume/w2-group-audit/direct.RtENIMZH/`.
-
-Direct replay matched 455,028,608 state bytes, 2,483,200 BF16 first-logit values, and 64 continuation IDs with proposal and acceptance histories. Seven ranked-cache HTTP phases also matched, including 16 rank 0 draft objects. Earlier altered FC changed 233,046 of 8,646,528 draft bytes despite matching target GQA and GDN. See `artifacts/tp2-resume/w2-group-audit/` (`direct.RtENIMZH/candidate/state.log`, `http.mZP03dnI/comparison.json`, `state.6XeMtH/candidate.log`). Official W2 makespan for this release remains unmeasured.
+Compare both ranks’ state and first-token logits, proposal and acceptance histories, and ranked cache objects including rank 0 draft data. Force allocation pressure on each rank. Require reference first tokens and zero used and reserved transient pool bytes after synchronization. [Frozen direct and ranked HTTP replays](https://github.com/para1lel/sglang.cpp/blob/a5974ba4eb99bd8e8f890c2e7262a27dbc3aace1/docs/native-prefill-workspace.md#tp2-paired-prefill-replay)
 
 ### TP2 grouped RMSNorm replay
 
-On B200s 0/6, five paired direct W4 tile trials saved a median 1.519 ms per 4,096-row tile. Each rank omitted 80 of 128 normalized BF16 stores. An independent replay matched 30 teacher score entries and five full tensor samples per rank, including forced FP8 projection fallback. W4 HTTP makespan remains unmeasured. See `artifacts/tp2-resume/w4-rms-quant/production/tile-0-6.log` and `artifacts/tp2-resume/w4-rms-vector-review/probe-final-0-6.log`.
+Compare BF16 and quantized tensors and teacher scores on both ranks, including forced FP8 projection fallback. [Frozen two-B200 tile replay](https://github.com/para1lel/sglang.cpp/blob/a5974ba4eb99bd8e8f890c2e7262a27dbc3aace1/docs/native-prefill-workspace.md#tp2-grouped-rmsnorm-replay)
 
 ### TP2 causal GQA operator replay
 
-On one B200, the native and prior staged readers matched all 12,582,912 BF16 outputs per W5 rank shard, including replay. Q and KV inputs matched. At 8,192 visible tokens, medians fell from 489 µs per rank to 427/421 µs. At 32,768, they fell from 1,904/1,900 to 1,478/1,465 µs. W4 captures at 32,768 matched bitwise and took 20–22% less time across four GQA layers. W4 and W5 serving remain unmeasured. See `artifacts/tp2-resume/native-long-gqa/` (`candidate-final-gpu0.log`, `candidate-w4-max-gpu0.log`, `decode-review/bench-gpu4.log`).
-
-A separate one-B200 probe used 4,096 rows with 12 Q and 2 KV heads. Cold preprocessing and gate plus quantization fell from 196 to 109 µs, excluding attention and output projection. Eight full planes matched at 0, 1,171, and 4,096 reused rows, covering rotated Q/K, KV payloads and scales, and activation codes and scales. See `artifacts/tp2-resume/native-causal-fuse/probe-ordered.log`.
-
-The integrated caller used two logical ranks on one B200 and traced collectives in place of launches. All 20 full-plane digests matched the baseline across 12Q/2KV and 24Q/4KV. They cover rotated Q/K, activation codes and scales, projected outputs, and both owners’ KV planes. Injected staged-reader and epilogue errors propagated. See `artifacts/tp2-resume/native-causal-integrated/hardware-gpu0.log` and paired results. Serving remains unmeasured.
+Compare BF16 staged-reader outputs across both rank shards with fixed Q and KV, including eager and replay. Compare rotated Q/K, KV planes and scales, activation codes and scales, and projection output. Check zero and nonzero already-visible rows and propagate injected staged-reader and epilogue errors. [Frozen W4/W5 shard, preprocessing, and caller probes](https://github.com/para1lel/sglang.cpp/blob/a5974ba4eb99bd8e8f890c2e7262a27dbc3aace1/docs/native-prefill-workspace.md#tp2-causal-gqa-operator-replay)
 
 ### TP2 grouped gate/up replay
 
-The [native 4,096-row gate/up route](fp8-prefill-projections.md#large-prefill-tiles) matched every BF16 output for checkpoint layers 0, 3, and 32 on both rank shards. With captured W4 activations on one B200, median operator time fell from 356.736 to 314.432 µs for rank 0 and from 356.288 to 314.240 µs for rank 1.
-
-Warm direct priming on two B200s used one 32,768-token W4 prompt in eight 4,096-row groups. Time fell from 1,087.120 to 1,058.156 ms (2.66%). Both arms matched rank hidden and residual state, token IDs, and acceptance. HTTP makespan remains unmeasured. See `artifacts/tp2-resume/native-prefill-gate/` (`gpu-0.jI3uJ3/rank-{0,1}.log`, `prime-4-5.dYtCZR/prime-{0,4}.log`).
+Compare full BF16 outputs of [4,096-row gate/up](fp8-prefill-projections.md#large-prefill-tiles) on both shards, then compare hidden and residual state, IDs, and acceptance after direct W4 priming. [Frozen operator and caller replay](https://github.com/para1lel/sglang.cpp/blob/a5974ba4eb99bd8e8f890c2e7262a27dbc3aace1/docs/native-prefill-workspace.md#tp2-grouped-gateup-replay)
 
 ### TP2 packed QKV replay
 
-On two B200s, 12 paired warm direct 8,192-token replays used two 4,096-row grants. Arm medians were 201.991 and 199.278 ms. The paired median saving was 2.587 ms, with 11 wins. Checks matched both ranks’ state at 8,192 and 8,207 tokens, 16 continuation IDs and MTP accounting, and 248,320 BF16 prompt logits. W4 and W5 makespan remain unmeasured. See `artifacts/tp2-resume/long-gemm/qkv-e912/receipts/` (`mesh.9ewqzG/timing.txt`, `mesh.7LWIWX/ab.log`).
+Compare BF16 logits, both rank states, and MTP continuation after two 4,096-row grants. [Frozen two-B200 direct replay](https://github.com/para1lel/sglang.cpp/blob/a5974ba4eb99bd8e8f890c2e7262a27dbc3aace1/docs/native-prefill-workspace.md#tp2-packed-qkv-replay)
 
 ### TP2 grouped attention output replay
 
-The [native 3,072-input route](fp8-prefill-projections.md#large-prefill-tiles) matched all BF16 outputs in early and late W4/W5 captures, covering both rank shards at checkpoint layers 0, 3, and 32. Eager, graph, and clean fallback comparisons matched.
-
-Warm direct eager priming on two B200s for one 32,768-token W4 prompt fell from 999.533 to 981.236 ms. ABBA and BAAB gave four observations per arm. Sampled rank hidden and residual state, token IDs, and MTP acceptance matched. For W5 at 131,072 tokens, the single unpaired observation per arm matched caller state and tokens. W4 HTTP makespan remains unmeasured. See `artifacts/tp2-resume/native-prefill-output/receipt.txt`.
+Compare full BF16 outputs of the [3,072-input route](fp8-prefill-projections.md#large-prefill-tiles) on early and late W4/W5 rank captures. Check eager, graph, and clean fallback, plus hidden and residual state, IDs, and acceptance at the caller. [Frozen operator and direct priming replays](https://github.com/para1lel/sglang.cpp/blob/a5974ba4eb99bd8e8f890c2e7262a27dbc3aace1/docs/native-prefill-workspace.md#tp2-grouped-attention-output-replay)
 
 ### TP2 long down projection replay
 
-The [CUTLASS down route](fp8-prefill-projections.md#large-prefill-tiles) replayed each rank shard separately on a single B200 using Qwen3.8-27B-FP8 checkpoint layers 0, 3, and 32 and fixed synthetic input activations. Eight alternating CUDA-event trials measured warm graph replay per layer from residual reset and RMSNorm through gate/up, SwiGLU, and down, including scale preparation. Eager compared all three layers, and graph replay compared layer 32. BF16 down outputs, SwiGLU E4M3 values, and FP32 scales matched bitwise.
-
-| Rows | Rank shard | Native median (µs) | CUTLASS median (µs) |
-| ---: | ---: | ---: | ---: |
-| 4,096 | 0 | 730.556 | 691.593 |
-| 4,096 | 1 | 730.008 | 686.147 |
-| 1,024 | 1 | 202.757 | 192.767 |
-
-The forced fallback linked the pre-change archive and required the scaled launcher to decline. At 4,096 rows, its medians were within 2.765 µs of native on both shards, with bitwise parity. The shape guard also declined 1,004 rows on rank 1, with native and fallback medians of 204.579 and 205.278 µs and bitwise parity. See `artifacts/tp2-resume/long-gemm/receipts/` (`summary.json`, `ab-*-down-only.log`, `ab-*-down-control.log`). W4 and W5 serving makespan remain unmeasured for this route.
+Compare BF16 down outputs, E4M3 SwiGLU values, and FP32 scales bitwise in eager, replay, and forced fallback. Use 4,096 and 1,024 rows, and test the 1,004-row shape decline. Time from residual reset and RMSNorm through down projection, including scale preparation. [Frozen rank inputs, timing, and fallback receipts](https://github.com/para1lel/sglang.cpp/blob/a5974ba4eb99bd8e8f890c2e7262a27dbc3aace1/docs/native-prefill-workspace.md#tp2-long-down-projection-replay)

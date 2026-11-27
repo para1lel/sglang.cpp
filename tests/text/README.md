@@ -174,7 +174,7 @@ split into two chunks, and seeded random chunks. It also checks cancellation.
 
 ```bash
 "${CXX:-c++}" -std=c++17 -O2 -pthread -Iinclude \
-    tests/text/chat_output_chunks.cpp src/runtime/model/qwen_chat_output.cpp \
+    tests/text/chat_output_chunks.cpp apps/server/qwen/qwen_chat_output.cpp \
     "$build/lib/libsglang_tokenizer.a" "$build/lib/libsglang_json.a" \
     -o "$out/chat-output-chunks"
 "$out/chat-output-chunks" "$checkpoint/tokenizer.json"

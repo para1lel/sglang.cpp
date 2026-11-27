@@ -10,7 +10,6 @@
 #include "sglang/runtime/execution/decoder_prefill_plan.h"
 #include "sglang/text/decoder_logprobs.h"
 #include "sglang/text/gdn_local.h"
-#include "sglang/runtime/backend/gdn_vendor_prefill.h"
 #include "sglang/text/prefill_attn_sm100.h"
 
 #include <algorithm>
@@ -111,7 +110,7 @@ struct PrefillDims {
         return GqaGeometry{q_width / mxfp8_head_dim, kv_width / mxfp8_head_dim};
     }
     std::size_t gdn_workspace_bytes(int rows) const {
-        return is_local_gdn() ? gdn_vendor_prefill_workspace_bytes(rows)
+        return is_local_gdn() ? text_gdn_local_workspace_bytes(rows)
                               : text_gdn_workspace_bytes(rows);
     }
 };
@@ -301,15 +300,6 @@ struct Chunk : PrefillProjections {
         auto* scratch = chunked_recurrence ? work.mlp_gate : nullptr;
         const auto scratch_bytes = rows * dims.intermediate * sizeof(Bf16);
         const bool local = dims.is_local_gdn();
-        if (quantized.values && local && gdn_vendor_prefill_enabled() &&
-            gdn_vendor_prefill_eligible_rows(rows)) {
-            const auto status = gdn_vendor_prefill_local_fp8(
-                rows, work.gdn_qkv, work.gdn_z, work.gdn_b, work.gdn_a, layer.recurrent,
-                state, work.gdn_scratch, dims.gdn_workspace_bytes(rows), gates, quantized,
-                stream);
-            check(status, "Advance and quantize prefill Gated DeltaNet (vendor)");
-            return;
-        }
         if (quantized.values) {
             const auto status = local
                 ? tensor_core_prefill_gdn_local(rows, work.gdn_qkv, work.gdn_z, work.gdn_b,
@@ -320,14 +310,6 @@ struct Chunk : PrefillProjections {
                                           layer.recurrent, state, work.gdn_scratch, gates,
                                           quantized, stream, scratch, scratch_bytes);
             check(status, "Advance and quantize prefill Gated DeltaNet");
-            return;
-        }
-        if (local && gdn_vendor_prefill_enabled() && gdn_vendor_prefill_eligible_rows(rows)) {
-            const auto status = gdn_vendor_prefill_local(
-                rows, work.gdn_qkv, work.gdn_z, work.gdn_b, work.gdn_a, layer.recurrent,
-                state, work.gdn_scratch, dims.gdn_workspace_bytes(rows), gates,
-                work.attention, stream);
-            check(status, "Advance prefill Gated DeltaNet (vendor)");
             return;
         }
         const auto status = tensor_core_fp8
@@ -701,29 +683,6 @@ inline void prefill_group_gdn(const Chunk& chunk, const GdnLayer& layer, int ban
                               const PrefillGrant* grants, int count, int offset) {
     const auto& buffers = chunk.work;
     const auto& dims = buffers.dims;
-    if (dims.is_local_gdn() && chunk.tensor_core_fp8 && gdn_vendor_prefill_enabled()) {
-        bool eligible = true;
-        each_prefill_segment(grants, count, offset, [&](const PrefillGrant& grant, int) {
-            eligible = eligible && gdn_vendor_prefill_eligible_rows(grant.rows);
-        });
-        if (eligible) {
-            each_prefill_segment(grants, count, offset, [&](const PrefillGrant& grant, int row) {
-                const auto segment = buffers.attention_segment(row);
-                const TextFp8Activation fp8{
-                    buffers.activation.values + std::size_t(row) * dims.gdn_value_width,
-                    buffers.activation.scales + std::size_t(row) * dims.gdn_heads,
-                };
-                const auto status = gdn_vendor_prefill_local_fp8(
-                    grant.rows, segment.gdn_qkv, segment.gdn_z, segment.gdn_b, segment.gdn_a,
-                    layer.recurrent, grant.request->states[bank],
-                    buffers.gdn_scratch,
-                    dims.gdn_workspace_bytes(grant.rows),
-                    reinterpret_cast<float2*>(segment.keys), fp8, chunk.stream);
-                check(status, "Advance grouped prefill Gated DeltaNet (vendor)");
-            });
-            return;
-        }
-    }
     GdnPrefillSegment segments[max_gdn_prefill_segments]{};
     bool grouped_recurrence = count > 1;
     int index = 0;
@@ -804,8 +763,6 @@ inline void prefill_partial_gdn(const Chunk& chunk, const GdnLayer& layer, int b
         std::size_t(dims.gdn_heads) * sizeof(float2)) {
         throw std::logic_error("Prefill key buffer too narrow for Gated DeltaNet gates");
     }
-    const bool vendor =
-        chunk.tensor_core_fp8 && dims.is_local_gdn() && gdn_vendor_prefill_enabled();
     int index = 0;
     int row = 0;
     while (index < count) {
@@ -817,22 +774,10 @@ inline void prefill_partial_gdn(const Chunk& chunk, const GdnLayer& layer, int b
             ++run;
         }
         const int rows = run * first.rows;
-        if (vendor && activation.values && gdn_vendor_prefill_eligible_rows(rows)) {
-            const auto segment = prefill_attention_segment(chunk, first, row);
-            const TextFp8Activation quantized{
-                activation.values + std::size_t(row) * dims.gdn_value_width,
-                activation.scales + std::size_t(row) * dims.gdn_heads,
-            };
-            check(gdn_vendor_prefill_local_fp8(
-                      rows, segment.work.gdn_qkv, segment.work.gdn_z, segment.work.gdn_b,
-                      segment.work.gdn_a, layer.recurrent, first.request->states[bank],
-                      chunk.work.gdn_scratch, dims.gdn_workspace_bytes(rows),
-                      reinterpret_cast<float2*>(segment.work.keys), quantized, chunk.stream),
-                  "Advance prefill Gated DeltaNet (vendor)");
-        } else if (!vendor && activation.values && chunk.tensor_core_fp8 && dims.is_local_gdn() &&
-                   count == 4 && run == 4 && rows == grouped_prefill_max_rows &&
-                   first.rows == batch_prefill_tile_rows && !first.media &&
-                   first.position % batch_prefill_tile_rows == 0) {
+        if (activation.values && chunk.tensor_core_fp8 && dims.is_local_gdn() &&
+            count == 4 && run == 4 && rows == grouped_prefill_max_rows &&
+            first.rows == batch_prefill_tile_rows && !first.media &&
+            first.position % batch_prefill_tile_rows == 0) {
             const bool ordered_first = bank == 0 && first.position == 0;
             if (ordered_first) {
                 const auto segment = prefill_attention_segment(chunk, first, row);

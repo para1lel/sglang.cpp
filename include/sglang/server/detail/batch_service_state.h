@@ -1,10 +1,9 @@
 #pragma once
 
 #include "sglang/server/batch_service.h"
-
+#include "sglang/server/detail/output_mailbox.h"
 #include "sglang/runtime/execution/batch_admission_order.h"
 #include "sglang/server/indexed_admission.h"
-#include "sglang/server/output_mailbox.h"
 #include "sglang/server/text_stop.h"
 
 #include <atomic>

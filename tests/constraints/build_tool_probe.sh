@@ -16,23 +16,12 @@ for name in "${server_units[@]}"; do
     fi
 done
 
-for name in qwen_chat_template qwen_chat_output qwen_tool_constraints qwen_serving_profile; do
-    path="$source_dir/src/runtime/model/$name.cpp"
-    if [[ -f "$path" ]]; then
-        sources+=("$path")
-    fi
-done
-
-source_options=()
-profile_header="$source_dir/include/sglang/runtime/model/serving_profile.h"
-if [[ -f "$profile_header" ]]; then
-    source_options=(-DSGLANG_TOOL_PROBE_SERVING_PROFILE)
-elif [[ -n ${CONDA_PREFIX:-} ]]; then
-    source_options=(-isystem "$CONDA_PREFIX/targets/x86_64-linux/include")
-fi
+qwen="$source_dir/apps/server/qwen"
+sources+=("$qwen"/{qwen_chat_template,qwen_chat_output,qwen_tool_constraints}.cpp
+          "$qwen/qwen_serving_profile.cpp")
 
 "${CXX:-c++}" -std=c++17 -O2 -pthread -Wall -Wextra -Wpedantic -Werror \
-    -ffunction-sections -fdata-sections -I"$source_dir/include" "${source_options[@]}" \
+    -ffunction-sections -fdata-sections -I"$source_dir/include" \
     "$probe_dir/tool_probe.cpp" "${sources[@]}" "$source_dir/src/media/multimodal_prompt.cpp" \
     "$build_dir/lib/libsglang_media_preprocess.a" "$build_dir/lib/libsglang_tokenizer.a" \
     "$build_dir/lib/libsglang_json.a" -Wl,--gc-sections,--no-undefined -o "$output"

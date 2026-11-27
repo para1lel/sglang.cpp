@@ -1,6 +1,6 @@
 #pragma once
 
-#include "sglang/runtime/model/serving_profile.h"
+#include "sglang/server/serving/serving_profile.h"
 #include "sglang/tokenizer/tokenizer.h"
 
 #include <list>

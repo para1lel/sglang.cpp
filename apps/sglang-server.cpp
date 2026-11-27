@@ -2,8 +2,6 @@
 #include "sglang/decoder_batch.h"
 #include "sglang/json.h"
 #include "sglang/runtime/backend/cuda_backend_policy.h"
-#include "sglang/runtime/backend/gdn_vendor_prefill.h"
-#include "sglang/runtime/model/qwen_serving_profile.h"
 #include "sglang/runtime/server/cache_identity.h"
 #include "sglang/runtime/server/single_device_batch_executor.h"
 #include "sglang/server/batch_service.h"
@@ -16,6 +14,7 @@
 #include "sglang/server/responses.h"
 #include "sglang/server/score.h"
 #include "sglang/server/tokenization.h"
+#include "sglang/server/serving/qwen_serving_profile.h"
 #include "sglang/server/vision_completion.h"
 
 #include <algorithm>
@@ -355,28 +354,22 @@ std::unique_ptr<BatchService> make_batch_service(const Arguments& arguments,
         arguments.max_num_batched_tokens, !arguments.eager};
     auto executor = std::make_unique<SingleDeviceBatchExecutor>(decoder, batch_options);
     std::vector<std::array<std::uint8_t, 16>> rank_devices;
-    std::vector<int> rank_cuda_devices;
     if (arguments.lmcache_enabled && arguments.tensor_parallel > 1) {
         const auto* topology = decoder.tensor_parallel_info();
         if (!topology || topology->world_size != arguments.tensor_parallel) {
             throw std::runtime_error("Tensor-parallel cache requires rank device receipts");
         }
         rank_devices.reserve(static_cast<std::size_t>(arguments.tensor_parallel));
-        rank_cuda_devices.reserve(static_cast<std::size_t>(arguments.tensor_parallel));
         for (int rank = 0; rank < arguments.tensor_parallel; ++rank) {
             std::array<std::uint8_t, 16> uuid{};
             std::memcpy(uuid.data(), topology->ranks[rank].uuid, uuid.size());
             rank_devices.push_back(uuid);
-            rank_cuda_devices.push_back(topology->ranks[rank].cuda_device);
         }
     }
     auto cache = arguments.lmcache_enabled && rank_devices.empty()
         ? std::make_unique<sglang::decoder::LmCacheClient>(arguments.lmcache) : nullptr;
-    const auto recurrence_tag = sglang::decoder::gdn_vendor_prefill_identity_tag(
-        rank_cuda_devices.empty() ? nullptr : rank_cuda_devices.data(),
-        static_cast<int>(rank_cuda_devices.size()));
     const auto identity = arguments.lmcache_enabled
-        ? sglang::server::cache_identity(arguments.checkpoint, recurrence_tag)
+        ? sglang::server::cache_identity(arguments.checkpoint)
         : std::string{};
     std::unique_ptr<BatchService> service;
     if (rank_devices.empty()) {

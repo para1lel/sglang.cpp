@@ -50,15 +50,15 @@ Ranked records live in per-rank key domains that name the world size, rank, KV h
 
 A ranked lookup asks every rank for its matched lengths and endpoint inventory. The group takes the minimum matched GQA and GDN lengths. It picks the largest GDN endpoint present on every rank, draft-eligible on the draft lane when a draft is requested. A truncated inventory reply is refused. [Composite lookup](../../src/runtime/cache/lmcache_group.cpp#L87)<!-- prefix: "PrefixCacheR" -->
 
-A ranked restore drives one transfer per rank and reports completion only when every rank completes. Byte receipts sum across ranks, and restored tokens are counted once. The serving cache service constructs the ranked group when serving under two ranks. [Ranked restore](../../src/runtime/cache/lmcache_group.cpp#L152)<!-- prefix: "LmCacheStatu" --> · [Group construction](../../apps/server/batch_cache.cpp#L311)<!-- prefix: "group = std:" -->
+A ranked restore drives one transfer per rank and reports completion only when every rank completes. Byte receipts sum across ranks, and restored tokens are counted once. The serving cache service constructs the ranked group when serving under two ranks. [Ranked restore](../../src/runtime/cache/lmcache_group.cpp#L152)<!-- prefix: "LmCacheStatu" --> · [Group construction](../../apps/server/batch_cache.cpp#L312)<!-- prefix: "group = std:" -->
 
 ## Cache identity and vendor isolation
 
 Each request's key domain embeds a checkpoint identity: a SHA-256 over `config.json`, the safetensors index, and every safetensors file's stat data. [Checkpoint identity](../../include/sglang/runtime/server/cache_identity.h#L43)<!-- prefix: "inline std::" --> · [Request domain](../../apps/server/batch_service_cache.cpp#L24)<!-- prefix: "std::string " -->
 
-Two-rank serving with the GDN vendor prefill opt-in active adds a vendor recurrence tag to that identity whenever at least one listed rank runs on supported hardware; the tag carries an ordered per-rank support mask. Zero eligible ranks keep the identity unchanged, preserving existing keys. The opt-in unset, set to another value, or in a build without the vendor asset also leaves the identity unchanged. TP1 never applies the tag. [Vendor tag](../../src/runtime/backend/gdn_vendor_prefill.cu#L479)<!-- prefix: "std::string " --> · [Tag selection](../../apps/sglang-server.cpp#L375)<!-- prefix: "const auto r" --> · [No-asset build](../../src/runtime/backend/cuda_backend_policy.cpp#L45)<!-- prefix: "std::string " -->
+Current native ranked keys use the checkpoint identity without a recurrence tag. [Frozen vendor recurrence tag behavior](https://github.com/para1lel/sglang.cpp/blob/a5974ba4eb99bd8e8f890c2e7262a27dbc3aace1/docs/serving/lmcache.md#cache-identity-and-vendor-isolation)
 
-Before isolation, opt-in runs left unlabelled records under the shared native domain. Operators who ran that opt-in against persistent daemons should drain and reset both rank daemons, or move both ranks to one fresh daemon namespace, before reusing native keys. Deployments where only native mode ever wrote need no reset. Changing the per-request cache salt does not migrate a namespace. [Reset controls](../prefix-cache.md#native-http-controls)
+If an older vendor opt-in wrote untagged records to persistent daemons, drain and reset both daemons or use a fresh namespace on both ranks before reusing native keys. A per-request cache salt leaves the namespace unchanged. [Reset controls](../prefix-cache.md#native-http-controls)
 
 ## Standalone verification
 

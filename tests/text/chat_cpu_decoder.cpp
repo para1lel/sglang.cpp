@@ -2,6 +2,7 @@
 #ifdef SGLANG_TEST_BACKEND_POLICY
 #include "sglang/runtime/backend/cuda_backend_policy.h"
 #endif
+#include "sglang/runtime/backend/tp_ar_counters.h"
 #include "sglang/server/vision_completion.h"
 #include "sglang/tokenizer/tokenizer.h"
 
@@ -275,6 +276,10 @@ const decoder::TpRuntimeInfo* Decoder::tensor_parallel_info() const {
 
 Decoder::Decoder(const std::filesystem::path&, int, bool) {}
 Decoder::~Decoder() = default;
+
+decoder::TpArCounters Decoder::tp_ar_counters() const {
+    return {};
+}
 
 std::string_view Decoder::accelerator_name() const {
     return {};

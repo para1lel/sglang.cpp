@@ -4,7 +4,7 @@
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| CUDA backend policy | Chooses the B200 split-KV policy or the generic SM100 path. | [Device policy](../src/runtime/backend/cuda_backend_policy.cpp#L18)<!-- prefix: "const bool b" --> |
+| CUDA backend policy | Chooses the B200 split-KV policy or the generic SM100 path. | [Device policy](../src/runtime/backend/cuda_backend_policy.cpp#L17)<!-- prefix: "const bool b" --> |
 | Batch executor | Selects direct decode lanes, binds scores and request state, and owns graph and scratch lifetimes. | [Batch selection](../src/decoder_batch.cpp#L373)<!-- prefix: "run = run_de" --> · [Graph dispatch](../src/text/decoder_graph.cpp#L83)<!-- prefix: "DecodeRun ru" --> · [Score allocation](../src/runtime/backend/cuda_resources.cpp#L509)<!-- prefix: "ExactGqaWork" --> |
 | Target attention | Appends KV, reads each row's causal prefix, and gates the attention output before projection. | [Eager attention](../include/sglang/runtime/execution/decoder_forward_layers.h#L840)<!-- prefix: "if (batch.ta" --> · [Bound singleton](../include/sglang/runtime/execution/decoder_forward_layers.h#L716)<!-- prefix: "if (batch.ta" --> · [Bound verification](../include/sglang/runtime/execution/decoder_forward_layers.h#L736)<!-- prefix: "inline void " --> |
 
@@ -78,25 +78,17 @@ A clean device, shared-memory, or tensor-map setup decline sends the selected ro
 
 ### W3 shared-KV operator probe
 
-Each case ran on one B200 with 12Q/2KV, BF16 queries, and MXFP8 KV, using eight warmups and 40 timed samples. At initial visible lengths 8,192, 8,704, and 9,216, median stream times for two 20-row split calls were 106.18, 116.45, and 115.71 µs. The eight-group TMA reader and combine took 69.44, 72.42, and 72.13 µs, respectively. The upper edge ran on a separate B200. At 10,236 visible tokens for the first row and 10,240 for the fifth, the split calls took 126.82 µs and the TMA route took 77.41 µs. Median host enqueue time rose in all four cases, from 8.93 to 10.85 µs at the upper edge.
-
-Across 122,880 output values per case, the largest absolute difference between reader outputs was 0.000488. Against 3,072 independent FP64 values per case, the maximum absolute error was 0.000122 for TMA and 0.000153 for split. Evidence is in `artifacts/tp2-resume/w3-probe/run.log` and `artifacts/tp2-resume/w3-probe/edge.log`.
-
-The focused route test passed at both position bounds, rejected the adjacent out-of-band cases and ineligible waves, and exercised the existing 32,768 suffix route. See `artifacts/tp2-resume/w3-probe/route-check.log`. [Route cases](../tests/decoder/long_decode_routes.cpp#L332)<!-- prefix: "void check_m" -->
-
-The operator probe timed raw attention, including split and combine, on one rank. The [historical W3 campaign](serving/tp2.md#campaign-record) measured 4,918.77 ms native makespan on release `168fdb1a`. The candidate's makespan and serving correctness remain unverified.
+Check both position bounds, adjacent declines, ineligible waves, and the 32,768-token suffix route. Compare BF16 output and independent FP64 at fixed Q and KV. Time reader plus combine separately from enqueue. [Route cases](../tests/decoder/long_decode_routes.cpp#L332)<!-- prefix: "void check_m" --> · [Frozen B200 shapes, errors, and timings](https://github.com/para1lel/sglang.cpp/blob/a5974ba4eb99bd8e8f890c2e7262a27dbc3aace1/docs/singleton-gqa-decode.md#w3-shared-kv-operator-probe)
 
 ### W4 18-split operator probe
 
 The focused B200 route test checked reader and combine order and launch geometry at both W4 bounds. It verified 16-split selection for 79 rows and for a sequence just below or above the band, with one ordinary row below the band. It also checked nonconsecutive positions, graph binding, and a constrained sequence. The W3 route test passed on the same build. [W4 route cases](../tests/decoder/long_decode_routes.cpp#L304)<!-- prefix: "void check_m" --> · [Launch checks](../tests/decoder/long_decode_routes.cpp#L703)<!-- prefix: "static void " -->
 
-At first visible lengths 32,769, 34,817, and 36,864, the 18-split reader differed from two eight-request 16-split reads by at most 0.000122 across 245,760 BF16 output values per case. Both paths had at most 0.000061 absolute error against 3,072 independent FP64 values per case. Each row wrote into the 18-split tail and preserved the surrounding scratch sentinels. See `artifacts/tp2-resume/w4-reader-review/release-final-gpu.log`.
-
-A separate one-B200 probe timed one full 80-row reader and combine in each arm. With eight warmups and 40 paired samples, median stream times at those three lengths fell from 291.65 to 273.92 µs, 303.30 to 284.96 µs, and 315.97 to 295.39 µs. The probe measured rank-local operator latency. W4 serving makespan and output parity remain unmeasured for this change. See `artifacts/tp2-resume/w4-reader-review/numeric-timing.log`.
+Compare 18- and 16-split readers against FP64 at 32,769, 34,817, and 36,864 visible tokens. Require every row to write the 18-split tail and preserve scratch guards. [Frozen numerical and reader-plus-combine timing receipts](https://github.com/para1lel/sglang.cpp/blob/a5974ba4eb99bd8e8f890c2e7262a27dbc3aace1/docs/singleton-gqa-decode.md#w4-18-split-operator-probe)
 
 ### W4 and W5 producer remap probe
 
-On two B200s, paired target verifier waves saved a median 0.120202 ms at W4 M80 and 0.2993685 ms at W5 M40. Each shape ran six AB/BA pairs at each of three positions, with all 18 pairs faster. Token winners, acceptance counts, both ranks' committed hidden, residual and GDN state, and the scoring rank's normalized carry matched exactly. W1, W2, W3, and deep singleton controls matched with zero remapped calls. The probe timed bounded verification waves. See `artifacts/tp2-resume/w5-reader/receipt.txt`.
+Compare W4 M80 and W5 M40 winners, acceptance, both rank states, and scoring-rank carry. Require zero remapped calls for W1–W3 and deep singletons. [Frozen two-B200 paired verification waves](https://github.com/para1lel/sglang.cpp/blob/a5974ba4eb99bd8e8f890c2e7262a27dbc3aace1/docs/singleton-gqa-decode.md#w4-and-w5-producer-remap-probe)
 
 ### Scratch-free attention checks
 

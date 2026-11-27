@@ -14,7 +14,7 @@
 
 ## Runtime path
 
-One HTTP request enters the [shared admission queue](../http-server.md#http-admission-and-shutdown). The worker submits one zero-output decoder job per item. If the client disconnects, the worker cancels unfinished work. A request with zero items returns without decoder work. [Dispatch](../../apps/server/prefix_controls.cpp#L803)<!-- prefix: "} else if (s" --> · [Worker](../../apps/server/score.cpp#L363)<!-- prefix: "void serve_s" -->
+One HTTP request enters the [shared admission queue](../http-server.md#http-admission-and-shutdown). The worker submits one zero-output decoder job per item. If the client disconnects, the worker cancels unfinished work. A request with zero items returns without decoder work. [Dispatch](../../apps/server/prefix_controls.cpp#L802)<!-- prefix: "} else if (s" --> · [Worker](../../apps/server/score.cpp#L363)<!-- prefix: "void serve_s" -->
 
 Score lanes use K0 and share target prefill grants with generation. Compatible lanes can share dense projections. A full prefix hit restores the terminal hidden and residual rows for next-token scoring. When the prompt completes, the decoder queues its full BF16 vocabulary row for host readback. The response preserves label order. [MTP depth](../../src/decoder_batch.cpp#L148)<!-- prefix: "if (options." --> · [Full-hit dispatch](../../src/decoder_batch.cpp#L301)<!-- prefix: "if (lane.res" --> · [Label logits](../../src/decoder_batch.cpp#L387)<!-- prefix: "if (lane.opt" -->
 

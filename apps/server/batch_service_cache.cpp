@@ -1,4 +1,4 @@
-#include "sglang/runtime/server/batch_service_state.h"
+#include "sglang/server/detail/batch_service_state.h"
 
 #include "sglang/runtime/cache/prefix_cache_layout.h"
 

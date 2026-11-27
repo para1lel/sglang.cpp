@@ -1,5 +1,5 @@
-#include "sglang/runtime/model/qwen_parser.h"
-#include "sglang/runtime/model/qwen_serving_profile.h"
+#include "sglang/server/serving/qwen_parser.h"
+#include "sglang/server/serving/qwen_serving_profile.h"
 
 #include "sglang/server/tool_literal.h"
 #include "sglang/server/tool_union.h"

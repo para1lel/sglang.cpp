@@ -75,11 +75,6 @@ if [[ -z ${SGLANG_CUTLASS_ARCHIVE:-} ]]; then
     SGLANG_CUTLASS_ARCHIVE=$(cached_cutlass_archive)
 fi
 export SGLANG_CUTLASS_ARCHIVE
-gdn_vendor_object_dir="$SGLANG_HOST_ROOT/environments/vllm-81a8cb063e62/gdn_vendor_object"
-gdn_vendor_archive="$gdn_vendor_object_dir/libgdn_cute_bf16_8_24.a"
-if [[ ${SGLANG_GDN_VENDOR_BUILD:-} != 0 && -f "$gdn_vendor_archive" ]]; then
-    sha256sum "$gdn_vendor_archive"
-fi
 "$xmake" g --network=private
 "$xmake" f -y -P . -o "$work/build" -p linux -a x86_64 -m release --mxfp8-gqa-check="$check"
 "$xmake" build -P . -v toolchain-probe

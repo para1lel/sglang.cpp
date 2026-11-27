@@ -1,9 +1,9 @@
 #pragma once
 
 #include "sglang/decoder_media.h"
-#include "sglang/runtime/server/batch_executor.h"
-#include "sglang/runtime/backend/tensor_parallel.h"
+#include "sglang/runtime/backend/tp_ar_counters.h"
 #include "sglang/runtime/server/batch_cache.h"
+#include "sglang/runtime/server/batch_executor.h"
 
 #include <array>
 #include <atomic>

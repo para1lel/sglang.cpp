@@ -6,7 +6,6 @@
 #include "sglang/runtime/backend/cuda_resources.h"
 
 #include <stdexcept>
-#include <string>
 #include <string_view>
 
 namespace sglang::decoder {
@@ -40,9 +39,5 @@ CudaBackendDevice read_cuda_backend_device(int device) {
     check(cudaGetDeviceProperties(&properties, device), "Read decoder CUDA device properties");
     return {CudaBackendPolicy::for_device(properties), properties.name};
 }
-
-#if !defined(SGLANG_GDN_VENDOR) || !SGLANG_GDN_VENDOR
-std::string gdn_vendor_prefill_identity_tag(const int*, int) { return {}; }
-#endif
 
 }

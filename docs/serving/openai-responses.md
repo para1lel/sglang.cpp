@@ -98,7 +98,7 @@ The response echoes the descriptor in `text.format` and returns the generated JS
 `output_text` string in the assistant message. The schema constrains output from the first
 generated token. Reasoning items, summaries and reasoning SSE events are unavailable with this
 format, including when `reasoning.effort` is omitted or set to `medium`.
-[Reasoning parser setup](../../src/runtime/model/qwen_serving_profile.cpp#L106)<!-- prefix: "if (request." -->
+[Reasoning parser setup](../../apps/server/qwen/qwen_serving_profile.cpp#L106)<!-- prefix: "if (request." -->
 
 For streaming, join the `response.output_text.delta` strings and parse the JSON after
 `response.completed`.

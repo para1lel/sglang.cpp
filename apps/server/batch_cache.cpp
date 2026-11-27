@@ -1,4 +1,5 @@
 #include "sglang/runtime/server/batch_cache.h"
+#include "sglang/runtime/cache/lmcache_group.h"
 
 #include <cstring>
 #include <algorithm>
@@ -288,11 +289,14 @@ void run_joint_store(CacheState* state,
 }
 
 struct BatchCache::State {
-    State(std::unique_ptr<LmCacheClient> connection, std::string identity, int lanes)
+    State(std::string identity, int lanes)
         : identity(std::move(identity)),
           reservations(std::make_shared<StoreReservations>(2 * lanes)),
           readers(std::min(lanes, 4)), restores(std::min(lanes, 4)),
-          stores_queue(std::min(lanes, 4)) {
+          stores_queue(std::min(lanes, 4)) {}
+
+    State(std::unique_ptr<LmCacheClient> connection, std::string identity, int lanes)
+        : State(std::move(identity), lanes) {
         if (connection) {
             std::vector<std::unique_ptr<LmCacheClient>> clients;
             clients.push_back(std::move(connection));
@@ -303,10 +307,7 @@ struct BatchCache::State {
 
     State(const LmCacheConfig& base, std::vector<std::array<std::uint8_t, 16>> rank_devices,
           std::string identity, int lanes)
-        : identity(std::move(identity)),
-          reservations(std::make_shared<StoreReservations>(2 * lanes)),
-          readers(std::min(lanes, 4)), restores(std::min(lanes, 4)),
-          stores_queue(std::min(lanes, 4)) {
+        : State(std::move(identity), lanes) {
         if (rank_devices.empty()) throw std::invalid_argument("Empty LMCache rank device list");
         group = std::make_unique<LmCacheGroup>(ranked_lmcache_configs(base,
                                                                      rank_devices.size()));

@@ -6,7 +6,6 @@
 #include <cuda.h>
 #include <cuda/atomic>
 
-#include <flashinfer/comm/trtllm_mnnvl_allreduce.cuh>
 #include <array>
 #include <cstdint>
 #include <cstdio>
@@ -34,23 +33,222 @@ constexpr std::uint32_t kLamportSentinel = 0x80000000u;
 constexpr std::uint32_t kBufferAlignment = 2 * 16;
 constexpr std::size_t kTwoshotCount = kTwoshotRows * kTokenDim;
 constexpr std::size_t kTwoshotBufferBytes = 2 * kTwoshotCount * kElementSize;
-constexpr int kTwoshotElementsPerCta = kTwoshotThreads * sizeof(float4) / kElementSize;
-constexpr int kTwoshotGrid =
-    kTwoshotRows * ((kTokenDim + kTwoshotElementsPerCta - 1) / kTwoshotElementsPerCta);
+constexpr int kBf16PerPack = sizeof(uint4) / kElementSize;
+constexpr unsigned kRowBytes = kTokenDim * kElementSize;
+constexpr int packs_per_row = kTokenDim / kBf16PerPack;
+constexpr int kTwoshotBlocksPerRow = packs_per_row / kTwoshotThreads;
+constexpr int kTwoshotGrid = kTwoshotRows * kTwoshotBlocksPerRow;
+static_assert(kTwoshotRows % kRanks == 0 && packs_per_row % kTwoshotThreads == 0);
 
-bool twoshot_grid_fits(int device) {
-    using flashinfer::trtllm_mnnvl_allreduce::twoshotAllreduceKernel;
-    int multiprocessors = 0;
+struct alignas(16) LamportState {
+    uint4 layout;
+    uint2 dirty_bytes;
+    std::uint32_t arrivals;
+};
+
+template <int Stages>
+struct LamportBuffer {
+    LamportState* state;
+    uint4 layout;
+    uint2 dirty_bytes;
+
+    __device__ explicit LamportBuffer(LamportState* flags)
+        : state(flags), layout(flags->layout), dirty_bytes(flags->dirty_bytes) {}
+
+    __device__ uint4* current(void* base, int stage = 0) const {
+        const unsigned capacity = layout.z / sizeof(uint4);
+        return static_cast<uint4*>(base) + layout.x * capacity + stage * (capacity / Stages);
+    }
+
+    __device__ void clear(void* base, unsigned stage) const {
+        if (stage >= layout.w) return;
+        constexpr uint4 sentinel{kLamportSentinel, kLamportSentinel,
+                                 kLamportSentinel, kLamportSentinel};
+        const unsigned capacity = layout.z / sizeof(uint4);
+        auto* dirty = static_cast<uint4*>(base) + layout.y * capacity + stage * (capacity / 2);
+        const unsigned packs = (stage == 0 ? dirty_bytes.x : dirty_bytes.y) / sizeof(uint4);
+        const unsigned first = (blockIdx.x * gridDim.y + blockIdx.y) * blockDim.x + threadIdx.x;
+        const unsigned stride = gridDim.x * gridDim.y * blockDim.x;
+        for (unsigned index = first; index < packs; index += stride) dirty[index] = sentinel;
+    }
+
+    __device__ void arrive() const {
+        const unsigned threads = (blockDim.x + 31) & ~31u;
+        if (threadIdx.x < 32) {
+            asm volatile("barrier.cta.sync 1, %0;" :: "r"(threads) : "memory");
+            if (threadIdx.x == 0) count_arrival();
+        } else {
+            asm volatile("barrier.cta.arrive 1, %0;" :: "r"(threads) : "memory");
+        }
+    }
+
+    __device__ void arrive_cluster() const {
+        __cluster_barrier_arrive();
+        __cluster_barrier_wait();
+        if (blockIdx.y == 0 && threadIdx.x == 0) count_arrival();
+    }
+
+    __device__ void rotate(unsigned groups, uint2 next_dirty_bytes) const {
+        if (blockIdx.x != 0 || blockIdx.y != 0 || threadIdx.x != 0) return;
+        unsigned arrivals;
+        do {
+            asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(arrivals)
+                         : "l"(&state->arrivals) : "memory");
+        } while (arrivals < groups);
+        state->layout = {(layout.x + 1) % kNumLamportBuffers, layout.x, layout.z, Stages};
+        state->dirty_bytes = next_dirty_bytes;
+        state->arrivals = 0;
+    }
+
+private:
+    __device__ void count_arrival() const {
+        asm volatile("red.async.release.global.gpu.add.u32 [%0], %1;" ::
+                     "l"(&state->arrivals), "r"(1) : "memory");
+    }
+};
+
+union PackedBf16 {
+    uint4 packed;
+    Bf16 elements[kBf16PerPack];
+};
+
+__device__ void sanitize_payload(PackedBf16& value) {
+#pragma unroll
+    for (int index = 0; index < kBf16PerPack; ++index) {
+        if (__bfloat16_as_ushort(value.elements[index]) == 0x8000u) {
+            value.elements[index] = __float2bfloat16_rn(0.f);
+        }
+    }
+}
+
+__device__ void store_multicast_pack(uint4* address, uint4 pack) {
+    asm volatile("multimem.st.relaxed.sys.global.v4.f32 [%0], {%1, %2, %3, %4};"
+                 :: "l"(address), "f"(__uint_as_float(pack.x)), "f"(__uint_as_float(pack.y)),
+                    "f"(__uint_as_float(pack.z)), "f"(__uint_as_float(pack.w)) : "memory");
+}
+
+__device__ bool poll_pack(const uint4* address, PackedBf16& value) {
+    auto& pack = value.packed;
+    asm volatile("ld.volatile.global.v4.u32 {%0, %1, %2, %3}, [%4];"
+                 : "=r"(pack.x), "=r"(pack.y), "=r"(pack.z), "=r"(pack.w)
+                 : "l"(address) : "memory");
+    return pack.x != kLamportSentinel && pack.y != kLamportSentinel &&
+           pack.z != kLamportSentinel && pack.w != kLamportSentinel;
+}
+
+__device__ PackedBf16 reduce_packs(const PackedBf16& rank0, const PackedBf16& rank1) {
+    PackedBf16 reduced;
+#pragma unroll
+    for (int index = 0; index < kBf16PerPack; ++index) {
+        const float first = 0.f + __bfloat162float(rank0.elements[index]);
+        const float sum = first + __bfloat162float(rank1.elements[index]);
+        reduced.elements[index] = __float2bfloat16_rn(sum);
+    }
+    return reduced;
+}
+
+template <int Rank>
+__device__ PackedBf16 reduce_local_remote(const PackedBf16& local, const PackedBf16& remote) {
+    if constexpr (Rank == 0) return reduce_packs(local, remote);
+    return reduce_packs(remote, local);
+}
+
+struct AllReduceArgs {
+    uint4* values;
+    void* local;
+    void* peer;
+    void* multicast;
+    LamportState* flags;
+};
+
+template <int Rank>
+__global__ __launch_bounds__(1024) void oneshot_allreduce(AllReduceArgs args) {
+    const unsigned row = blockIdx.x;
+    const unsigned offset = blockIdx.y * blockDim.x + threadIdx.x;
+    const unsigned packed = row * packs_per_row + offset;
+    LamportBuffer<1> flags(args.flags);
+    PackedBf16 value{args.values[packed]};
+    sanitize_payload(value);
+    auto* multicast = flags.current(args.multicast);
+    auto* local = flags.current(args.local);
+    store_multicast_pack(multicast + (row * kRanks + Rank) * packs_per_row + offset, value.packed);
+    flags.arrive_cluster();
+    flags.clear(args.local, 0);
+    flags.clear(args.local, 1);
+    PackedBf16 remote;
+    while (!poll_pack(local + (row * kRanks + 1 - Rank) * packs_per_row + offset, remote)) {}
+    args.values[packed] = reduce_local_remote<Rank>(value, remote).packed;
+    flags.rotate(gridDim.x, {gridDim.x * kRanks * kRowBytes, 0});
+}
+
+__global__ __launch_bounds__(kTwoshotThreads) void twoshot_allreduce(AllReduceArgs args, int rank) {
+    const int row = blockIdx.x;
+    const int offset = blockIdx.y * kTwoshotThreads + threadIdx.x;
+    const int packed = row * packs_per_row + offset;
+    const bool owner = row % kRanks == rank;
+    const int scatter_offset = row / kRanks * kRanks * packs_per_row + offset;
+    LamportBuffer<2> flags(args.flags);
+    auto* scatter_local = flags.current(args.local);
+    auto* scatter_dest = owner ? scatter_local : flags.current(args.peer);
+    PackedBf16 value{args.values[packed]};
+    sanitize_payload(value);
+    scatter_dest[scatter_offset + rank * packs_per_row] = value.packed;
+    flags.clear(args.local, 0);
+    if (owner) {
+        PackedBf16 rank0;
+        PackedBf16 rank1;
+        bool ready;
+        do {
+            const bool rank0_ready = poll_pack(scatter_local + scatter_offset, rank0);
+            const bool rank1_ready = poll_pack(scatter_local + scatter_offset + packs_per_row,
+                                               rank1);
+            ready = rank0_ready && rank1_ready;
+        } while (!ready);
+        auto reduced = reduce_packs(rank0, rank1);
+        sanitize_payload(reduced);
+        store_multicast_pack(flags.current(args.multicast, 1) + packed, reduced.packed);
+    }
+    flags.clear(args.local, 1);
+    flags.arrive();
+    PackedBf16 result;
+    while (!poll_pack(flags.current(args.local, 1) + packed, result)) {}
+    args.values[packed] = result.packed;
+    flags.rotate(kTwoshotGrid, {kTwoshotRows * kRowBytes, kTwoshotRows * kRowBytes});
+}
+
+bool twoshot_grid_fits(int multiprocessors) {
     int active_blocks = 0;
-    if (cudaDeviceGetAttribute(&multiprocessors, cudaDevAttrMultiProcessorCount, device) !=
-            cudaSuccess ||
-        cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-            &active_blocks, twoshotAllreduceKernel<kRanks, Bf16, true>, kTwoshotThreads, 0) !=
-            cudaSuccess) {
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &active_blocks, twoshot_allreduce, kTwoshotThreads, 0) != cudaSuccess) {
         (void)cudaGetLastError();
         return false;
     }
     return active_blocks * multiprocessors >= kTwoshotGrid;
+}
+
+cudaError_t launch_oneshot(AllReduceArgs args, int rank, int rows, int multiprocessors,
+                           cudaStream_t stream) {
+    int cluster = 8;
+    while (rows * cluster > multiprocessors && cluster > 1) cluster /= 2;
+    cudaLaunchAttribute attribute{};
+    attribute.id = cudaLaunchAttributeClusterDimension;
+    attribute.val.clusterDim = {1, static_cast<unsigned>(cluster), 1};
+    cudaLaunchConfig_t config{};
+    config.gridDim = dim3(rows, cluster);
+    config.blockDim = dim3(packs_per_row / cluster);
+    config.stream = stream;
+    config.attrs = &attribute;
+    config.numAttrs = 1;
+    return rank == 0 ? cudaLaunchKernelEx(&config, oneshot_allreduce<0>, args)
+                     : cudaLaunchKernelEx(&config, oneshot_allreduce<1>, args);
+}
+
+cudaError_t launch_twoshot(AllReduceArgs args, int rank, cudaStream_t stream) {
+    cudaLaunchConfig_t config{};
+    config.gridDim = dim3(kTwoshotRows, kTwoshotBlocksPerRow);
+    config.blockDim = dim3(kTwoshotThreads);
+    config.stream = stream;
+    return cudaLaunchKernelEx(&config, twoshot_allreduce, args, rank);
 }
 
 std::uint64_t round_up(std::uint64_t value, std::uint64_t alignment) {
@@ -92,19 +290,16 @@ void require_cu(CUresult status, const char* what) {
 
 using namespace text_kernel;
 
-namespace transport = flashinfer::trtllm_mnnvl_allreduce::utils;
-using PackedBf16 = transport::PackedVec<float4, Bf16>;
 static_assert(kTokenDim == rms_hidden_width);
-constexpr int packs_per_row = kTokenDim / 8;
 constexpr int packs_per_thread = (packs_per_row + block_threads - 1) / block_threads;
 
 template <typename Rows>
 struct ReduceNormArgs {
     Bf16* branch;
     const Bf16* gain;
-    void** rank_buffers;
+    void* local;
     void* multicast;
-    std::uint32_t* flags;
+    LamportState* flags;
     Rows rows;
 };
 
@@ -122,11 +317,10 @@ struct ReduceNorm<MnnvlRmsQuantizeRows40> {
     std::uint64_t epoch;
 };
 
-__device__ bool poll_m40_rank0(PackedBf16* remote, Bf16* local, int row, int packed,
+__device__ bool poll_m40_rank0(const uint4* address, PackedBf16& remote,
                                std::uint64_t* rejected, std::uint64_t epoch) {
     unsigned misses = 0;
-    while (!transport::pollOneshotRemoteRank<1, 2, 0, Bf16, float4, 8>(
-            remote, local, row, kTokenDim, packed)) {
+    while (!poll_pack(address, remote)) {
         if ((++misses & 255) == 0 &&
             PairAtomic(*rejected).load(cuda::memory_order_acquire) == epoch) return false;
     }
@@ -145,45 +339,45 @@ __global__ __launch_bounds__(block_threads) void reduce_norm_rows(
     __shared__ alignas(16) Bf16 residual_values[kTokenDim];
     __shared__ alignas(16) Bf16 gains[kTokenDim];
 
-    transport::LamportFlags<float4, false> flags(args.flags, 1);
-    auto* const multicast = static_cast<float4*>(flags.getCurLamportBuf(args.multicast));
-    auto* const local = static_cast<Bf16*>(flags.getCurLamportBuf(args.rank_buffers[Rank]));
+    LamportBuffer<1> flags(args.flags);
+    auto* const multicast = flags.current(args.multicast);
+    const auto* const peer = flags.current(args.local) + (row * kRanks + 1 - Rank) * packs_per_row;
     PackedBf16 values[packs_per_thread];
 #pragma unroll
     for (int index = 0; index < packs_per_thread; ++index) {
         const int packed = threadIdx.x + index * block_threads;
         if (packed < packs_per_row) {
             auto& value = values[index];
-            value.packed = transport::loadPacked<float4>(branch + packed * 8);
-            transport::sanitizeLamportPayload(value);
-            multicast[(row * kRanks + Rank) * packs_per_row + packed] = value.packed;
+            value.packed = reinterpret_cast<const uint4*>(branch)[packed];
+            sanitize_payload(value);
+            store_multicast_pack(multicast + (row * kRanks + Rank) * packs_per_row + packed,
+                                 value.packed);
             stage_rms_vector_async(output.residual + packed * 8, residual_values + packed * 8);
             stage_rms_vector_async(args.gain + packed * 8, gains + packed * 8);
         }
     }
     asm volatile("cp.async.commit_group;" ::: "memory");
-    flags.ctaArrive();
-    flags.clearDirtyLamportBuf(args.rank_buffers[Rank], -1);
+    flags.arrive();
+    flags.clear(args.local, 0);
+    flags.clear(args.local, 1);
     bool cancelled = false;
 #pragma unroll
     for (int index = 0; index < packs_per_thread; ++index) {
         const int packed = threadIdx.x + index * block_threads;
         if (packed < packs_per_row) {
-            PackedBf16 remote[2];
+            PackedBf16 remote;
             if constexpr (can_cancel) {
-                if (cancelled || !poll_m40_rank0(remote, local, row, packed, params.rejected,
+                if (cancelled || !poll_m40_rank0(peer + packed, remote, params.rejected,
                                                  params.epoch)) {
                     cancelled = true;
                     continue;
                 }
             } else {
-                transport::waitOneshotRemoteRanks<2, Rank, Bf16, float4, 8>(
-                    remote, local, row, kTokenDim, packed);
+                while (!poll_pack(peer + packed, remote)) {}
             }
-            const auto reduced = transport::reduceOneshotDeterministic<2, Rank, Bf16, float4, 8>(
-                remote, values[index]);
-            reinterpret_cast<float4*>(branch)[packed] = reduced.packed;
-            reinterpret_cast<float4*>(branch_values)[packed] = reduced.packed;
+            const auto reduced = reduce_local_remote<Rank>(values[index], remote);
+            reinterpret_cast<uint4*>(branch)[packed] = reduced.packed;
+            reinterpret_cast<uint4*>(branch_values)[packed] = reduced.packed;
         }
     }
     asm volatile("cp.async.wait_group 0;" ::: "memory");
@@ -194,8 +388,7 @@ __global__ __launch_bounds__(block_threads) void reduce_norm_rows(
     }
     rms_quantize_staged<true, true>(branch_values, residual_values, gains, output.residual,
                                     output.normalized, output.activation);
-    flags.waitAndUpdate({static_cast<std::uint32_t>(gridDim.x * kTokenDim * kRanks * sizeof(Bf16)),
-                         0, 0, 0});
+    flags.rotate(gridDim.x, {gridDim.x * kRanks * kRowBytes, 0});
 }
 
 template <typename Rows>
@@ -240,8 +433,8 @@ struct MnnvlAllReduce::State {
     std::uint32_t buffer_size_bytes = 0;   
     std::uint64_t max_elements = 0;        
 
-    std::uint32_t* flags[kRanks]{};   
-    void** ptrs_dev[kRanks]{};        
+    LamportState* flags[kRanks]{};
+    int multiprocessors[kRanks]{};
 
     bool created_physical[kRanks] = {false, false};
     bool created_multicast = false;
@@ -312,11 +505,6 @@ void MnnvlAllReduce::State::release() {
             cudaSetDevice(devices[r]);
             cudaFree(flags[r]);
             flags[r] = nullptr;
-        }
-        if (ptrs_dev[r] != nullptr) {
-            cudaSetDevice(devices[r]);
-            cudaFree(ptrs_dev[r]);
-            ptrs_dev[r] = nullptr;
         }
     }
     if (m40_rejected) {
@@ -486,27 +674,15 @@ void MnnvlAllReduce::init_lamport(State& state) {
     CallerDevice device_scope;
     for (int r = 0; r < kRanks; ++r) {
         device_scope.select(state.devices[r], "Select a rank device");
-        cudaError_t status = cudaMalloc(&state.flags[r], sizeof(std::uint32_t) * 9);
+        cudaError_t status = cudaMalloc(&state.flags[r], sizeof(LamportState));
         if (status != cudaSuccess) {
             throw std::runtime_error(std::string("Allocate the Lamport flags: ") +
                                      cudaGetErrorString(status));
         }
-        status = cudaMalloc(&state.ptrs_dev[r], sizeof(void*) * kRanks);
-        if (status != cudaSuccess) {
-            throw std::runtime_error(std::string("Allocate the buffer pointers: ") +
-                                     cudaGetErrorString(status));
-        }
-        const std::uint32_t flag_host[9] = {0, 2, state.buffer_size_bytes, 0, 0, 0, 0, 0, 0};
-        status = cudaMemcpy(state.flags[r], flag_host, sizeof(flag_host), cudaMemcpyHostToDevice);
+        const LamportState flag_host{{0, 2, state.buffer_size_bytes, 0}, {0, 0}, 0};
+        status = cudaMemcpy(state.flags[r], &flag_host, sizeof(flag_host), cudaMemcpyHostToDevice);
         if (status != cudaSuccess) {
             throw std::runtime_error(std::string("Initialize the Lamport flags: ") +
-                                     cudaGetErrorString(status));
-        }
-        void* ptr_host[kRanks] = {reinterpret_cast<void*>(state.uc_ptrs[0]),
-                                  reinterpret_cast<void*>(state.uc_ptrs[1])};
-        status = cudaMemcpy(state.ptrs_dev[r], ptr_host, sizeof(ptr_host), cudaMemcpyHostToDevice);
-        if (status != cudaSuccess) {
-            throw std::runtime_error(std::string("Initialize the buffer pointers: ") +
                                      cudaGetErrorString(status));
         }
         fill_sentinel_kernel<<<256, 256, 0, 0>>>(
@@ -525,7 +701,13 @@ void MnnvlAllReduce::init_lamport(State& state) {
             throw std::runtime_error(std::string("Finish the Lamport initialization: ") +
                                      cudaGetErrorString(status));
         }
-        state.twoshot_supported = state.twoshot_supported && twoshot_grid_fits(state.devices[r]);
+        status = cudaDeviceGetAttribute(&state.multiprocessors[r],
+                                        cudaDevAttrMultiProcessorCount, state.devices[r]);
+        if (status != cudaSuccess) {
+            throw std::runtime_error(std::string("Query the MNNVL device size: ") +
+                                     cudaGetErrorString(status));
+        }
+        state.twoshot_supported &= twoshot_grid_fits(state.multiprocessors[r]);
         state.reduce_norm_supported &= reduce_norm_ready<MnnvlRmsQuantizeRows>(state.devices[r], r);
         state.reduce_norm_m40_supported &=
             reduce_norm_ready<MnnvlRmsQuantizeRows40>(state.devices[r], r);
@@ -660,31 +842,13 @@ void MnnvlAllReduce::allreduce_bf16(__nv_bfloat16* const buffers[], const cudaSt
     CallerDevice device_scope;
     for (int r = 0; r < kRanks; ++r) {
         device_scope.select(state_->devices[r], "Select a rank device");
-        flashinfer::trtllm_mnnvl_allreduce::AllReduceFusionParams params{};
-        params.nRanks = kRanks;
-        params.rank = r;
-        params.numTokens = tokens;
-        params.tokenDim = kTokenDim;
-        params.bufferPtrsDev = state_->ptrs_dev[r];
-        params.bufferPtrLocal = reinterpret_cast<void*>(state_->uc_ptrs[r]);
-        params.multicastPtr = reinterpret_cast<void*>(state_->mc_va);
-        params.bufferFlags = state_->flags[r];
-        params.rmsNormFusion = false;
-        params.launchWithPdl = false;
-        params.input = buffers[r];
-        params.residualIn = nullptr;
-        params.gamma = nullptr;
-        params.epsilon = 0.0;
-        params.weightBias = 0.0f;
-        params.quantType = flashinfer::trtllm_mnnvl_allreduce::QuantType::kNone;
-        params.residualOut = nullptr;
-        params.output = buffers[r];   
-        params.quantOut = nullptr;
-        params.scalingFactorOut = nullptr;
-        params.stream = streams[r];
-        using namespace flashinfer::trtllm_mnnvl_allreduce;
-        const cudaError_t status = two_shot ? twoshotAllreduceFusionDispatch<Bf16>(params)
-                                            : oneshotAllreduceFusionDispatch<Bf16>(params);
+        const AllReduceArgs args{reinterpret_cast<uint4*>(buffers[r]),
+                                 reinterpret_cast<void*>(state_->uc_ptrs[r]),
+                                 reinterpret_cast<void*>(state_->uc_ptrs[1 - r]),
+                                 reinterpret_cast<void*>(state_->mc_va), state_->flags[r]};
+        const cudaError_t status = two_shot
+            ? launch_twoshot(args, r, streams[r])
+            : launch_oneshot(args, r, tokens, state_->multiprocessors[r], streams[r]);
         if (status != cudaSuccess) {
             state_->failed = true;
             throw MnnvlArError(std::string("Enqueue the MNNVL BF16 allreduce: ") +
@@ -746,7 +910,8 @@ bool MnnvlAllReduce::try_reduce_norm(Bf16* const buffers[], const cudaStream_t s
 
     ReduceNorm<Rows> launch[kRanks];
     for (int rank = 0; rank < kRanks; ++rank) {
-        launch[rank].args = {buffers[rank], gains[rank], state_->ptrs_dev[rank],
+        launch[rank].args = {buffers[rank], gains[rank],
+                             reinterpret_cast<void*>(state_->uc_ptrs[rank]),
                              reinterpret_cast<void*>(state_->mc_va), state_->flags[rank],
                              rows[rank]};
         if constexpr (!narrow) {

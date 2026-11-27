@@ -1,5 +1,5 @@
-#include "sglang/runtime/model/qwen_parser.h"
-#include "sglang/runtime/model/qwen_serving_profile.h"
+#include "sglang/server/serving/qwen_parser.h"
+#include "sglang/server/serving/qwen_serving_profile.h"
 
 #include <algorithm>
 #include <array>
@@ -238,7 +238,6 @@ bool append_collection(std::string& output, std::string_view text, Type type) {
             return true;
         }
     } catch (const json::ParseError&) {
-        // A parameter may still match a later type in the union.
     }
     return false;
 }
@@ -681,7 +680,6 @@ private:
 };
 
 std::size_t ChatToolFrame::scan(std::string_view input, bool final, bool truncated) {
-    // A closed parameter owns any call-shaped text that it contains.
     for (;;) {
         auto& frame = frames_.back();
         const auto step = frame.scan(input);

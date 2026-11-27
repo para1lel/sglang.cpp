@@ -1,8 +1,8 @@
 #include "sglang/server/parse_function_call.h"
 
 #include "sglang/json.h"
-#include "sglang/runtime/model/qwen_parser.h"
 #include "sglang/server/http.h"
+#include "sglang/server/serving/qwen_parser.h"
 #include "sglang/utf8.h"
 
 namespace sglang::server {

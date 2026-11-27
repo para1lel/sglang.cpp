@@ -1,4 +1,4 @@
-#include "sglang/runtime/model/qwen_serving_profile.h"
+#include "sglang/server/serving/qwen_serving_profile.h"
 
 #include "sglang/server/chat_template.h"
 

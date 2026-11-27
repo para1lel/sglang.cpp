@@ -797,8 +797,8 @@ void check_ordered_prefill_precision(cudaStream_t stream) {
 void check_ordered_prefill_score_overflow(cudaStream_t stream) {
     constexpr int rows = 65;
     constexpr std::array cases{
-        std::pair{65, 33u}, std::pair{32768, 17u}, std::pair{32769, 17u},
-        std::pair{131072, 17u}, std::pair{131073, 65u},
+        std::pair{65, 33U},    std::pair{32768, 17U}, std::pair{32769, 2U},
+        std::pair{131072, 2U}, std::pair{131073, 2U},
     };
     constexpr int page_count = (cases.back().first + page_tokens - 1) / page_tokens;
     constexpr auto payload = page_count * sglang::mxfp8_payload_bytes_per_page;

@@ -311,7 +311,7 @@ def verify_operators(evidence):
     output = (evidence / "operators.log").read_text()
     assert "Rebound cache, page table and position on four device graph replays" in output
     assert "Rebound GDN history and recurrent banks on six device graph replays" in output
-    overflow_cases = ((65, 33), (32768, 17), (32769, 17), (131072, 17), (131073, 65))
+    overflow_cases = ((65, 33), (32768, 17), (32769, 2), (131072, 2), (131073, 2))
     for visible, width in overflow_cases:
         receipt = f"Prefill overflow visible={visible} grid={width}"
         assert f"{receipt} matched unaligned and FP64 reference" in output

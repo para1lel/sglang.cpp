@@ -15,9 +15,10 @@ void read_paged_sequences(const PagedPrefillSequence* sequences, int count,
     }
     for (int index = 0; index < count; ++index) {
         const auto& sequence = sequences[index];
-        check(tensor_core_model_prefill_gqa(sequence.cache, sequence.pages, sequence.position,
-                                           sequence.rows, sequence.queries, sequence.output,
-                                           stream, scratch), "Read causal prefill MXFP8 attention");
+        check(tensor_core_multirow_prefill_gqa(sequence.cache, sequence.pages, sequence.position,
+                                               sequence.rows, sequence.queries, sequence.output,
+                                               stream, scratch),
+              "Read causal prefill MXFP8 attention");
     }
 }
 
@@ -151,8 +152,9 @@ bool prefill_causal_group_gqa(const Chunk& chunk, const GqaLayer& layer, int ban
         for (int lane = 0, offset = 0; lane < count; offset += grants[lane++].rows) {
             const auto& grant = grants[lane];
             const auto tile = prefill_attention_segment(chunk, grant, offset);
-            check(tensor_core_model_prefill_gqa(cache, pages, grant.position, grant.rows,
-                      tile.work.rope_queries, tile.work.attention, chunk.stream, serial_scratch),
+            check(tensor_core_multirow_prefill_gqa(cache, pages, grant.position, grant.rows,
+                                                   tile.work.rope_queries, tile.work.attention,
+                                                   chunk.stream, serial_scratch),
                   "Read causal prefill MXFP8 attention");
         }
     }

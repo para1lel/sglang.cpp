@@ -609,6 +609,45 @@ __global__ void tmem_merge(Attention request, const float* partial, const float2
     }
 }
 
+cudaError_t launch_split_tmem(Attention& request, CUtensorMap& key_map, CUtensorMap& value_map,
+                              cudaStream_t stream) {
+    const auto& cache = request.cache;
+    const auto partial_rows =
+        std::size_t{tmem_parts} * flash_chunk * gqa_query_heads(cache.kv_heads);
+    const std::size_t partial_values = partial_rows * channels;
+    void* scratch = nullptr;
+    const auto bytes = (partial_values * sizeof(float)) + (partial_rows * sizeof(float2));
+    auto status = cudaMallocAsync(&scratch, bytes, stream);
+    if (status != cudaSuccess) {
+        return status;
+    }
+    auto* partial = static_cast<float*>(scratch);
+    auto* statistics = reinterpret_cast<float2*>(partial + partial_values);
+    int active = flash_chunk;
+    void* args[] = {
+        &request,
+        &key_map,
+        &value_map,
+        static_cast<void*>(&partial),
+        static_cast<void*>(&statistics),
+        &active,
+    };
+    const dim3 blocks(flash_chunk / flash_rows, gqa_head_pairs(cache), tmem_parts);
+    status = cudaLaunchKernel(tmem_flash_attention<false>, blocks, tmem_threads, args,
+                              sizeof(TmemFlashTile), stream);
+    if (status == cudaSuccess) {
+        void* merge_args[] = {
+            &request,
+            static_cast<void*>(&partial),
+            static_cast<void*>(&statistics),
+        };
+        const dim3 merge_blocks(flash_chunk, gqa_head_pairs(cache));
+        status = cudaLaunchKernel(tmem_merge, merge_blocks, channels, merge_args, 0, stream);
+    }
+    const auto release = cudaFreeAsync(scratch, stream);
+    return status == cudaSuccess ? release : status;
+}
+
 struct TmemAttentionBatch {
     PagedAttentionBatch tiles;
     CUtensorMap key_maps[paged_batch_sequences];
@@ -756,12 +795,14 @@ std::optional<cudaError_t> launch_tmem_prefill(
         pending != cudaSuccess) return pending;
     const auto stock = ragged_rows ? tmem_flash_attention<true, true> :
         ordered ? tmem_flash_attention<true> : tmem_flash_attention<false>;
-    const bool before_flash = automatic && raw_pipeline_before_flash(cache, ragged_rows, visible);
+    const bool tune_pipeline = automatic && visible <= max_multirow_visible_tokens;
+    const bool before_flash =
+        tune_pipeline && raw_pipeline_before_flash(cache, ragged_rows, visible);
     const bool one_wave = (rows + pipeline_rows - 1) / pipeline_rows
         * gqa_head_pairs(cache) <= properties.multiProcessorCount;
-    bool pipeline = automatic && (before_flash || ragged_rows == pipeline_query_rows ||
-        (ragged_rows > pipeline_query_rows && one_wave &&
-         default_ragged_prefill(cache, position, rows)));
+    bool pipeline = tune_pipeline && (before_flash || ragged_rows == pipeline_query_rows ||
+                                      (ragged_rows > pipeline_query_rows && one_wave &&
+                                       default_ragged_prefill(cache, position, rows)));
     const auto stock_kernel = reinterpret_cast<const void*>(stock);
     const auto pipeline_kernel = reinterpret_cast<const void*>(tmem_pipeline_attention);
     const void* kernel = pipeline ? pipeline_kernel : stock_kernel;
@@ -793,27 +834,7 @@ std::optional<cudaError_t> launch_tmem_prefill(
         const dim3 blocks((rows + flash_rows - 1) / flash_rows, gqa_head_pairs(cache));
         return cudaLaunchKernel(kernel, blocks, tmem_threads, args, dynamic_shared, stream);
     }
-    const std::size_t partial_rows = tmem_parts * flash_chunk * gqa_query_heads(cache.kv_heads);
-    const std::size_t partial_values = partial_rows * channels;
-    void* scratch = nullptr;
-    auto status = cudaMallocAsync(&scratch,
-        partial_values * sizeof(float) + partial_rows * sizeof(float2), stream);
-    if (status != cudaSuccess) {
-        return status;
-    }
-    auto* partial = static_cast<float*>(scratch);
-    auto* statistics = reinterpret_cast<float2*>(partial + partial_values);
-    int active = rows;
-    void* args[] = {&request, &key_map, &value_map, &partial, &statistics, &active};
-    const dim3 blocks(flash_chunk / flash_rows, gqa_head_pairs(cache), tmem_parts);
-    status = cudaLaunchKernel(kernel, blocks, tmem_threads, args, dynamic_shared, stream);
-    if (status == cudaSuccess) {
-        void* merge_args[] = {&request, &partial, &statistics};
-        const dim3 merge_blocks(flash_chunk, gqa_head_pairs(cache));
-        status = cudaLaunchKernel(tmem_merge, merge_blocks, channels, merge_args, 0, stream);
-    }
-    const auto release = cudaFreeAsync(scratch, stream);
-    return status == cudaSuccess ? release : status;
+    return launch_split_tmem(request, key_map, value_map, stream);
 }
 
 std::optional<cudaError_t> launch_paired_tmem_prefill(

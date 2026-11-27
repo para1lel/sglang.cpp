@@ -58,11 +58,6 @@ cudaError_t tensor_core_multirow_prefill_gqa(
     const __nv_bfloat16* queries, __nv_bfloat16* output, cudaStream_t stream,
     PairedPrefillScratch scratch);
 
-cudaError_t tensor_core_model_prefill_gqa(
-    Mxfp8KvCache cache, Mxfp8PageTable pages, int position, int rows,
-    const __nv_bfloat16* queries, __nv_bfloat16* output, cudaStream_t stream,
-    PairedPrefillScratch scratch = PairedPrefillScratch{});
-
 }
 
 }

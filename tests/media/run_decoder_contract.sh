@@ -29,7 +29,7 @@ names=(mrope mrope_model rope append attend attend_tensor decode decode_vector s
 patterns=('mrope_gqa_preprocessE.*P11CUstream_st$'
           'mrope_gqa_preprocessE.*GqaGeometryE$' 'text_gqa_preprocessE.*GqaGeometryE$'
           'mxfp8_kv_appendE.*GqaGeometryE$' 'mxfp8_gqa_attentionE.*GqaGeometryE$'
-          'tensor_core_model_prefill_gqaENS_12Mxfp8KvCache.*PairedPrefillScratch'
+          'tensor_core_multirow_prefill_gqaENS_12Mxfp8KvCache.*PairedPrefillScratch'
           'exact_decode_gqa_attentionENS_12Mxfp8KvCache.*TableEi.*P11CUstream_stmb$'
           'vector_decode_gqa_attentionENS_12Mxfp8KvCache.*TableEi'
           'mrope_gqa_preprocess_keysE.*P11CUstream_st$' 'text_rms_norm_pair_rowsE')

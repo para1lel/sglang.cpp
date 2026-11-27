@@ -541,9 +541,10 @@ struct DeviceInput {
                 check_cuda(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal),
                            "Begin paired capture with scratch");
             }
-            check_cuda(decoder::tensor_core_model_prefill_gqa(
+            check_cuda(decoder::tensor_core_multirow_prefill_gqa(
                            cache, table, position, rows, queries.get(), output.get() + guard,
-                           stream, scratch), "Dispatch paired attention with scratch");
+                           stream, scratch),
+                       "Dispatch paired attention with scratch");
             if (mode == "capture") {
                 check_cuda(cudaStreamEndCapture(stream, &graph.graph),
                            "End paired capture with scratch");
@@ -639,9 +640,9 @@ void check_paired_prefill(cudaStream_t stream) {
                samples, stream, {.value_scale_offset = 8});
     device.run("paired unaligned value scales", input, position, synchronous, samples, stream,
                {.value_scale_offset = 1});
-    device.run("paired page-aligned before staging bound", input, position - mxfp8_page_size, flash,
-               attention_samples(input, position - mxfp8_page_size), stream);
-    device.run("paired page-aligned nonchunk start", input, position + mxfp8_page_size, flash,
+    device.run("paired page-aligned before staging bound", input, position - mxfp8_page_size,
+               tmem_paired, attention_samples(input, position - mxfp8_page_size), stream);
+    device.run("paired page-aligned nonchunk start", input, position + mxfp8_page_size, tmem_paired,
                attention_samples(input, position + mxfp8_page_size), stream);
     const auto partial_samples = attention_samples(input, position, partial);
     const auto aligned_partial = device.run("paired partial tile", input, position,
@@ -732,15 +733,15 @@ void check_paired_lower_edge(cudaStream_t stream) {
     constexpr int key_tile = 64;
     Input input(first + rows + 1);
     DeviceInput device(input);
-    device.run("TMEM aligned start below lower bound", input, first - key_tile, flash,
+    device.run("TMEM unaligned start before 4096", input, first - key_tile, tmem_paired_tail,
                attention_samples(input, first - key_tile), stream);
-    device.run("TMEM lower edge predecessor", input, first - 1, flash,
+    device.run("TMEM lower edge predecessor", input, first - 1, tmem_paired_tail,
                attention_samples(input, first - 1), stream);
     const auto samples = attention_samples(input, first);
     const auto raw = device.run("TMEM first aligned start", input, first, tmem_paired,
                                 samples, stream, {.repeat_graph = true});
     device.check_staged_scratch(input, first, raw, stream, tmem_paired);
-    device.run("TMEM nonaligned start", input, first + 1, flash,
+    device.run("TMEM nonaligned start", input, first + 1, tmem_paired_tail,
                attention_samples(input, first + 1), stream);
     device.run("TMEM unaligned key", input, first, multirow, samples, stream,
                {.key_offset = 1});
@@ -751,19 +752,22 @@ void check_paired_lower_edge(cudaStream_t stream) {
 void check_long_flash(cudaStream_t stream) {
     constexpr int ordered_visible = 32768;
     constexpr int flash_visible = 131072;
-    constexpr int aligned_above_limit = flash_visible + 64;
+    constexpr int page_aligned_above = flash_visible + mxfp8_page_size;
     constexpr int partial = rows - 1;
-    constexpr Dispatch partial_protected{"protected_prefill_attention", partial};
-    Input input(aligned_above_limit);
+    constexpr Dispatch long_ragged{"tmem_flash_attentionILb1ELb1EE", 16, head_blocks};
+    Input input(page_aligned_above);
     DeviceInput device(input);
     for (int visible : {ordered_visible, ordered_visible + 1}) {
         const int position = visible - rows;
         const auto label = std::to_string(visible) + " visible";
         const auto samples = attention_samples(input, position);
-        const auto expected = visible == ordered_visible ? tmem_paired : flash;
-        const auto baseline = device.run(label.c_str(), input, position, expected, samples, stream);
+        const auto expected = visible == ordered_visible ? tmem_paired : tmem_paired_tail;
+        device.run(label.c_str(), input, position, expected, samples, stream);
         if (visible == ordered_visible + 1) {
             constexpr Dispatch sync{"flash_prefill_attentionILi64ELb0ELb0EE", rows / 64};
+            const auto baseline =
+                device.run("32769 with eight-byte-aligned value scales", input, position, flash,
+                           samples, stream, {.value_scale_offset = 8});
             const auto scale_label = label + " with unaligned key scales";
             const auto unaligned = device.run(scale_label.c_str(), input, position,
                                               sync, samples, stream, {.key_scale_offset = 1});
@@ -779,8 +783,7 @@ void check_long_flash(cudaStream_t stream) {
     device.run("32768 partial tile", input, ordered_visible - partial, long_1023_dispatch(),
                attention_samples(input, ordered_visible - partial, partial), stream,
                {.count = partial});
-    device.run("32769 partial tile", input, ordered_visible + 1 - partial,
-               long_1023_dispatch(partial_protected),
+    device.run("32769 partial tile", input, ordered_visible + 1 - partial, long_ragged,
                attention_samples(input, ordered_visible + 1 - partial, partial), stream,
                {.count = partial});
     device.run("TMEM first long aligned start", input, ordered_visible, tmem_paired,
@@ -796,10 +799,11 @@ void check_long_flash(cudaStream_t stream) {
     const auto baseline =
         device.run("131072 visible", input, position, tmem_paired, samples, stream);
     device.run("131072 exact", input, position, exact, samples, stream, {.use_exact = true});
-    device.run("131073 visible", input, position + 1, protected_rows,
+    device.run("131073 visible", input, position + 1, tmem_paired_tail,
                attention_samples(input, position + 1), stream);
-    device.run("TMEM aligned end above upper bound", input, aligned_above_limit - rows,
-               protected_rows, attention_samples(input, aligned_above_limit - rows), stream);
+    const int page_aligned_start = page_aligned_above - rows;
+    device.run("TMEM page-aligned nonchunk long start", input, page_aligned_start, tmem_paired,
+               attention_samples(input, page_aligned_start), stream);
     check_future_values("131072 future value perturbation", input, device, position, 65,
                         baseline, tmem_paired, stream);
     input.add_score_overflow(position);
@@ -815,7 +819,12 @@ void check_partial_boundaries(cudaStream_t stream) {
         DeviceInput device(input);
         const auto samples = attention_samples(input, position, count);
         const auto label = std::to_string(count) + " query rows";
-        const auto expected = count == 143 ? ordered_dispatch(count) : flash_dispatch(count);
+        auto expected = flash_dispatch(count);
+        if (count == 143) {
+            expected = ordered_dispatch(count);
+        } else if (count == rows) {
+            expected = tmem_paired_tail;
+        }
         const auto baseline = device.run(label.c_str(), input, position, expected, samples,
                                          stream, {.count = count});
         if (count == 144) {
@@ -879,7 +888,8 @@ void check_tail_recovery(cudaStream_t stream, int position, int count, Dispatch 
 }
 
 void check_exceptional_repair(const char* label, int position, Dispatch dispatch,
-                              cudaStream_t stream, int count = rows) {
+                              cudaStream_t stream, RunOptions options = RunOptions()) {
+    const int count = options.count;
     Input input(position + count, count);
     std::fill(input.keys.begin(), input.keys.end(), 0);
     std::fill(input.values.begin(), input.values.end(), 0x38);
@@ -890,8 +900,7 @@ void check_exceptional_repair(const char* label, int position, Dispatch dispatch
     const int query = ((count - 1) * row_width) + (queries_per_kv * channels);
     input.queries[query] = __ushort_as_bfloat16(0x7fc0);
     DeviceInput device(input);
-    const auto repaired =
-        device.run(label, input, position, dispatch, {}, stream, {.count = count});
+    const auto repaired = device.run(label, input, position, dispatch, {}, stream, options);
     for (int row = 0; row < count; ++row) {
         for (int head = 0; head < mxfp8_query_heads; ++head) {
             const bool bad_key = row >= key_row && head < queries_per_kv;
@@ -917,8 +926,10 @@ void check_tmem_repair(cudaStream_t stream) {
     constexpr Dispatch pipeline{"tmem_pipeline_attention", 5, head_blocks, 1, 416};
     check_mixed_grouped_prefill(stream);
     check_exceptional_repair("paired exceptional repair", 4096, tmem_paired, stream);
-    check_exceptional_repair("pipeline exceptional repair", 8192, pipeline, stream, pipeline_rows);
-    check_exceptional_repair("wide Flash exceptional repair", 1025, flash, stream);
+    check_exceptional_repair("pipeline exceptional repair", 8192, pipeline, stream,
+                             {.count = pipeline_rows});
+    check_exceptional_repair("wide Flash exceptional repair", 1025, flash, stream,
+                             {.value_scale_offset = 8});
 }
 }
 
@@ -942,7 +953,6 @@ void check_flash_prefill(cudaStream_t stream, bool repair_only) {
     check_partial_boundaries(stream);
     check_tail_recovery(stream, 61, 193, flash_dispatch(193));
     constexpr int position = 61;
-    constexpr auto early = flash_dispatch(rows);
     {
         Input input(position + rows);
         input.add_causal_marker(position, 1);
@@ -952,13 +962,13 @@ void check_flash_prefill(cudaStream_t stream, bool repair_only) {
         input.add_causal_marker(position, rows - 1);
         const auto samples = attention_samples(input, position);
         DeviceInput device(input);
-        device.run("aligned causal tail", input, position, early, samples, stream);
+        device.run("aligned causal tail", input, position, tmem_paired_tail, samples, stream);
         device.run("aligned exact", input, position, exact, samples, stream, {.use_exact = true});
         device.run("unaligned key", input, position, multirow, samples, stream, {.key_offset = 1});
         device.run("unaligned value", input, position, multirow, samples, stream,
                    {.value_offset = 1});
         input.add_score_overflow(position);
-        device.run("Flash score overflow recovery", input, position, early,
+        device.run("Early paired score overflow recovery", input, position, tmem_paired_tail,
                    attention_samples(input, position), stream);
     }
     check_long_flash(stream);

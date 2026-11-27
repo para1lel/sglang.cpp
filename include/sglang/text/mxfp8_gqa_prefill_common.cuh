@@ -110,7 +110,6 @@ struct FlashSoftmax {
 };
 
 inline constexpr int max_multirow_visible_tokens = 32768;
-inline constexpr int max_flash_visible_tokens = 131072;
 
 __device__ std::size_t row_offset(int query_heads, int row, int head);
 

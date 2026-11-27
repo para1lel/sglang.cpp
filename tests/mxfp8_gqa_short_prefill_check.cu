@@ -286,9 +286,9 @@ void check_mixed_grouped_prefill(cudaStream_t stream) {
         capture(batch, false);
         check(cudaMemsetAsync(output.data, 0xff, actual.size() * sizeof(Bf16), stream));
         for (const auto& request : batch) {
-            check(decoder::tensor_core_model_prefill_gqa(request.cache, request.pages,
-                                                         request.position, request.rows,
-                                                         request.queries, request.output, stream));
+            check(decoder::tensor_core_multirow_prefill_gqa(
+                request.cache, request.pages, request.position, request.rows, request.queries,
+                request.output, stream, decoder::PairedPrefillScratch{}));
         }
         check(cudaMemcpyAsync(actual.data(), output.data, actual.size() * sizeof(Bf16),
                               cudaMemcpyDeviceToHost, stream));

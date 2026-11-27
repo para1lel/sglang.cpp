@@ -323,11 +323,12 @@ void Chunk::gqa_read(Mxfp8KvCache cache, Mxfp8PageTable pages, PairedPrefillScra
               long_staging)
         : std::nullopt;
     if (!staged) {
-        staged = tensor_core_fp8
-            ? tensor_core_model_prefill_gqa(cache, pages, position, rows, work.rope_queries,
-                                            work.attention, stream, scratch)
-            : mxfp8_gqa_attention(cache, pages, position + rows, position, rows,
-                work.rope_queries, work.attention, stream, work.dims.gqa_geometry());
+        staged = tensor_core_fp8 ? tensor_core_multirow_prefill_gqa(cache, pages, position, rows,
+                                                                    work.rope_queries,
+                                                                    work.attention, stream, scratch)
+                                 : mxfp8_gqa_attention(cache, pages, position + rows, position,
+                                                       rows, work.rope_queries, work.attention,
+                                                       stream, work.dims.gqa_geometry());
     }
     check(*staged, "Read causal prefill MXFP8 attention");
 }

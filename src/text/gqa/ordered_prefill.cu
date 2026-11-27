@@ -1,5 +1,6 @@
 #include "sglang/text/mxfp8_gqa_prefill_common.cuh"
 #include "sglang/decoder_cuda.cuh"
+#include "sglang/text_attention.h"
 
 #include <climits>
 
@@ -278,91 +279,121 @@ __global__ void multirow_prefill_attention(Attention request, int rows) {
     }
 }
 
+std::optional<cudaError_t> try_paired_prefill(const Attention& request, Mxfp8PageTable pages,
+                                              cudaStream_t stream,
+                                              decoder::PairedPrefillScratch scratch) {
+    const auto& cache = request.cache;
+    const int position = request.position;
+    const bool staged_position =
+        position % flash_chunk == 0 || (position >= 8192 && position % mxfp8_page_size != 0);
+    const bool staging_eligible =
+        staged_position && position <= max_multirow_visible_tokens - flash_chunk;
+    if (staging_eligible && scratch.keys != nullptr && scratch.values != nullptr) {
+        if (const auto status = launch_staged_tmem_prefill(cache, pages, position, request.queries,
+                                                           request.output, stream, scratch)) {
+            return status;
+        }
+    }
+    return launch_paired_tmem_prefill(cache, pages, position, request.queries, request.output,
+                                      stream);
 }
 
-cudaError_t decoder::tensor_core_multirow_prefill_gqa(
-    Mxfp8KvCache cache, Mxfp8PageTable pages, int position, int rows,
-    const Bf16* queries, Bf16* output, cudaStream_t stream, GqaGeometry geometry) {
-    if (rows == 0) return cudaSuccess;
-    if (!gqa_geometry_matches(geometry, cache)) return cudaErrorInvalidValue;
-    return tensor_core_multirow_prefill_gqa(cache, pages, position, rows, queries, output,
-                                           stream, PairedPrefillScratch{});
-}
-
-cudaError_t decoder::tensor_core_multirow_prefill_gqa(
-    Mxfp8KvCache cache, Mxfp8PageTable pages, int position, int rows,
-    const Bf16* queries, Bf16* output, cudaStream_t stream, PairedPrefillScratch scratch) {
-    if (rows == 0) return cudaSuccess;
-    if (position < 0 || rows < 0 || position > INT_MAX - rows) return cudaErrorInvalidValue;
-    Attention request{cache, pages.device_pages, position, queries, output};
-    const int visible = position + rows;
+std::optional<cudaError_t> try_ragged_prefill(const Attention& request, Mxfp8PageTable pages,
+                                              int rows, int visible, cudaStream_t stream) {
+    const auto& [cache, _, position, queries, output] = request;
+    if (visible > max_multirow_visible_tokens) {
+        if (rows >= 1 && rows < flash_chunk && visible <= text_attention_max_tokens) {
+            return launch_tmem_prefill(cache, pages, position, queries, output, stream, true, rows,
+                                       true);
+        }
+        return std::nullopt;
+    }
     const bool ragged = default_ragged_prefill(cache, position, rows) ||
-        default_ragged_prefill_tail({cache, pages, position, rows, queries, output},
-                                   max_multirow_visible_tokens);
-    if ((ragged || raw_pipeline_before_flash(cache, rows, visible)) &&
-        visible <= max_multirow_visible_tokens) {
-        if (const auto status = launch_tmem_prefill(cache, pages, position, queries, output,
-                                                   stream, true, rows, true)) {
-            return *status;
-        }
-    }
-    if (rows >= min_flash_rows && rows <= flash_chunk && visible <= max_flash_visible_tokens &&
-        (reinterpret_cast<std::uintptr_t>(cache.key_payload) % alignof(uint4) == 0) &&
-        (reinterpret_cast<std::uintptr_t>(cache.value_payload) % alignof(uint4) == 0)) {
-        if (rows == flash_chunk &&
-            (position >= 8192 || position % flash_chunk == 0)) {
-            constexpr int max_default_paired_position = 31744;
-            const bool default_paired = position <= max_default_paired_position &&
-                (position % flash_chunk == 0 || position % mxfp8_page_size != 0);
-            if (default_paired && scratch.keys && scratch.values) {
-                if (const auto status = launch_staged_tmem_prefill(cache, pages, position,
-                                                                  queries, output, stream,
-                                                                  scratch)) {
-                    return *status;
-                }
-            }
-            if (default_paired || (position % flash_chunk == 0 &&
-                                   position >= max_multirow_visible_tokens)) {
-                if (const auto status = launch_paired_tmem_prefill(cache, pages, position, queries,
-                                                                  output, stream)) {
-                    return *status;
-                }
-            }
-        }
-        if (const auto status = launch_flash_prefill(request, rows, stream)) {
-            return *status;
-        }
-    }
+                        default_ragged_prefill_tail({cache, pages, position, rows, queries, output},
+                                                    max_multirow_visible_tokens);
+    if (!ragged && !raw_pipeline_before_flash(cache, rows, visible))
+        return std::nullopt;
+    return launch_tmem_prefill(cache, pages, position, queries, output, stream, true, rows, true);
+}
+
+template <int Rows, int Blocks, bool Staged = false>
+cudaError_t launch_ordered_tiles(Attention request, int rows, cudaStream_t stream) {
     void* args[] = {&request, &rows};
-    constexpr int min_paired_rows = 64;
+    const dim3 blocks((rows / Rows) + (rows % Rows), gqa_head_pairs(request.cache));
+    return cudaLaunchKernel(multirow_prefill_attention<Rows, Blocks, Staged>, blocks, channels,
+                            args, 0, stream);
+}
+
+cudaError_t launch_ordered_prefill(Attention request, int rows, int visible, bool stage_payloads,
+                                   cudaStream_t stream) {
+    const int head_pairs = gqa_head_pairs(request.cache);
     constexpr int min_staged_visible = 8192;
     constexpr int min_wide_tail_rows = 32;
     constexpr int min_paired_tail_rows = 12;
-    if (rows >= 2 && rows < min_flash_rows &&
-        visible >= min_staged_visible && visible <= max_flash_visible_tokens &&
-        reinterpret_cast<std::uintptr_t>(cache.key_payload) % alignof(uint4) == 0 &&
-        reinterpret_cast<std::uintptr_t>(cache.value_payload) % alignof(uint4) == 0 &&
-        reinterpret_cast<std::uintptr_t>(cache.key_scales) % alignof(std::uint64_t) == 0 &&
-        reinterpret_cast<std::uintptr_t>(cache.value_scales) % alignof(std::uint64_t) == 0) {
-        const int tile_rows = rows >= min_wide_tail_rows ? wide_rows :
-            rows >= min_paired_tail_rows && rows % paired_rows == 0 ? paired_rows : 1;
-        const dim3 blocks(rows / tile_rows + rows % tile_rows, gqa_head_pairs(cache));
-        const auto kernel = tile_rows == wide_rows ?
-            multirow_prefill_attention<wide_rows, 2, true> : tile_rows == paired_rows ?
-            multirow_prefill_attention<paired_rows, 3, true> :
-            multirow_prefill_attention<1, 4, true>;
-        return cudaLaunchKernel(kernel, blocks, channels, args, 0, stream);
+    if (stage_payloads && rows >= 2 && rows < min_flash_rows && visible >= min_staged_visible) {
+        if (rows >= min_wide_tail_rows) {
+            return launch_ordered_tiles<wide_rows, 2, true>(request, rows, stream);
+        }
+        if (rows >= min_paired_tail_rows && rows % paired_rows == 0) {
+            return launch_ordered_tiles<paired_rows, 3, true>(request, rows, stream);
+        }
+        return launch_ordered_tiles<1, 4, true>(request, rows, stream);
     }
+    constexpr int min_paired_rows = 64;
     if (rows < min_paired_rows || visible > max_multirow_visible_tokens) {
-        const dim3 blocks(rows, gqa_head_pairs(cache));
-        return cudaLaunchKernel(protected_prefill_attention, blocks, channels, args, 0, stream);
+        void* args[] = {&request};
+        return cudaLaunchKernel(protected_prefill_attention, dim3(rows, head_pairs), channels, args,
+                                0, stream);
     }
     constexpr int min_wide_rows = 128;
-    const int tile_rows = rows >= min_wide_rows ? wide_rows : paired_rows;
-    const dim3 blocks(rows / tile_rows + rows % tile_rows, gqa_head_pairs(cache));
-    const auto kernel = tile_rows == wide_rows ? multirow_prefill_attention<wide_rows, 2> :
-                                                multirow_prefill_attention<paired_rows, 3>;
-    return cudaLaunchKernel(kernel, blocks, channels, args, 0, stream);
+    return rows >= min_wide_rows ? launch_ordered_tiles<wide_rows, 2>(request, rows, stream)
+                                 : launch_ordered_tiles<paired_rows, 3>(request, rows, stream);
+}
+
+}
+
+cudaError_t decoder::tensor_core_multirow_prefill_gqa(Mxfp8KvCache cache, Mxfp8PageTable pages,
+                                                      int position, int rows, const Bf16* queries,
+                                                      Bf16* output, cudaStream_t stream,
+                                                      PairedPrefillScratch scratch) {
+    if (rows == 0)
+        return cudaSuccess;
+    if (position < 0 || rows < 0 || position > INT_MAX - rows)
+        return cudaErrorInvalidValue;
+    Attention request{cache, pages.device_pages, position, queries, output};
+    const int visible = position + rows;
+    if (const auto status = try_ragged_prefill(request, pages, rows, visible, stream)) {
+        return *status;
+    }
+    const bool aligned_payloads =
+        reinterpret_cast<std::uintptr_t>(cache.key_payload) % alignof(uint4) == 0 &&
+        reinterpret_cast<std::uintptr_t>(cache.value_payload) % alignof(uint4) == 0;
+    const bool flash_eligible = aligned_payloads && visible <= text_attention_max_tokens;
+    if (flash_eligible && rows == flash_chunk) {
+        if (const auto status = try_paired_prefill(request, pages, stream, scratch)) {
+            return *status;
+        }
+    }
+    if (flash_eligible && rows >= min_flash_rows && rows <= flash_chunk) {
+        if (const auto status = launch_flash_prefill(request, rows, stream))
+            return *status;
+    }
+    const bool aligned_scales =
+        reinterpret_cast<std::uintptr_t>(cache.key_scales) % alignof(std::uint64_t) == 0 &&
+        reinterpret_cast<std::uintptr_t>(cache.value_scales) % alignof(std::uint64_t) == 0;
+    return launch_ordered_prefill(request, rows, visible, flash_eligible && aligned_scales, stream);
+}
+
+cudaError_t decoder::tensor_core_multirow_prefill_gqa(Mxfp8KvCache cache, Mxfp8PageTable pages,
+                                                      int position, int rows, const Bf16* queries,
+                                                      Bf16* output, cudaStream_t stream,
+                                                      GqaGeometry geometry) {
+    if (rows == 0)
+        return cudaSuccess;
+    if (!gqa_geometry_matches(geometry, cache))
+        return cudaErrorInvalidValue;
+    return tensor_core_multirow_prefill_gqa(cache, pages, position, rows, queries, output, stream,
+                                            PairedPrefillScratch{});
 }
 
 cudaError_t decoder::tensor_core_prefill_gqa(
@@ -372,14 +403,6 @@ cudaError_t decoder::tensor_core_prefill_gqa(
     void* args[] = {&request, &device_position};
     return cudaLaunchKernel(tiled_prefill_attention, dim3(rows, gqa_head_pairs(cache)),
                             channels, args, 0, stream);
-}
-
-cudaError_t decoder::tensor_core_model_prefill_gqa(
-    Mxfp8KvCache cache, Mxfp8PageTable pages, int position, int rows,
-    const __nv_bfloat16* queries, __nv_bfloat16* output, cudaStream_t stream,
-    PairedPrefillScratch scratch) {
-    return tensor_core_multirow_prefill_gqa(cache, pages, position, rows, queries, output,
-                                           stream, scratch);
 }
 
 }

@@ -18,7 +18,7 @@ B200 batch replay binds one direct lane’s live position, page table, KV, and i
 
 ### Scratch-free ordered attention
 
-Restored singleton prefill, allocation-limited prefill, and eager decode can use the scratch-free reader. It uses the tiny kernel below eight visible tokens, then stages 32 keys for two query heads with causal masking and token-order accumulation. Serial graphs with reserved KV beyond inline capacity use the tiled reader and reload device position on replay. [Eager dispatch](../src/mxfp8_gqa.cu#L805)<!-- prefix: "cudaError_t " --> · [Serial graph dispatch](../src/runtime/execution/decoder_forward_attention.cpp#L212)<!-- prefix: "if (capacity" --> · [Ordered kernel](../src/text/gqa/ordered_prefill.cu#L11)<!-- prefix: "__global__ v" --> · [Tile geometry](../include/sglang/text/mxfp8_gqa_prefill_common.cuh#L40-L41)<!-- prefix: "inline const" -->
+Restored singleton prefill, allocation-limited prefill, and eager decode can use the scratch-free reader. It uses the tiny kernel below eight visible tokens, then stages 32 keys for two query heads with causal masking and token-order accumulation. Serial graphs with reserved KV beyond inline capacity use the tiled reader and reload device position on replay. [Eager dispatch](../src/mxfp8_gqa.cu#L805)<!-- prefix: "cudaError_t " --> · [Serial graph dispatch](../src/runtime/execution/decoder_forward_attention.cpp#L212)<!-- prefix: "if (capacity" --> · [Ordered kernel](../src/text/gqa/ordered_prefill.cu#L12)<!-- prefix: "__global__ v" --> · [Tile geometry](../include/sglang/text/mxfp8_gqa_prefill_common.cuh#L40-L41)<!-- prefix: "inline const" -->
 
 ### Draft singleton reroute
 

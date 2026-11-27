@@ -1,19 +1,13 @@
 # Batch CUDA Graph checks
 
-Use the managed Pixi `default` environment and reserve an idle B200 for the entire
-run. Set `GPU_UUID` to its device UUID while holding the shared UUID lock. Use the
-pinned Qwen3.8-27B-FP8 checkpoint.
-
-From the repository root, build the normal release server and the two opt-in checks.
+From the repository root in managed Pixi `default`, hold the shared UUID lock on an idle B200 for the entire run and set `GPU_UUID`. Use the pinned Qwen3.8-27B-FP8 checkpoint and the Release server with both opt-in probes.
 
 ```bash
 out="$PWD/build/batch-graph-check"
 checkpoint=/data0/shared/Qwen3.8-27B-FP8
 xmake f -P "$PWD" -o "$out" -p linux -a x86_64 -m release \
     --mxfp8-gqa-check=y --batch-graph-lanes=y
-xmake build -P "$PWD" sglang-server
-xmake build -P "$PWD" mxfp8-gqa-check
-xmake build -P "$PWD" batch-graph-lanes
+xmake build -P "$PWD" sglang-server mxfp8-gqa-check batch-graph-lanes
 GPU_UUID="${GPU_UUID:?Set the reserved B200 UUID}" \
     bash tests/batch/run_batch_graph.sh "$out" "$checkpoint" "$out/evidence"
 ```
@@ -104,47 +98,32 @@ python3 -IB tests/batch/run_wide.py --binary "$out/bin/sglang-server" \
     --cpu-only --evidence "$out/wide-cli"
 ```
 
-From the same source and build, compile the native lane probe and CUPTI observer.
-The probe wraps two native entry points to check one full-width model call and
-packed FP8 projection fan-out.
+Link the lane probe and CUPTI observer against the same Release build. The first wraps two symbols to check one full-width model call and packed FP8 projection fan-out.
 
 ```bash
 toolkit="${CONDA_PREFIX:?Activate the managed Pixi default environment}/targets/x86_64-linux"
 nccl=$(python -I -c 'import sysconfig; print(sysconfig.get_path("purelib") + "/nvidia/nccl")')
 forward=_ZNK6sglang7Decoder5Model7forwardEPKNS_7decoder11ForwardLaneEiP11CUstream_st
 gemm=_ZN6sglang13text_fp8_gemmEPKhPK13__nv_bfloat16iiPKNS_17TextFp8ProjectionEiP11CUstream_st
+cuda_lib=(-L"$toolkit/lib" -Wl,-rpath,"$toolkit/lib")
 "$CXX" -std=c++17 -O2 -Wall -Wextra -Werror -Iinclude -I"$toolkit/include" \
-    tests/batch/check_wide_lanes.cpp -L"$toolkit/lib" -L"$toolkit/lib/stubs" \
-    -Wl,-rpath,"$toolkit/lib" -Wl,--wrap="$forward" -Wl,--wrap="$gemm" \
+    tests/batch/check_wide_lanes.cpp "${cuda_lib[@]}" -L"$toolkit/lib/stubs" \
+    -Wl,--wrap="$forward" -Wl,--wrap="$gemm" \
     -Wl,--start-group "$out"/lib/libsglang_*.a -Wl,--end-group \
     -Wl,-rpath,"$nccl/lib" "$nccl/lib/libnccl.so.2" -lcuda -lcudart -pthread -o "$out/bin/check-wide-lanes"
 "$CXX" -std=c++17 -O2 -fPIC -shared -I"$toolkit/include" \
-    tests/batch/graph_activity.cpp -L"$toolkit/lib" -Wl,-rpath,"$toolkit/lib" \
-    -lcupti -o "$out/bin/wide-activity.so"
+    tests/batch/graph_activity.cpp "${cuda_lib[@]}" -lcupti -o "$out/bin/wide-activity.so"
 CUDA_VISIBLE_DEVICES="${GPU_UUID:?Set the reserved B200 UUID}" CUDA_DEVICE_ORDER=PCI_BUS_ID \
     python3 -IB tests/batch/run_wide.py --binary "$out/bin/sglang-server" \
     --checkpoint "$checkpoint" --lanes "$out/bin/check-wide-lanes" \
     --activity "$out/bin/wide-activity.so" --evidence "$out/wide"
 ```
 
-The GPU runner checks both 16 and 32 lanes by default. It compares native and
-HTTP token IDs with serial results from the same runtime. All clients must emit a token
-before the first `[DONE]`. The runner checks queueing, cancellation, and slot
-reuse. Request bytes must return to zero after retirement.
-
-The HTTP trace must show a full-width scheduler step and eager multi-lane decode.
-Each step can contain at most 128 prompt and decode
-rows with the explicit test budget. The native probe requires one full-width
-eager decode call and eager execution for pairs. A singleton on the highest slot
-must replay once warmed. The mask must include the highest slot bit, and CUPTI must
-record the replay.
+Both widths, 16 and 32, match native and HTTP IDs with serial output. All clients emit a token before the first `[DONE]`. Check queueing, cancellation, slot reuse, and request bytes returning to zero. The trace shows a full-width step and eager multi-lane decode, with at most 128 prompt and decode rows per step. The native probe requires one full-width eager call and eager pairs. A warmed highest-slot singleton replays with its mask bit set and a corresponding CUPTI launch.
 
 ## CPU score slab check
 
-From the repository root in the managed Pixi `default` environment, build and
-run the score-slab check with CUDA hidden. It links the checkpoint and JSON
-archives from the Release build above and uses host stubs for allocation and
-graph APIs. It requires no checkpoint files or GPU.
+Use the Release checkpoint and JSON archives in managed Pixi. CUDA stays hidden. Host stubs cover allocation and graph APIs without weights or a GPU.
 
 ```bash
 toolkit="${CONDA_PREFIX:?Activate the managed Pixi default environment}/targets/x86_64-linux"

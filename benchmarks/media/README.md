@@ -31,30 +31,7 @@ The processor uses these frames without resampling. The temporal-pair centers ar
 
 ## Run identity
 
-The timed window was 14:51:51–14:52:21 UTC on GPU0, an NVIDIA B200 with driver `590.48.01`.
-The device UUID was `GPU-40f23920-6ba0-cdc4-e7e7-64b6cb470b32`.
-The device had no active compute or resident memory before launch and after shutdown.
-
-| Component | Identity |
-| --- | --- |
-| Project source | `98b5b35916b7fcadd36859c30abf069e03def377` |
-| vLLM source and wheel | `81a8cb063e6247fe254d7caf7e98a6691d71022a`, `0.34.0rc1.dev787+g81a8cb063` |
-| GPU runtime | Torch `2.14.0+cu132`, CUDA `13.2`, FlashInfer `0.7.4` |
-| Media preprocessing | Transformers `5.23.0`, OpenCV `5.1.0.95`, `opencv` loader |
-| Checkpoint | Qwen3.8-27B-FP8, manifest SHA-256 `b54fe44144f1701a9369e8b912997ee5cab77cd176c8f97ad3fe63e78cf3c303` |
-
-The worker reported BF16 model activations, a 1 GiB KV cache, and `FULL_AND_PIECEWISE`
-CUDA graphs. All 16 GQA layers used FlashInfer with E4M3 KV, BF16 Q, and unit Q/K/V
-scales in FP32 on the device. GQA projections used E4M3 weights. GDN used BF16
-convolution and FP32 recurrence.
-
-An independent renderer check matched both uint8 patch arrays against offline preprocessing.
-Each separate three-iteration profile had one fused input normalization, 27 BF16 SM100
-vision attention calls, 16 FA2 GQA prefill calls, and 32 TRTLLM-Gen GQA decode calls.
-Each profile also had 48 chunked GDN prefill calls and 96 packed recurrent decode calls.
-The visual embeddings had shapes `[64,5120]` and `[32,5120]`. The language MRoPE deltas
-were −56 and −24. Both profiled streams reproduced the corresponding vLLM output IDs.
-Only the warmed, uninstrumented requests contribute to the timing reference.
+The November 18 capture ran on GPU0, an NVIDIA B200. Only warmed, uninstrumented requests contribute timing samples. The [frozen run identity](https://github.com/para1lel/sglang.cpp/blob/aab1101e145507c4c40435602e3a2d3c5d88111d/benchmarks/media/README.md#run-identity) records the device, runtime, checkpoint and separate worker and renderer profiles.
 
 ## Verify offline
 
@@ -67,41 +44,10 @@ python -B -m benchmarks.media.collect verify
 The verifier checks the exact request bytes, embedded media hashes, and input ID hashes.
 It recomputes the reference statistics and thresholds from the compact timing rows.
 
+Each case requires median tokens per second and its ratio to the reference median to exceed their respective unrounded thresholds. The p95 TTFT, TPOT and end-to-end latencies must each be at or below their stored ceiling. [W1-image cutoffs](gpu0-reference.json#L170)<!-- prefix: "\"thresholds\"" --> · [W1-video cutoffs](gpu0-reference.json#L346)<!-- prefix: "\"thresholds\"" -->
+
+For native codec parity with the same bodies, run the [optional codec test](../../tests/media/http-contract.md#optional-codecs) on a reserved B200. It checks decoded RGB8, compressed requests and eager decode across JSON and SSE.
+
 ## Reproduce the measurement
 
-Use the [pinned vLLM environment](../vllm/README.md#environment) and a matching local checkpoint.
-Provide absolute paths for the paths in this command. Use the existing device-specific lock.
-Set `CACHE_SEED` to a matching provisioned cache to reproduce the seeded launch.
-Set `LD_LIBRARY_PATH` to the required host CUDA compatibility library directory.
-Run from the repository root.
-
-```bash
-export VLLM_ENV CHECKPOINT GPU_UUID GPU_LOCK_FILE RUN_DIR
-bash benchmarks/media/serve.sh
-```
-
-The launcher verifies the wheel, installed native binaries, and checkpoint before serving.
-Use the same physical GPU UUID when pairing measurements.
-After `/health` succeeds, run the collector from a second terminal:
-
-```bash
-"$VLLM_ENV/venv/bin/python" -B -m benchmarks.media.collect measure \
-    --url http://127.0.0.1:17462 --output "$RUN_DIR/measurement"
-```
-
-Stop the foreground server with Ctrl-C after collection. Keep new raw streams in the run directory.
-To audit a new collection, run the same command with `replay` in place of `measure`.
-
-Both requests use greedy decoding, seed 0, an output budget of 128, and EOS ignored.
-Prefix reuse, processor caching, and speculative decoding are disabled.
-The collector verifies the worker state and two `/tokenize` responses per case before timing.
-It sends one image-then-video warmup cohort and one measured cohort. Each
-request uses a new loopback connection. Every attempted stream enters validation.
-The measured stream per case supplies its point estimates.
-
-TTFT starts at client submission and ends on the first output ID.
-TPOT divides first-to-last output time by 127.
-End-to-end latency ends on `[DONE]`. Throughput divides 128 by end-to-end seconds.
-The archived three-warmup, nine-measurement capture used inclusive linear
-percentiles and sample standard deviation. Its replay retains the original
-throughput and p95 gates stored in the reference.
+The [November 18 procedure](https://github.com/para1lel/sglang.cpp/blob/e681f90867aa9c59bb0c11bf0e796557f36ce088/benchmarks/media/README.md#reproduce-the-measurement) runs three warmups and nine timed requests per case. Its replay validates saved streams and recomputes statistics and cutoffs. The [later single-round procedure](https://github.com/para1lel/sglang.cpp/blob/aab1101e145507c4c40435602e3a2d3c5d88111d/benchmarks/media/README.md#reproduce-the-measurement) runs one warmup and one timed request per case and can replay saved streams in the original format.

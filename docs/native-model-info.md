@@ -165,37 +165,24 @@ Both aliases use the shared decoded path. A GET ignores the query and any succes
 
 ### Model information and discovery
 
-With the native server on its default loopback port, send both GET requests.
+Run against the native server on the default loopback port.
 
 ```bash
-curl --fail-with-body -i http://127.0.0.1:17384/model_info
-curl --fail-with-body -i http://127.0.0.1:17384/get_model_info
+base=http://127.0.0.1:17384
+curl --fail-with-body -i "$base/model_info"
+curl --fail-with-body -i "$base/get_model_info"
+curl -i -X POST "$base/model_info"
+curl --fail-with-body -i "$base/v1/models"
+curl --fail-with-body -i "$base/v1/models/%51wen3.8-27B-FP8?test=1"
+curl -i "$base/v1/models/unknown"
+curl -I "$base/v1/models/Qwen3.8-27B-FP8"
 ```
 
-Require HTTP 200, matching JSON objects, and the values specified above. If the values differ, check the checkpoint path and parser options used at launch.
-
-Send a POST to check the method response.
-
-```bash
-curl -i -X POST http://127.0.0.1:17384/model_info
-```
-
-Require HTTP 405 and `Allow: GET`. If another route responds, check the server address and the exact request target.
-
-Request the discovery list and retrieve the model by its encoded ID.
-
-```bash
-curl --fail-with-body -i http://127.0.0.1:17384/v1/models
-curl --fail-with-body -i 'http://127.0.0.1:17384/v1/models/%51wen3.8-27B-FP8?test=1'
-curl -i http://127.0.0.1:17384/v1/models/unknown
-curl -I http://127.0.0.1:17384/v1/models/Qwen3.8-27B-FP8
-```
-
-Require HTTP 200 for the first two requests and compare the list's only card with the bare object, allowing different `created` values. Require HTTP 404 with `model_not_found` for the unknown ID and HTTP 405 with `Allow: GET` and no body for `HEAD`.
+Require the two model-info GETs to return identical HTTP 200 objects and POST to return HTTP 405 with `Allow: GET`. Compare the discovery list's only card with the encoded retrieval result, allowing different `created` values. Check the unknown ID returns HTTP 404 with `model_not_found` and HEAD returns HTTP 405 with `Allow: GET` and no body.
 
 ### Server information at idle and under load
 
-Build the server and select a reserved B200 with the [launch procedure](../README.md#serve-token-ids-over-http). Start a fresh process with no other clients.
+Start a fresh release server on a reserved B200 with no other clients. The duplicate checkpoint and launch canaries exercise redaction and effective option resolution.
 
 ```bash
 CUDA_VISIBLE_DEVICES="${GPU_UUID:?set the reserved B200 UUID}" INFO_TEST=env-canary \
@@ -205,74 +192,8 @@ CUDA_VISIBLE_DEVICES="${GPU_UUID:?set the reserved B200 UUID}" INFO_TEST=env-can
     --batch-cuda-graphs --eager --sampling-defaults openai
 ```
 
-In a second Bash shell with `curl` and `jq`, compare both responses at idle.
+Use the [copyable idle and load probes](https://github.com/para1lel/sglang.cpp/blob/572627c81b89b1c75c7bcda1c2e9c23a4c8e95f6/docs/native-model-info.md#server-information-at-idle-and-under-load) with Bash, `curl`, and `jq`. Require identical alias responses at idle, correct effective options and paths, exactly two redacted checkpoint flags, no canary values, positive startup time, and zero running requests and generation tokens. Verify both aliases ignore a GET body, query, and auth header. Check HEAD, POST, and PUT return 405 with `Allow: GET`. HEAD has no body. Require slash redirects to preserve the query, an unknown path to return 404, and `/health_generate` to leave both counters unchanged.
 
-```bash
-set -euo pipefail
-base=http://127.0.0.1:17384
-samples=$(mktemp -d)
-for route in server_info get_server_info; do
-    curl -fsS -X GET -d body-canary -H 'Authorization: Bearer header-canary' \
-        "$base/$route?test=query-canary" | jq -S . > "$samples/$route"
-    for method in HEAD POST PUT; do
-        status=$(curl -sS --ignore-content-length -X "$method" -D "$samples/headers" \
-            -o "$samples/body" -w '%{http_code}' "$base/$route?test=1")
-        test "$status" = 405
-        tr -d '\r' < "$samples/headers" | grep -ix 'Allow: GET'
-        if [[ $method == HEAD ]]; then test ! -s "$samples/body"
-        else jq -e '. == {"detail":"Method Not Allowed"}' "$samples/body"; fi
-    done
-done
-diff -u "$samples/server_info" "$samples/get_server_info"
-jq -e '.port == 17384 and .device == 0 and .max_running_requests == 2 and
-    .max_num_batched_tokens == 4096 and .prefix_cache_entries == 0 and .mtp_steps == 0 and
-    (.lmcache_enabled == false) and (.lmcache_available == false) and
-    .enable_multimodal and has("mtp_seed_fc") and .mtp_seed_fc == null and
-    .sampling_defaults == "openai" and .eager and (.batch_cuda_graphs == false) and
-    .model_path == "/data0/shared/Qwen3.8-27B-FP8" and .tokenizer_path == .model_path and
-    ([.launch_command | scan("<redacted>")] | length) == 2 and
-    (.launch_command | contains("/data0/") | not) and (tostring | contains("canary") | not) and
-    .startup_time.server_e2e > 0 and (.internal_states | length) == 1 and
-    (.internal_states[0] | .ready and .effective_max_running_requests_per_dp == 2 and
-    .num_running_reqs == 0 and .generation_tokens_total == 0)' "$samples/server_info"
-for route in server_info get_server_info; do
-    status=$(curl -sS -X PUT -D "$samples/headers" -o "$samples/body" \
-        -w '%{http_code}' "$base/$route//?test=1")
-    test "$status" = 307
-    test ! -s "$samples/body"
-    tr -d '\r' < "$samples/headers" | grep -Fxi "Location: $base/$route?test=1"
-done
-test "$(curl -sS -o /dev/null -w '%{http_code}' "$base/server_info_unknown")" = 404
-curl -fsS "$base/health_generate"
-curl -fsS "$base/server_info" | jq -S . | diff - "$samples/server_info"
-```
+Run the two concurrent 96-token requests from the probe. Require both lanes visible together, a nondecreasing cumulative token count across both aliases, including a sample strictly between 0 and 192, and final ready state with zero running requests and exactly 192 generation tokens. If polling misses overlap, repeat with longer requests and adjust the expected total. Repeat after accounting changes with prefix reuse and MTP output. Omit `--eager` for prefix reuse.
 
-Both aliases must return identical objects at idle. The health probe must preserve both counters.
-
-Send two concurrent requests and sample both routes until generation finishes.
-
-```bash
-generate() {
-    curl -fsS --max-time 180 -H 'Content-Type: application/json' \
-        -d '{"input_ids":[220],"sampling_params":{"max_new_tokens":96,"temperature":0,"ignore_eos":true}}' \
-        "$base/generate"
-}
-generate > "$samples/first" & first=$!
-generate > "$samples/second" & second=$!
-while kill -0 "$first" 2>/dev/null || kill -0 "$second" 2>/dev/null; do
-    for route in server_info get_server_info; do
-        curl -fsS --max-time 5 "$base/$route" | jq -c '.internal_states[0]' >> "$samples/busy"
-    done
-done
-wait "$first"
-wait "$second"
-jq -es 'all(.[]; (.output_ids | length) == 96 and .meta_info.completion_tokens == 96)' \
-    "$samples/first" "$samples/second"
-jq -es 'any(.[]; .num_running_reqs == 2) and
-    any(.[]; .generation_tokens_total > 0 and .generation_tokens_total < 192) and
-    ([.[].generation_tokens_total] | . == sort)' "$samples/busy"
-curl -fsS "$base/get_server_info" | jq -e '.internal_states[0] |
-    .ready and .num_running_reqs == 0 and .generation_tokens_total == 192'
-```
-
-Both lanes must be visible together, and the final token count must equal the two response lengths. If polling misses the overlap, restart with longer requests and adjust the expected counts. After an accounting change, repeat with prefix reuse enabled and with MTP output. Omit `--eager` when enabling prefix reuse.
+[Full verification appendix](https://github.com/para1lel/sglang.cpp/blob/572627c81b89b1c75c7bcda1c2e9c23a4c8e95f6/docs/native-model-info.md#verification)

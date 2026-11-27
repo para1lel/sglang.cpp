@@ -113,32 +113,20 @@ A failed write or disconnect cancels the request and waits for decoder retiremen
 
 ## Verification
 
-Run the [CPU reader and queue checks](../tests/prefix/README.md#cpu-reader-queue) with prefix reuse off and on. Exercise partial headers and bodies at the reader limit and absolute deadline, large buffered requests, overload, cancellation, FIFO replacement, and shutdown. Require responsive `/health` and `/ready` while readers or completions occupy their slots and during reset acknowledgement. With reuse enabled, reset during a claimed completion must return HTTP 409.
+Run the [CPU reader and queue checks](../tests/prefix/README.md#cpu-reader-queue) with prefix reuse off and on. Cover partial and large requests, reader limit and deadline, overload, FIFO replacement, cancellation, and shutdown. Require responsive `/health` and `/ready` during occupied slots and reset acknowledgement. Reset during a claimed completion must return HTTP 409.
 
-Run the [CPU placement probe](../tests/batch/run_indexed_admission.sh#L1)<!-- prefix: "#!/usr/bin/e" --> with the source directory and binary output path. A one-item batch must wait for its busy owner lane even when another lane is free.
-
-Probe generation on the default port.
+Run the [CPU placement probe](../tests/batch/run_indexed_admission.sh#L1)<!-- prefix: "#!/usr/bin/e" --> with the source directory and binary output path. An indexed singleton must wait for its owner lane even when a peer lane is free. Run these fixtures from the repository root in managed Linux Pixi with `artifacts/` present. The decode grace check uses GNU linker wrapping and libstdc++.
 
 ```bash
-curl -i --max-time 30 http://127.0.0.1:17384/health_generate
-```
-
-On an idle healthy server, require HTTP 200 with an empty body. Hold publication on busy lanes, then release a user token. The waiting probe must return 200 without synthetic admission. Require empty 503 responses on deadline, FIFO overflow, and shutdown of writable active or queued probes. Check `/health` and `/ready` while the probe waits. Disconnect it and require the next probe to run. After permanent worker failure, check all three [health responses](#health-and-readiness).
-
-Run `bash tests/batch/run_service_mtp.sh "$PWD" "$PWD/artifacts/service-mtp-check"` from the repository root in the managed environment with `artifacts/` present. Require one admission callback before token delivery. [Callback assertions](../tests/batch/service_mtp.cpp#L41)<!-- prefix: "callbacks.on" -->
-
-Run the host decode grace regression from the repository root in the default Linux Pixi environment. Create `artifacts/` first. The stub decoder uses GNU linker wrapping and libstdc++.
-
-```bash
+bash tests/batch/run_service_mtp.sh "$PWD" "$PWD/artifacts/service-mtp-check"
 bash tests/batch/run_service_decode_grace.sh "$PWD" "$PWD/artifacts/service-decode-grace-check"
+bash tests/batch/run_service_mtp_mailbox.sh "$PWD" "$PWD/artifacts/service-mtp-mailbox"
 ```
 
-With all outputs pending, a spurious wake must leave the worker waiting. At 24 acknowledgements it stays in grace. At 25 it dispatches before timeout. Release the remaining seven for a separate dispatch. Require two ordered IDs and a length finish per item, reset rejection while streaming, and successful idle reset. [Threshold assertions](../tests/batch/service_decode_grace.cpp#L145)<!-- prefix: "fixture.awai" -->
+Require exactly one admission callback before token delivery. A spurious wake and 24 acknowledgements stay in grace. At 25, dispatch before timeout, then dispatch the other seven separately. Check two ordered IDs and a length finish per item, reset rejection during streaming, and successful idle reset. The mailbox fixture covers first acknowledgement, the two-step bound, ready peers, stop and length, slot reuse, eligibility, late arrivals, blocked writers, and trace order. Check phase-dependent abort, failure after a completion claim, and recoverable and permanent faults for peers.
 
-Run `bash tests/batch/run_service_mtp_mailbox.sh "$PWD" "$PWD/artifacts/service-mtp-mailbox"` in the same environment. The fixture checks first acknowledgement, the two-step bound, ready peers, ordered IDs, stop and length, and slot reuse. It covers opt-out, target-only options, and step delivery. A winning native abort drops unclaimed overlap, and peers still receive recoverable and permanent faults. It also checks abort before and after a completion claim and fault after a claim. [Scalar fixture](../tests/batch/service_mtp_mailbox.cpp#L107)<!-- prefix: "void check_s" --> · [Abort and fault fixture](../tests/batch/service_mtp_mailbox.cpp#L280)<!-- prefix: "void check_a" --> · [Completion claim fixture](../tests/batch/service_mtp_mailbox.cpp#L351)<!-- prefix: "void check_c" -->
+Use `curl -i --max-time 30 http://127.0.0.1:17384/health_generate`. Require an empty HTTP 200 when idle and after the next user token on busy lanes, with no synthetic admission. Deadline, FIFO overflow, and shutdown of writable probes return empty 503s. Check responsiveness while waiting, rerun after disconnect, and verify all three [health responses](#health-and-readiness) after a permanent worker failure.
 
-The roster cases check late arrival, abort, blocked or disconnected writers, and trace order. The order fixture covers already-published jobs and replacement after retirement. [Cold-roster fixture](../tests/batch/service_mtp_mailbox.cpp#L425)<!-- prefix: "void check_p" --> · [Publication order fixture](../tests/batch/service_mtp_mailbox.cpp#L511)<!-- prefix: "void check_p" --> · [Replacement fixture](../tests/batch/service_mtp_mailbox.cpp#L546)<!-- prefix: "void check_p" --> · [Trace control](../tests/batch/service_mtp_mailbox.cpp#L611)<!-- prefix: "void check_p" -->
+On a reserved B200, run the [streaming checks](development.md#streaming-verification) and [traced prefill reset](../tests/prefill/README.md). Require early headers and reset after one traced chunk, retirement to zero request bytes, and successful replacement. With and without buffered decoder steps, require an SSE comment after 15 seconds of wire silence and measure TTFT at the first output ID frame. Check JSON rejection before headers and HTTP 200 with one SSE error and no `[DONE]` after headers but before the first token.
 
-Run the [streaming verification](development.md#streaming-verification) on a reserved B200. The [native prefill reset check](../tests/prefill/README.md) requires headers before prefill finishes. It resets after a traced chunk, checks retirement to zero request bytes, and verifies a replacement. [Reset assertions](../tests/prefill/run_native.py#L145)<!-- prefix: "def check_re" -->
-
-Check wire silence with no decoder steps and with steps that [buffer tokens](lessons.md#l008--buffered-tokens-suppress-sse-keepalives). Require a comment after 15 seconds and measure TTFT at the first output ID frame. Exercise rejection before headers and generation failure after headers but before the first token. Require JSON status for rejection and an SSE error without `[DONE]` for the open stream.
+[Full verification appendix](https://github.com/para1lel/sglang.cpp/blob/572627c81b89b1c75c7bcda1c2e9c23a4c8e95f6/docs/http-server.md#verification)

@@ -216,19 +216,11 @@ Send [`POST /abort_request`](native-abort.md) from a second connection to cancel
 
 ## Verification
 
-Start the release server with its pinned checkpoint on a reserved B200. Run the single-prompt examples from [Runtime path](#runtime-path).
-For each fixed prompt and sampling configuration, compare final text, IDs, token counts, and finish reason across both methods and response modes. Require cumulative ID prefixes, one final object, and one `[DONE]` per successful stream.
+Run the [single-prompt and batch examples](#runtime-path) on a reserved B200 with the pinned release checkpoint. Compare JSON and SSE for both methods. Check text, finish reason, token counts, cumulative IDs, one final event per item, and one `[DONE]` after all items finish. Run the batch cases at `--max-active 1` and `2`; check stable IDs, per-index counts, one-item array and SSE shapes, and zero IDs for the first nested-ID item.
 
-Send malformed JSON with both methods and require the same HTTP 400. With `PUT`, omit the length and require HTTP 411. Send an unsupported media type and require HTTP 415. Check for HTTP 405 and `Allow: POST, PUT` with `curl -I http://127.0.0.1:17384/generate`.
+Check zero budget and an explicit stop at the first greedy ID. The stop retains that ID and returns empty text. Require HTTP 400 for malformed JSON, conflicting prompts, a mismatched sampling array, or an invalid later item. SSE validation errors must precede headers. With PUT, check 411 for missing length and 415 for unsupported media type. Confirm HTTP 405 and `Allow: POST, PUT` with `curl -I http://127.0.0.1:17384/generate`.
 
-Repeat the ID request with `max_new_tokens: 0`. Require the zero-budget result in both response modes.
-Use the first ID from the greedy request as an explicit stop ID. Require `stop`, the matched ID in `output_ids`, and empty text.
-Send both prompt fields with `stream: true`. Require a JSON HTTP 400 before SSE opens.
-Use the [shared transport checks](http-server.md#verification) for keepalives, cancellation, and failures after admission.
-
-At K0 and positive depth, compare greedy JSON and SSE with top three and both text settings. Check score prefixes and IDs, then cover top zero, zero budget, a stop ID, and mixed lanes. Verify full prompt scores and an interior suffix. Require HTTP 400 for invalid offsets, requested-ID scoring, and active sampling.
-
-In the managed Pixi environment, build the score check from the repository root. Run it on a reserved B200.
+For generated scores, compare greedy JSON and SSE at K0 and positive depth. Check top three with both text settings, top zero, full and suffix prompt scores, score prefixes and IDs, zero budget, stop IDs, and mixed lanes. Require HTTP 400 for invalid offsets, requested-ID scoring, or active sampling. In managed Pixi, run this independent full-vocabulary log-softmax comparison on the reserved B200.
 
 ```bash
 checkpoint=/data0/shared/Qwen3.8-27B-FP8
@@ -237,9 +229,7 @@ xmake build -P . generated-logprobs-check
 ./build/bin/generated-logprobs-check "$checkpoint"
 ```
 
-Require exit status zero for reducer and checkpoint cases. On captured target rows, compare selected and ranked scores against an independent full-vocabulary log-softmax. [Build target](../xmake.lua#L413)<!-- prefix: "target(\"gene" --> · [Checkpoint check](../tests/text/generated_logprobs_check.cpp#L248)<!-- prefix: "int main(int" -->
-
-Build the [CPU fixture](../tests/text/README.md#native-generate-on-cpu). Run the score suite against that binary.
+Build the [CPU fixture](../tests/text/README.md#native-generate-on-cpu), then run both suites in the same environment from the repository root. Require zero exit status for all three checks.
 
 ```bash
 out="$PWD/artifacts/native-generate-cpu"
@@ -247,26 +237,10 @@ checkpoint=/data0/shared/Qwen3.8-27B-FP8
 CUDA_VISIBLE_DEVICES='' /data1/shared/dongwu.chen/.pixi/envs/default/bin/python -B \
     tests/text/test_native_generated_logprobs_cpu.py \
     --binary "$out/server" --checkpoint "$checkpoint" --output "$out/logprob-evidence"
-```
-
-Require exit status zero. The suite checks cumulative scores, mixed opt-in, token text, stops, abort, and validation. It checks that `top_k: 1` stays greedy with positive temperature. [CPU suite](../tests/text/test_native_generated_logprobs_cpu.py#L1)<!-- prefix: "\"\"\"Check nat" -->
-
-Run both batch examples in JSON and SSE at `--max-active 1` and `2`. Match terminal events to JSON with fixed greedy options and cache state. Check cumulative ID prefixes, per-index token counts, and stable item IDs within each request. Require one `[DONE]` after both items finish.
-Require zero output IDs for the first nested-ID item. Check a one-element JSON array and indexed SSE for a one-item batch.
-Require JSON HTTP 400 before SSE for a mismatched sampling array or invalid later prompt.
-
-Build the [CPU fixture](../tests/text/README.md#native-generate-on-cpu), then run the text-stop suite against that same binary from the repository root.
-
-```bash
-out="$PWD/artifacts/native-generate-cpu"
-checkpoint=/data0/shared/Qwen3.8-27B-FP8
 CUDA_VISIBLE_DEVICES='' python3 -B tests/text/test_native_text_stops_cpu.py \
     --binary "$out/server" --checkpoint "$checkpoint" --output "$out/text-stop-evidence"
 ```
 
-Script stops within one token, across two tokens, and across UTF-8 byte pieces. Compare JSON and terminal SSE for the match, trimmed text, retained IDs, and completion count. Check that intermediate events hide pending prefixes.
-Reverse competing patterns in one decoder step. At length, check release of an unmatched suffix and replacement of incomplete UTF-8.
-Check two indexed items with different stops, then broadcast options with `ignore_eos: true`. Require HTTP 400 for a nested stop array.
-Script MTP IDs beyond a match and verify their removal from the result and usage. At length without a match, compare the retained text and IDs across JSON and SSE. Check lane reuse after a stop and client abort.
-Inject a capacity failure before admission and check the mapped JSON error. After an item event, inject a failure and require HTTP 200, one SSE error, and closure without `[DONE]`.
-Check that a stalled item's 15-second comment stays out of TTFT. Disconnect a batch with an unsubmitted item. Verify cancellation, retirement of active jobs, and reuse by a replacement request.
+The score fixture also checks token text, mixed opt-in, abort, and greedy `top_k: 1` at positive temperature. For text stops, cover single tokens, token boundaries, and UTF-8 pieces. Reverse competing matches in one step, and check hidden partials, incomplete UTF-8 at length, discarded speculative IDs and usage, indexed stops, broadcast with `ignore_eos: true`, and lane reuse. Reject nested stop arrays. Check [transport admission, keepalives, and cancellation](http-server.md#verification). Require the mapped JSON error for pre-admission failure. After an item event, require HTTP 200, one SSE error, and closure without `[DONE]`. Disconnect with an unsubmitted item and confirm cancellation, retirement, and reuse.
+
+[Full verification appendix](https://github.com/para1lel/sglang.cpp/blob/572627c81b89b1c75c7bcda1c2e9c23a4c8e95f6/docs/native-generate.md#verification)

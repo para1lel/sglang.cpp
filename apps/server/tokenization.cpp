@@ -709,65 +709,28 @@ void tokenize(const Socket& connection, const CompletionTokenizer& loader,
     write_json(connection, "200 OK", output);
 }
 
-bool integer_space(char32_t scalar) {
-    return (scalar >= U'\t' && scalar <= U'\r') || scalar == U' ' || scalar == 0x85 ||
-           scalar == 0xa0 || scalar == 0x1680 || (scalar >= 0x2000 && scalar <= 0x200a) ||
-           scalar == 0x2028 || scalar == 0x2029 || scalar == 0x202f || scalar == 0x205f ||
-           scalar == 0x3000;
-}
-
-bool digit(char32_t scalar) {
-    return scalar >= U'0' && scalar <= U'9';
-}
-
 [[noreturn]] void invalid_ids() {
     throw HttpError(bad_request, "Expected tokens to be integers in a flat or nested array");
 }
 
 std::string integer_text(std::string_view text) {
-    const auto scalars = read_utf8(text);
-    std::u32string_view input(scalars);
-    while (!input.empty() && integer_space(input.front())) {
-        input.remove_prefix(1);
-    }
-    while (!input.empty() && integer_space(input.back())) {
-        input.remove_suffix(1);
-    }
-    const bool negative = !input.empty() && input.front() == U'-';
-    if (!input.empty() && (negative || input.front() == U'+')) {
-        input.remove_prefix(1);
-    }
-    if (input.empty() || !digit(input.front())) {
+    const auto number = detail::scan_integer_text(text);
+    if (!number || number->digit_count > 4300) {
         invalid_ids();
     }
-    const auto point = input.find(U'.');
-    const auto whole = input.substr(0, point);
-    if (point != std::u32string_view::npos) {
-        const auto fraction = input.substr(point + 1);
-        if (fraction.empty() || fraction.find_first_not_of(U'0') != std::u32string_view::npos) {
-            invalid_ids();
-        }
-    }
-    std::string digits;
-    for (std::size_t index = 0; index < whole.size(); ++index) {
-        const auto scalar = whole[index];
-        if (digit(scalar)) {
-            if (scalar != U'0' || !digits.empty()) {
-                digits += static_cast<char>(scalar);
-            }
-        } else if (scalar != U'_' || !digit(whole[index - 1]) ||
-                   index + 1 == whole.size() || !digit(whole[index + 1])) {
-            invalid_ids();
-        }
-    }
-    if (digits.size() > 4300) {
-        invalid_ids();
-    }
-    if (digits.empty()) {
+    if (number->digit_count == 0) {
         return "0";
     }
-    if (negative) {
-        digits.insert(digits.begin(), '-');
+
+    std::string digits;
+    digits.reserve(number->digit_count + static_cast<std::size_t>(number->negative));
+    if (number->negative) {
+        digits += '-';
+    }
+    for (const char digit : number->significant) {
+        if (digit != '_') {
+            digits += digit;
+        }
     }
     return digits;
 }

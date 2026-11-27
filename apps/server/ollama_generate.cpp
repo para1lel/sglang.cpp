@@ -48,37 +48,11 @@ bool python_whitespace(char32_t character) {
     return (character >= 0x1c && character <= 0x1f) || unicode_whitespace(character);
 }
 
-bool decimal_digit(char32_t character) {
-    return '0' <= character && character <= '9';
-}
-
-bool context_integer_text(std::string_view text) {
-    const auto characters = read_utf8(text);
-    std::u32string_view number = characters;
-    while (!number.empty() && unicode_whitespace(number.front())) number.remove_prefix(1);
-    while (!number.empty() && unicode_whitespace(number.back())) number.remove_suffix(1);
-    if (!number.empty() && (number.front() == '+' || number.front() == '-')) {
-        number.remove_prefix(1);
-    }
-    const auto point = number.find('.');
-    const auto integer = number.substr(0, point);
-    if (integer.empty() || !decimal_digit(integer.front()) || !decimal_digit(integer.back())) {
-        return false;
-    }
-    bool separator = false;
-    for (const auto character : integer) {
-        if (!decimal_digit(character) && (character != '_' || separator)) return false;
-        separator = character == '_';
-    }
-    if (point == number.npos) return true;
-    const auto fraction = number.substr(point + 1);
-    return !fraction.empty() && fraction.find_first_not_of('0') == fraction.npos;
-}
-
 bool context_integer(const json::Value& value) {
     if (value.boolean() || value.signed_integer() || value.unsigned_integer() ||
         value.wide_integer()) return true;
-    if (const auto text = value.string()) return context_integer_text(*text);
+    if (const auto text = value.string())
+        return detail::scan_integer_text(*text).has_value();
     const auto number = value.number();
     return number && std::isfinite(*number) && std::trunc(*number) == *number &&
         std::abs(*number) < 9223372036854775808.0;

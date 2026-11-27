@@ -113,17 +113,17 @@ On one reserved B200, replay checkpoint Q, MXFP8 payloads and scales, and remapp
 
 Check span bounds, canaries, and scratch one byte short. Require raw output parity after descriptor rejection, empty cluster occupancy, or unavailable predecode.
 
-Compare four-grant staging bitwise with per-lane dispatch. Cover four-, two-, and one-lane groups, invalid KV, aliasing, mixed starts, and stream rejection. Reject each launch in turn. Check subgroup fallback and later staging. An unexpected attention launch error after predecode must propagate without a second launch. Compare allocation counts and arena high-water marks.
+Compare four-grant staging bitwise with per-lane dispatch. Cover four-, two-, and one-lane groups, invalid KV, aliasing, mixed starts, and stream rejection. Reject each launch and check subgroup fallback and later staging. Unexpected attention errors after predecode must propagate without relaunch. Compare allocations and arena high-water marks.
 
 Check a cold capture with scratch supplied. Require one raw kernel node and compare replay after a selector change. Check explicit `paired` and the default dispatch boundaries. Count allocation calls on each arm.
 
 Time eager predecode plus attention in base, candidate, candidate, base order. Archived checkpoint replay matched BF16 bitwise and reduced operator time. Check lifetime and serving separately. [Operator evidence](https://github.com/para1lel/sglang.cpp/blob/4dd8c887c278c67744ed80e7feb2a825a92197a2/docs/native-prefill-workspace.md#verification)
 
-On B200, fix admissions and grants. Compare scores, state, generated IDs, and terminal records against ordinary dispatch. Cover unequal and trailing grants, a singleton, two 256-row grants at K0, and mixed prefill and decode. Check group and row counters. Deny grouped allocation and check ordinary prefill with smaller scratch. Measure active and retained memory separately.
+On B200, fix admissions and grants. Compare scores, state, IDs, and terminal records with ordinary dispatch. Cover unequal or trailing grants, a singleton, two 256-row K0 grants, and mixed prefill and decode. Check group and row counts. Deny grouped allocation to check ordinary prefill with smaller scratch. Measure active and retained memory separately.
 
 Check whole-tile pairs at both lane offsets, including mixed, partial, and split grants. Compare full logits and recurrent state plus sampled hidden and residual values.
 
-Use the default 32,768-row budget. Check four 8,192-row grants and equal grants with distinct restored starts. Compare scores, target and draft KV and scales, GDN carry and history, hidden, residual, and IDs. Include unequal grants and mixed decode. Deny the 4,096-row workspace at and above the 8,192-row pair limit. Check paired fallback at the limit, causal and ordinary fallback above it, and recovery. Record groups, active workspace, and retained GPU memory.
+With the 32,768-row budget, check four 8,192-row grants and equal grants with distinct restored starts. Compare scores, target and draft KV and scales, GDN carry and history, hidden, residual, and IDs. Cover unequal grants and mixed decode. Deny 4,096-row workspace at and above the 8,192-row pair limit. Check paired fallback at the limit, causal and ordinary fallback above it, and recovery. Record groups and active and retained GPU memory.
 
 Historical K0 pairing used reduced-output W4. W3 exercised no pairs. W5 and W6 used host replay. Check grant sizes and admission/decode overlap before attributing serving gains to pairing. [Historical pairing evidence](https://github.com/para1lel/sglang.cpp/blob/4dd8c887c278c67744ed80e7feb2a825a92197a2/docs/native-prefill-workspace.md#verification)
 
@@ -131,7 +131,7 @@ Historical K0 pairing used reduced-output W4. W3 exercised no pairs. W5 and W6 u
 
 On B200s 0/6, five warm direct trials per arm gave medians of 206.956 ms ordinary and 159.788 ms grouped. Actual pressure on either rank preserved first tokens. Transient pools used and reserved zero bytes after synchronization. See `artifacts/tp2-resume/w2-group-audit/direct.RtENIMZH/`.
 
-The direct replay matched 455,028,608 state bytes, 2,483,200 BF16 first-logit values, and 64 continuation IDs with proposal and acceptance histories. All seven ranked-cache HTTP phases matched, including 16 rank 0 draft objects. An earlier altered-FC trial changed 233,046 of 8,646,528 draft bytes while target GQA and GDN matched. See `artifacts/tp2-resume/w2-group-audit/` (`direct.RtENIMZH/candidate/state.log`, `http.mZP03dnI/comparison.json`, `state.6XeMtH/candidate.log`). Official W2 makespan remains unmeasured for this release.
+Direct replay matched 455,028,608 state bytes, 2,483,200 BF16 first-logit values, and 64 continuation IDs with proposal and acceptance histories. Seven ranked-cache HTTP phases also matched, including 16 rank 0 draft objects. Earlier altered FC changed 233,046 of 8,646,528 draft bytes despite matching target GQA and GDN. See `artifacts/tp2-resume/w2-group-audit/` (`direct.RtENIMZH/candidate/state.log`, `http.mZP03dnI/comparison.json`, `state.6XeMtH/candidate.log`). Official W2 makespan for this release remains unmeasured.
 
 ### TP2 grouped RMSNorm replay
 
@@ -139,23 +139,27 @@ On B200s 0/6, five paired direct W4 tile trials saved a median 1.519 ms per 4,09
 
 ### TP2 causal GQA operator replay
 
-On one B200, the native page reader matched all 12,582,912 BF16 outputs per W5 rank shard and replay against the previous staged reader. Query and KV inputs stayed byte-identical. At 8,192 visible tokens, median time fell from 489 µs on each rank to 427 and 421 µs. At 32,768, it fell from 1,904 and 1,900 µs to 1,478 and 1,465 µs. Separate W4 captures at 32,768 tokens matched bitwise, with median times 20–22% lower across four GQA layers. W4 and W5 serving makespan remain unmeasured. See `artifacts/tp2-resume/native-long-gqa/` (`candidate-final-gpu0.log`, `candidate-w4-max-gpu0.log`, `decode-review/bench-gpu4.log`).
+On one B200, the native and prior staged readers matched all 12,582,912 BF16 outputs per W5 rank shard, including replay. Q and KV inputs matched. At 8,192 visible tokens, medians fell from 489 µs per rank to 427/421 µs. At 32,768, they fell from 1,904/1,900 to 1,478/1,465 µs. W4 captures at 32,768 matched bitwise and took 20–22% less time across four GQA layers. W4 and W5 serving remain unmeasured. See `artifacts/tp2-resume/native-long-gqa/` (`candidate-final-gpu0.log`, `candidate-w4-max-gpu0.log`, `decode-review/bench-gpu4.log`).
 
-On one B200, a separate 4,096-row probe with 12 query heads and two KV heads timed cold preprocessing and gate plus quantization at 196 to 109 µs. It skipped attention and output projection. Eight complete planes matched bitwise at 0, 1,171, and 4,096 reused rows, including rotated Q/K, KV payloads and scales, and activation codes and scales. See `artifacts/tp2-resume/native-causal-fuse/probe-ordered.log`.
+A separate one-B200 probe used 4,096 rows with 12 Q and 2 KV heads. Cold preprocessing and gate plus quantization fell from 196 to 109 µs, excluding attention and output projection. Eight full planes matched at 0, 1,171, and 4,096 reused rows, covering rotated Q/K, KV payloads and scales, and activation codes and scales. See `artifacts/tp2-resume/native-causal-fuse/probe-ordered.log`.
 
-The integrated caller check used two logical ranks on one B200 with the collective replaced by a trace. All 20 baseline/candidate full-plane digests matched across the 12Q/2KV and 24Q/4KV layouts. The digests cover rotated Q/K, activation codes and scales, projected outputs, and both owners’ KV planes. Injected staged-reader and epilogue errors propagated. See `artifacts/tp2-resume/native-causal-integrated/hardware-gpu0.log` and its paired result logs. Serving makespan remains unmeasured.
+The integrated caller used two logical ranks on one B200 and traced collectives in place of launches. All 20 full-plane digests matched the baseline across 12Q/2KV and 24Q/4KV. They cover rotated Q/K, activation codes and scales, projected outputs, and both owners’ KV planes. Injected staged-reader and epilogue errors propagated. See `artifacts/tp2-resume/native-causal-integrated/hardware-gpu0.log` and paired results. Serving remains unmeasured.
 
 ### TP2 grouped gate/up replay
 
 The [native 4,096-row gate/up route](fp8-prefill-projections.md#large-prefill-tiles) matched every BF16 output for checkpoint layers 0, 3, and 32 on both rank shards. With captured W4 activations on one B200, median operator time fell from 356.736 to 314.432 µs for rank 0 and from 356.288 to 314.240 µs for rank 1.
 
-On two B200s, warm direct decoder priming of one 32,768-token W4 prompt used eight 4,096-row groups. Time fell from 1,087.120 to 1,058.156 ms, a 2.66% reduction. The harness recorded rank hidden and residual state in both arms. Those states, token IDs, and MTP acceptance matched. HTTP serving makespan remains unmeasured. See `artifacts/tp2-resume/native-prefill-gate/` (`gpu-0.jI3uJ3/rank-{0,1}.log`, `prime-4-5.dYtCZR/prime-{0,4}.log`).
+Warm direct priming on two B200s used one 32,768-token W4 prompt in eight 4,096-row groups. Time fell from 1,087.120 to 1,058.156 ms (2.66%). Both arms matched rank hidden and residual state, token IDs, and acceptance. HTTP makespan remains unmeasured. See `artifacts/tp2-resume/native-prefill-gate/` (`gpu-0.jI3uJ3/rank-{0,1}.log`, `prime-4-5.dYtCZR/prime-{0,4}.log`).
+
+### TP2 packed QKV replay
+
+On two B200s, 12 paired warm direct 8,192-token replays used two 4,096-row grants. Arm medians were 201.991 and 199.278 ms. The paired median saving was 2.587 ms, with 11 wins. Checks matched both ranks’ state at 8,192 and 8,207 tokens, 16 continuation IDs and MTP accounting, and 248,320 BF16 prompt logits. W4 and W5 makespan remain unmeasured. See `artifacts/tp2-resume/long-gemm/qkv-e912/receipts/` (`mesh.9ewqzG/timing.txt`, `mesh.7LWIWX/ab.log`).
 
 ### TP2 grouped attention output replay
 
-The [native 3,072-input route](fp8-prefill-projections.md#large-prefill-tiles) matched every BF16 output for early and late W4 and W5 captures. Replays covered both TP2 rank shards and checkpoint layers 0, 3, and 32. Eager, CUDA graph, and clean fallback comparisons matched.
+The [native 3,072-input route](fp8-prefill-projections.md#large-prefill-tiles) matched all BF16 outputs in early and late W4/W5 captures, covering both rank shards at checkpoint layers 0, 3, and 32. Eager, graph, and clean fallback comparisons matched.
 
-On two B200s, warm direct eager decoder priming for one 32,768-token W4 prompt fell from 999.533 to 981.236 ms. The ABBA and BAAB sequences had four observations per arm. Sampled rank hidden and residual state, token IDs, and MTP acceptance matched. For the 131,072-token W5 prompt, caller state and token records matched. The single observation per arm was unpaired. W4 HTTP makespan remains unmeasured. See `artifacts/tp2-resume/native-prefill-output/receipt.txt`.
+Warm direct eager priming on two B200s for one 32,768-token W4 prompt fell from 999.533 to 981.236 ms. ABBA and BAAB gave four observations per arm. Sampled rank hidden and residual state, token IDs, and MTP acceptance matched. For W5 at 131,072 tokens, the single unpaired observation per arm matched caller state and tokens. W4 HTTP makespan remains unmeasured. See `artifacts/tp2-resume/native-prefill-output/receipt.txt`.
 
 ### TP2 long down projection replay
 

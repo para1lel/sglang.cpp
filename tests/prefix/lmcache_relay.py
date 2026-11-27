@@ -126,12 +126,15 @@ def frame_metadata(opcode, payload):
 
 
 class Barrier:
-    def __init__(self, opcode, family, *, phase, drop, skip):
+    def __init__(
+        self, opcode: int, target: int | str | None, *, phase: str, drop: bool, skip: int
+    ) -> None:
         self.opcode = opcode
-        self.family = family
+        self.family = target if isinstance(target, int) else None
         self.phase = phase
         self.drop = drop
         self.skip = skip
+        self.device = target if isinstance(target, str) else None
         self.entered = threading.Event()
         self.release = threading.Event()
         self.finished = threading.Event()
@@ -244,11 +247,19 @@ class Relay(socketserver.ThreadingUnixStreamServer):
             if phase == "reply":
                 self.entries.append(entry)
             barrier = self.barrier
-            if (barrier is None or barrier.release.is_set() or barrier.entered.is_set()
-                    or entry["opcode"] != barrier.opcode
-                    or phase != barrier.phase or entry["status"] != (4 if phase == "arm" else 0)
-                    or (barrier.family is not None and
-                        not any(family == barrier.family for family, _ in entry["keys"]))):
+            if (
+                barrier is None
+                or barrier.release.is_set()
+                or barrier.entered.is_set()
+                or entry["opcode"] != barrier.opcode
+                or phase != barrier.phase
+                or entry["status"] != (4 if phase == "arm" else 0)
+                or (barrier.device is not None and entry.get("device") != barrier.device)
+                or (
+                    barrier.family is not None
+                    and not any(family == barrier.family for family, _ in entry["keys"])
+                )
+            ):
                 return None
             if barrier.skip:
                 barrier.skip -= 1
@@ -264,13 +275,21 @@ class Relay(socketserver.ThreadingUnixStreamServer):
             if entry is not None and self.barrier is not None and self.barrier.entry is entry:
                 self.barrier.finished.set()
 
-    def arm(self, opcode, family=None, *, phase="reply", drop=False, skip=0):
+    def arm(
+        self,
+        opcode: int,
+        target: int | str | None = None,
+        *,
+        phase: str = "reply",
+        drop: bool = False,
+        skip: int = 0,
+    ) -> Barrier:
         with self.guard:
             previous = self.barrier
             if previous and not previous.finished.is_set() and (
                     previous.entered.is_set() or not previous.release.is_set()):
                 raise ValueError("LMCache relay already has an outstanding barrier")
-            self.barrier = Barrier(opcode, family, phase=phase, drop=drop, skip=skip)
+            self.barrier = Barrier(opcode, target, phase=phase, drop=drop, skip=skip)
             return self.barrier
 
     def since(self, index=0):

@@ -8,12 +8,12 @@ Native reuses GQA, GDN, and draft checkpoints through a local LMCache daemon. Th
 | --- | --- | --- |
 | Server | Configure prefix reuse, validate salts, and report usage. | [Salt validation](../apps/server/text_request.cpp#L619)<!-- prefix: "void set_cac" --> · [Usage writer](../apps/server/text_completion.cpp#L50)<!-- prefix: "void append_" --> |
 | HTTP controls | Dispatch cache reset, metrics, and bounded scheduler profiling. | [Control routes](../apps/server/prefix_controls.cpp#L483)<!-- prefix: "void Connect" --> |
-| Native cache | Builds prefix identities and describes GPU allocation regions. | [Prefix keys](../src/runtime/cache/prefix_payload.cpp#L108)<!-- prefix: "PrefixCacheK" --> · [Client](../include/sglang/runtime/cache/lmcache_client.h#L67)<!-- prefix: "class LmCach" --> |
-| LMCache | Resolves coverage, executes transfers, and retains CPU L1 records across native workers. | [Lookup](../tools/lmcache/sglang_lmcache.py#L142)<!-- prefix: "def resolve(" --> · [Storage](../tools/lmcache/sglang_lmcache.py#L433)<!-- prefix: "class Record" --> |
+| Native cache | Builds prefix identities and describes GPU allocation regions. | [Prefix keys](../src/runtime/cache/prefix_payload.cpp#L108)<!-- prefix: "PrefixCacheK" --> · [Client](../include/sglang/runtime/cache/lmcache_client.h#L65)<!-- prefix: "class LmCach" --> |
+| LMCache | Resolves coverage, executes transfers, and retains CPU L1 records across native workers. | [Lookup](../tools/lmcache/sglang_lmcache.py#L150)<!-- prefix: "def resolve(" --> · [Storage](../tools/lmcache/sglang_lmcache.py#L441)<!-- prefix: "class Record" --> |
 
 ## LMCache daemon
 
-Start a dedicated LMCache 0.5.8 daemon as the same Linux user as the native server. Expose the same physical GPU UUID to both processes. Use namespace `sglang`. The [daemon guide](serving/lmcache.md#start-the-daemon) gives the launch command, socket defaults, and capacity options.
+Start one [LMCache 0.5.8 daemon](serving/lmcache.md#start-the-daemon) as the native server’s Linux user. Expose the same physical GPU set to both processes and use namespace `sglang`. This includes both ranks in TP2.
 
 ## Runtime path
 
@@ -33,9 +33,9 @@ Checkpoints contain committed target state. A 128-ID prompt with 128 outputs at 
 
 GQA and draft records hold contiguous MXFP8 chunks of up to 256 rows. A GDN checkpoint holds convolution history, recurrent state, and the final BF16 hidden and residual rows. Each record is keyed by its prefix end. [Chunk encoding](../src/runtime/cache/lmcache_client.cpp#L267)<!-- prefix: "void append_" --> · [Checkpoint encoding](../src/runtime/cache/lmcache_client.cpp#L290)<!-- prefix: "void append_" -->
 
-The daemon tracks resident GDN endpoints from L1 write completion and deletion events. Lookup tests the request's exact prefix digests at those endpoints against L1. It reports the highest matching GDN boundary and the longest contiguous GQA match. The usable GDN boundary requires contiguous GQA through that row and respects the request's restore limit. At an MTP boundary `P`, it also requires contiguous draft coverage of `P-1` rows. GQA coverage can extend beyond the usable GDN boundary. [Resident endpoints](../tools/lmcache/sglang_lmcache.py#L48)<!-- prefix: "class GdnEnd" --> · [Coverage selection](../tools/lmcache/sglang_lmcache.py#L142)<!-- prefix: "def resolve(" -->
+The daemon tracks resident GDN endpoints from L1 write completion and deletion events. Lookup tests the request's exact prefix digests at those endpoints against L1. It reports the highest matching GDN boundary and the longest contiguous GQA match. The usable GDN boundary requires contiguous GQA through that row and respects the request's restore limit. At an MTP boundary `P`, it also requires contiguous draft coverage of `P-1` rows. GQA coverage can extend beyond the usable GDN boundary. [Resident endpoints](../tools/lmcache/sglang_lmcache.py#L56)<!-- prefix: "class GdnEnd" --> · [Coverage selection](../tools/lmcache/sglang_lmcache.py#L150)<!-- prefix: "def resolve(" -->
 
-Resume at the usable GDN boundary, or row zero when there is none. Recompute intervening GDN rows and use restored GQA read-only through its coverage. Append GQA only for uncovered rows. Native commits these extents after a successful transfer. [Restore view](../src/decoder_prefix_cache.cpp#L254)<!-- prefix: "PrefixDevice" --> · [Commit](../src/decoder_prefix_cache.cpp#L311)<!-- prefix: "int commit_r" -->
+Resume at the usable GDN boundary, or row zero when there is none. Recompute intervening GDN rows and use restored GQA read-only through its coverage. Append GQA only for uncovered rows. Native commits these extents after a successful transfer. TP2 commits only after all rank transfers complete. It resumes GDN from a common usable endpoint and can reuse GQA independently. [Ranked lookup and restore](serving/lmcache.md#ranked-tp2-transport) · [Restore view](../src/decoder_prefix_cache.cpp#L254)<!-- prefix: "PrefixDevice" --> · [Commit](../src/decoder_prefix_cache.cpp#L311)<!-- prefix: "int commit_r" -->
 
 A paired boundary at `P` seeds shifted draft row `P-1` with the first suffix ID on a partial hit or the first committed output on a full hit. Full hits score from restored hidden/residual rows using the request's [grammar](text-serving.md#finite-choice-constraints) and [sampler](text-serving.md#sampling). Restore and full-hit scoring do not charge [target rows](batch-graphs.md#runtime-path) or change other lanes' decode policy.
 
@@ -45,7 +45,7 @@ Prompt scoring restores no farther than `logprob_start_len` and leaves at least 
 
 ### Media identity and prefill
 
-Keys bind covered media patch identity, layout, feature row, and rotary positions. A change inside the covered prefix changes its identity. External C++ features can run without a cache identity. Key construction stops before the first such media row. [Media key construction](../src/runtime/cache/prefix_payload.cpp#L128)<!-- prefix: "const auto e" --> · [Media execution](multimodal-decoder.md#runtime-path)
+Keys bind covered media patch identity, layout, feature row, and rotary positions. A change inside the covered prefix changes its identity. External C++ features can run without a cache identity. Key construction stops before the first such media row. [Media key construction](../src/runtime/cache/prefix_payload.cpp#L130)<!-- prefix: "const auto e" --> · [Media execution](multimodal-decoder.md#runtime-path)
 
 Cold and restored suffix rows use the same [prefill planner](native-prefill-workspace.md#runtime-path). The former exact-only cache route and its fixed-shape Tensor Core probe remain archived. [Historical cache guide](https://github.com/para1lel/sglang.cpp/blob/28148cda233e5522274e258d5eb5caa9ab83e313/docs/prefix-cache.md#tensor-core-scheduling)
 
@@ -59,7 +59,7 @@ After submission the lane can advance or retire. STORE owns metadata, immutable 
 
 Abort can abandon LOOKUP. GET holds its destination and lane through completion even after shutdown interrupts the socket. A disconnected armed GET or STORE holds its resources until matching lease release or original daemon exit. Timeouts and replacement daemons leave the lease live. A hung GPU can hold shutdown indefinitely. An authorized operator can stop new admissions and retire the daemon.
 
-Failed restore or a non-CUDA future error clears partial state before cold prefill. CUDA errors propagate and terminal faults disable the batch. Poll outstanding restores after recoverable failure until retirement. Direct MTP polls restore and cancellation, reports `cached_prompt_tokens`, and waits for terminal submission. A successful `claim_completion` preserves the checkpoint across cancellation. `reserve_prefix_store: false` retries; synchronous callers must release capacity independently. [Lease status](../tools/lmcache/sglang_lmcache.py#L564)<!-- prefix: "def lease_st" --> · [Restore](../src/runtime/execution/decoder_batch_prefix.cpp#L35)<!-- prefix: "DecoderBatch" --> · [Direct MTP](../src/decoder_batch.cpp#L815)<!-- prefix: "void Decoder" -->
+Failed restore or a non-CUDA future error clears partial state before cold prefill. CUDA errors propagate and terminal faults disable the batch. Poll outstanding restores after recoverable failure until retirement. Direct MTP polls restore and cancellation, reports `cached_prompt_tokens`, and waits for terminal submission. A successful `claim_completion` preserves the checkpoint across cancellation. `reserve_prefix_store: false` retries; synchronous callers must release capacity independently. [Lease status](../tools/lmcache/sglang_lmcache.py#L597)<!-- prefix: "def lease_st" --> · [Restore](../src/runtime/execution/decoder_batch_prefix.cpp#L35)<!-- prefix: "DecoderBatch" --> · [Direct MTP](../src/decoder_batch.cpp#L815)<!-- prefix: "void Decoder" -->
 
 ### Native HTTP controls
 
@@ -73,7 +73,7 @@ The metrics, reset, and profile routes are available when LMCache is configured,
 | `POST /start_profile` | Exactly three fields. `profile_prefix` is a string of 1–64 bytes. `max_iterations` is an integer from 1 to 64. `profiler_kwargs` equals `{"with_stack":false}`. | Opens one capture and returns `{"success":true,"profiler":"native-batch-steps"}`. Returns HTTP 409 if a capture is open. |
 | `POST /stop_profile` | `{}` | Closes the capture and adds `profile_prefix` and `steps` to the JSON response. Returns HTTP 409 if no capture is open. |
 
-Reset and [flush](#cache-flush) clear the entire daemon store across workers. Restrict forwarded access to these controls. Successful controls return 200 and malformed POST controls return 400. Reset stays busy through pending stores and waits for the daemon acknowledgement. Queued generations wait through the reset response write. Counters persist and health/readiness stay available.
+Reset and [flush](#cache-flush) clear the entire daemon store across workers and both TP2 ranks through one reset. Restrict forwarded access to these controls. Successful controls return 200 and malformed POST controls return 400. Reset stays busy through pending stores and waits for the daemon acknowledgement. Queued generations wait through the reset response write. Counters persist and health/readiness stay available.
 
 The `vllm:` metric `num_requests_running` counts claimed completions through socket closure. `num_requests_waiting` excludes disconnected clients. `prefix_cache_hits_total` counts coherently restored prompt IDs. First published output records prompt length and computed prefill rows. `generation_tokens_total` counts published IDs. `sglang_cpp:lmcache_` reports availability, misses, I/O errors, stores, per-family rows/bytes, and time. `sglang_cpp:lmcache_pending_stores` counts capacity waits and submitted transfers through view release. Joint acknowledged checkpoints increment `sglang_cpp:prefix_cache_stores_total` once. `DecoderBatch::prefix_cache_stats().stores` (fifth `store_prefix` argument) and `sglang_cpp:lmcache_rank` count successful rank replies, even after lane retirement or joint failure. Traced receipts wake the idle worker. [Series](../apps/server/loads.cpp#L264)<!-- prefix: "std::string " --> [Rank stats](../src/runtime/execution/decoder_batch_prefix.cpp#L20)<!-- prefix: "DecoderPrefi" -->
 
@@ -128,7 +128,7 @@ The same run covers selective reuse, divergence, salt and shifted draft reuse, h
 
 ### Live control regression
 
-Check malformed controls, busy/idle reset, bounded profiles, and peer graph eligibility. After cold reset require zero cached IDs. On replay after acknowledge and drain, require the expected restored length and identical first scores, IDs, finish and usage. [Former resident-cache procedure](https://github.com/para1lel/sglang.cpp/blob/a7583f7b6346b5eb91aba2cba4748a6461e60fb4/docs/prefix-cache.md#verification). [In-process fence installation](../tests/prefix/lmcache_relay.py#L289)<!-- prefix: "def install_" --> · [Terminal send trace](../tests/prefix/lmcache_send_trace.py#L31)<!-- prefix: "def terminal" -->
+Check malformed controls, busy/idle reset, bounded profiles, and peer graph eligibility. After cold reset require zero cached IDs. On replay after acknowledge and drain, require the expected restored length and identical first scores, IDs, finish and usage. [Former resident-cache procedure](https://github.com/para1lel/sglang.cpp/blob/a7583f7b6346b5eb91aba2cba4748a6461e60fb4/docs/prefix-cache.md#verification). [In-process fence installation](../tests/prefix/lmcache_relay.py#L308)<!-- prefix: "def install_" --> · [Terminal send trace](../tests/prefix/lmcache_send_trace.py#L31)<!-- prefix: "def terminal" -->
 
 ### Flush verification
 

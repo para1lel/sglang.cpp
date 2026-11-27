@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import concurrent.futures
 import contextlib
 import os
@@ -11,17 +13,23 @@ import time
 from collections import Counter
 from importlib.metadata import version
 from io import BytesIO
+from typing import TYPE_CHECKING
 
 import torch
 from lmcache.logging import init_logger
 from lmcache.v1.distributed.api import MemoryLayoutDesc, ObjectKey
-from lmcache.v1.distributed.l1_manager.dram import DramL1Manager
 from lmcache.v1.distributed.internal_api import L1ManagerListener
+from lmcache.v1.distributed.l1_manager.dram import DramL1Manager
 from lmcache.v1.distributed.storage_manager import _L1_WRITE_TAG, l1_owners_of
 from lmcache.v1.multiprocess.engine_module import DiscoverableModule
-
 from sglang_gpu_transfer import DIGEST_BYTES, GDN_END, PREFIX_CHUNK, DeviceCopies, Transfer
 from sglang_socket import OwnedUnixStreamServer
+
+if TYPE_CHECKING:
+    from collections.abc import Generator
+
+    from lmcache.v1.distributed.storage_manager import StorageManager
+    from lmcache.v1.multiprocess.engine_context import MPCacheServerContext
 
 
 VERSION = "0.5.8"
@@ -431,13 +439,14 @@ class DmaReservations(L1ManagerListener):
 
 
 class Records:
-    def __init__(self, storage):
+    def __init__(self, storage: StorageManager, *, single_device: bool = False) -> None:
         self.storage = storage
         (self.l1,) = storage.l1_managers()
         if not isinstance(self.l1, DramL1Manager) or storage.l2_adapters():
             raise ValueError("sglang LMCache requires a dedicated DRAM L1 daemon")
-        self.device = DeviceCopies()
-        self.writes = threading.Lock()
+        self.device = DeviceCopies(single_device=single_device)
+        self.writes = threading.Condition()
+        self.writing_keys = set()
         self.dma = DmaReservations(self.l1)
         self.gdn_endpoints = GdnEndpoints()
         self.l1.register_listener(self.gdn_endpoints)
@@ -460,6 +469,21 @@ class Records:
         request.end()
         request.reply(0, found)
 
+    @contextlib.contextmanager
+    def claim_write(self, request: Request, keys: list[ObjectKey]) -> Generator[None, None, None]:
+        with self.writes:
+            while not self.writing_keys.isdisjoint(keys):
+                request.check_mutation()
+                self.writes.wait(timeout=0.25)
+            request.check_mutation()
+            self.writing_keys.update(keys)
+        try:
+            yield
+        finally:
+            with self.writes:
+                self.writing_keys.difference_update(keys)
+                self.writes.notify_all()
+
     def retrieve(self, request, transfer):
         keys = [record.key for record in transfer.records]
         with self.read(keys) as resident:
@@ -472,7 +496,7 @@ class Records:
 
     def store(self, request, transfer):
         keys = [record.key for record in transfer.records]
-        with self.writes, self.read(keys) as resident:
+        with self.claim_write(request, keys), self.read(keys) as resident:
             pending = [record for record in transfer.records if record.key not in resident]
             if any(not self.fits(resident, record) for record in transfer.records
                    if record.key in resident):
@@ -519,17 +543,26 @@ class Records:
 class SocketServer(OwnedUnixStreamServer):
     request_queue_size = 64
 
-    def __init__(self, endpoint, namespace, records):
+    def __init__(
+        self,
+        endpoint: str,
+        namespace: str,
+        records: Records,
+        device_copies: DeviceCopies | None = None,
+    ) -> None:
         self.namespace = namespace.encode("ascii")
         self.records = records
+        self.device_copies = device_copies
         self.incarnation = os.urandom(16)
         self.leases = set()
         self.condition = threading.Condition()
         self.operations = 0
         self.pending_mutations = 0
-        self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS)
-        self.slots = threading.BoundedSemaphore(WORKERS)
-        self.gpu_slots = threading.BoundedSemaphore(WORKERS - 4)
+        device_count = 1 if device_copies is None else len(device_copies.devices)
+        workers = WORKERS * device_count
+        self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=workers)
+        self.slots = threading.BoundedSemaphore(workers)
+        self.gpu_slots = threading.BoundedSemaphore((WORKERS - 4) * device_count)
         super().__init__(endpoint, Handler)
 
     def verify_request(self, request, _address):
@@ -651,6 +684,8 @@ class Handler(socketserver.BaseRequestHandler):
                 transfer = Transfer.parse(metadata, lambda family, identity, endpoint=0:
                                           object_key(namespace, family, identity, endpoint),
                                           legacy)
+                if self.server.device_copies is not None:
+                    self.server.device_copies.device_for(transfer.device)
                 operation = records.retrieve if request.op in (3, 10) else records.store
                 with self.server.lease(request):
                     result = operation(request, transfer)
@@ -695,15 +730,29 @@ class SglangSnapshotModule(DiscoverableModule):
         namespace = config["namespace"]
         if not os.path.isabs(endpoint) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", namespace):
             raise ValueError("invalid LMCache endpoint or namespace")
-        return cls(build_ctx.engine_context, endpoint, namespace)
+        single_device = config.get("single_device", False)
+        return cls(build_ctx.engine_context, endpoint, namespace, single_device=single_device)
 
-    def __init__(self, context, endpoint, namespace):
-        records = Records(context.storage_manager)
-        self.server = SocketServer(endpoint, namespace, records)
+    def __init__(
+        self,
+        context: MPCacheServerContext,
+        endpoint: str,
+        namespace: str,
+        *,
+        single_device: bool = False,
+    ) -> None:
+        records = Records(context.storage_manager, single_device=single_device)
+        self.server = SocketServer(endpoint, namespace, records, records.device)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
-        LOG.info("sglang GPU LMCache at %s, device %s, L1 capacity %d bytes", endpoint,
-                 records.device.uuid.hex(), records.l1.get_capacity_bytes())
+        devices = records.device.devices
+        LOG.info(
+            "sglang GPU LMCache at %s, %s %s, L1 capacity %d bytes",
+            endpoint,
+            "device" if len(devices) == 1 else "devices",
+            ",".join(uuid.hex() for uuid in devices),
+            records.l1.get_capacity_bytes(),
+        )
 
     def get_handlers(self):
         return {}

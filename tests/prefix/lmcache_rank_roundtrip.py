@@ -1,35 +1,37 @@
 """Run the real Unix daemon handler and native rank client with CPU-backed record inventories."""
 
-from contextlib import contextmanager, ExitStack
 import os
-from pathlib import Path
 import subprocess
 import sys
+from contextlib import ExitStack, contextmanager
+from importlib import import_module
+from pathlib import Path
 from tempfile import TemporaryDirectory
 from threading import Thread
 
-from lmcache_relay import PREFIX_DETAIL, RANK_GET, RANK_PUT, RECEIPT, Relay
+from lmcache_relay import DRAFT, PREFIX_DETAIL, RANK_GET, RANK_PUT, RECEIPT, Relay
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tools/lmcache"))
-from sglang_lmcache import GdnEndpoints, SocketServer
-from sglang_gpu_transfer import NativeMxfp8
+NativeMxfp8 = import_module("sglang_gpu_transfer").NativeMxfp8
+lmcache = import_module("sglang_lmcache")
 
 
 class HostRecords:
     """Keep the parsed record descriptors in place of a CUDA-backed DRAM L1."""
 
-    def __init__(self, world, rank):
+    def __init__(self, world: int) -> None:
         self.world = world
-        self.rank = rank
         self.records = {}
-        self.gdn_endpoints = GdnEndpoints()
+        self.devices = tuple(bytes([rank + 1]) + bytes(15) for rank in range(world))
+        self.owners = {}
+        self.gdn_endpoints = lmcache.GdnEndpoints()
 
     @contextmanager
     def read(self, keys):
         yield {key: self.records[key] for key in keys if key in self.records}
 
     def receipt(self, transfer):
-        assert transfer.device[0] == self.rank + 1
+        rank = self.devices.index(bytes(transfer.device))
         tally = [0, 0, 0]
         for record in transfer.records:
             family = record.key.object_group_id
@@ -39,7 +41,7 @@ class HostRecords:
                 assert widths == [2949120 // self.world, 150994944 // self.world, 10240, 10240]
             else:
                 heads = 4 // self.world if family == 1 else 4
-                assert family == 1 or self.rank == 0
+                assert family == 1 or rank == 0
                 assert record.view.kv_heads == heads
                 assert record.size == record.tokens * heads * 528 * (16 if family == 1 else 1)
         tokens = sum(r.tokens for r in transfer.records if r.key.object_group_id == 1)
@@ -48,13 +50,17 @@ class HostRecords:
     def store(self, request, transfer):
         response = self.receipt(transfer)
         for record in transfer.records:
+            self.owners[record.key] = bytes(transfer.device)
             self.records[record.key] = record
         self.gdn_endpoints.on_l1_keys_write_finished([r.key for r in transfer.records])
         return response
 
     def retrieve(self, request, transfer):
         response = self.receipt(transfer)
-        if any(self.records.get(r.key) != r for r in transfer.records):
+        if any(
+            self.records.get(r.key) != r or self.owners[r.key] != bytes(transfer.device)
+            for r in transfer.records
+        ):
             return 1, b""
         return response
 
@@ -95,22 +101,16 @@ def exercise(binary, runtime, world):
         assert result.returncode == 0, (args, result.stderr)
         return result.stdout.strip()
 
-    stores = []
-    relays = []
+    records = HostRecords(world)
+    endpoint = runtime / "sglang-lmcache.sock"
+    upstream = runtime / "daemon.sock"
     with ExitStack() as stack:
-        for rank in range(world):
-            suffix = f"-r{rank}" if world > 1 else ""
-            name = f"sglang{suffix}"
-            records = HostRecords(world, rank)
-            stores.append(records)
-            endpoint = runtime / f"sglang-lmcache{suffix}.sock"
-            upstream = runtime / f"daemon{suffix}.sock"
-            server = SocketServer(str(upstream), name, records)
-            thread = Thread(target=server.serve_forever, kwargs={"poll_interval": 0.02})
-            thread.start()
-            stack.callback(thread.join)
-            stack.callback(server.close)
-            relays.append(stack.enter_context(Relay(endpoint, upstream)))
+        server = lmcache.SocketServer(str(upstream), "sglang", records)
+        thread = Thread(target=server.serve_forever, kwargs={"poll_interval": 0.02})
+        thread.start()
+        stack.callback(thread.join)
+        stack.callback(server.close)
+        relay = stack.enter_context(Relay(endpoint, upstream))
         call("ready")
         assert call("lookup") == "0 0 0 0 0"
         call("store", 65)
@@ -127,16 +127,23 @@ def exercise(binary, runtime, world):
         call("store", 225, rank=1)
         assert call("lookup") == "193 193 193 65 64"
         assert call("lookup", swap=True) == "0 0 0 0 0"
+        assert call("get", 65, swap=True) == "miss"
         assert call("get", 65) == f"{65 * 33792} {2 * 76992512} {64 * 2112} 65"
         call("store", 193, rank=1)
         assert call("lookup", draft=False) == "193 193 193 193 0"
         assert call("lookup") == "193 193 193 65 64"
-        call("store", 193)
+        terminal = 193
+        call("store", terminal)
         assert call("lookup") == "193 193 193 193 192"
         assert call("lookup", 160) == "193 193 193 65 64"
-        key, = [k for k in stores[1].records if k.extra_attributes.get("sglang_gdn_end") == 193]
-        del stores[1].records[key]
-        stores[1].gdn_endpoints.on_l1_keys_deleted_by_manager([key])
+        (key,) = (
+            k
+            for k, device in records.owners.items()
+            if device == records.devices[1] and k.extra_attributes.get("sglang_gdn_end") == terminal
+        )
+        del records.records[key]
+        del records.owners[key]
+        records.gdn_endpoints.on_l1_keys_deleted_by_manager([key])
         assert call("get", 193) == "miss"
         assert call("lookup") == "193 193 193 65 64"
         for rank in range(world):
@@ -144,18 +151,22 @@ def exercise(binary, runtime, world):
         assert call("lookup", 1) == "193 193 193 1 0"
         assert call("get", 1) == f"33792 {2 * 76992512} 0 1"
         assert call("lookup", 0) == "193 193 193 0 0"
-        for rank, relay in enumerate(relays):
-            assert not relay.errors
-            trace = relay.since()
-            assert {PREFIX_DETAIL, RANK_GET, RANK_PUT} <= {event["opcode"] for event in trace}
-            assert all(event["namespace"] == f"sglang-r{rank}" for event in trace)
+        assert not relay.errors
+        trace = relay.since()
+        assert all(event["namespace"] == "sglang" for event in trace)
+        assert sum(event["opcode"] == PREFIX_DETAIL for event in trace) > 1
+        for rank, device in enumerate(records.devices):
+            transfers = [event for event in trace if event.get("device") == device.hex()]
+            assert {RANK_GET, RANK_PUT} <= {event["opcode"] for event in transfers}
             if rank == 1:
-                assert not any(family == 3 for event in trace for family, _ in event["keys"])
+                assert not any(
+                    family == DRAFT for event in transfers for family, _ in event["keys"]
+                )
 
 
 if __name__ == "__main__":
     check_scales()
-    with TemporaryDirectory(prefix="sglang-ranks-") as work:
-        for world_size in (1, 2):
+    for world_size in (1, 2):
+        with TemporaryDirectory(prefix="sglang-ranks-") as work:
             exercise(sys.argv[1], Path(work), world_size)
     print("TP1 and TP2 daemon framing, rank-local geometry, common endpoints and joint GET passed")

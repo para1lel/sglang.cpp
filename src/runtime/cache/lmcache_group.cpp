@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <exception>
-#include <optional>
 #include <stdexcept>
 #include <system_error>
 #include <thread>
@@ -13,75 +12,24 @@ namespace {
 
 constexpr int draft_rank = 0;
 
-}   
-
-std::vector<LmCacheConfig> ranked_lmcache_configs(int world_size, int timeout_ms) {
-    if (world_size <= 0) throw std::invalid_argument("Invalid LMCache world size");
-    std::vector<LmCacheConfig> configs;
-    configs.reserve(static_cast<std::size_t>(world_size));
-    for (int rank = 0; rank < world_size; ++rank) {
-        if (world_size == 1) {
-            configs.push_back(LmCacheConfig{default_lmcache_endpoint(), "sglang", timeout_ms});
-            continue;
-        }
-        configs.push_back(LmCacheConfig{rank_lmcache_endpoint(rank),
-                                        "sglang-r" + std::to_string(rank), timeout_ms, true});
+LmCacheConfig cache_config(LmCacheConfig config, int world_size) {
+    if (world_size <= 0) {
+        throw std::invalid_argument("Invalid LMCache world size");
     }
-    return configs;
+    config.native_v4 |= world_size > 1;
+    return config;
+}
 }
 
-std::vector<LmCacheConfig> ranked_lmcache_configs(const LmCacheConfig& base, int world_size) {
-    if (world_size <= 0) throw std::invalid_argument("Invalid LMCache world size");
-    std::vector<LmCacheConfig> configs;
-    configs.reserve(static_cast<std::size_t>(world_size));
-    for (int rank = 0; rank < world_size; ++rank) {
-        if (world_size == 1) {
-            configs.push_back(base);
-            continue;
-        }
-        configs.push_back(LmCacheConfig{rank_lmcache_endpoint(base.endpoint, rank),
-                                        base.name_space + "-r" + std::to_string(rank),
-                                        base.timeout_ms, true});
-    }
-    return configs;
+LmCacheGroup::LmCacheGroup(LmCacheClient client) : client_(std::move(client)) {
 }
 
-namespace {
-
-std::vector<std::unique_ptr<LmCacheClient>> connect(std::vector<LmCacheConfig> configs) {
-    if (configs.empty()) throw std::invalid_argument("Empty LMCache rank configuration");
-    std::vector<std::unique_ptr<LmCacheClient>> clients;
-    clients.reserve(configs.size());
-    for (auto& config : configs) {
-        clients.push_back(std::make_unique<LmCacheClient>(std::move(config)));
-    }
-    return clients;
+LmCacheGroup::LmCacheGroup(LmCacheConfig config, int world_size)
+    : client_(cache_config(std::move(config), world_size)), world_size_(world_size) {
 }
-
-}   
-
-LmCacheGroup::LmCacheGroup(std::vector<LmCacheConfig> configs)
-    : LmCacheGroup(connect(std::move(configs))) {}
-
-LmCacheGroup::LmCacheGroup(std::vector<std::unique_ptr<LmCacheClient>> clients) {
-    if (clients.empty()) throw std::invalid_argument("Empty LMCache rank configuration");
-    for (std::size_t rank = 0; rank < clients.size(); ++rank) {
-        if (!clients[rank]) throw std::invalid_argument("Missing LMCache rank client");
-        for (std::size_t other = 0; other < rank; ++other) {
-            if (clients[rank]->config().endpoint == clients[other]->config().endpoint) {
-                throw std::invalid_argument("Duplicate LMCache rank endpoint");
-            }
-        }
-    }
-    clients_ = std::move(clients);
-}
-
 
 bool LmCacheGroup::ready() const {
-    for (const auto& client : clients_) {
-        if (!client->ready()) return false;
-    }
-    return true;
+    return client_.ready();
 }
 
 PrefixCacheRead LmCacheGroup::lookup_prefix(const std::vector<const PrefixCacheKeys*>& keys,
@@ -90,17 +38,22 @@ PrefixCacheRead LmCacheGroup::lookup_prefix(const std::vector<const PrefixCacheK
     if (keys.size() != world) {
         throw std::invalid_argument("LMCache rank key count mismatch");
     }
-    for (const auto* rank_keys : keys) {
-        if (!rank_keys) throw std::invalid_argument("Missing LMCache rank keys");
+    for (int rank = 0; rank < world_size_; ++rank) {
+        if (keys[rank] == nullptr) {
+            throw std::invalid_argument("Missing LMCache rank keys");
+        }
+        if (!keys[rank]->matches_rank(world_size_, rank)) {
+            return {};
+        }
     }
     if (world == 1) {
-        const auto match = clients_.front()->lookup_prefix(*keys.front(), max_restore, draft);
+        const auto match = client_.lookup_prefix(*keys.front(), max_restore, draft);
         return {match.gqa, match.matched_gdn, match.gqa, match.gdn, match.draft};
     }
     std::vector<LmCachePrefixDetail> details(world);
     for (std::size_t rank = 0; rank < world; ++rank) {
-        details[rank] = clients_[rank]->lookup_prefix_detail(
-            *keys[rank], max_restore, draft && static_cast<int>(rank) == draft_rank);
+        details[rank] =
+            client_.lookup_prefix_detail(*keys[rank], max_restore, draft && rank == draft_rank);
     }
     PrefixCacheRead read;
     read.matched_gqa = details.front().gqa;
@@ -135,18 +88,22 @@ PrefixCacheRead LmCacheGroup::lookup_prefix(const std::vector<const PrefixCacheK
 
 std::string LmCacheGroup::prepare_store(int rank, const PrefixCacheKeys& keys,
                                         const PrefixDeviceTransfer& transfer) const {
-    return client(rank).prepare_store(keys, transfer);
+    if (rank < 0 || rank >= world_size_ || !keys.matches_rank(world_size_, rank) ||
+        (rank != draft_rank && transfer.layout.draft.end != 0)) {
+        throw std::invalid_argument("Invalid LMCache rank store");
+    }
+    return client_.prepare_store(keys, transfer);
 }
 
 LmCacheStatus LmCacheGroup::store(int rank, const PrefixCacheKeys& keys,
                                   const PrefixDeviceTransfer& transfer,
                                   LmCacheReceipt* receipt) const {
-    return client(rank).store(keys, transfer, receipt);
+    return store_prepared(prepare_store(rank, keys, transfer), receipt);
 }
 
-LmCacheStatus LmCacheGroup::store_prepared(int rank, std::string_view metadata,
+LmCacheStatus LmCacheGroup::store_prepared(std::string_view metadata,
                                            LmCacheReceipt* receipt) const {
-    return client(rank).store_prepared(metadata, receipt);
+    return client_.store_prepared(metadata, receipt);
 }
 
 LmCacheStatus LmCacheGroup::retrieve(const std::vector<const PrefixCacheKeys*>& keys,
@@ -158,17 +115,24 @@ LmCacheStatus LmCacheGroup::retrieve(const std::vector<const PrefixCacheKeys*>& 
     if (keys.size() != world || transfers.size() != world) {
         throw std::invalid_argument("LMCache rank transfer count mismatch");
     }
-    for (std::size_t rank = 0; rank < world; ++rank) {
+    for (int rank = 0; rank < world_size_; ++rank) {
         if (!keys[rank] || !transfers[rank]) {
             throw std::invalid_argument("Missing LMCache rank transfer");
         }
     }
     if (receipt) *receipt = {};
     if (per_rank) per_rank->assign(world, LmCacheReceipt{});
+    for (int rank = 0; rank < world_size_; ++rank) {
+        if (!keys[rank]->matches_rank(world_size_, rank)) {
+            return LmCacheStatus::miss;
+        }
+        if (rank != draft_rank && transfers[rank]->layout.draft.end != 0) {
+            throw std::invalid_argument("Invalid LMCache rank draft transfer");
+        }
+    }
     if (world == 1) {
         auto* sink = per_rank ? &(*per_rank)[0] : receipt;
-        const auto status =
-            clients_.front()->retrieve(*keys.front(), *transfers.front(), sink, stop_fd);
+        const auto status = client_.retrieve(*keys.front(), *transfers.front(), sink, stop_fd);
         if (receipt && per_rank) *receipt = (*per_rank)[0];
         return status;
     }
@@ -176,38 +140,27 @@ LmCacheStatus LmCacheGroup::retrieve(const std::vector<const PrefixCacheKeys*>& 
     std::vector<LmCacheStatus> statuses(world, LmCacheStatus::declined);
     std::vector<LmCacheReceipt> receipts(world);
     std::vector<std::exception_ptr> errors(world);
-    std::vector<std::optional<std::thread>> workers(world);
+    const auto restore_rank = [&](std::size_t rank) noexcept {
+        try {
+            statuses[rank] =
+                client_.retrieve(*keys[rank], *transfers[rank], &receipts[rank], stop_fd);
+        } catch (...) {
+            errors[rank] = std::current_exception();
+        }
+    };
+    std::vector<std::thread> workers(world - 1);
     for (std::size_t rank = 1; rank < world; ++rank) {
         try {
-            workers[rank].emplace([this, rank, &keys, &transfers, &statuses, &receipts,
-                                   &errors, stop_fd]() noexcept {
-                try {
-                    statuses[rank] = clients_[rank]->retrieve(*keys[rank], *transfers[rank],
-                                                              &receipts[rank], stop_fd);
-                } catch (...) {
-                    errors[rank] = std::current_exception();
-                }
-            });
+            workers[rank - 1] = std::thread(restore_rank, rank);
         } catch (const std::system_error&) {
-            workers[rank].reset();
         }
     }
-    try {
-        statuses[0] = clients_.front()->retrieve(*keys.front(), *transfers.front(),
-                                                 &receipts[0], stop_fd);
-    } catch (...) {
-        errors[0] = std::current_exception();
-    }
+    restore_rank(0);
     for (std::size_t rank = 1; rank < world; ++rank) {
-        if (workers[rank]) {
-            workers[rank]->join();
+        if (workers[rank - 1].joinable()) {
+            workers[rank - 1].join();
         } else {
-            try {
-                statuses[rank] = clients_[rank]->retrieve(*keys[rank], *transfers[rank],
-                                                          &receipts[rank], stop_fd);
-            } catch (...) {
-                errors[rank] = std::current_exception();
-            }
+            restore_rank(rank);
         }
     }
     for (const auto& error : errors) {
@@ -233,23 +186,10 @@ LmCacheStatus LmCacheGroup::retrieve(const std::vector<const PrefixCacheKeys*>& 
 }
 
 void LmCacheGroup::reset() const {
-    std::exception_ptr first;
-    for (const auto& client : clients_) {
-        try {
-            client->reset();
-        } catch (...) {
-            if (!first) first = std::current_exception();
-        }
-    }
-    if (first) std::rethrow_exception(first);
+    client_.reset();
 }
 
-}   
-
-namespace sglang::decoder {
-
-int LmCacheGroup::world_size() const { return static_cast<int>(clients_.size()); }
-
-const LmCacheClient& LmCacheGroup::client(int rank) const { return *clients_.at(rank); }
-
+int LmCacheGroup::world_size() const {
+    return world_size_;
+}
 }

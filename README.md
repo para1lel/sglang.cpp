@@ -56,8 +56,8 @@ To serve on two reserved B200s, set `GPU_UUIDS` to their comma-separated UUIDs i
 rank order and run `CUDA_VISIBLE_DEVICES="$GPU_UUIDS" host ./build/bin/sglang-server --tp 2`.
 Use `GET /server_info` to verify the effective configuration. [Server information](docs/native-model-info.md#server-information)
 
-LMCache prefix reuse is enabled by default and uses one daemon per GPU. Start the
-daemon or daemons before launching the server to reuse prefixes. [LMCache setup](docs/serving/lmcache.md)
+LMCache prefix reuse is enabled by default. Start one node-local daemon with
+visibility of every GPU serving the model. [LMCache setup](docs/serving/lmcache.md)
 
 ## API and performance
 

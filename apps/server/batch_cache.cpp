@@ -1,7 +1,6 @@
 #include "sglang/runtime/server/batch_cache.h"
 #include "sglang/runtime/cache/lmcache_group.h"
 
-#include <cstring>
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
@@ -215,8 +214,8 @@ void run_joint_store(CacheState* state,
     const auto run_rank = [state, &checkpoint, &statuses, &receipts,
                            &errors](std::size_t lane) noexcept {
         try {
-            statuses[lane] = state->group->store_prepared(
-                static_cast<int>(lane), checkpoint->metadata[lane], &receipts[lane]);
+            statuses[lane] =
+                state->group->store_prepared(checkpoint->metadata[lane], &receipts[lane]);
             if (statuses[lane] != LmCacheStatus::complete) return;
             if (checkpoint->stores) ++*checkpoint->stores;
             if (lane < state->rank_stores.size()) {
@@ -298,9 +297,7 @@ struct BatchCache::State {
     State(std::unique_ptr<LmCacheClient> connection, std::string identity, int lanes)
         : State(std::move(identity), lanes) {
         if (connection) {
-            std::vector<std::unique_ptr<LmCacheClient>> clients;
-            clients.push_back(std::move(connection));
-            group = std::make_unique<LmCacheGroup>(std::move(clients));
+            group = std::make_unique<LmCacheGroup>(std::move(*connection));
             try { available = group->ready(); } catch (const std::exception&) {}
         }
     }
@@ -309,8 +306,12 @@ struct BatchCache::State {
           std::string identity, int lanes)
         : State(std::move(identity), lanes) {
         if (rank_devices.empty()) throw std::invalid_argument("Empty LMCache rank device list");
-        group = std::make_unique<LmCacheGroup>(ranked_lmcache_configs(base,
-                                                                     rank_devices.size()));
+        for (auto device = rank_devices.begin(); device != rank_devices.end(); ++device) {
+            if (std::find(rank_devices.begin(), device, *device) != device) {
+                throw std::invalid_argument("Duplicate LMCache rank device");
+            }
+        }
+        group = std::make_unique<LmCacheGroup>(base, static_cast<int>(rank_devices.size()));
         devices = std::move(rank_devices);
         rank_stores = std::vector<std::atomic_uint64_t>(devices.size());
         rank_restores = std::vector<std::atomic_uint64_t>(devices.size());
@@ -321,8 +322,7 @@ struct BatchCache::State {
 
     int rank_of(const PrefixDeviceTransfer& view) const {
         for (std::size_t rank = 0; rank < devices.size(); ++rank) {
-            if (std::memcmp(devices[rank].data(), view.transfer.device.data(),
-                            view.transfer.device.size()) == 0) {
+            if (devices[rank] == view.transfer.device) {
                 return static_cast<int>(rank);
             }
         }

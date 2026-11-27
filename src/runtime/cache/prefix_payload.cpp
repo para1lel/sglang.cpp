@@ -108,8 +108,10 @@ std::size_t prefix_payload_bytes(PrefixPayloadKind kind, int begin, int end,
 PrefixCacheKeys::PrefixCacheKeys(const std::vector<int>& prompt, std::string_view salt,
                                   const std::vector<DecoderMedia>* media,
                                   const PrefixCacheLayout* layout) {
-    std::string domain =
-        prefix_cache_domain(layout ? *layout : tp1_prefix_cache_layout);
+    const auto& geometry = layout != nullptr ? *layout : tp1_prefix_cache_layout;
+    world_size_ = geometry.world_size;
+    rank_ = geometry.rank;
+    std::string domain = prefix_cache_domain(geometry);
     domain.append(salt);
     if (!media || media->empty()) {
         keys_.reserve(prompt.size() + 1);
@@ -142,6 +144,10 @@ PrefixCacheKeys::PrefixCacheKeys(const std::vector<int>& prompt, std::string_vie
             append_row(expanded.token_ids[row], expanded.positions[row], {}, -1);
         }
     }
+}
+
+bool PrefixCacheKeys::matches_rank(int world_size, int rank) const {
+    return world_size_ == world_size && rank_ == rank;
 }
 
 std::string PrefixCacheKeys::key(int end) const {

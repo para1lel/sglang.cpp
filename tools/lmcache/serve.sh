@@ -17,8 +17,8 @@ python=${LMCACHE_PYTHON:-python3}
 usage() {
     echo 'Usage: serve.sh [--socket PATH] [--namespace NAME] [--memory-gib N] [--port N] [--rank N]'
     echo 'Set LMCACHE_PYTHON to the interpreter with LMCache 0.5.8 installed.'
-    echo 'Expose exactly one CUDA device to the daemon, matching the native server GPU.'
-    echo '--rank N namespaces this daemon for TP rank N: socket <default>-rN.sock,'
+    echo 'Expose the native server GPUs to one daemon using CUDA_VISIBLE_DEVICES.'
+    echo '--rank N selects legacy single-device naming: socket <default>-rN.sock,'
     echo 'namespace sglang-rN and port 17655+N unless overridden explicitly.'
 }
 
@@ -83,9 +83,10 @@ except ValueError:
     sys.exit("Invalid LMCache capacity")
 if not math.isfinite(size) or size <= 0:
     sys.exit("LMCache capacity must be finite and positive")
-print(json.dumps({"module_path": "sglang_lmcache", "config": {
-    "socket": path, "namespace": namespace,
-}}))
+config = {"socket": path, "namespace": namespace}
+if rank != "-1":
+    config["single_device"] = True
+print(json.dumps({"module_path": "sglang_lmcache", "config": config}))
 PY
 )
 

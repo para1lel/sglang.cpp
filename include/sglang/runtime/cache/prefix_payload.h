@@ -79,13 +79,16 @@ public:
     int cacheable_tokens() const;
     std::string key(int end) const;
     void append(int token);
+    bool matches_rank(int world_size, int rank) const;
 
-private:
+  private:
     void append_row(int token, MropePosition position, std::string_view media, int feature_row);
 
     std::vector<tokenizer::Sha256Digest> keys_;
     int tokens_ = 0;
     int next_position_ = 0;
+    int world_size_ = 1;
+    int rank_ = 0;
 };
 
 }

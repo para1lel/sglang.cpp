@@ -19,7 +19,7 @@ Match checkpoint, tokenizer, template, processor, weight precision, sampling, ca
 Use MTP4, 32,768 tokens per step, eight slots per GPU, and cold prefixes.
 
 - **Pinned vLLM.** Set `--max-num-batched-tokens 32768 --max-num-scheduled-tokens 32768` and enable `--async-scheduling`. Match `--max-num-seqs` to the active capacity. Verify MTP4 and the effective aligned GDN cache settings at the API and worker.
-- **Native.** Use the default direct GPU LMCache path. The paired driver starts a private LMCache 0.5.8 daemon with 64 GiB CPU L1 on the same physical GPU. [Daemon launcher](../benchmarks/paired/lmcache_arm.sh#L36)<!-- prefix: "start_lmcach" -->
+- **Native.** Use the default direct GPU LMCache path. The paired driver starts a private LMCache 0.5.8 daemon on the selected physical GPU with 64 GiB CPU L1 for TP1. TP2 uses one daemon with both UUIDs and one 128 GiB CPU L1. [TP1 daemon launcher](../benchmarks/paired/lmcache_arm.sh#L36)<!-- prefix: "start_lmcach" -->
 
 The pinned vLLM arm uses its local prefix cache. Verify `kv_transfer=false` and `kv_offloading_size=null` in the worker receipt. The same check requires zero CPU weight offload. [Worker receipt check](https://github.com/para1lel/sglang.cpp/blob/03ee22d849e6ef7bca723595a7c8e63c47187749/benchmarks/paired/saved_evidence.py#L223)<!-- prefix: "and worker[\"" -->
 
@@ -65,7 +65,7 @@ Report output tokens/s, TTFT, TPOT, end-to-end latency, and whether every lane s
 | End-to-end latency (ms) | Time from request submission to its terminal response. Record stream chunking when multiple tokens arrive together. |
 | Requests/s and aggregate tokens/s | Completed requests per cohort second, and total input plus output tokens per cohort second, respectively. |
 
-Exclude startup, model load, JIT, and graph capture. Drain and acknowledge resets before each cohort. Require zero cached tokens and unchanged hit counters. For each native LMCache daemon, verify periodic and terminal stores, written positions, transfers, zero GQA/GDN/draft reuse, and no new declines or I/O errors. Use settled counters for cache accounting and stream timestamps for the timing ratio. [Cold reset](../benchmarks/paired/cold_cache.py#L112)<!-- prefix: "def before_c" --> · [Drain verification](../benchmarks/paired/cold_cache.py#L134)<!-- prefix: "def verify_l" -->
+Exclude startup, model load, JIT, and graph capture. Drain and acknowledge resets before each cohort. TP2 uses one daemon reset. Require zero cached tokens and unchanged hit counters. Check the joint native receipt for periodic and terminal stores, written positions, transfer bytes, zero GQA/GDN/draft reuse, and unchanged decline and I/O error counters. For TP2, each rank must acknowledge every store with zero restores and read bytes. GQA and GDN write bytes must be positive and equal across ranks. Only rank 0 writes draft bytes. Use settled counters for cache accounting and stream timestamps for the timing ratio. [Cold reset](../benchmarks/paired/cold_cache.py#L112)<!-- prefix: "def before_c" --> · [Drain verification](../benchmarks/paired/cold_cache.py#L134)<!-- prefix: "def verify_l" --> · [Rank receipts](../benchmarks/tp2/cache_activity.py#L16)<!-- prefix: "def replay(r" -->
 
 Report absolute metrics and successful and attempted requests for each engine, row, and mode. Give the latency sample count and percentile method.
 

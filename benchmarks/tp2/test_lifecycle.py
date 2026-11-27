@@ -1,11 +1,11 @@
 """Regression checks for the one-process, two-device native topology."""
 
-import pytest
+from pathlib import Path
 
 import cache_activity
 import cold_cache
+import pytest
 from native import graph_policy, owners, rank_table
-
 
 DEVICES = [f"GPU-00000000-0000-0000-0000-00000000000{n}" for n in (1, 2)]
 
@@ -39,17 +39,20 @@ def test_graph_policy_records_real_boolean_and_requires_shared_setting(tmp_path)
         graph_policy({"batch_cuda_graphs": True}, tmp_path)
 
 
-def test_joint_gpu_ownership_includes_one_server_and_exactly_the_local_daemon(tmp_path):
+def test_joint_gpu_ownership_includes_one_server_and_one_shared_daemon(tmp_path: Path) -> None:
     inventory = tmp_path / "compute.csv"
-    rows = [f"{gpu}, {pid}, owned, 50 MiB" for gpu, pids in zip(DEVICES, [(31, 41), (31, 42)])
-            for pid in pids]
+    rows = [f"{gpu}, {pid}, owned, 50 MiB" for gpu in DEVICES for pid in (31, 41)]
     inventory.write_text("\n".join(rows))
-    owners(inventory, DEVICES, [41, 42], 31)
-    for changed in (rows[:-1], rows + rows[-1:], rows + [rows[0].replace(", 31,", ", 99,")],
-                    rows[:-1] + [rows[-1].replace(", 42,", ", 41,")]):
+    owners(inventory, DEVICES, 41, 31)
+    for changed in (
+        rows[:-1],
+        [*rows, rows[-1]],
+        [*rows, rows[0].replace(", 31,", ", 99,")],
+        [*rows[:-1], rows[-1].replace(", 41,", ", 42,")],
+    ):
         inventory.write_text("\n".join(changed))
         with pytest.raises(ValueError, match="ownership"):
-            owners(inventory, DEVICES, [41, 42], 31)
+            owners(inventory, DEVICES, 41, 31)
 
 
 @pytest.mark.parametrize("fault", [None, "idle-rank", "wrong-draft-owner", "partial-shard",

@@ -71,6 +71,20 @@ Choose the participating B200 by `GPU_INDEX`. Both engine processes use only
 that device. The row width is the requests per participating GPU multiplied by
 the number of participating GPUs. The current launcher supports one GPU.
 
+For two devices, use [`benchmarks/tp2/run.sh`](../../docs/serving/tp2.md#acceptance-target).
+The `tp2-paired-v2` driver uses a fresh campaign root and one private LMCache
+0.5.8 process, socket, loopback port, and `sglang` namespace. Its 128 GiB CPU L1
+is shared by both GPU UUIDs. An acknowledged reset covers both ranks. Verify
+rank-local receipts and match the active cache gate on each rank. The separate
+TP1 driver retains a private 64 GiB daemon. Set `PAIRED_LMCACHE_PORT` to
+choose the TP2 daemon’s loopback port (default 17655).
+
+The campaign records `daemon_port` and `lmcache_capacity_bytes`. Native
+readiness and completion receipts report one `daemon_pid` and two ranks.
+The `daemon/` receipts bind both UUIDs, the socket peer, and the process
+configuration. Replay `tp2-paired-v1` at its pinned revision with the original
+evidence. [Campaign identity](../../benchmarks/tp2/run.sh#L75)<!-- prefix: "'{protocol:\"" --> · [Daemon receipts](../../benchmarks/tp2/native.py#L57)<!-- prefix: "def verify_d" --> · [Historical two-daemon protocol](https://github.com/para1lel/sglang.cpp/blob/57ac5fbbdf20a5a80c5bc079b49073a44c06680f/benchmarks/tp2/run.sh#L73)
+
 See the [named workloads](../../docs/performance.md#named-workloads) for row sizes.
 
 W4 selects lanes 00–07 from the immutable archived W5 corpus. W5 selects all

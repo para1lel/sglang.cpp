@@ -54,8 +54,6 @@ struct LmCacheReceipt {
 };
 
 std::string default_lmcache_endpoint();
-std::string rank_lmcache_endpoint(int rank);
-std::string rank_lmcache_endpoint(const std::string& endpoint, int rank);
 
 struct LmCacheConfig {
     std::string endpoint = default_lmcache_endpoint();

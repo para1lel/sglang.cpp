@@ -1,24 +1,28 @@
-"""Check rank-local direct prefix transfers and generated IDs on a private daemon pair."""
+"""Check both rank transfers and generated IDs through a single physical LMCache daemon."""
 
 import argparse
-from concurrent.futures import ThreadPoolExecutor
-from contextlib import ExitStack, closing, contextmanager
 import json
 import os
-from pathlib import Path
 import signal
 import socket
 import subprocess
 import sys
+from collections.abc import Generator
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing, contextmanager
+from importlib import import_module
+from pathlib import Path
 from tempfile import TemporaryDirectory
 from time import monotonic, sleep
 
 ROOT = Path(__file__).resolve().parents[3]
 sys.path[:0] = [str(ROOT / "tests"), str(ROOT / "tests" / "prefix"),
                 str(ROOT / "tests" / "text")]
-from lmcache_relay import DRAFT, GDN, GQA, PREFIX_DETAIL, RANK_GET, RANK_PUT, READY, RESET
-from lmcache_relay import Relay, control
-from media import http_routes as http
+lmcache = import_module("lmcache_relay")
+http = import_module("media.http_routes")
+
+PREFIX = [760, 6511, 314, 9338, 369, 220, 17, 478, 220, 17, 283, 13, 198]
+PROMPT = [*PREFIX, 760, 6511, 314, 6124, 369]
 
 
 def free_port():
@@ -28,13 +32,24 @@ def free_port():
 
 
 @contextmanager
-def daemon(args, work, gpu, rank):
-    socket_path = work / f"daemon-r{rank}.sock"
-    log_path = args.evidence / f"daemon-r{rank}.log"
-    env = dict(os.environ, CUDA_VISIBLE_DEVICES=gpu, XDG_RUNTIME_DIR=str(work),
-               PYTHONPATH=os.environ.get("LMCACHE_EXTRA_PYTHONPATH", ""))
-    command = ["bash", str(ROOT / "tools/lmcache/serve.sh"), "--rank", str(rank), "--socket",
-               str(socket_path), "--port", free_port(), "--memory-gib", "1"]
+def daemon(args: argparse.Namespace, work: Path) -> Generator[tuple[Path, int]]:
+    socket_path = work / "daemon.sock"
+    log_path = args.evidence / "daemon.log"
+    env = dict(
+        os.environ,
+        XDG_RUNTIME_DIR=str(work),
+        PYTHONPATH=os.environ.get("LMCACHE_EXTRA_PYTHONPATH", ""),
+    )
+    command = [
+        "bash",
+        str(ROOT / "tools/lmcache/serve.sh"),
+        "--socket",
+        str(socket_path),
+        "--port",
+        free_port(),
+        "--memory-gib",
+        "2",
+    ]
     with log_path.open("wb") as out:
         proc = subprocess.Popen(command, env=env, stdout=out, stderr=subprocess.STDOUT,
                                 start_new_session=True)
@@ -42,15 +57,15 @@ def daemon(args, work, gpu, rank):
             deadline = monotonic() + 60
             while monotonic() < deadline and proc.poll() is None:
                 try:
-                    reply = control(socket_path, f"sglang-r{rank}", READY)
+                    reply = lmcache.control(socket_path, "sglang", lmcache.READY)
                     if reply == (0, b"0.5.8+native-v3"):
                         break
                 except (FileNotFoundError, ConnectionRefusedError):
                     pass
                 sleep(0.1)
             else:
-                raise RuntimeError(f"Daemon {rank} failed readiness, see {log_path}")
-            yield socket_path
+                raise RuntimeError(f"Shared daemon failed readiness, see {log_path}")
+            yield socket_path, proc.pid
         finally:
             if proc.poll() is None:
                 os.killpg(proc.pid, signal.SIGTERM)
@@ -71,14 +86,19 @@ def receipt(events, rank, gpu, opcode, endpoint):
     got = [entry for entry in events if entry["opcode"] == opcode]
     assert got and all(e["status"] == 0 for e in got), (rank, opcode, got)
     total = [sum(e["receipt"][i] for e in got) for i in range(4)]
-    expected = [16896 * endpoint, 76992512, (endpoint - 1) * 2112 if rank == 0 else 0,
-                endpoint if opcode == RANK_PUT else 0]
+    expected = [
+        16896 * endpoint,
+        76992512,
+        (endpoint - 1) * 2112 if rank == 0 else 0,
+        endpoint if opcode == lmcache.RANK_PUT else 0,
+    ]
     assert total == expected, (rank, opcode, total, expected)
     families = {key[0] for e in got for key in e["keys"]}
-    assert families == ({GQA, GDN, DRAFT} if rank == 0 else {GQA, GDN}), (rank, families)
+    target = {lmcache.GQA, lmcache.GDN}
+    assert families == (target | {lmcache.DRAFT} if rank == 0 else target), (rank, families)
     for e in got:
-        assert e["device"] == gpu.removeprefix("GPU-").replace("-", "")
-        assert e["namespace"] == f"sglang-r{rank}"
+        assert e["device"] == gpu
+        assert e["namespace"] == "sglang"
         assert e["allocations"] > 0 and e["forwarded"]
     return total
 
@@ -124,24 +144,30 @@ def drain(port):
     raise TimeoutError("Pending LMCache stores did not drain")
 
 
-def delayed_store(args, port, prefix, relays, offsets, baseline, gpu):
-    barrier = relays[1].arm(RANK_PUT)
+def delayed_store(
+    args: argparse.Namespace, port: int, relay: lmcache.Relay, devices: list[str]
+) -> tuple[int, dict[str, int], dict[str, int | dict[str, int]]]:
+    offset = len(relay.since())
+    baseline = metrics(port)
+    barrier = relay.arm(lmcache.RANK_PUT, devices[1])
     with ThreadPoolExecutor(max_workers=1) as worker:
-        prime = worker.submit(capture, args, port, "prime", prefix, 1, 0, "subject")
+        prime = worker.submit(capture, args, port, "prime", PREFIX, 1, 0, "subject")
         try:
             barrier.wait()
             deadline = monotonic() + 10
             while monotonic() < deadline:
-                completed = relays[0].since(offsets[0])
+                completed = [e for e in relay.since(offset) if e.get("device") == devices[0]]
                 midpoint = metrics(port)
-                if (any(e["opcode"] == RANK_PUT and e["forwarded"] for e in completed)
-                        and midpoint["rank0_draft_written_bytes_total"]
-                        > baseline["rank0_draft_written_bytes_total"]):
+                if (
+                    any(e["opcode"] == lmcache.RANK_PUT and e["forwarded"] for e in completed)
+                    and midpoint["rank0_draft_written_bytes_total"]
+                    > baseline["rank0_draft_written_bytes_total"]
+                ):
                     break
                 sleep(0.02)
             else:
                 raise AssertionError("Rank 0 store did not retire before rank 1")
-            physical = receipt(completed, 0, gpu, RANK_PUT, len(prefix))
+            physical = receipt(completed, 0, devices[0], lmcache.RANK_PUT, len(PREFIX))
             deltas = {key: value - baseline[key] for key, value in midpoint.items()}
             expected = {"pending_stores": 1, "rank0_stores_total": 1, "rank1_stores_total": 0,
                         "stores_total": 0, "gqa_written_tokens_total": 0,
@@ -156,13 +182,86 @@ def delayed_store(args, port, prefix, relays, offsets, baseline, gpu):
             barrier.release.set()
         prime.result()
     drain(port)
-    return {"held": midpoint["pending_stores"], "drained": pending(port), "deltas": observed}
+    return (
+        offset,
+        baseline,
+        {
+            "held": midpoint["pending_stores"],
+            "drained": pending(port),
+            "deltas": observed,
+        },
+    )
 
 
-def exercise(args, work, devices, sockets, relays):
-    path = str(work / "relay.sock")
-    prefix = [760, 6511, 314, 9338, 369, 220, 17, 478, 220, 17, 283, 13, 198]
-    prompt = prefix + [760, 6511, 314, 6124, 369]
+def exercise(
+    args: argparse.Namespace, work: Path, devices: list[str], daemon_socket: Path, daemon_pid: int
+) -> None:
+    path = work / "relay.sock"
+    with lmcache.Relay(path, daemon_socket) as relay:
+        try:
+            roundtrip(args, devices, daemon_socket, relay, str(path))
+        finally:
+            events = {"pid": daemon_pid, "events": relay.since(), "errors": relay.errors}
+            (args.evidence / "relay.json").write_text(
+                json.dumps(events, default=bytes.hex, indent=2) + "\n", encoding="utf-8"
+            )
+        assert not relay.errors
+        transfers = [
+            e for e in relay.since() if e["opcode"] in (lmcache.RANK_GET, lmcache.RANK_PUT)
+        ]
+        assert {e["device"] for e in transfers} == set(devices)
+        assert {e["daemon_pid"] for e in transfers} == {daemon_pid}
+
+
+def tail_restores(
+    args: argparse.Namespace,
+    port: int,
+    relay: lmcache.Relay,
+    devices: list[str],
+    committed: list[int],
+) -> dict[str, list[int]]:
+    continued = [*committed, 220, 17]
+    reference = capture(args, port, "tail-cold", continued, 4, 0, "tail-reference")
+    drain(port)
+    offset = len(relay.since())
+    tail = capture(args, port, "tail-restored", continued, 4, len(committed), "subject")
+    assert tail == reference, (tail, reference)
+    drain(port)
+    totals = {}
+    for rank, gpu in enumerate(devices):
+        transfers = [e for e in relay.since(offset) if e.get("device") == gpu]
+        totals[f"rank{rank}_tail_get"] = receipt(
+            transfers, rank, gpu, lmcache.RANK_GET, len(committed)
+        )
+    return totals
+
+
+def erase_rank1(daemon_socket: Path, stores: list[list[dict[str, object]]]) -> None:
+    keys = [
+        next(
+            k
+            for e in rank
+            if e["opcode"] == lmcache.RANK_PUT
+            for k in e["keys"]
+            if k[0] == lmcache.GQA
+        )
+        for rank in stores
+    ]
+    assert keys[0] != keys[1]
+    assert (
+        lmcache.control(daemon_socket, "sglang", lmcache.ERASE, lmcache.key_body(keys[1]))[0] == 0
+    )
+    present = (1).to_bytes(4, "big") + lmcache.key_body(keys[0])
+    assert lmcache.control(daemon_socket, "sglang", lmcache.LOOKUP, present) == (0, b"\x01")
+
+
+def roundtrip(
+    args: argparse.Namespace,
+    devices: list[str],
+    daemon_socket: Path,
+    relay: lmcache.Relay,
+    path: str,
+) -> None:
     with http.serve(args, "ranked-cache", "--tp", "2", "--eager", "--mtp-steps", "4",
                     "--lmcache-socket", path) as (port, _):
         status, _, raw = http.exchange(port, "/server_info")
@@ -171,52 +270,45 @@ def exercise(args, work, devices, sockets, relays):
         assert status == 200 and info["tp_size"] == info["tensor_parallel"] == 2
         assert info["lmcache_available"] and info["lmcache_enabled"] and info["mtp_steps"] == 4
         if not args.store_only:
-            cold = capture(args, port, "cold", prompt, 8, 0, "reference")
+            cold = capture(args, port, "cold", PROMPT, 8, 0, "reference")
             drain(port)
-        offsets = [len(relay.since()) for relay in relays]
-        pre_prime = metrics(port)
-        held = delayed_store(args, port, prefix, relays, offsets, pre_prime, devices[0])
+        offset, pre_prime, held = delayed_store(args, port, relay, devices)
         totals = {"pending_store": held}
-        for rank, relay in enumerate(relays):
-            totals[f"rank{rank}_store"] = receipt(relay.since(offsets[rank]), rank,
-                                                  devices[rank], RANK_PUT, len(prefix))
+        stores = [[e for e in relay.since(offset) if e.get("device") == gpu] for gpu in devices]
+        for rank, events in enumerate(stores):
+            totals[f"rank{rank}_store"] = receipt(
+                events, rank, devices[rank], lmcache.RANK_PUT, len(PREFIX)
+            )
         pre_restore = metrics(port)
         check_counters(pre_prime, pre_restore, totals, "store")
         assert pre_restore["stores_total"] - pre_prime["stores_total"] == 1
         token_counter = "gqa_written_tokens_total"
-        assert pre_restore[token_counter] - pre_prime[token_counter] == len(prefix)
+        assert pre_restore[token_counter] - pre_prime[token_counter] == len(PREFIX)
         if args.store_only:
             (args.evidence / "rank-receipts.json").write_text(json.dumps(totals, indent=2) + "\n")
             (args.evidence / "metrics.json").write_text(json.dumps({
                 "baseline": pre_prime, "settled": pre_restore,
             }, indent=2) + "\n")
             return
-        offsets = [len(relay.since()) for relay in relays]
-        hit = capture(args, port, "restored", prompt, 8, len(prefix), "subject")
+        offset = len(relay.since())
+        hit = capture(args, port, "restored", PROMPT, 8, len(PREFIX), "subject")
         drain(port)
         assert hit == cold, (hit, cold)
-        for rank, relay in enumerate(relays):
-            events = relay.since(offsets[rank])
-            assert any(e["opcode"] == PREFIX_DETAIL and e["status"] == 0 for e in events)
-            totals[f"rank{rank}_get"] = receipt(events, rank, devices[rank], RANK_GET, len(prefix))
+        events = relay.since(offset)
+        assert sum(
+            e["opcode"] == lmcache.PREFIX_DETAIL and e["status"] == 0 for e in events
+        ) >= len(devices)
+        for rank, gpu in enumerate(devices):
+            transfers = [e for e in events if e.get("device") == gpu]
+            totals[f"rank{rank}_get"] = receipt(transfers, rank, gpu, lmcache.RANK_GET, len(PREFIX))
         post_restore = metrics(port)
         check_counters(pre_restore, post_restore, totals, "get")
         (args.evidence / "metrics.json").write_text(json.dumps({
             "pre_prime": pre_prime, "pre_restore": pre_restore, "post_restore": post_restore,
         }, indent=2) + "\n")
-        committed = prompt + hit[0][:-1]
-        continued = committed + [220, 17]
-        reference = capture(args, port, "tail-cold", continued, 4, 0, "tail-reference")
-        drain(port)
-        offsets = [len(relay.since()) for relay in relays]
-        tail = capture(args, port, "tail-restored", continued, 4, len(committed), "subject")
-        assert tail == reference, (tail, reference)
-        drain(port)
-        for rank, relay in enumerate(relays):
-            totals[f"rank{rank}_tail_get"] = receipt(relay.since(offsets[rank]), rank,
-                                                     devices[rank], RANK_GET, len(committed))
-        assert control(sockets[1], "sglang-r1", RESET)[0] == 0
-        fallback = capture(args, port, "missing-rank", prompt, 8, 0, "subject")
+        totals.update(tail_restores(args, port, relay, devices, [*PROMPT, *hit[0][:-1]]))
+        erase_rank1(daemon_socket, stores)
+        fallback = capture(args, port, "missing-rank", PROMPT, 8, 0, "subject")
         assert fallback == cold, (fallback, cold)
         drain(port)
         (args.evidence / "rank-receipts.json").write_text(json.dumps(totals, indent=2) + "\n")
@@ -236,19 +328,11 @@ def main():
     devices = os.environ["CUDA_VISIBLE_DEVICES"].split(",")
     assert len(devices) == 2 and devices[0] != devices[1]
     args.evidence.mkdir(exist_ok=True, parents=True)
-    with TemporaryDirectory(prefix="tp2-serving-", dir="/tmp") as directory, ExitStack() as stack:
+    uuids = [gpu.removeprefix("GPU-").replace("-", "").lower() for gpu in devices]
+    with TemporaryDirectory(prefix="tp2-serving-", dir="/tmp") as directory:
         work = Path(directory)
-        sockets = [stack.enter_context(daemon(args, work, gpu, i)) for i, gpu in enumerate(devices)]
-        relays = [stack.enter_context(Relay(work / f"relay-r{r}.sock", p))
-                  for r, p in enumerate(sockets)]
-        try:
-            exercise(args, work, devices, sockets, relays)
-        finally:
-            for rank, relay in enumerate(relays):
-                events = {"events": relay.since(), "errors": relay.errors}
-                (args.evidence / f"relay-r{rank}.json").write_text(
-                    json.dumps(events, default=bytes.hex, indent=2) + "\n")
-        assert not any(relay.errors for relay in relays)
+        with daemon(args, work) as (endpoint, pid):
+            exercise(args, work, uuids, endpoint, pid)
 
 
 if __name__ == "__main__":

@@ -2,7 +2,7 @@
 
 `--tp` accepts 1 or 2 and defaults to 1. TP2 defaults to [eligible verification replay](../batch-graphs.md#tp2-target-verification-graph). `--eager` disables it. Ordinary TP2 decode is eager. Use `benchmarks/tp2/run.sh` for two-B200 campaigns. [TP option](../../apps/sglang-server.cpp#L168)<!-- prefix: "} else if (o" --> · [Graph policy](../../apps/sglang-server.cpp#L354)<!-- prefix: "arguments.ma" --> · [TP1 topology](../../include/sglang/runtime/server/batch_session.h#L15)<!-- prefix: "inline const" --> · [Launcher limit](../../benchmarks/paired/README.md#L72)<!-- prefix: "the number o" -->
 
-TP2 with LMCache requires rank device receipts. The server derives one endpoint per rank from the base socket path. Each rank uses a private namespace and daemon. [Rank endpoints](../../include/sglang/runtime/cache/lmcache_client.h#L58)<!-- prefix: "std::string " --> · [Ranked transport](lmcache.md#ranked-tp2-transport)
+TP2 uses one node-local LMCache daemon, socket and namespace across both ranks. Each rank still needs independent device and transfer receipts. [Ranked transport](lmcache.md#ranked-tp2-transport)
 
 Both ranks own target workers and store 16,896 target KV bytes per token per rank. Rank 0 owns draft weights and cache. Restore requires the same GDN endpoint on both ranks. [Cold, warm, and one-sided eviction receipts](https://github.com/para1lel/sglang.cpp/blob/a5974ba4eb99bd8e8f890c2e7262a27dbc3aace1/docs/serving/tp2.md#tp2-serving-status-and-acceptance-target)
 
@@ -26,14 +26,14 @@ Each rank gathers embeddings and scatters reduced states to row-owned buffers wi
 
 ## Prerequisites and command
 
-Use two visible GPUs, a sharded-checkpoint build, LMCache 0.5.8, and one daemon per rank started with `tools/lmcache/serve.sh --rank N`. Then run:
+Use a sharded-checkpoint build and start [LMCache 0.5.8](lmcache.md#start-the-daemon) with both GPU UUIDs, omitting `--rank`. In the server shell expose the same GPUs in rank order. Use the daemon socket in the server command:
 
 ```sh
 sglang-server --checkpoint MODEL --device 0 --port PORT --tp 2 --eager \
   --mtp-steps 4 --lmcache-socket SOCKET
 ```
 
-The smoke arguments are in `artifacts/tp2-review/serving/cache-2328/complete/cache/ranked-cache.argv.json`. The campaigns omitted `--eager` and used `--port 17393 --tp 2 --max-active 16`.
+The two-daemon smoke arguments and paired-v1 campaigns remain archived with their original topology. [Historical TP2 command](https://github.com/para1lel/sglang.cpp/blob/57ac5fbbdf20a5a80c5bc079b49073a44c06680f/docs/serving/tp2.md#prerequisites-and-command)
 
 ## Two-rank allreduce transport
 
@@ -76,6 +76,6 @@ A passing campaign must satisfy every condition below.
 - **Devices.** Run both engines alone on the same two B200 devices in the same rank order. Record both UUIDs, the rank assignment, interconnect, and distributed library.
 - **Workloads.** Reuse the frozen W1–W5 fixture bytes. Offer 2, 2, 8, 16, and 8 requests total on W1–W5. This is one, one, four, eight, and four per GPU. Eight slots per GPU give sixteen slots total. W4 fills them exactly. W4 uses the first sixteen archived W5 lanes. W1 and W2 need one new distinct lane each. W3 and W5 need four more each. Freeze every new lane as distinct deterministic bytes in a separate additive TP2 corpus. Retain the TP1 lanes and bytes. Duplicate no request.
 - **Native arm.** Run the native server with `--tp 2`, the default direct GPU LMCache path, and the LMCache daemon enabled. Verify the reported `tp_size` is two. [Server information](../native-model-info.md#server-information) Confirm effective direct cache activity on each rank, so a reported `tp_size` cannot hide a bypass. Record the adopted topology and the effective daemon configuration.
-- **Cache.** Start one LMCache daemon per rank, each bound to its own GPU and rank namespace. [Ranked transport](lmcache.md#ranked-tp2-transport) Draft records live only in the rank 0 daemon. Drain and reset both rank daemons before cold timing.
+- **Cache.** Start one LMCache process with both GPU UUIDs and one 128 GiB CPU L1. Draft records belong to rank 0. Drain and acknowledge one reset before cold timing. Require cache transfer and store evidence for both ranks independently. [Ranked transport](lmcache.md#ranked-tp2-transport)
 - **vLLM arm.** Run the pinned checkout with `--tensor-parallel-size 2`. [TP option](https://github.com/vllm-project/vllm/blob/81a8cb063e6247fe254d7caf7e98a6691d71022a/vllm/engine/arg_utils.py#L1219)<!-- prefix: "\"--tensor-pa" --> Require `kv_transfer=false`, `kv_offloading_size=null`, and zero CPU weight offload in both workers' receipts. [Receipt policy](../performance.md#scheduler-and-reporting-policy)
 - **Gate.** Submit each row's requests simultaneously through the original submission path. Run one warmup and one measured cohort per row and engine, and use the measured verdict. Record clocks and output lengths. Treat output content as reference only; no warmup-measured token identity is required. Require native TP2 makespan ≤1.10× pinned vLLM TP2 on each W1–W5 row independently. A passing row covers no other row. Apply the [scheduler policy](../performance.md#scheduler-and-reporting-policy) unchanged.

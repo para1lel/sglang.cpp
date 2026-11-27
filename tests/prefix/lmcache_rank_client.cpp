@@ -55,7 +55,7 @@ int main(int argc, char** argv) {
     const std::string op = argv[1];
     const int world = std::stoi(argv[2]), rank = std::stoi(argv[3]), end = std::stoi(argv[4]);
     const bool draft = std::stoi(argv[5]) != 0, swap = std::stoi(argv[6]) != 0;
-    LmCacheGroup group(ranked_lmcache_configs(world));
+    const LmCacheGroup group({default_lmcache_endpoint(), "sglang"}, world);
     Rank first(world, swap ? 1 : 0), second(world, swap ? 0 : 1);
     const auto& lane = rank ? second : first;
     std::vector<const PrefixCacheKeys*> keys{&first.keys};

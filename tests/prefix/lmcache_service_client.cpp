@@ -157,7 +157,7 @@ int main(int argc, char** argv) {
     devices[0][0] = 1;
     devices[1][0] = 2;
     BatchCache cache({argv[1], "service", 2000}, devices, "service", 1);
-    require(cache.metrics().available, "ranked daemons unavailable");
+    require(cache.metrics().available, "shared daemon unavailable");
     Keys keys;
     for (int r = 0; r < 2; ++r) {
         const auto layout = tp2_prefix_cache_layout(r);

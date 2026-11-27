@@ -257,38 +257,52 @@ def independent_destinations(records, pointers):
 
 
 class DeviceCopies:
-    def __init__(self):
-        if torch.cuda.device_count() != 1:
-            raise RuntimeError("sglang LMCache requires exactly one visible CUDA device")
+    def __init__(self, *, single_device: bool = False) -> None:
+        count = torch.cuda.device_count()
+        if count == 0 or (single_device and count != 1):
+            required = "exactly one" if single_device else "at least one"
+            raise RuntimeError(f"sglang LMCache requires {required} visible CUDA device")
         torch.cuda.init()
         device_ops.BatchStep([], [])
         self.batched = device_ops.batch_memcpy_supported()
-        self.device = torch.device("cuda:0")
-        (uuid,) = cuda_check(driver.cuDeviceGetUuid(0), "read daemon CUDA UUID")
-        self.uuid = bytes(uuid.bytes)
-        self.backend = get_event_ipc_backend(self.device)
+        self.devices = {}
+        for ordinal in range(count):
+            (uuid,) = cuda_check(driver.cuDeviceGetUuid(ordinal), "read daemon CUDA UUID")
+            self.devices[bytes(uuid.bytes)] = torch.device("cuda", ordinal)
+        if len(self.devices) != count:
+            raise RuntimeError("sglang LMCache requires distinct visible CUDA device UUIDs")
+
+    def device_for(self, uuid: bytes) -> torch.device:
+        device = self.devices.get(uuid)
+        if device is None:
+            raise ValueError("GPU UUID is not visible to the daemon")
+        return device
 
     def run(self, transfer, records, objects, store):
-        if transfer.device != self.uuid:
-            raise ValueError("GPU UUID differs from daemon device")
-        with torch.cuda.device(self.device), ExitStack() as cleanup:
-            event = self.backend.import_event(transfer.event, self.device)
-            stream = torch.cuda.Stream(device=self.device)
-            pointers = self.map_allocations(cleanup, transfer.allocations)
+        device = self.device_for(transfer.device)
+        backend = get_event_ipc_backend(device)
+        with torch.cuda.device(device), ExitStack() as cleanup:
+            pointers = self.map_allocations(cleanup, transfer.allocations, device.index)
+            event = backend.import_event(transfer.event, device)
+            stream = torch.cuda.Stream(device=device)
             batched = self.batched and (store or independent_destinations(records, pointers))
             build = build_rectangles if batched else build_copies
             copies = build(records, objects, pointers, store)
             direction = TransferDirection.D2H if store else TransferDirection.H2D
             try:
-                self.backend.wait_event(event, stream)
+                backend.wait_event(event, stream)
                 with torch.cuda.stream(stream):
                     if batched:
                         cuda_check(runtime.cudaMemcpy3DBatchAsync(
                             len(copies), copies, 0, stream.cuda_stream), "submit batched CUDA copy")
                     else:
                         device_ops.execute_object_group_transfer(
-                            direction, self.device, LazyMemoryAllocator.PIN_CHUNK_SIZE,
-                            [], [device_ops.BatchStep(copies, [])])
+                            direction,
+                            device,
+                            LazyMemoryAllocator.PIN_CHUNK_SIZE,
+                            [],
+                            [device_ops.BatchStep(copies, [])],
+                        )
             finally:
                 try:
                     stream.synchronize()
@@ -297,13 +311,20 @@ class DeviceCopies:
                         "Unable to drain daemon CUDA transfer; stopping before lease release")
                     os._exit(1)
 
-    def map_allocations(self, cleanup, allocations):
+    def map_allocations(
+        self, cleanup: ExitStack, allocations: list[tuple[bytes, int]], ordinal: int
+    ) -> list[int]:
         pointers = []
         for handle, size in allocations:
             (address,) = cuda_check(runtime.cudaIpcOpenMemHandle(
                 cuda_ipc_handle_from_bytes(handle), runtime.cudaIpcMemLazyEnablePeerAccess),
                 "import CUDA IPC allocation")
             cleanup.callback(self.unmap_allocation, address)
+            (attributes,) = cuda_check(
+                runtime.cudaPointerGetAttributes(address), "inspect CUDA IPC allocation device"
+            )
+            if attributes.device != ordinal:
+                raise ValueError("CUDA IPC allocation does not belong to the requested GPU UUID")
             base, span = cuda_check(driver.cuMemGetAddressRange(address), "validate CUDA IPC span")
             if int(base) != address or span < size:
                 raise ValueError("CUDA IPC view exceeds mapped allocation")

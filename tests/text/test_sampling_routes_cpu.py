@@ -3,6 +3,7 @@
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing, contextmanager
+from functools import partial
 import http.client
 import json
 import os
@@ -36,13 +37,53 @@ def body(route, **options):
     return {"model": MODEL, "return_token_ids": True, **prompt, **options}
 
 
-def send(port, route, payload):
+def greedy_payload(route, fields, *, budget, stream=None):
+    streaming = {} if stream is None else {"stream": stream}
+    if route == "/generate":
+        return {"input_ids": [32, 220], **streaming, "sampling_params": {
+            "max_new_tokens": budget, "temperature": 0, **fields,
+        }}
+    return body(route, max_tokens=budget, temperature=0, **streaming, **fields)
+
+
+@contextmanager
+def control_response(port, method, path, payload=None, headers=None):
+    with closing(http.client.HTTPConnection("127.0.0.1", port, timeout=5)) as connection:
+        connection.request(method, path, payload, headers or {})
+        with connection.getresponse() as response:
+            yield response
+
+
+def wire(port, method, path, payload=None, headers=None):
+    with control_response(port, method, path, payload, headers) as response:
+        return response.status, response.headers, response.read()
+
+
+def sse_frames(response):
+    return iter(lambda: event(response), "[DONE]")
+
+
+def checked_body(test, response, frames=None):
+    test.assertEqual(response.headers.get_content_type(),
+                     "application/json" if frames is None else "text/event-stream")
+    if frames is None:
+        return json.load(response)
+    packets = list(frames)
+    test.assertEqual(response.read(), b"")
+    return packets
+
+
+@contextmanager
+def post_response(port, route, payload):
     connection, response = request(port, route, payload)
     with closing(connection), response:
+        yield response
+
+
+def send(port, route, payload):
+    with post_response(port, route, payload) as response:
         if response.headers.get_content_type() == "text/event-stream":
-            events = []
-            for packet in iter(lambda: event(response), "[DONE]"):
-                events.append(packet)
+            events = list(sse_frames(response))
             assert response.read() == b""
             return response.status, events
         return response.status, json.load(response)
@@ -163,12 +204,7 @@ class Routes(unittest.TestCase):
 
     def test_sparse_logit_bias(self):
         for route in ("/generate", TEXT, CHAT):
-            def payload(fields):
-                if route == "/generate":
-                    return {"input_ids": [32, 220], "sampling_params": {
-                        "max_new_tokens": 1, "temperature": 0, **fields,
-                    }}
-                return body(route, max_tokens=1, temperature=0, **fields)
+            payload = partial(greedy_payload, route, budget=1)
 
             with self.subTest(route=route):
                 for fields in ({}, {"logit_bias": None}, {"logit_bias": {}},
@@ -240,12 +276,7 @@ class Routes(unittest.TestCase):
     def test_output_history_penalties(self):
         names = ("frequency_penalty", "presence_penalty")
         for route in ("/generate", TEXT, CHAT):
-            def payload(fields):
-                if route == "/generate":
-                    return {"input_ids": [32, 220], "sampling_params": {
-                        "max_new_tokens": 1, "temperature": 0, **fields,
-                    }}
-                return body(route, max_tokens=1, temperature=0, **fields)
+            payload = partial(greedy_payload, route, budget=1)
 
             for values in ((0, 0), (-2, 2), (2, -2), (-0.29, 1.125), (None, None)):
                 with self.subTest(route=route, values=values):
@@ -269,12 +300,7 @@ class Routes(unittest.TestCase):
             name = "min_new_tokens" if native else "min_tokens"
             other = "min_tokens" if native else "min_new_tokens"
 
-            def payload(fields, *, budget=3, stream=False):
-                if native:
-                    return {"input_ids": [32, 220], "stream": stream, "sampling_params": {
-                        "max_new_tokens": budget, "temperature": 0, **fields,
-                    }}
-                return body(route, max_tokens=budget, temperature=0, stream=stream, **fields)
+            payload = partial(greedy_payload, route, budget=3, stream=False)
 
             with self.subTest(route=route):
                 _, implicit = self.exchange(route, payload({}))
@@ -298,12 +324,7 @@ class Routes(unittest.TestCase):
 
     def test_repetition_penalty(self):
         for route in ("/generate", TEXT, CHAT):
-            def payload(fields, *, stream=False):
-                if route == "/generate":
-                    return {"input_ids": [32, 220], "stream": stream, "sampling_params": {
-                        "max_new_tokens": 3, "temperature": 0, **fields,
-                    }}
-                return body(route, max_tokens=3, temperature=0, stream=stream, **fields)
+            payload = partial(greedy_payload, route, budget=3, stream=False)
 
             with self.subTest(route=route):
                 _, default = self.exchange(route, payload({}))
@@ -346,15 +367,9 @@ class Routes(unittest.TestCase):
         self.assertEqual(seen["prompt_tokens"], prompt_tokens)
         self.assertEqual(seen["budget"], self.context - CHAT_CONTEXT_RESERVE - prompt_tokens)
 
-    def wire(self, port, method, path, payload=None, headers=None):
-        with closing(http.client.HTTPConnection("127.0.0.1", port, timeout=5)) as connection:
-            connection.request(method, path, payload, headers or {})
-            with connection.getresponse() as response:
-                return response.status, response.headers, response.read()
-
     def control(self, port, path, *, method="GET", payload=None, status=200,
                 content_type="application/json"):
-        actual, headers, data = self.wire(port, method, path, payload)
+        actual, headers, data = wire(port, method, path, payload)
         self.assertEqual(actual, status, (method, path, data))
         self.assertEqual(headers.get_content_type(), content_type)
         self.assertEqual(headers["Content-Length"], str(len(data)))
@@ -476,7 +491,7 @@ class Routes(unittest.TestCase):
                             self.assertEqual(json.loads(data), {"detail": "Method Not Allowed"})
 
     def assert_redirect(self, method, target, location):
-        status, headers, body = self.wire(self.port, method, target)
+        status, headers, body = wire(self.port, method, target)
         self.assertEqual(status, 307, (target, body))
         self.assertEqual(headers["Location"], f"http://127.0.0.1:{self.port}{location}")
         self.assertEqual((headers["Content-Length"], body), ("0", b""))
@@ -494,18 +509,18 @@ class Routes(unittest.TestCase):
                     "message": f"The model '{model}' does not exist",
                     "type": "invalid_request_error", "param": "model", "code": "model_not_found",
                 })
-        self.assertEqual(self.wire(self.port, "GET", f"/v1/models%252F{MODEL}")[0], 404)
+        self.assertEqual(wire(self.port, "GET", f"/v1/models%252F{MODEL}")[0], 404)
 
     def test_encoded_put_and_redirect(self):
         self.assert_redirect("PUT", "/%67enerate%2F?x=%23?y", "/generate?x=%23?y")
         target = "/%67enerate?stream=false&trace=%2F"
-        status, headers, data = self.wire(self.port, "DELETE", target)
+        status, headers, data = wire(self.port, "DELETE", target)
         self.assertEqual((status, set(headers["Allow"].split(", "))), (405, {"POST", "PUT"}))
         self.assertEqual(json.loads(data), {"detail": "Method Not Allowed"})
         payload = {"input_ids": [32], "stream": True,
                    "sampling_params": {"max_new_tokens": 1, "temperature": 0}}
-        status, headers, data = self.wire(self.port, "PUT", target, json.dumps(payload),
-                                          {"Content-Type": "application/json"})
+        status, headers, data = wire(self.port, "PUT", target, json.dumps(payload),
+                                     {"Content-Type": "application/json"})
         self.assertEqual(status, 200, data)
         self.assertEqual(headers["Content-Type"], "text/event-stream")
         frames = data.split(b"\n\n")
@@ -542,7 +557,7 @@ class Routes(unittest.TestCase):
                 encoded = path.replace("_info", "%5finfo")
                 self.assertEqual(self.control(self.port, encoded + "?query=%3f"), expected)
                 self.assert_redirect("GET", encoded + "%2f?q=%252F", path + "?q=%252F")
-                status, headers, data = self.wire(self.port, "HEAD", encoded)
+                status, headers, data = wire(self.port, "HEAD", encoded)
                 self.assertEqual((status, headers["Allow"], data), (405, "GET", b""))
 
     def test_cuda_graph_launch_defaults_and_eager_override(self):
@@ -600,14 +615,14 @@ class Routes(unittest.TestCase):
         for method, query in (("GET", ""), ("POST", "?timeout=bad&time%6Fut=0"),
                               ("GET", "?timeout=1e%2B3")):
             with self.subTest(method=method, query=query):
-                status, headers, data = self.wire(port, method, "/flush%5fcache" + query)
+                status, headers, data = wire(port, method, "/flush%5fcache" + query)
                 self.assertEqual((status, data), (200, flushed))
                 self.assertEqual(headers["Content-Length"], str(len(flushed)))
                 self.assertIsNone(headers["Content-Type"])
         error = self.control(self.port, "/flush_cache", status=503)
         self.assertEqual(error["error"]["message"], "LMCache namespace reset was not acknowledged")
         self.assert_redirect("POST", "/flush_cache%2F?timeout=%FF", "/flush_cache?timeout=%FF")
-        status, headers, data = self.wire(self.port, "HEAD", "/flush_cache")
+        status, headers, data = wire(self.port, "HEAD", "/flush_cache")
         self.assertEqual((status, set(headers["Allow"].split(", ")), data),
                          (405, {"GET", "POST"}, b""))
         for method, value, decoded, diagnostic in (
@@ -858,14 +873,20 @@ class Routes(unittest.TestCase):
                 self.completion(packet, by_seed[seed], 24, "length")
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--server", type=Path, required=True)
+def run_cpu_suite(test_case, script, description, *, server_option=False,
+                  select_tests=False, verbosity=2):
+    parser = argparse.ArgumentParser(description=description)
+    binary = "server" if server_option else "binary"
+    parser.add_argument(f"--{binary}", type=Path, required=True)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    options, tests = parser.parse_known_args()
-    Routes.binary = options.server.resolve(strict=True)
-    Routes.checkpoint = options.checkpoint.resolve(strict=True)
-    Routes.output = options.output.resolve()
-    Routes.output.mkdir(parents=True, exist_ok=True)
-    unittest.main(argv=[__file__, *tests], verbosity=2)
+    options, tests = parser.parse_known_args() if select_tests else (parser.parse_args(), [])
+    test_case.binary = getattr(options, binary).resolve(strict=server_option)
+    test_case.checkpoint = options.checkpoint.resolve(strict=server_option)
+    test_case.output = options.output.resolve()
+    test_case.output.mkdir(parents=True, exist_ok=True)
+    unittest.main(argv=[script, *tests], verbosity=verbosity)
+
+
+if __name__ == "__main__":
+    run_cpu_suite(Routes, __file__, __doc__, server_option=True, select_tests=True)

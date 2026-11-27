@@ -70,7 +70,7 @@ bash tests/text/build_chat_cpu.sh . - "$output/sglang-server-cpu"
     --checkpoint "$checkpoint" --output "$output"
 ```
 
-Require exit status zero for each command. The score contract checks budget arithmetic, prompt composition, ordered labels, empty items, normalization, and response fields. The tokenization suite includes a score fixture for methods, `HEAD` body suppression, and an empty score `POST`. [Budget arithmetic](../../tests/decoder/score_check.cpp#L26)<!-- prefix: "void check_b" --> · [HTTP fixture](../../tests/text/test_native_tokenization_cpu.py#L106)<!-- prefix: "def test_sco" -->
+Require exit status zero for each command. The score contract checks budget arithmetic, prompt composition, ordered labels, empty items, normalization, and response fields. The tokenization suite includes a score fixture for methods, `HEAD` body suppression, and an empty score `POST`. [Budget arithmetic](../../tests/decoder/score_check.cpp#L26)<!-- prefix: "void check_b" --> · [HTTP fixture](../../tests/text/test_native_tokenization_cpu.py#L103)<!-- prefix: "def test_sco" -->
 
 On a reserved B200, match the checkpoint, prefill policy, and token history. Compare label log probabilities with appended-label prompt scores from `/generate`. Compare isolated score requests with concurrent scores and generation. Cover cache-off, cold, full-hit, and suffix-hit requests. Verify label order and check cache counters separately from the score response. [Mixed route checks](../../tests/media/http-contract.md)
 

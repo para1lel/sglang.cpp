@@ -1,6 +1,5 @@
 """Check generation health through the production HTTP queue and CPU decoder double."""
 
-import argparse
 from contextlib import closing
 import http.client
 from pathlib import Path
@@ -11,9 +10,8 @@ import time
 import unittest
 from unittest.mock import patch
 
-from test_native_chat import request
 from test_native_generate_cpu import ABORTED, abort, batch_frame, generate_client, get, named
-from test_sampling_routes_cpu import receipts, send, server
+from test_sampling_routes_cpu import post_response, receipts, run_cpu_suite, send, server
 
 
 HEALTH = "/health_generate"
@@ -226,8 +224,7 @@ class GenerationHealth(unittest.TestCase):
         probe = self.connection()
         self.expect_pending(probe)
         self.check_controls()
-        connection, response = request(self.port, "/abort_request", {"rid": "abort-health"})
-        with closing(connection), response:
+        with post_response(self.port, "/abort_request", {"rid": "abort-health"}) as response:
             self.assertEqual(response.status, 200)
             self.assertEqual(response.read(), b"")
         packet = batch_frame(generation)
@@ -291,13 +288,4 @@ class GenerationHealth(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--binary", type=Path, required=True)
-    parser.add_argument("--checkpoint", type=Path, required=True)
-    parser.add_argument("--output", type=Path, required=True)
-    args = parser.parse_args()
-    GenerationHealth.binary = args.binary.resolve()
-    GenerationHealth.checkpoint = args.checkpoint.resolve()
-    GenerationHealth.output = args.output.resolve()
-    GenerationHealth.output.mkdir(parents=True, exist_ok=True)
-    unittest.main(argv=[__file__], verbosity=2)
+    run_cpu_suite(GenerationHealth, __file__, __doc__)

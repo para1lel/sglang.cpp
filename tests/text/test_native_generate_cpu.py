@@ -1,6 +1,5 @@
 """Exercise the native generate route through the host-only server."""
 
-import argparse
 from contextlib import closing
 import http.client
 import json
@@ -14,8 +13,10 @@ import unittest
 from unittest.mock import patch
 
 from test_native_chat import tokenizer_pieces
-from test_native_text import EOS, HEADERS, MODEL, event
-from test_sampling_routes_cpu import CHAT, MODELS, TEXT, body, receipts, send, server
+from test_native_text import EOS, HEADERS, MODEL, check, event
+from test_sampling_routes_cpu import (
+    CHAT, MODELS, TEXT, body, receipts, run_cpu_suite, send, server, wire,
+)
 
 
 GENERATE = "/generate"
@@ -25,10 +26,8 @@ ABORTED_WAITING = {"type": "abort", "message": "Abort in waiting queue"}
 
 
 def get(port, path):
-    with closing(http.client.HTTPConnection("127.0.0.1", port, timeout=5)) as connection:
-        connection.request("GET", path)
-        with connection.getresponse() as response:
-            return response.status, response.read()
+    status, _, data = wire(port, "GET", path)
+    return status, data
 
 
 def generate_client(port, payload):
@@ -74,6 +73,13 @@ def batch_frame(reply):
     assert line.startswith(b"data: ") and line.endswith(b"\n"), line
     assert reply.readline() == b"\n"
     return "[DONE]" if line == b"data: [DONE]\n" else json.loads(line[6:])
+
+
+def batch_frames(reply, eof_message):
+    while (frame := batch_frame(reply)) != "[DONE]":
+        check(frame is not None, eof_message)
+        if frame != "keepalive":
+            yield frame
 
 
 class NativeGenerate(unittest.TestCase):
@@ -981,13 +987,4 @@ class NativeGenerate(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--binary", type=Path, required=True)
-    parser.add_argument("--checkpoint", type=Path, required=True)
-    parser.add_argument("--output", type=Path, required=True)
-    args = parser.parse_args()
-    NativeGenerate.binary = args.binary.resolve()
-    NativeGenerate.checkpoint = args.checkpoint.resolve()
-    NativeGenerate.output = args.output.resolve()
-    NativeGenerate.output.mkdir(parents=True, exist_ok=True)
-    unittest.main(argv=[__file__], verbosity=2)
+    run_cpu_suite(NativeGenerate, __file__, __doc__)

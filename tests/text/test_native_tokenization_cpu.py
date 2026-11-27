@@ -1,6 +1,5 @@
 """Exercise native tokenization HTTP routes with the Qwen checkpoint and CPU server."""
 
-import argparse
 from contextlib import closing
 from email.parser import BytesHeaderParser
 import http.client
@@ -13,7 +12,7 @@ import unittest
 from unittest.mock import patch
 
 from test_native_generate_cpu import abort, generate_client, get
-from test_sampling_routes_cpu import server
+from test_sampling_routes_cpu import control_response, run_cpu_suite, server
 
 
 TOKENIZE = ("/tokenize", "/v1/tokenize")
@@ -32,10 +31,8 @@ def packet(response):
 def post(port, path, body, headers=HEADERS):
     if not isinstance(body, bytes):
         body = json.dumps(body).encode()
-    with closing(http.client.HTTPConnection("127.0.0.1", port, timeout=5)) as connection:
-        connection.request("POST", path, body, headers)
-        with connection.getresponse() as response:
-            return packet(response)
+    with control_response(port, "POST", path, body, headers) as response:
+        return packet(response)
 
 
 class NativeTokenization(unittest.TestCase):
@@ -175,13 +172,4 @@ class NativeTokenization(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--binary", type=Path, required=True)
-    parser.add_argument("--checkpoint", type=Path, required=True)
-    parser.add_argument("--output", type=Path, required=True)
-    args = parser.parse_args()
-    NativeTokenization.binary = args.binary.resolve()
-    NativeTokenization.checkpoint = args.checkpoint.resolve()
-    NativeTokenization.output = args.output.resolve()
-    NativeTokenization.output.mkdir(parents=True, exist_ok=True)
-    unittest.main(argv=[__file__], verbosity=2)
+    run_cpu_suite(NativeTokenization, __file__, __doc__)

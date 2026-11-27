@@ -1,6 +1,5 @@
 """Exercise four /v1/completions prompt forms through the CPU host server."""
 
-import argparse
 from contextlib import closing
 import http.client
 import json
@@ -14,7 +13,7 @@ import unittest
 from unittest.mock import patch
 
 from test_native_text import HEADERS, MODEL, event, events, exchange, legacy, raw, usage
-from test_sampling_routes_cpu import receipts, server
+from test_sampling_routes_cpu import receipts, run_cpu_suite, server
 
 
 class CompletionPrompts(unittest.TestCase):
@@ -312,13 +311,4 @@ class CompletionPrompts(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--server", type=Path, required=True)
-    parser.add_argument("--checkpoint", type=Path, required=True)
-    parser.add_argument("--output", type=Path, required=True)
-    options, tests = parser.parse_known_args()
-    CompletionPrompts.binary = options.server.resolve(strict=True)
-    CompletionPrompts.checkpoint = options.checkpoint.resolve(strict=True)
-    CompletionPrompts.output = options.output.resolve()
-    CompletionPrompts.output.mkdir(parents=True, exist_ok=True)
-    unittest.main(argv=[__file__, *tests], verbosity=2)
+    run_cpu_suite(CompletionPrompts, __file__, __doc__, server_option=True, select_tests=True)

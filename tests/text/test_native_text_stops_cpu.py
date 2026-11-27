@@ -1,15 +1,14 @@
 """Exercise native text stops with the real tokenizer, scheduler and loopback HTTP."""
 
-import argparse
-from contextlib import closing
 import json
-from pathlib import Path
 import unittest
 from unittest.mock import patch
 
-from test_native_chat import request, tokenizer_pieces
-from test_native_generate_cpu import GENERATE, batch_frame
-from test_sampling_routes_cpu import TEXT, body, receipts, server
+from test_native_chat import tokenizer_pieces
+from test_native_generate_cpu import GENERATE, batch_frames
+from test_sampling_routes_cpu import (
+    TEXT, body, checked_body, post_response, receipts, run_cpu_suite, server,
+)
 
 
 def options(seed, budget, **extra):
@@ -61,20 +60,11 @@ class NativeTextStops(unittest.TestCase):
     def exchange(self, params, stream, *, port=None, inputs=None, expected_status=200, **fields):
         packet = {"input_ids": inputs or [32], "sampling_params": params, "stream": stream,
                   **fields}
-        connection, response = request(self.port if port is None else port, GENERATE, packet)
-        with closing(connection), response:
+        with post_response(self.port if port is None else port, GENERATE, packet) as response:
             self.assertEqual(response.status, expected_status)
-            if not stream or expected_status != 200:
-                self.assertEqual(response.headers.get_content_type(), "application/json")
-                return json.load(response)
-            self.assertEqual(response.headers.get_content_type(), "text/event-stream")
-            frames = []
-            while (frame := batch_frame(response)) != "[DONE]":
-                self.assertIsNotNone(frame, "EOF before DONE")
-                if frame != "keepalive":
-                    frames.append(frame)
-            self.assertEqual(response.read(), b"")
-            return frames
+            streamed = stream and expected_status == 200
+            frames = batch_frames(response, "EOF before DONE") if streamed else None
+            return checked_body(self, response, frames)
 
     def terminal(self, packet, text, ids, reason, prompts=1):
         self.assertEqual(packet["text"], text)
@@ -352,8 +342,7 @@ class NativeTextStops(unittest.TestCase):
 
     def check_openai(self, port, seed, stop, text, ids, reason, budget):
         payload = body(TEXT, seed=seed, stop=stop, max_tokens=budget, temperature=0)
-        connection, response = request(port, TEXT, payload)
-        with closing(connection), response:
+        with post_response(port, TEXT, payload) as response:
             self.assertEqual(response.status, 200)
             result = json.load(response)
         choice, = result["choices"]
@@ -417,16 +406,7 @@ class NativeTextStops(unittest.TestCase):
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--binary", type=Path, required=True)
-    parser.add_argument("--checkpoint", type=Path, required=True)
-    parser.add_argument("--output", type=Path, required=True)
-    args, unittest_args = parser.parse_known_args()
-    NativeTextStops.binary = args.binary.resolve()
-    NativeTextStops.checkpoint = args.checkpoint.resolve()
-    NativeTextStops.output = args.output.resolve()
-    NativeTextStops.output.mkdir(parents=True, exist_ok=True)
-    unittest.main(argv=[__file__, *unittest_args])
+    run_cpu_suite(NativeTextStops, __file__, __doc__, select_tests=True, verbosity=1)
 
 
 if __name__ == "__main__":

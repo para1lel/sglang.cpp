@@ -7,20 +7,19 @@ Read affected consumers before changing their interface or representation.
 ## Keep modules coherent
 
 Give each responsibility one authoritative implementation.
-Prefer extending the existing owner to creating a parallel version.
-Keep interfaces small enough to state their inputs, effects, errors, and ownership.
-Add an abstraction when it removes meaningful caller complexity or repeated invariant handling.
-Avoid layers with no caller or operational purpose.
+Prefer extending its owner to creating a parallel version.
+Keep interfaces small enough to state inputs, effects, errors, and ownership.
+Add abstractions that remove meaningful caller complexity or repeated invariant handling.
+Avoid layers without a caller or operational purpose.
 
 Fix the cause at the narrowest owner that protects related paths.
 Preserve established semantics outside the requested change.
-Use explicit types, units, interval endpoints, and valid-state rules where ambiguity can change behavior.
+Use explicit types, units, interval endpoints, and valid-state rules where ambiguity affects behavior.
 Keep mutable state transitions coherent across success, error, cancellation, and retry.
-Choose names and structure that expose the invariant without explanatory repetition.
+Expose invariants through names and structure without explanatory repetition.
 
 Separate correctness eligibility from selection preferences.
-A cost policy chooses among legal implementations.
-It does not make an otherwise supported input illegal.
+A cost policy may choose among legal implementations but cannot make a supported input illegal.
 Keep a correct fallback when the optimized path cannot meet its contract.
 Reject unsupported inputs before unsafe arithmetic, allocation, or submission.
 Check direct internal entries when public validation can be bypassed.
@@ -35,8 +34,7 @@ Find the first divergent value or state before changing a numerical policy.
 
 Derive indices, spans, layouts, and allocation sizes from authoritative representations.
 Check overflow before products or narrowing conversions.
-Treat aliases as actual overlapping storage spans.
-Different argument names do not establish separate memory.
+Determine aliasing from overlapping storage spans regardless of argument names.
 Validate empty work, tails, strides, alignment, and maximum supported geometry where relevant.
 
 Preserve order when a schema, protocol, parser, ABI, or consumer makes it observable.
@@ -46,8 +44,8 @@ Use supplied domain guidance for model mathematics, compiler legality, or device
 
 ## Maintain layout and dependencies
 
-Put files in the repository's established layout.
-Avoid duplicate implementation files named as temporary, backup, or alternate versions.
+Use the established layout.
+Avoid duplicate temporary, backup, or alternate implementation files.
 Keep generated disposable output outside the maintained tree.
 Remove obsolete code and unused imports within the assigned change.
 Keep debugging scaffolds out of delivered library code.
@@ -56,8 +54,8 @@ Give deferred work a tracked issue or other project-approved owner.
 Declare new dependencies and pin them according to project policy.
 Record necessary license and source attribution for copied material.
 Retain actual dependencies in build and link rules.
-Make optional dependency failure explicit.
-Avoid silently using a different installed package or stale compiled artifact.
+Report optional dependency failures explicitly.
+Prevent silent use of a different installed package or stale compiled artifact.
 
 For source and artifact identity, read [execution identity](execution-identity.md).
 For native ownership, asynchronous reads, and partial cleanup, read [resource lifetimes](resource-lifetimes.md).
@@ -84,7 +82,7 @@ An intentional policy migration requires separate review; ordinary development c
 
 Apply code limits to maintained source, templates, and generated code checked into the project.
 Use the language's parser or verifier for function boundaries.
-For directory counts, count each immediate subdirectory once.
+Count each immediate subdirectory once.
 Exclude Git metadata and ignored disposable caches, builds, and artifacts.
 Tracked content still counts when an ignore rule matches it.
 Include nonignored untracked files in a working-tree count.
@@ -92,7 +90,7 @@ Use the selected index tree for a commit gate.
 
 Split content at a meaningful ownership boundary before exceeding a limit.
 Keep each rule with its reason.
-Compiler transformations need not restrict disposable generated output to maintained-source limits.
+Disposable compiler-generated output is exempt from maintained-source limits.
 Document size and language rules belong to [doc's writing reference](../../doc-mode/references/writing.md).
 Mechanically testable requirements belong in [incremental gates](../../test-mode/references/evidence.md#examine-the-selected-index).
 
@@ -107,15 +105,15 @@ Supply worker instructions by local path or body instead of requiring a global s
 
 ## Comments and self-review
 
-Use code and names to show what happens.
-Add a comment for a non-obvious reason, invariant, or external constraint.
-Keep historical change descriptions in Git or the handoff.
-Check existing comments and docstrings when their function changes.
+Use code and names to show behavior.
+Comment on non-obvious reasons, invariants, or external constraints.
+Keep change history in Git or the handoff.
+Review existing comments and docstrings on changed functions.
 Remove references to deleted or renamed symbols.
-Ask doc to repair durable documents and incoming links outside coding's ownership.
+Ask doc to repair durable documents and incoming links outside coding's scope.
 
-Before returning, examine correctness, simplicity, public reachability, compatibility, and failure behavior.
-Check that each new implementation has a supported path from a real consumer.
-A passing nearby fixture does not establish production reachability.
+Before returning, check correctness, simplicity, public reachability, compatibility, and failure behavior.
+Verify each new implementation has a supported path from a real consumer.
+Production reachability requires evidence beyond a passing nearby fixture.
 Return unsupported assumptions as limitations.
 Writing a rule or increasing test count cannot substitute for correcting the implementation.

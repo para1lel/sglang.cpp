@@ -14,7 +14,7 @@ Keep secrets out of the record.
 Freeze reference outputs, expected hashes, input distribution, assertions, tolerances, and workload meaning before evaluating the candidate.
 Keep independent references separate from candidate mutations.
 Validate copied inputs against recorded expected hashes.
-Rehashing changed bytes and accepting the new hash does not validate earlier evidence.
+Rehashing and accepting changed bytes cannot validate earlier evidence.
 Report an intentional expectation change as a contract change for review.
 
 Build success requires fixed source, effective options, patches, dependencies, and produced artifact hashes.
@@ -23,21 +23,21 @@ Distinguish library identity from the consuming executable's identity.
 Read pinned Git objects with replacement processing disabled.
 Preserve replacement refs rather than removing them.
 
-For a remote run, identify the transferred snapshot and remote effective configuration.
-Verify the copied input bytes before accepting returned output.
-Record actual hardware, tool versions, selected device, and resource-sharing conditions when they affect the claim.
-A transport error, incomplete run, or absent artifact is not a passing result.
+For remote runs, identify the transferred snapshot and effective remote configuration.
+Verify copied bytes before accepting returned output.
+Record actual hardware, tool versions, device selection, and resource sharing when they affect the claim.
+Transport errors, incomplete runs, and missing artifacts cannot pass.
 
 ## Establish execution and observation
 
-Use the production configuration for a production claim.
+Use production configuration for production claims.
 Check effective dispatch and numerical policies.
-Establish the actual changed branch with a distinguishing observation.
+Use a distinguishing observation to establish which changed branch executed.
 A compiled feature, public wrapper call, or passing neighboring fixture alone is insufficient.
 Confirm the loaded or imported implementation belongs to the intended snapshot.
 
-Validate an observer with a positive control that reaches its actual boundary.
-For compiled interception, exercise a separately compiled call or launch through that boundary.
+Validate an observer with a positive control that reaches its boundary.
+For compiled interception, use a separately compiled call or launch through that boundary.
 Confirm that the observer reports work or rejects the intended control.
 Zero counters from an incomplete observer do not establish absence of work.
 
@@ -53,10 +53,10 @@ Verify that the loaded packages and binaries come from the pinned inputs.
 Run a known control through the reference path needed for the claim, including device execution when required.
 Report the reference as unavailable if no permitted environment can run that control.
 
-When an observer is repaired, identify the claims affected by its earlier gap.
+After observer repair, identify claims affected by its earlier gap.
 Retain independent valid numerical evidence.
-Repeat the affected observation with fixed operation inputs.
-Do not erase all earlier evidence or accept all earlier claims without that assessment.
+Repeat affected observations with fixed operation inputs.
+Assess those claims and evidence before accepting or discarding earlier results.
 
 ## Examine the selected index
 
@@ -67,14 +67,14 @@ Use a companion `commit-msg` gate for message syntax supplied after pre-commit.
 Language compliance and semantic review remain separate obligations.
 
 Validate a fixed snapshot of the selected index, including an alternate `GIT_INDEX_FILE`.
-For the maintained target, have main identify and freeze that selection.
+Have main identify and freeze the selection for the maintained target.
 Use staged checker code and staged tool configuration when they belong to the candidate.
 Read staged blobs with replacement processing disabled.
-Keep the caller's index bytes, worktree, replacement refs, and configuration intact.
-Gates inspect; they do not rewrite source or repair the index.
+Preserve caller index bytes, worktree, replacement refs, and configuration.
+Gates inspect without rewriting source or repairing the index.
 
-An unstaged repair must not conceal an invalid staged file.
-An unstaged defect must not replace a valid staged input.
+Keep unstaged repairs from concealing invalid staged files.
+Keep unstaged defects from replacing valid staged inputs.
 Include additions, deletions, renames, affected directory counts, incoming references, and necessary consumers.
 Check document, code, function, and directory limits, code links, syntax, metadata, and configured static analysis.
 Use [coding's configured size limits](../../coding-mode/references/code-standards.md#maintained-size-limits), including the target's frozen adoption values.
@@ -99,9 +99,9 @@ Keep semantic limits explicit; a size checker cannot certify English or runtime 
 
 Record reviewed source, diff identity, requirements, configuration, findings, and verification limits.
 Keep reviewer identity separate from author identity for independent reviews.
-If integration changes the candidate, reassess affected conclusions against the resulting identity.
-Conflicts, rebases, or a changed dependency can alter behavior even when a patch identifier matches.
-Have main provide the final candidate for necessary repeat checks.
+After integration changes, reassess affected conclusions against the resulting identity.
+Conflicts, rebases, or dependency changes can alter behavior despite matching patch identifiers.
+Have main supply the final candidate for necessary repeat checks.
 
 Review test and fixture changes for hidden deselection or altered outcomes.
 When test configuration can conceal existing regressions, use trusted baseline tests and configuration in an isolated comparison.
@@ -115,9 +115,9 @@ An unresolved serious defect needs developer agreement before affected delivery.
 ## Preserve results
 
 Keep raw output, samples, sanitizer records, and review reports in assigned ignored artifacts.
-Record actual pass, failure, timeout, skipped, unavailable, and unexecuted states separately.
-For selected test runs, zero collected cases or all-skipped cases provide no passing acceptance evidence.
-A reasoned static result remains a separate result.
+Distinguish pass, failure, timeout, skipped, unavailable, and unexecuted states.
+Zero collected or all-skipped cases provide no passing evidence for a selected run.
+Record reasoned static results separately.
 
 Keep original bytes and hashes for evidence referenced by findings or session records.
 If evidence moves, retain an exact recovery location.

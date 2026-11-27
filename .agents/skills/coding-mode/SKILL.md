@@ -6,7 +6,7 @@ disable-model-invocation: true
 
 # Coding mode
 
-Implement the assigned behavior within explicit writable paths.
+Implement the assigned behavior in explicitly writable paths.
 Own production code and assigned build, dependency, configuration, and root instruction changes.
 Leave tests, research, and durable project documents with their assigned owners.
 
@@ -17,9 +17,9 @@ Return changes without staging or committing them.
 
 ## Establish the contract
 
-Read repository instructions, project guide, vision, roadmap, lessons, standards, and affected component documents.
-Read relevant existing research supplied by main.
-Compare their statements with the affected implementation.
+Read repository instructions, the project guide, vision, roadmap, lessons, standards, and affected component documents.
+Read relevant research from main.
+Compare those sources with the affected implementation.
 Identify required behavior, supported inputs, compatibility constraints, and failure behavior.
 Keep intended changes distinct from existing defects and unrelated refactoring.
 
@@ -30,8 +30,8 @@ For source, build, cache, dispatch, or instrumentation changes, also read [execu
 For asynchronous work, native handles, shared storage, or cleanup, read [resource lifetimes](references/resource-lifetimes.md).
 
 Apply relevant domain guidance only when main or the user supplies its path or body.
-Otherwise, use the task's contracts and pinned primary sources.
-Keep domain-specific API and hardware claims pinned to primary sources.
+Otherwise, use task contracts and pinned primary sources.
+Pin domain API and hardware claims to primary sources.
 Send unresolved factual questions to research through main.
 
 ## Make the bounded change
@@ -45,7 +45,7 @@ Keep a verified reference or fallback when it forms part of the current contract
 Use existing module boundaries and naming conventions.
 Split work by responsibility when a change becomes difficult to review.
 Keep independent refactoring separate from behavior changes.
-Introduce a dependency only when its benefit supports its maintenance and deployment cost.
+Add a dependency only when its benefit justifies maintenance and deployment costs.
 Update the assigned dependency declaration and lock state consistently.
 
 Preserve acceptance inputs, reference implementations, expected hashes, tolerances, and workload meaning.
@@ -63,25 +63,25 @@ For instruction files, preserve explicit invocation, role ownership, and local r
 
 Inspect the complete assigned diff against the acceptance conditions.
 Check public reachability, error paths, cleanup, aliases, ordering, dependency changes, and effective configuration.
-Remove incidental debug output, commented-out code, and temporary implementation copies.
+Remove incidental debug output, commented-out code, and temporary copies of the implementation.
 Check comments affected by a changed function, even when the comments did not change.
 Report renamed or removed symbols to doc so incoming references can be repaired.
 
-Run necessary local build or syntax commands when they make the implementation reviewable.
-Record their exact inputs and actual outcomes.
+Run local build or syntax commands needed for review.
+Record exact inputs and actual outcomes.
 Request independent static review or execution from test through main.
 A local build does not establish behavioral acceptance.
-When an environment is unavailable, describe the missing check and its impact.
+If an environment is unavailable, identify the missing check and its impact.
 
 Keep the candidate stable during independent verification.
 If source or configuration must change, inform main so affected evidence can be reassessed.
-Report an out-of-scope defect separately instead of repairing it opportunistically.
+Report out-of-scope defects separately without repairing them opportunistically.
 
 ## Return to main
 
-Return the changed paths and exact source and diff identities required by the worker contract.
-Explain the cause, resulting behavior, compatibility impact, and relevant implementation decisions.
-Include build provenance, copied-source attribution, executed local commands, and unresolved assumptions when applicable.
-State the weakest part of the implementation and any simpler alternative considered.
-List the tests, documents, or further source research needed from other workers.
+Return changed paths and the worker contract's exact source and diff identities.
+Explain the cause, resulting behavior, compatibility impact, and relevant decisions.
+Include applicable build provenance, copied-source attribution, executed local commands, and unresolved assumptions.
+State the weakest implementation point and any simpler alternative considered.
+List tests, documents, or source research needed from other workers.
 Do not declare acceptance or global completion.

@@ -6,15 +6,15 @@ disable-model-invocation: true
 
 # Test mode
 
-Establish whether the assigned candidate meets its contract.
+Determine whether the candidate meets its assigned contract.
 Prefer static review when source and invariants can prove correctness.
-Use execution for behavior that the static argument cannot establish.
+Execute checks for behavior that static review cannot establish.
 Own only assigned test, fixture, benchmark, check, and ignored evidence paths.
 
 Read [the worker contract](../main-mode/references/delegation.md#worker-contract).
 Main supplies the exact candidate and explicit mode instructions.
 Main owns the maintained target's branches, worktree registration, selected index, commits, and integration.
-Review the implementation without repairing production files.
+Review without repairing production files.
 Return production defects to main for coding.
 
 ## Establish the obligations
@@ -25,10 +25,10 @@ For build or observer claims, read [execution identity](../coding-mode/reference
 For cleanup, concurrency, or asynchronous state, read [resource lifetimes](../coding-mode/references/resource-lifetimes.md).
 Read only the relevant supplied domain references.
 
-Identify the observable behavior and necessary invariants changed by the candidate.
-Separate required outcomes from additional author claims.
-Assess the approach, its assumptions, and a simpler alternative when relevant.
-Examine existing tests and prior evidence before adding work.
+Identify the observable behavior and necessary invariants the candidate changes.
+Separate required outcomes from added author claims.
+Assess the approach, its assumptions, and any relevant simpler alternative.
+Check existing tests and evidence before adding work.
 
 Read [test selection](references/test-selection.md) to choose static review, existing checks, or new cases.
 Read [evidence integrity](references/evidence.md) before accepting execution, observer, or gate results.
@@ -36,8 +36,8 @@ For numerical, GPU, optimization, or timing claims, also read [numerical and per
 
 ## Review first
 
-Trace required behavior from public entry to the changed implementation and its observable result.
-State the preconditions and the argument that establishes each statically provable obligation.
+Trace required behavior from public entry through the changed implementation to its observable result.
+Give the preconditions and proof for each statically provable obligation.
 Check boundaries, callers, effective configuration, error paths, ownership, and compatibility.
 Do not label a source reading as an executed test.
 
@@ -45,8 +45,8 @@ Use a fresh worker for independent acceptance review when main requests one.
 Keep the reviewed working tree stable.
 Run perturbations in an assigned isolated copy or [disposable fixture repository](../main-mode/references/delegation.md#disposable-git-fixtures).
 Test can prepare independent fixtures; main registers any target-linked worktree.
-An independent reviewer can write its assigned report and separately assigned tests.
-It cannot repair the candidate while claiming to review the original diff.
+An independent reviewer can write the assigned report and separately assigned tests.
+The reviewer cannot repair the candidate while claiming to review the original diff.
 
 ## Select proportionate verification
 
@@ -61,19 +61,19 @@ Preserve independent expected results before running the candidate.
 An actual failing control is required when validating a new or changed enforcement gate.
 A gate that checks itself with the same defective assumption needs an independent control.
 
-For selected execution, zero collected cases, all-skipped cases, timeout, and missing tools are not passing acceptance evidence.
-Keep a reasoned static-only conclusion separate from an empty test run.
+For selected execution, zero cases, all skips, timeout, and missing tools provide no passing acceptance evidence.
+Keep reasoned static conclusions separate from empty runs.
 Check the actual production configuration and changed branch when the claim concerns production behavior.
 
 ## Report findings and results
 
 Bind the result to the exact source, diff, configuration, and evidence identities.
-For each required outcome, give its static argument or actual check and the result.
-Keep passed, failed, unavailable, skipped, and unexecuted checks distinct.
+For each required outcome, give its static argument or actual check and result.
+Distinguish passed, failed, unavailable, skipped, and unexecuted checks.
 State whether acceptance is supported, changes are required, or evidence is insufficient.
 
-For a defect, give its trigger, observable impact, source location, and proposed correction.
-Separate introduced defects, pre-existing defects, optional improvements, and verification gaps.
+For each defect, give its trigger, observable impact, source location, and proposed correction.
+Distinguish introduced and pre-existing defects, optional improvements, and verification gaps.
 A serious demonstrated correctness defect remains blocking.
 On repeat review, reassess prior findings and the changed diff without adding unrelated demands.
 Expand for affected consumers or new correctness evidence.

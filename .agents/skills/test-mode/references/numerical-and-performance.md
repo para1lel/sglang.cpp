@@ -7,7 +7,7 @@ Select checks for changed contracts rather than every possible parameter combina
 ## Preserve the numerical question
 
 Identify operation inputs, output shape, layout, dtype, accumulation policy, and allowed error.
-Use a trusted independent reference for the property under examination.
+Use a trusted independent reference for the property tested.
 Use exact comparisons for discrete metadata and required bitwise behavior.
 Justify numerical tolerances from the contract and reference precision.
 Control reduced-precision reference behavior, including TF32 when relevant.
@@ -27,15 +27,15 @@ Large-offset evidence can use a proof or a suitable probe when allocation costs 
 Preserve source reads and conflicting addresses when checking races.
 Use applicable memory, race, synchronization, or instruction evidence for those obligations.
 
-For suspected uninitialized reads, poison relevant unwritten or padding storage when that can expose the defect.
+For suspected uninitialized reads, poison relevant unwritten or padding storage when it can expose the defect.
 Confirm the poison reaches the real allocation and operation.
-A generic allocator patch that misses the production allocation cannot establish the claim.
+An allocator patch that misses the production allocation cannot establish the claim.
 Keep poison and instrumentation outside performance measurements.
 
 When a changed autotune policy can select different generated implementations, assess affected legal configurations.
-Report which configurations actually ran.
-A capped subset must not be described as every configuration.
-Validate compilation and cache policy so stale artifacts do not hide the candidate.
+Report which configurations ran.
+Identify capped subsets as such.
+Validate compilation and cache policy so stale artifacts cannot hide the candidate.
 
 For graph-related changes, examine replay after relevant input, plan, or backend changes.
 For lifetime changes, consider setup failure, growth, cancellation, closure, and delayed completion.
@@ -44,8 +44,8 @@ An eager pass or numerical match alone cannot establish graph lifetime safety.
 
 ## Diagnose before changing the contract
 
-Preserve the failing input, source identity, seed when applicable, expected result, and actual result.
-Minimize the example without losing the failed invariant.
+Preserve the failing input, source identity, applicable seed, expected result, and actual result.
+Minimize the example while preserving the failed invariant.
 Locate the earliest incorrect state or operation.
 Use synchronization diagnostics to locate asynchronous failures when needed.
 Use backend memory and synchronization tools for illegal access or race questions.
@@ -64,10 +64,10 @@ A complete replacement with a vendor operation does not satisfy an assignment to
 Other authorized implementation choices remain governed by the task.
 
 Compare baseline and candidate with matching effective policies, hardware, inputs, and cache conditions.
-Use an interleaved comparison in one measurement session when drift can affect the result.
-Keep each implementation's mutable inputs independent while preserving required internal aliases.
+Interleave comparisons in one session when drift can affect the result.
+Keep mutable inputs independent between implementations and preserve required internal aliases.
 Measure complete useful work.
-Include compilation, transfer, launch, synchronization, replay, or setup costs in any metric that claims those costs.
+Include compilation, transfer, launch, synchronization, replay, or setup in metrics that claim those costs.
 Separate cold startup from steady state.
 
 Use a timer that measures the intended asynchronous work.
@@ -88,16 +88,16 @@ Report:
 - Every required workload's result, including failures and regressions.
 - The bottleneck explanation, raw evidence identity, and claim limitations.
 
-Use profiles to locate a bottleneck.
-Profiler timings alone do not establish uninstrumented latency comparisons.
-Instruction presence does not prove overlap.
-High occupancy alone does not prove speed.
+Use profiles to locate bottlenecks.
+Uninstrumented latency claims require evidence beyond profiler timings.
+Instruction presence alone cannot prove overlap.
+High occupancy alone cannot prove speed.
 Investigate unexplained large speedups for skipped work, early exits, stale code, or invalid timing.
 Show that the measured path actually executed the changed branch.
 
-Keep individual required workload failures visible.
-An aggregate gain cannot close a failed required case.
-A valid measurement can still show no improvement.
+Keep each required workload failure visible.
+Aggregate gains cannot close failed required cases.
+Valid measurements can show no improvement.
 Do not add or multiply speedups from separate attempts.
 Results on different hardware do not establish the target result.
 Kernel-only timing supports a kernel claim; application claims require their own complete boundary.
@@ -109,7 +109,7 @@ Specialize only when workload or bottleneck differences justify the branch and i
 Compare specializations against the same baseline.
 Record failed attempts when they establish a reusable constraint.
 
-A claim that optimization has reached a limit needs a measured baseline and a reasoned candidate.
-Include the actual check result and a quantified bound or specific obstacle.
+A claimed optimization limit requires a measured baseline and reasoned candidate.
+Give the actual check result with a quantified bound or specific obstacle.
 An unavailable profiler or one losing candidate does not establish that no improvement is possible.
 Return estimates as estimates and unexecuted measurements as missing evidence.

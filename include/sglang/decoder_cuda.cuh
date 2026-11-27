@@ -26,6 +26,11 @@ cudaError_t decode_bf16_gdn_gates(const __nv_bfloat16* weight_b,
                                   const __nv_bfloat16* weight_a, const __nv_bfloat16* input,
                                   int rows, int width, __nv_bfloat16* output_b,
                                   __nv_bfloat16* output_a, cudaStream_t stream);
+cudaError_t decode_bf16_gdn_gates_local(const __nv_bfloat16* weight_b,
+                                        const __nv_bfloat16* weight_a,
+                                        const __nv_bfloat16* input, int rows, int width,
+                                        __nv_bfloat16* output_b, __nv_bfloat16* output_a,
+                                        cudaStream_t stream);
 struct VerifyGdnGateRow {
     const __nv_bfloat16* input;
     __nv_bfloat16* output_b;
@@ -36,6 +41,12 @@ std::optional<cudaError_t> try_verify_bf16_gdn_gates(
     const __nv_bfloat16* weight_b, const __nv_bfloat16* weight_a,
     const VerifyGdnGateRow* rows, int count, cudaStream_t stream);
 std::optional<cudaError_t> try_verify_bf16_gdn_gates_compact(
+    const __nv_bfloat16* weight_b, const __nv_bfloat16* weight_a,
+    const VerifyGdnGateRow* rows, int count, cudaStream_t stream);
+std::optional<cudaError_t> try_verify_bf16_gdn_gates_local(
+    const __nv_bfloat16* weight_b, const __nv_bfloat16* weight_a,
+    const VerifyGdnGateRow* rows, int count, cudaStream_t stream);
+std::optional<cudaError_t> try_verify_bf16_gdn_gates_compact_local(
     const __nv_bfloat16* weight_b, const __nv_bfloat16* weight_a,
     const VerifyGdnGateRow* rows, int count, cudaStream_t stream);
 cudaError_t decode_bf16_lm_head(const __nv_bfloat16* weight, const __nv_bfloat16* input,
@@ -109,10 +120,14 @@ struct WideVerifyRmsQuantizeRows {
 };
 
 cudaError_t verify_quantize_fp8(VerifyQuantizeRows rows, int width, cudaStream_t stream);
+cudaError_t verify_quantize_partial_fp8(VerifyQuantizeRows rows, int count, int width,
+                                        cudaStream_t stream);
 cudaError_t verify_quantize_fp8_wide(WideVerifyQuantizeRows rows, int count, int width,
                                      cudaStream_t stream);
 cudaError_t verify_rms_quantize(VerifyRmsQuantizeRows rows, const __nv_bfloat16* weight,
                                 cudaStream_t stream);
+cudaError_t verify_rms_quantize_partial(VerifyRmsQuantizeRows rows, int count,
+                                        const __nv_bfloat16* weight, cudaStream_t stream);
 cudaError_t verify_rms_quantize_wide(WideVerifyRmsQuantizeRows rows, int count,
                                      const __nv_bfloat16* weight, cudaStream_t stream);
 
@@ -124,6 +139,9 @@ std::optional<cudaError_t> try_prefill_bf16_gdn_gates_sm100(
     const __nv_bfloat16* weight_b, const __nv_bfloat16* weight_a, const __nv_bfloat16* input,
     int rows, __nv_bfloat16* output_b, __nv_bfloat16* output_a, void* scratch,
     std::size_t scratch_bytes, cudaStream_t stream);
+std::optional<cudaError_t> try_prefill_bf16_gdn_gates_local(
+    const __nv_bfloat16* weight_b, const __nv_bfloat16* weight_a, const __nv_bfloat16* input,
+    int rows, __nv_bfloat16* output_b, __nv_bfloat16* output_a, cudaStream_t stream);
 
 cudaError_t tensor_core_prefill_gdn(int rows, const __nv_bfloat16* qkv, const __nv_bfloat16* z,
                                     const __nv_bfloat16* b, const __nv_bfloat16* a,
@@ -178,6 +196,20 @@ cudaError_t tensor_core_prefill_rms_quantize(
     const __nv_bfloat16* branch, __nv_bfloat16* residual, const __nv_bfloat16* weight,
     int width, int rows, __nv_bfloat16* normalized, TextFp8Activation activation,
     cudaStream_t stream, RmsQuantizeLaunch launch = RmsQuantizeLaunch::ordinary);
+std::optional<cudaError_t> try_prefill_rms_quantize_vector(
+    const __nv_bfloat16* branch, __nv_bfloat16* residual, const __nv_bfloat16* weight,
+    __nv_bfloat16* normalized, TextFp8Activation activation, cudaStream_t stream);
+struct PrefillPeerNormRow {
+    const __nv_bfloat16* branch;
+    __nv_bfloat16* residual;
+    const __nv_bfloat16* gain;
+    __nv_bfloat16* normalized;
+    TextFp8Activation activation;
+};
+
+bool aligned_prefill_peer_norm(const PrefillPeerNormRow& row);
+cudaError_t prefill_peer_rms_quantize(PrefillPeerNormRow row, const __nv_bfloat16* peer,
+                                     cudaStream_t stream);
 cudaError_t tensor_core_decode_rms_project(
     const __nv_bfloat16* branch, __nv_bfloat16* residual, const __nv_bfloat16* weight,
     int width, int rows, __nv_bfloat16* normalized, TextFp8Activation activation,
@@ -221,6 +253,8 @@ struct DraftAttentionRow {
     __nv_bfloat16* output;
     ExactGqaWorkspace workspace;
 };
+
+inline constexpr int draft_attention_batch_rows = 16;
 
 cudaError_t mtp_gqa_attention_batch(const DraftAttentionRow* rows, int count, bool b200,
                                     cudaStream_t stream);
@@ -378,17 +412,11 @@ struct DecodeFp8Projection {
     int rows;
 };
 
-// Read-only activation and weight spans may overlap. Output spans must be disjoint from every
-// input span and from each other, including when they are views of one allocation. Invalid spans
-// return cudaErrorInvalidValue before launch. Gate/up has the fused exception documented below.
 cudaError_t decode_fp8_project(TextFp8ActivationView input, DecodeFp8Projection projection,
                                int width, cudaStream_t stream);
 cudaError_t decode_fp8_qkv(TextFp8ActivationView input, DecodeFp8Projection query,
                            DecodeFp8Projection key, DecodeFp8Projection value, int width,
                            cudaStream_t stream);
-// The fused 5120-by-17408 path requires 16-byte-aligned FP8 values. It writes only gate.output and
-// accepts identical gate and up output spans. Fallback uses up.output as scratch and requires
-// disjoint spans. Both paths return SwiGLU in gate.output.
 cudaError_t decode_fp8_gate_up(TextFp8ActivationView input, DecodeFp8Projection gate,
                                DecodeFp8Projection up, int width, cudaStream_t stream);
 

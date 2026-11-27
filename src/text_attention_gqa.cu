@@ -3,7 +3,8 @@
 #include "sglang/decoder_cuda.cuh"
 #include "sglang/text/gqa_verify_batch.h"
 #include "sglang/text/mtp/draft_batch_ops.h"
-#include "sglang/text/quantize_warp.cuh"
+#include "sglang/text/quantization/quantize_warp.cuh"
+#include "sglang/runtime/execution/tp_verify_graph.h"
 
 #include <cuda_runtime.h>
 
@@ -39,22 +40,23 @@ __device__ int rotary_position(const MropePosition* positions, std::size_t row, 
     return position.temporal;
 }
 
-template <bool IncludeQueries, typename Position>
+template <typename Position>
 __device__ __forceinline__ void gqa_preprocess_head(
-    Position first_position, std::size_t row, int head, const __nv_bfloat16* q_gate,
-    const __nv_bfloat16* keys, const __nv_bfloat16* q_norm, const __nv_bfloat16* k_norm,
-    __nv_bfloat16* rope_queries, __nv_bfloat16* rope_keys) {
-    constexpr int query_heads = IncludeQueries ? mxfp8_query_heads : 0;
+    Position first_position, std::size_t row, int head, int query_heads, int kv_heads,
+    const __nv_bfloat16* q_gate, const __nv_bfloat16* keys, const __nv_bfloat16* q_norm,
+    const __nv_bfloat16* k_norm, __nv_bfloat16* rope_queries, __nv_bfloat16* rope_keys) {
     const int channel = threadIdx.x;
     const bool is_query = head < query_heads;
     const int kv_head = head - query_heads;
+    const std::size_t q_gate_width = 2 * query_heads * mxfp8_head_dim;
+    const std::size_t kv_width = kv_heads * mxfp8_head_dim;
     const __nv_bfloat16* const input = is_query
-        ? q_gate + row * text_gqa_q_gate_width + head * 2 * mxfp8_head_dim
-        : keys + row * text_gqa_kv_width + kv_head * mxfp8_head_dim;
+        ? q_gate + row * q_gate_width + head * 2 * mxfp8_head_dim
+        : keys + row * kv_width + kv_head * mxfp8_head_dim;
     const __nv_bfloat16* const norm = is_query ? q_norm : k_norm;
     __nv_bfloat16* const output = is_query
-        ? rope_queries + row * text_gqa_q_width + head * mxfp8_head_dim
-        : rope_keys + row * text_gqa_kv_width + kv_head * mxfp8_head_dim;
+        ? rope_queries + row * (query_heads * mxfp8_head_dim) + head * mxfp8_head_dim
+        : rope_keys + row * kv_width + kv_head * mxfp8_head_dim;
 
     __shared__ float warp_squares[mxfp8_head_dim / warp_size];
     const float value = __bfloat162float(input[channel]);
@@ -92,29 +94,40 @@ __device__ __forceinline__ void gqa_preprocess_head(
 }
 
 template <typename Position, bool IncludeQueries = true>
-__global__ void gqa_preprocess(Position first_position, const __nv_bfloat16* q_gate,
-                               const __nv_bfloat16* keys, const __nv_bfloat16* q_norm,
-                               const __nv_bfloat16* k_norm, __nv_bfloat16* rope_queries,
-                               __nv_bfloat16* rope_keys) {
-    constexpr int head_count = (IncludeQueries ? mxfp8_query_heads : 0) + mxfp8_kv_heads;
-    gqa_preprocess_head<IncludeQueries>(first_position, blockIdx.x / head_count,
-        blockIdx.x % head_count, q_gate, keys, q_norm, k_norm, rope_queries, rope_keys);
+__global__ void gqa_preprocess(Position first_position, int query_heads, int kv_heads,
+                               const __nv_bfloat16* q_gate, const __nv_bfloat16* keys,
+                               const __nv_bfloat16* q_norm, const __nv_bfloat16* k_norm,
+                               __nv_bfloat16* rope_queries, __nv_bfloat16* rope_keys) {
+    const int head_count = (IncludeQueries ? query_heads : 0) + kv_heads;
+    gqa_preprocess_head(first_position, blockIdx.x / head_count, blockIdx.x % head_count,
+                        IncludeQueries ? query_heads : 0, kv_heads, q_gate, keys, q_norm, k_norm,
+                        rope_queries, rope_keys);
 }
 
 template <typename Position>
-__global__ void gqa_preprocess_queries(Position position, const __nv_bfloat16* q_gate,
-                                       const __nv_bfloat16* norm, __nv_bfloat16* queries) {
-    gqa_preprocess_head<true>(position, blockIdx.x / mxfp8_query_heads,
-        blockIdx.x % mxfp8_query_heads, q_gate, nullptr, norm, nullptr, queries, nullptr);
+__global__ void gqa_preprocess_queries(Position position, int query_heads,
+                                       const __nv_bfloat16* q_gate, const __nv_bfloat16* norm,
+                                       __nv_bfloat16* queries) {
+    gqa_preprocess_head(position, blockIdx.x / query_heads, blockIdx.x % query_heads, query_heads,
+                        0, q_gate, nullptr, norm, nullptr, queries, nullptr);
 }
 
 template <int Capacity, bool IncludeQueries = true>
 __global__ void gqa_verify_preprocess_kernel(
     const __grid_constant__ decoder::GqaVerifyRows<decoder::GqaVerifyPreprocessRow, Capacity> batch,
+    int query_heads, int kv_heads, const __nv_bfloat16* q_norm, const __nv_bfloat16* k_norm) {
+    const auto& row = batch.rows[blockIdx.x];
+    gqa_preprocess_head(row.position, 0, blockIdx.y, IncludeQueries ? query_heads : 0, kv_heads,
+                        row.q_gate, row.keys, q_norm, k_norm, row.rope_queries, row.rope_keys);
+}
+
+__global__ void live_preprocess(
+    const __grid_constant__ decoder::GqaVerifyRows<decoder::GqaVerifyPreprocessRow> batch,
+    const int* rotary, int query_heads, int kv_heads,
     const __nv_bfloat16* q_norm, const __nv_bfloat16* k_norm) {
     const auto& row = batch.rows[blockIdx.x];
-    gqa_preprocess_head<IncludeQueries>(row.position, 0, blockIdx.y, row.q_gate, row.keys,
-                                       q_norm, k_norm, row.rope_queries, row.rope_keys);
+    gqa_preprocess_head(rotary[blockIdx.x], 0, blockIdx.y, query_heads, kv_heads,
+                        row.q_gate, row.keys, q_norm, k_norm, row.rope_queries, row.rope_keys);
 }
 
 __device__ __forceinline__ __nv_bfloat16 gated_attention(__nv_bfloat16 gate,
@@ -158,19 +171,18 @@ __device__ __forceinline__ GatedAttentionPairs gqa_postgate_pairs(
 }
 
 __global__ void gqa_postgate_quantize(const __nv_bfloat16* q_gate, const __nv_bfloat16* attention,
-                                     TextFp8Activation output) {
+                                      int q_width, TextFp8Activation output) {
     using namespace text_kernel;
     static_assert(text_fp8_group_size == warp_width * 4);
     static_assert(mxfp8_head_dim % text_fp8_group_size == 0);
-    constexpr int groups_per_row = text_gqa_q_width / text_fp8_group_size;
-    static_assert(groups_per_row % block_warps == 0);
+    const int groups_per_row = q_width / text_fp8_group_size;
     const int group = blockIdx.x * block_warps + threadIdx.x / warp_width;
     const int lane = threadIdx.x % warp_width;
     const int offset = group * text_fp8_group_size + lane * 4;
     const auto row = static_cast<std::size_t>(blockIdx.y);
-    const auto [first, second] = gqa_postgate_pairs(q_gate + row * text_gqa_q_gate_width,
-                                                   attention + row * text_gqa_q_width, offset);
-    output.values += row * text_gqa_q_width;
+    const auto [first, second] = gqa_postgate_pairs(q_gate + row * 2 * q_width,
+                                                    attention + row * q_width, offset);
+    output.values += row * q_width;
     output.scales += row * groups_per_row;
     quantize_warp_pairs(first, second, group, offset, lane, output);
 }
@@ -182,13 +194,322 @@ __global__ void gqa_verify_postgate_kernel(
     gqa_postgate_head(blockIdx.y, row.q_gate, row.attention, row.attention);
 }
 
+bool gqa_heads(GqaGeometry geometry, int& query_heads, int& kv_heads) {
+    if (!gqa_geometry_valid(geometry)) {
+        return false;
+    }
+    query_heads = geometry.query_heads;
+    kv_heads = geometry.kv_heads;
+    return true;
+}
+
+cudaError_t text_gqa_preprocess_impl(int first_position, int token_count,
+                                     const __nv_bfloat16* q_gate, const __nv_bfloat16* keys,
+                                     const __nv_bfloat16* q_norm, const __nv_bfloat16* k_norm,
+                                     __nv_bfloat16* rope_queries, __nv_bfloat16* rope_keys,
+                                     cudaStream_t stream, GqaGeometry geometry) {
+    if (token_count == 0) {
+        return cudaSuccess;
+    }
+    int query_heads;
+    int kv_heads;
+    if (token_count < 0 || token_count > text_attention_max_tokens || first_position < 0
+        || first_position > text_attention_max_tokens - token_count
+        || !q_gate || !keys || !q_norm || !k_norm || !rope_queries || !rope_keys
+        || !gqa_heads(geometry, query_heads, kv_heads)) {
+        return cudaErrorInvalidValue;
+    }
+    const int blocks = token_count * (query_heads + kv_heads);
+    void* arguments[] = {&first_position, &query_heads, &kv_heads,
+        &q_gate, &keys, &q_norm, &k_norm, &rope_queries, &rope_keys};
+    return cudaLaunchKernel(gqa_preprocess<int>, dim3(blocks), dim3(mxfp8_head_dim),
+                            arguments, 0, stream);
+}
+
+cudaError_t text_gqa_preprocess_keys_impl(int first_position, int token_count,
+                                          const __nv_bfloat16* keys,
+                                          const __nv_bfloat16* k_norm,
+                                          __nv_bfloat16* rope_keys, cudaStream_t stream,
+                                          GqaGeometry geometry) {
+    int query_heads;
+    int kv_heads;
+    if (token_count <= 0 || token_count > text_attention_max_tokens || first_position < 0 ||
+        first_position > text_attention_max_tokens - token_count ||
+        !keys || !k_norm || !rope_keys || !gqa_heads(geometry, query_heads, kv_heads)) {
+        return cudaErrorInvalidValue;
+    }
+    query_heads = 0;
+    const __nv_bfloat16* unused_input = nullptr;
+    __nv_bfloat16* unused_output = nullptr;
+    void* args[] = {&first_position, &query_heads, &kv_heads, &unused_input, &keys,
+                    &unused_input, &k_norm, &unused_output, &rope_keys};
+    return cudaLaunchKernel(gqa_preprocess<int, false>, token_count * kv_heads,
+                            mxfp8_head_dim, args, 0, stream);
+}
+
+cudaError_t text_gqa_postgate_impl(int token_count, const __nv_bfloat16* q_gate,
+                                   const __nv_bfloat16* attention, __nv_bfloat16* output,
+                                   cudaStream_t stream, GqaGeometry geometry) {
+    int query_heads;
+    int kv_heads;
+    if (token_count == 0) {
+        return cudaSuccess;
+    }
+    if (token_count < 0 || token_count > text_attention_max_tokens
+        || !q_gate || !attention || !output || !gqa_heads(geometry, query_heads, kv_heads)) {
+        return cudaErrorInvalidValue;
+    }
+    void* arguments[] = {&q_gate, &attention, &output};
+    return cudaLaunchKernel(gqa_postgate, dim3(token_count * query_heads),
+                            dim3(mxfp8_head_dim), arguments, 0, stream);
+}
+
+}
+
+cudaError_t text_gqa_preprocess(int first_position, int token_count,
+                                const __nv_bfloat16* q_gate, const __nv_bfloat16* keys,
+                                const __nv_bfloat16* q_norm, const __nv_bfloat16* k_norm,
+                                __nv_bfloat16* rope_queries, __nv_bfloat16* rope_keys,
+                                cudaStream_t stream) {
+    return text_gqa_preprocess_impl(first_position, token_count, q_gate, keys, q_norm, k_norm,
+                                    rope_queries, rope_keys, stream, gqa_full_geometry);
+}
+
+cudaError_t text_gqa_preprocess(int first_position, int token_count,
+                                const __nv_bfloat16* q_gate, const __nv_bfloat16* keys,
+                                const __nv_bfloat16* q_norm, const __nv_bfloat16* k_norm,
+                                __nv_bfloat16* rope_queries, __nv_bfloat16* rope_keys,
+                                cudaStream_t stream, GqaGeometry geometry) {
+    return text_gqa_preprocess_impl(first_position, token_count, q_gate, keys, q_norm, k_norm,
+                                    rope_queries, rope_keys, stream, geometry);
+}
+
+cudaError_t text_gqa_preprocess_keys(int first_position, int token_count,
+                                    const __nv_bfloat16* keys, const __nv_bfloat16* k_norm,
+                                    __nv_bfloat16* rope_keys, cudaStream_t stream) {
+    return text_gqa_preprocess_keys_impl(first_position, token_count, keys, k_norm, rope_keys,
+                                         stream, gqa_full_geometry);
+}
+
+cudaError_t text_gqa_preprocess_keys(int first_position, int token_count,
+                                    const __nv_bfloat16* keys, const __nv_bfloat16* k_norm,
+                                    __nv_bfloat16* rope_keys, cudaStream_t stream,
+                                    GqaGeometry geometry) {
+    return text_gqa_preprocess_keys_impl(first_position, token_count, keys, k_norm, rope_keys,
+                                         stream, geometry);
+}
+
+cudaError_t text_gqa_postgate(int token_count, const __nv_bfloat16* q_gate,
+                              const __nv_bfloat16* attention, __nv_bfloat16* output,
+                              cudaStream_t stream) {
+    return text_gqa_postgate_impl(token_count, q_gate, attention, output, stream,
+                                  gqa_full_geometry);
+}
+
+cudaError_t text_gqa_postgate(int token_count, const __nv_bfloat16* q_gate,
+                              const __nv_bfloat16* attention, __nv_bfloat16* output,
+                              cudaStream_t stream, GqaGeometry geometry) {
+    return text_gqa_postgate_impl(token_count, q_gate, attention, output, stream, geometry);
+}
+
+namespace {
+
+cudaError_t decode_gqa_preprocess_impl(const int* position, const __nv_bfloat16* q_gate,
+                                       const __nv_bfloat16* keys, const __nv_bfloat16* q_norm,
+                                       const __nv_bfloat16* k_norm, __nv_bfloat16* rope_queries,
+                                       __nv_bfloat16* rope_keys, cudaStream_t stream,
+                                       GqaGeometry geometry) {
+    int query_heads;
+    int kv_heads;
+    if (!gqa_heads(geometry, query_heads, kv_heads)) {
+        return cudaErrorInvalidValue;
+    }
+    const int blocks = query_heads + kv_heads;
+    void* arguments[] = {&position, &query_heads, &kv_heads,
+        &q_gate, &keys, &q_norm, &k_norm, &rope_queries, &rope_keys};
+    return cudaLaunchKernel(gqa_preprocess<const int*>, dim3(blocks), dim3(mxfp8_head_dim),
+                            arguments, 0, stream);
+}
+
+cudaError_t mrope_gqa_preprocess_impl(const MropePosition* positions, int rows,
+                                      const __nv_bfloat16* q_gate, const __nv_bfloat16* keys,
+                                      const __nv_bfloat16* q_norm, const __nv_bfloat16* k_norm,
+                                      __nv_bfloat16* rope_queries, __nv_bfloat16* rope_keys,
+                                      cudaStream_t stream, GqaGeometry geometry) {
+    int query_heads;
+    int kv_heads;
+    if (rows <= 0 || rows > text_attention_max_tokens || !positions || !q_gate || !keys ||
+        !q_norm || !k_norm || !rope_queries || !rope_keys
+        || !gqa_heads(geometry, query_heads, kv_heads)) {
+        return cudaErrorInvalidValue;
+    }
+    const int blocks = rows * (query_heads + kv_heads);
+    void* arguments[] = {&positions, &query_heads, &kv_heads,
+        &q_gate, &keys, &q_norm, &k_norm, &rope_queries, &rope_keys};
+    return cudaLaunchKernel(gqa_preprocess<const MropePosition*>, blocks, mxfp8_head_dim,
+                            arguments, 0, stream);
+}
+
+cudaError_t prefill_gqa_queries_impl(int position, const MropePosition* positions, int rows,
+                                     const __nv_bfloat16* q_gate, const __nv_bfloat16* norm,
+                                     __nv_bfloat16* queries, cudaStream_t stream,
+                                     GqaGeometry geometry) {
+    int query_heads;
+    int kv_heads;
+    if (rows <= 0 || rows > text_attention_max_tokens || !q_gate || !norm || !queries ||
+        (!positions && (position < 0 || position > text_attention_max_tokens - rows))
+        || !gqa_heads(geometry, query_heads, kv_heads)) {
+        return cudaErrorInvalidValue;
+    }
+    const auto launch = [&](auto first) {
+        void* args[] = {&first, &query_heads, &q_gate, &norm, &queries};
+        return cudaLaunchKernel(gqa_preprocess_queries<decltype(first)>,
+                                rows * query_heads, mxfp8_head_dim, args, 0, stream);
+    };
+    return positions ? launch(positions) : launch(position);
+}
+
+cudaError_t mrope_gqa_preprocess_keys_impl(const MropePosition* positions, int rows,
+                                           const __nv_bfloat16* keys,
+                                           const __nv_bfloat16* k_norm,
+                                           __nv_bfloat16* rope_keys, cudaStream_t stream,
+                                           GqaGeometry geometry) {
+    int query_heads;
+    int kv_heads;
+    if (rows <= 0 || rows > text_attention_max_tokens || !positions || !keys || !k_norm ||
+        !rope_keys || !gqa_heads(geometry, query_heads, kv_heads)) {
+        return cudaErrorInvalidValue;
+    }
+    query_heads = 0;
+    const __nv_bfloat16* unused_input = nullptr;
+    __nv_bfloat16* unused_output = nullptr;
+    void* arguments[] = {&positions, &query_heads, &kv_heads, &unused_input, &keys,
+                         &unused_input, &k_norm, &unused_output, &rope_keys};
+    return cudaLaunchKernel(gqa_preprocess<const MropePosition*, false>,
+                            rows * kv_heads, mxfp8_head_dim, arguments, 0, stream);
+}
+
+std::optional<cudaError_t> try_prefill_gqa_postgate_quantize_impl(
+    int rows, const __nv_bfloat16* q_gate, const __nv_bfloat16* attention,
+    TextFp8Activation activation, cudaStream_t stream, GqaGeometry geometry) {
+    using namespace text_kernel;
+    int query_heads;
+    int kv_heads;
+    if (!gqa_heads(geometry, query_heads, kv_heads)) {
+        return cudaErrorInvalidValue;
+    }
+    const int q_width = query_heads * mxfp8_head_dim;
+    const int blocks = q_width / (text_fp8_group_size * block_warps);
+    int q_width_arg = q_width;
+    if (rows != 4096 || q_width % (text_fp8_group_size * block_warps) || !q_gate || !attention ||
+        !activation.values || !activation.scales ||
+        !aligned(q_gate, alignof(__nv_bfloat162)) || !aligned(attention, alignof(__nv_bfloat162)) ||
+        !aligned(activation.values, alignof(__nv_fp8x4_storage_t)) ||
+        !aligned(activation.scales, alignof(float))) {
+        return std::nullopt;
+    }
+    const auto pending = cudaGetLastError();
+    if (pending != cudaSuccess) return pending;
+    void* args[] = {&q_gate, &attention, &q_width_arg, &activation};
+    const auto status = cudaLaunchKernel(gqa_postgate_quantize, dim3(blocks, rows), block_threads,
+                                         args, 0, stream);
+    const auto recorded = cudaGetLastError();
+    return status == cudaSuccess ? recorded : status;
+}
+
+}
+
+cudaError_t decoder::decode_gqa_preprocess(const int* position, const __nv_bfloat16* q_gate,
+                                           const __nv_bfloat16* keys,
+                                           const __nv_bfloat16* q_norm,
+                                           const __nv_bfloat16* k_norm,
+                                           __nv_bfloat16* rope_queries,
+                                           __nv_bfloat16* rope_keys, cudaStream_t stream) {
+    return decode_gqa_preprocess_impl(position, q_gate, keys, q_norm, k_norm, rope_queries,
+                                      rope_keys, stream, gqa_full_geometry);
+}
+
+cudaError_t decoder::decode_gqa_preprocess(const int* position, const __nv_bfloat16* q_gate,
+                                           const __nv_bfloat16* keys,
+                                           const __nv_bfloat16* q_norm,
+                                           const __nv_bfloat16* k_norm,
+                                           __nv_bfloat16* rope_queries,
+                                           __nv_bfloat16* rope_keys, cudaStream_t stream,
+                                           GqaGeometry geometry) {
+    return decode_gqa_preprocess_impl(position, q_gate, keys, q_norm, k_norm, rope_queries,
+                                      rope_keys, stream, geometry);
+}
+
+cudaError_t decoder::mrope_gqa_preprocess(
+    const MropePosition* positions, int rows, const __nv_bfloat16* q_gate,
+    const __nv_bfloat16* keys, const __nv_bfloat16* q_norm, const __nv_bfloat16* k_norm,
+    __nv_bfloat16* rope_queries, __nv_bfloat16* rope_keys, cudaStream_t stream) {
+    return mrope_gqa_preprocess_impl(positions, rows, q_gate, keys, q_norm, k_norm, rope_queries,
+                                     rope_keys, stream, gqa_full_geometry);
+}
+
+cudaError_t decoder::mrope_gqa_preprocess(
+    const MropePosition* positions, int rows, const __nv_bfloat16* q_gate,
+    const __nv_bfloat16* keys, const __nv_bfloat16* q_norm, const __nv_bfloat16* k_norm,
+    __nv_bfloat16* rope_queries, __nv_bfloat16* rope_keys, cudaStream_t stream,
+    GqaGeometry geometry) {
+    return mrope_gqa_preprocess_impl(positions, rows, q_gate, keys, q_norm, k_norm, rope_queries,
+                                     rope_keys, stream, geometry);
+}
+
+cudaError_t decoder::prefill_gqa_queries(int position, const MropePosition* positions, int rows,
+                                        const __nv_bfloat16* q_gate, const __nv_bfloat16* norm,
+                                        __nv_bfloat16* queries, cudaStream_t stream) {
+    return prefill_gqa_queries_impl(position, positions, rows, q_gate, norm, queries, stream,
+                                    gqa_full_geometry);
+}
+
+cudaError_t decoder::prefill_gqa_queries(int position, const MropePosition* positions, int rows,
+                                        const __nv_bfloat16* q_gate, const __nv_bfloat16* norm,
+                                        __nv_bfloat16* queries, cudaStream_t stream,
+                                        GqaGeometry geometry) {
+    return prefill_gqa_queries_impl(position, positions, rows, q_gate, norm, queries, stream,
+                                    geometry);
+}
+
+cudaError_t decoder::mrope_gqa_preprocess_keys(
+    const MropePosition* positions, int rows, const __nv_bfloat16* keys,
+    const __nv_bfloat16* k_norm, __nv_bfloat16* rope_keys, cudaStream_t stream) {
+    return mrope_gqa_preprocess_keys_impl(positions, rows, keys, k_norm, rope_keys, stream,
+                                          gqa_full_geometry);
+}
+
+cudaError_t decoder::mrope_gqa_preprocess_keys(
+    const MropePosition* positions, int rows, const __nv_bfloat16* keys,
+    const __nv_bfloat16* k_norm, __nv_bfloat16* rope_keys, cudaStream_t stream,
+    GqaGeometry geometry) {
+    return mrope_gqa_preprocess_keys_impl(positions, rows, keys, k_norm, rope_keys, stream,
+                                          geometry);
+}
+
+std::optional<cudaError_t> decoder::try_prefill_gqa_postgate_quantize(
+    int rows, const __nv_bfloat16* q_gate, const __nv_bfloat16* attention,
+    TextFp8Activation activation, cudaStream_t stream) {
+    return try_prefill_gqa_postgate_quantize_impl(rows, q_gate, attention, activation, stream,
+                                                  gqa_full_geometry);
+}
+
+std::optional<cudaError_t> decoder::try_prefill_gqa_postgate_quantize(
+    int rows, const __nv_bfloat16* q_gate, const __nv_bfloat16* attention,
+    TextFp8Activation activation, cudaStream_t stream, GqaGeometry geometry) {
+    return try_prefill_gqa_postgate_quantize_impl(rows, q_gate, attention, activation, stream,
+                                                  geometry);
 }
 
 template <int Capacity>
 cudaError_t decoder::gqa_verify_preprocess(
     const GqaVerifyRows<GqaVerifyPreprocessRow, Capacity>& batch, int count,
-    const __nv_bfloat16* q_norm, const __nv_bfloat16* k_norm, cudaStream_t stream) {
-    if (count <= 0 || count > Capacity || !q_norm || !k_norm) {
+    const __nv_bfloat16* q_norm, const __nv_bfloat16* k_norm, cudaStream_t stream,
+    GqaGeometry geometry) {
+    int query_heads;
+    int kv_heads;
+    if (count <= 0 || count > Capacity || !q_norm || !k_norm
+        || !gqa_heads(geometry, query_heads, kv_heads)) {
         return cudaErrorInvalidValue;
     }
     for (int index = 0; index < count; ++index) {
@@ -199,10 +520,19 @@ cudaError_t decoder::gqa_verify_preprocess(
         }
     }
     void* arguments[] = {const_cast<GqaVerifyRows<GqaVerifyPreprocessRow, Capacity>*>(&batch),
-                         &q_norm, &k_norm};
+                         &query_heads, &kv_heads, &q_norm, &k_norm};
     return cudaLaunchKernel(gqa_verify_preprocess_kernel<Capacity>,
-                            dim3(count, mxfp8_query_heads + mxfp8_kv_heads),
+                            dim3(count, query_heads + kv_heads),
                             mxfp8_head_dim, arguments, 0, stream);
+}
+
+cudaError_t decoder::tp_verify_graph::preprocess(
+    const GqaVerifyRows<GqaVerifyPreprocessRow>& batch, const int* rotary, GqaGeometry geometry,
+    const Bf16* q_norm, const Bf16* k_norm, cudaStream_t stream) {
+    live_preprocess<<<dim3(rows, geometry.query_heads + geometry.kv_heads),
+                      mxfp8_head_dim, 0, stream>>>(
+        batch, rotary, geometry.query_heads, geometry.kv_heads, q_norm, k_norm);
+    return cudaPeekAtLastError();
 }
 
 cudaError_t decoder::draft_verify_preprocess_keys(
@@ -216,16 +546,21 @@ cudaError_t decoder::draft_verify_preprocess_keys(
         if (row.position < 0 || row.position >= text_attention_max_tokens ||
             !row.keys || !row.rope_keys) return cudaErrorInvalidValue;
     }
+    int query_heads = 0;
+    int kv_heads = mxfp8_kv_heads;
     const __nv_bfloat16* q_norm = nullptr;
-    void* args[] = {const_cast<GqaVerifyRows<GqaVerifyPreprocessRow>*>(&batch), &q_norm, &k_norm};
+    void* args[] = {const_cast<GqaVerifyRows<GqaVerifyPreprocessRow>*>(&batch), &query_heads,
+                    &kv_heads, &q_norm, &k_norm};
     return cudaLaunchKernel(gqa_verify_preprocess_kernel<target_split_eager_max_rows, false>,
-                            dim3(count, mxfp8_kv_heads), mxfp8_head_dim, args, 0, stream);
+                            dim3(count, kv_heads), mxfp8_head_dim, args, 0, stream);
 }
 
 template <int Capacity>
 cudaError_t decoder::gqa_verify_postgate(const GqaVerifyRows<GqaVerifyGateRow, Capacity>& batch,
-                                         int count, cudaStream_t stream) {
-    if (count <= 0 || count > Capacity) {
+                                         int count, cudaStream_t stream, GqaGeometry geometry) {
+    int query_heads;
+    int kv_heads;
+    if (count <= 0 || count > Capacity || !gqa_heads(geometry, query_heads, kv_heads)) {
         return cudaErrorInvalidValue;
     }
     for (int index = 0; index < count; ++index) {
@@ -235,148 +570,19 @@ cudaError_t decoder::gqa_verify_postgate(const GqaVerifyRows<GqaVerifyGateRow, C
         }
     }
     void* arguments[] = {const_cast<GqaVerifyRows<GqaVerifyGateRow, Capacity>*>(&batch)};
-    return cudaLaunchKernel(gqa_verify_postgate_kernel<Capacity>, dim3(count, mxfp8_query_heads),
+    return cudaLaunchKernel(gqa_verify_postgate_kernel<Capacity>, dim3(count, query_heads),
                             mxfp8_head_dim, arguments, 0, stream);
 }
 
 template cudaError_t decoder::gqa_verify_preprocess(
     const GqaVerifyRows<GqaVerifyPreprocessRow>&, int, const __nv_bfloat16*,
-    const __nv_bfloat16*, cudaStream_t);
+    const __nv_bfloat16*, cudaStream_t, GqaGeometry);
 template cudaError_t decoder::gqa_verify_preprocess(
     const GqaVerifyRows<GqaVerifyPreprocessRow, max_wide_mtp_rows>&, int, const __nv_bfloat16*,
-    const __nv_bfloat16*, cudaStream_t);
+    const __nv_bfloat16*, cudaStream_t, GqaGeometry);
 template cudaError_t decoder::gqa_verify_postgate(
-    const GqaVerifyRows<GqaVerifyGateRow>&, int, cudaStream_t);
+    const GqaVerifyRows<GqaVerifyGateRow>&, int, cudaStream_t, GqaGeometry);
 template cudaError_t decoder::gqa_verify_postgate(
-    const GqaVerifyRows<GqaVerifyGateRow, max_wide_mtp_rows>&, int, cudaStream_t);
-
-cudaError_t text_gqa_preprocess(int first_position, int token_count,
-                                const __nv_bfloat16* q_gate, const __nv_bfloat16* keys,
-                                const __nv_bfloat16* q_norm, const __nv_bfloat16* k_norm,
-                                __nv_bfloat16* rope_queries, __nv_bfloat16* rope_keys,
-                                cudaStream_t stream) {
-    if (token_count == 0) {
-        return cudaSuccess;
-    }
-    if (token_count < 0 || token_count > text_attention_max_tokens || first_position < 0
-        || first_position > text_attention_max_tokens - token_count
-        || !q_gate || !keys || !q_norm || !k_norm || !rope_queries || !rope_keys) {
-        return cudaErrorInvalidValue;
-    }
-    const int blocks = token_count * (mxfp8_query_heads + mxfp8_kv_heads);
-    void* arguments[] = {
-        &first_position, &q_gate, &keys, &q_norm, &k_norm, &rope_queries, &rope_keys};
-    return cudaLaunchKernel(gqa_preprocess<int>, dim3(blocks), dim3(mxfp8_head_dim),
-                            arguments, 0, stream);
-}
-
-cudaError_t text_gqa_preprocess_keys(int first_position, int token_count,
-                                    const __nv_bfloat16* keys, const __nv_bfloat16* k_norm,
-                                    __nv_bfloat16* rope_keys, cudaStream_t stream) {
-    if (token_count <= 0 || token_count > text_attention_max_tokens || first_position < 0 ||
-        first_position > text_attention_max_tokens - token_count ||
-        !keys || !k_norm || !rope_keys) {
-        return cudaErrorInvalidValue;
-    }
-    const __nv_bfloat16* unused_input = nullptr;
-    __nv_bfloat16* unused_output = nullptr;
-    void* args[] = {&first_position, &unused_input, &keys, &unused_input, &k_norm,
-                    &unused_output, &rope_keys};
-    return cudaLaunchKernel(gqa_preprocess<int, false>, token_count * mxfp8_kv_heads,
-                            mxfp8_head_dim, args, 0, stream);
-}
-
-cudaError_t decoder::decode_gqa_preprocess(const int* position, const __nv_bfloat16* q_gate,
-                                           const __nv_bfloat16* keys,
-                                           const __nv_bfloat16* q_norm,
-                                           const __nv_bfloat16* k_norm,
-                                           __nv_bfloat16* rope_queries,
-                                           __nv_bfloat16* rope_keys, cudaStream_t stream) {
-    constexpr int blocks = mxfp8_query_heads + mxfp8_kv_heads;
-    void* arguments[] = {
-        &position, &q_gate, &keys, &q_norm, &k_norm, &rope_queries, &rope_keys};
-    return cudaLaunchKernel(gqa_preprocess<const int*>, dim3(blocks), dim3(mxfp8_head_dim),
-                            arguments, 0, stream);
-}
-
-cudaError_t decoder::mrope_gqa_preprocess(
-    const MropePosition* positions, int rows, const __nv_bfloat16* q_gate,
-    const __nv_bfloat16* keys, const __nv_bfloat16* q_norm, const __nv_bfloat16* k_norm,
-    __nv_bfloat16* rope_queries, __nv_bfloat16* rope_keys, cudaStream_t stream) {
-    if (rows <= 0 || rows > text_attention_max_tokens || !positions || !q_gate || !keys ||
-        !q_norm || !k_norm || !rope_queries || !rope_keys) {
-        return cudaErrorInvalidValue;
-    }
-    const int blocks = rows * (mxfp8_query_heads + mxfp8_kv_heads);
-    void* arguments[] = {
-        &positions, &q_gate, &keys, &q_norm, &k_norm, &rope_queries, &rope_keys};
-    return cudaLaunchKernel(gqa_preprocess<const MropePosition*>, blocks, mxfp8_head_dim,
-                            arguments, 0, stream);
-}
-
-cudaError_t decoder::prefill_gqa_queries(int position, const MropePosition* positions, int rows,
-                                        const __nv_bfloat16* q_gate, const __nv_bfloat16* norm,
-                                        __nv_bfloat16* queries, cudaStream_t stream) {
-    if (rows <= 0 || rows > text_attention_max_tokens || !q_gate || !norm || !queries ||
-        (!positions && (position < 0 || position > text_attention_max_tokens - rows))) {
-        return cudaErrorInvalidValue;
-    }
-    const auto launch = [&](auto first) {
-        void* args[] = {&first, &q_gate, &norm, &queries};
-        return cudaLaunchKernel(gqa_preprocess_queries<decltype(first)>, rows * mxfp8_query_heads,
-                                mxfp8_head_dim, args, 0, stream);
-    };
-    return positions ? launch(positions) : launch(position);
-}
-
-cudaError_t decoder::mrope_gqa_preprocess_keys(
-    const MropePosition* positions, int rows, const __nv_bfloat16* keys,
-    const __nv_bfloat16* k_norm, __nv_bfloat16* rope_keys, cudaStream_t stream) {
-    if (rows <= 0 || rows > text_attention_max_tokens || !positions || !keys || !k_norm ||
-        !rope_keys) {
-        return cudaErrorInvalidValue;
-    }
-    const __nv_bfloat16* unused_input = nullptr;
-    __nv_bfloat16* unused_output = nullptr;
-    void* arguments[] = {&positions, &unused_input, &keys, &unused_input, &k_norm,
-                         &unused_output, &rope_keys};
-    return cudaLaunchKernel(gqa_preprocess<const MropePosition*, false>,
-                            rows * mxfp8_kv_heads, mxfp8_head_dim, arguments, 0, stream);
-}
-
-cudaError_t text_gqa_postgate(int token_count, const __nv_bfloat16* q_gate,
-                              const __nv_bfloat16* attention, __nv_bfloat16* output,
-                              cudaStream_t stream) {
-    if (token_count == 0) {
-        return cudaSuccess;
-    }
-    if (token_count < 0 || token_count > text_attention_max_tokens
-        || !q_gate || !attention || !output) {
-        return cudaErrorInvalidValue;
-    }
-    void* arguments[] = {&q_gate, &attention, &output};
-    return cudaLaunchKernel(gqa_postgate, dim3(token_count * mxfp8_query_heads),
-                            dim3(mxfp8_head_dim), arguments, 0, stream);
-}
-
-std::optional<cudaError_t> decoder::try_prefill_gqa_postgate_quantize(
-    int rows, const __nv_bfloat16* q_gate, const __nv_bfloat16* attention,
-    TextFp8Activation activation, cudaStream_t stream) {
-    using namespace text_kernel;
-    if (rows != 4096 || !q_gate || !attention || !activation.values || !activation.scales ||
-        !aligned(q_gate, alignof(__nv_bfloat162)) || !aligned(attention, alignof(__nv_bfloat162)) ||
-        !aligned(activation.values, alignof(__nv_fp8x4_storage_t)) ||
-        !aligned(activation.scales, alignof(float))) {
-        return std::nullopt;
-    }
-    const auto pending = cudaGetLastError();
-    if (pending != cudaSuccess) return pending;
-    constexpr int blocks = text_gqa_q_width / (text_fp8_group_size * block_warps);
-    void* args[] = {&q_gate, &attention, &activation};
-    const auto status = cudaLaunchKernel(gqa_postgate_quantize, dim3(blocks, rows), block_threads,
-                                         args, 0, stream);
-    const auto recorded = cudaGetLastError();
-    return status == cudaSuccess ? recorded : status;
-}
+    const GqaVerifyRows<GqaVerifyGateRow, max_wide_mtp_rows>&, int, cudaStream_t, GqaGeometry);
 
 }

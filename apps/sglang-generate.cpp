@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cmath>
 #include <exception>
+#include <cstdio>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -19,12 +20,36 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 
+void print_tp_receipt(const sglang::Decoder& decoder) {
+    const auto* info = decoder.tensor_parallel_info();
+    if (info == nullptr) {
+        return;
+    }
+    for (int rank = 0; rank < info->world_size && rank < 2; ++rank) {
+        const auto& entry = info->ranks[rank];
+        char uuid[33];
+        for (int i = 0; i < 16; ++i) {
+            std::snprintf(uuid + 2 * i, 3, "%02x",
+                          static_cast<unsigned char>(entry.uuid[i]));
+        }
+        std::cerr << "tp2 rank=" << rank << " device=" << entry.cuda_device
+                  << " uuid=" << uuid << " pid=" << entry.pid
+                  << " nccl=" << (entry.nccl_established ? "ok" : "missing")
+                  << " weights=" << entry.weight_bytes
+                  << " lm_head=" << (entry.lm_head ? 1 : 0)
+                  << " mtp=" << (entry.mtp ? 1 : 0) << '\n';
+    }
+    std::cerr << "tp2 world=" << info->world_size << " ranks="
+              << info->world_size << '\n';
+}
+
 struct Arguments {
     std::filesystem::path checkpoint = "/data0/shared/Qwen3.8-27B-FP8";
     std::vector<int> prompt;
     sglang::DecoderOptions options;
     int device = 0;
     int warmup = 0;
+    int tensor_parallel = 1;
     int repeats = 1;
     bool help = false;
 };
@@ -36,6 +61,7 @@ void usage(std::ostream& output) {
            << "                       [--temperature T] [--top-p P] [--top-k K]\n"
            << "                       [--min-p P] [--seed INTEGER]\n"
            << "                       [--warmup N] [--repeats N] [--checkpoint DIR] [--device N]\n"
+           << "                       [--tp N] (1 or 2; default 1)\n"
            << "The checkpoint defaults to /data0/shared/Qwen3.8-27B-FP8. "
               "Device is a CUDA ordinal.\n"
            << "Prompt IDs may be separated by commas or whitespace. Results are written as JSON.\n";
@@ -158,6 +184,11 @@ Arguments parse_arguments(int argc, char** argv) {
             arguments.repeats = positive_or_zero(value, option);
         } else if (option == "--device") {
             arguments.device = positive_or_zero(value, option);
+        } else if (option == "--tp") {
+            arguments.tensor_parallel = positive_or_zero(value, option);
+            if (arguments.tensor_parallel == 0 || arguments.tensor_parallel > 2) {
+                throw std::invalid_argument("Expected --tp in [1, 2]");
+            }
         } else if (!parse_sampling(option, value, arguments.options)) {
             throw std::invalid_argument("Unknown option " + std::string(option));
         }
@@ -263,7 +294,9 @@ void write_result(const Arguments& arguments, const Measurements& measured,
                << ",\"mtp_accepted_tokens\":" << result.mtp_accepted_tokens
                << ",\"mtp_rounds\":" << result.mtp_rounds;
     }
-    output << ",\"device\":" << arguments.device << ",\"warmup\":" << arguments.warmup
+    output << ",\"device\":" << arguments.device << ",\"tensor_parallel\":"
+           << arguments.tensor_parallel
+           << ",\"warmup\":" << arguments.warmup
            << ",\"repeats\":" << arguments.repeats << ",\"load_ms\":" << load_ms
            << ",\"fp8_prefill\":\"" << (tc_prefill ? "tensor-core" : "exact")
            << "\",\"mtp_int8_head\":" << (decoder.has_int8_draft_head() ? "true" : "false")
@@ -287,7 +320,9 @@ int main(int argc, char** argv) {
         }
         const auto start = Clock::now();
         const sglang::Decoder decoder(arguments.checkpoint, arguments.device,
-                                      arguments.options.mtp_steps != 0);
+                                      arguments.options.mtp_steps != 0,
+                                      arguments.tensor_parallel);
+        print_tp_receipt(decoder);
         const double load_ms = milliseconds(Clock::now() - start);
         const auto measured = measure(decoder, arguments);
         write_result(arguments, measured, decoder, load_ms);

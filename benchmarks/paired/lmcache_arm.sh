@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
 
-# The daemon is owned by the native arm and has its own process group.
 lmcache_evidence() {
     PYTHONPATH="$project" "$client_python" -B "$paired_dir/lmcache_evidence.py" "$@"
 }
@@ -27,8 +26,10 @@ print(os.pathsep.join(os.path.realpath(p) for p in path.split(os.pathsep)) if pa
 record_lmcache_peer() {
     local run=$1 suffix=${2:-} options=()
     if [[ -n $suffix ]]; then options=(--once); fi
-    lmcache_evidence ready "$lmcache_runtime/sglang-lmcache.sock" "$lmcache_pid" \
-        --wire SLC3 "${options[@]}" >"$run/lmcache-ready$suffix.json" || return
+    local socket=${lmcache_endpoint:-$lmcache_runtime/sglang-lmcache.sock}
+    lmcache_evidence ready "$socket" "$lmcache_pid" --wire SLC3 \
+        --namespace "${lmcache_namespace:-sglang}" "${options[@]}" \
+        >"$run/lmcache-ready$suffix.json" || return
     cat "/proc/$lmcache_pid/cmdline" >"$run/lmcache-live-argv$suffix.bin"
 }
 
@@ -37,6 +38,12 @@ start_lmcache() {
     record_compute "$run/compute-before-daemon.csv" || return
     check_compute_owners "$run/compute-before-daemon.csv" || return
     lmcache_runtime=$(mktemp -d /tmp/sglang-paired.XXXXXXXX)
+    launch_lmcache "$run"
+}
+
+launch_lmcache() {
+    local run=$1
+    shift
     local -a daemon=(env -i PATH=/usr/bin:/bin LANG=C.UTF-8
         "HOME=$run/home" "TMPDIR=$run/tmp" "XDG_CACHE_HOME=$run/cache"
         "LMCACHE_PYTHON=$lmcache_python" "PYTHONPATH=$lmcache_pythonpath"
@@ -44,8 +51,9 @@ start_lmcache() {
         "LD_LIBRARY_PATH=$compat" "CUDA_VISIBLE_DEVICES=$gpu_uuid" CUDA_DEVICE_ORDER=PCI_BUS_ID
         OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1
         numactl --localalloc taskset --cpu-list "$client_cpus"
-        bash "$lmcache_launcher" --socket "$lmcache_runtime/sglang-lmcache.sock"
-        --namespace sglang --memory-gib 64 --port "$lmcache_port")
+        bash "$lmcache_launcher" --socket
+        "${lmcache_endpoint:-$lmcache_runtime/sglang-lmcache.sock}"
+        --namespace "${lmcache_namespace:-sglang}" --memory-gib 64 --port "$lmcache_port" "$@")
     write_command "$run/lmcache-command.sh" "${daemon[@]}"
     sha256sum "${lmcache_sources[@]}" >"$run/lmcache-source.sha256" || return
     launch_session "$run/lmcache-pid.txt" "${daemon[@]}" >"$run/lmcache.log" 2>&1 9<&- &
@@ -84,7 +92,6 @@ stop_lmcache() {
                 "$lmcache_runtime/sglang-lmcache.sock" "$lmcache_socket_id" || return 2
             lmcache_socket_id=
         fi
-        # This arm exclusively owns the mktemp directory after its daemon group exits.
         local locks=$lmcache_runtime/.sglang-lmcache-locks-$EUID
         local endpoint=$lmcache_runtime/sglang-lmcache.sock
         if [[ -d $locks && ! -L $locks && -O $locks && ! -e $endpoint && ! -L $endpoint ]]; then

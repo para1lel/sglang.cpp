@@ -8,6 +8,7 @@ struct DraftOperatorCapabilities;
 struct DraftDepthScratch;
 struct PrefillProjections;
 struct PrefixCacheRead;
+struct PrefixCacheLayout;
 struct PrefixDeviceTransfer;
 
 inline constexpr int draft_projection_rows = 16;
@@ -47,19 +48,15 @@ private:
     struct State;
     std::unique_ptr<const State> state_;
     friend class MtpDraftRequest;
+    friend class PeerDraftRepair;
 };
 
-/// Retain this request in the submitted stream's ownership until completion.
-/// Serialize use on one stream and select the weights' CUDA device before enqueueing.
 class MtpDraftRequest {
 public:
     MtpDraftRequest(std::shared_ptr<const MtpDraftWeights> weights, int capacity,
                     RequestBlockCache* cache = nullptr);
     ~MtpDraftRequest();
 
-    /// Append at valid_prefix() using the shifted token and the corresponding
-    /// normalized hidden row. An unscored enqueue only appends KV and returns nullptr.
-    /// A scored enqueue returns a device row usable as the next enqueue's input.
     const Bf16* enqueue(int position, int shifted_token, const Bf16* hidden, bool score,
                         cudaStream_t stream, const ConstraintWorkspace* scratch = nullptr,
                         const ConstraintCandidates* allowed = nullptr,
@@ -67,23 +64,21 @@ public:
                         const Bf16* feature = nullptr);
     static void enqueue_wave(MtpDraftInput* rows, int count, bool score, cudaStream_t stream);
     static bool prepare_depth(MtpDraftRequest& lane, DraftDepthScratch& scratch,
-                              std::uint8_t* activation, cudaStream_t stream);
+                              std::uint8_t* activation, bool tensor_parallel, cudaStream_t stream);
     static void enqueue_depth(MtpDraftInput* rows, int count, const DraftDepthScratch& scratch,
                               cudaStream_t stream);
     static void repair_wave(const DraftRepairs* repairs, int count, Bf16* packed,
-                            cudaStream_t stream);
+                            cudaStream_t stream, bool exact = false);
 
     void seed_prefill(int position, const int* shifted_tokens, const Bf16* hidden,
                       const Bf16* residual, const Bf16* final_norm,
                       const PrefillProjections& projections, MtpPrefillBuffers buffers,
                       const MediaPrefill* media = nullptr);
 
-    /// Read the most recent scored enqueue after its stream has completed.
     int read_token() const;
     bool retry_invalid_int8(cudaStream_t stream);
 
     int valid_prefix() const;
-    /// Shorten logical KV coverage. Subsequent enqueues overwrite the suffix.
     void rewind(int valid_tokens);
     std::size_t device_allocation_bytes() const;
     void recycle_after_completion();
@@ -94,17 +89,40 @@ private:
                             const ConstraintCandidates* allowed, bool defer_score,
                             const MropePosition* mrope, int rotary_position, const Bf16* feature);
     static void enqueue_wave_impl(MtpDraftInput* rows, int count, bool score,
-                                  cudaStream_t stream, bool defer_score, Bf16* packed = nullptr);
+                                  cudaStream_t stream, bool defer_score, Bf16* packed = nullptr,
+                                  bool exact = false);
+    friend class PeerDraftRepair;
     friend PrefixDeviceTransfer restore_prefix_view(Request&, const PrefixCacheRead&,
-                                                     cudaStream_t, MtpDraftRequest*);
+                                                    cudaStream_t, MtpDraftRequest*,
+                                                    const PrefixCacheLayout*);
     friend PrefixDeviceTransfer export_prefix_view(const Request&, int, int, int, cudaStream_t,
-                                                    const MtpDraftRequest*, const Workspace*, bool);
+                                                   const MtpDraftRequest*, const Workspace*, bool,
+                                                   const PrefixCacheLayout*);
     friend int commit_restored_prefix(Request&, const PrefixDeviceTransfer&, MtpDraftRequest*);
     Mxfp8KvCache prefix_cache_view(int rows, bool storing) const;
     const Allocations& prefix_cache_memory() const;
     void commit_restored_prefix(int rows);
 
     struct State;
+    std::unique_ptr<State> state_;
+};
+
+class PeerDraftRepair {
+public:
+    static bool eligible(const MtpRound* rounds, int count);
+    static std::unique_ptr<PeerDraftRepair> prepare(const MtpDraftWeights& weights, int peer);
+    ~PeerDraftRepair();
+
+    void submit(const MtpRound* rounds, int count, const VerificationRow* peer_rows,
+                const Bf16* peer_embedding, const Bf16* peer_norm, cudaStream_t primary_stream,
+                cudaStream_t peer_stream);
+    bool apply(const DraftRepairs* repairs, int count, cudaStream_t primary_stream);
+    void discard();
+    void drain() noexcept;
+
+private:
+    struct State;
+    explicit PeerDraftRepair(std::unique_ptr<State> state);
     std::unique_ptr<State> state_;
 };
 

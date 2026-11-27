@@ -1,14 +1,13 @@
-#include "sglang/decoder_mtp.h"
+#include "sglang/text/mtp/draft_state.h"
 
-#include "sglang/decoder_cuda.cuh"
 #include "sglang/decoder_media_internal.h"
 #include "sglang/decoder_prefill.h"
 #include "sglang/decoder_verify.h"
-#include "sglang/runtime/backend/cuda_backend_policy.h"
 #include "sglang/runtime/model/qwen_weight_upload.h"
 #include "sglang/text/mtp/draft_depth.h"
 #include "sglang/text/mtp/draft_projection.h"
 #include "sglang/text/mtp/tc_vocab.h"
+#include "sglang/runtime/cache/kv_residency_policy.h"
 
 #include <cmath>
 #include <cstdio>
@@ -18,59 +17,31 @@
 #include <utility>
 
 namespace sglang::decoder {
+
+DraftWorkspace::DraftWorkspace(Allocations& memory)
+    : embedding(memory.allocate<Bf16>(hidden_size)),
+      concatenated(memory.allocate<Bf16>(2 * hidden_size)),
+      residual(memory.allocate<Bf16>(hidden_size)),
+      normalized(memory.allocate<Bf16>(hidden_size)),
+      branch(memory.allocate<Bf16>(hidden_size)),
+      q_gate(memory.allocate<Bf16>(text_gqa_q_gate_width)),
+      keys(memory.allocate<Bf16>(text_gqa_kv_width)),
+      values(memory.allocate<Bf16>(text_gqa_kv_width)),
+      rope_queries(memory.allocate<Bf16>(text_gqa_q_width)),
+      rope_keys(memory.allocate<Bf16>(text_gqa_kv_width)),
+      attention(memory.allocate<Bf16>(text_gqa_q_width)),
+      gate(memory.allocate<Bf16>(intermediate_size)),
+      up(memory.allocate<Bf16>(intermediate_size)),
+      score_storage(memory.allocate<float>(score_storage_count)),
+      logits(reinterpret_cast<Bf16*>(score_storage)),
+      activation{memory.allocate<std::uint8_t>(intermediate_size),
+                 memory.allocate<float>(text_fp8_group_count(intermediate_size))},
+      argmax_scratch(memory.allocate<TextLogitCandidate>(text_argmax_scratch_count(vocab_size))),
+      argmax(memory.allocate<TextLogitCandidate>(1)) {}
+
 namespace {
 
 static_assert(draft_projection_rows % draft_wave_rows == 0);
-
-struct DraftWorkspace {
-    static constexpr int score_storage_count = vocab_size * sizeof(Bf16) / sizeof(float);
-    static_assert(score_storage_count * sizeof(float) == vocab_size * sizeof(Bf16));
-
-    explicit DraftWorkspace(Allocations& memory)
-        : embedding(memory.allocate<Bf16>(hidden_size)),
-          concatenated(memory.allocate<Bf16>(2 * hidden_size)),
-          residual(memory.allocate<Bf16>(hidden_size)),
-          normalized(memory.allocate<Bf16>(hidden_size)),
-          branch(memory.allocate<Bf16>(hidden_size)),
-          q_gate(memory.allocate<Bf16>(text_gqa_q_gate_width)),
-          keys(memory.allocate<Bf16>(text_gqa_kv_width)),
-          values(memory.allocate<Bf16>(text_gqa_kv_width)),
-          rope_queries(memory.allocate<Bf16>(text_gqa_q_width)),
-          rope_keys(memory.allocate<Bf16>(text_gqa_kv_width)),
-          attention(memory.allocate<Bf16>(text_gqa_q_width)),
-          gate(memory.allocate<Bf16>(intermediate_size)),
-          up(memory.allocate<Bf16>(intermediate_size)),
-          score_storage(memory.allocate<float>(score_storage_count)),
-          logits(reinterpret_cast<Bf16*>(score_storage)),
-          activation{memory.allocate<std::uint8_t>(intermediate_size),
-                     memory.allocate<float>(text_fp8_group_count(intermediate_size))},
-          argmax_scratch(
-              memory.allocate<TextLogitCandidate>(text_argmax_scratch_count(vocab_size))),
-          argmax(memory.allocate<TextLogitCandidate>(1)) {}
-
-    ExactGqaWorkspace attention_scores() const {
-        return {score_storage, score_storage_count / mxfp8_query_heads};
-    }
-
-    Bf16* embedding;
-    Bf16* concatenated;
-    Bf16* residual;
-    Bf16* normalized;
-    Bf16* branch;
-    Bf16* q_gate;
-    Bf16* keys;
-    Bf16* values;
-    Bf16* rope_queries;
-    Bf16* rope_keys;
-    Bf16* attention;
-    Bf16* gate;
-    Bf16* up;
-    float* score_storage;
-    Bf16* logits;
-    TextFp8Activation activation;
-    TextLogitCandidate* argmax_scratch;
-    TextLogitCandidate* argmax;
-};
 
 void quantize(const Bf16* input, int width, const DraftWorkspace& work, cudaStream_t stream) {
     check(text_quantize_fp8(input, width, work.activation, stream), "Quantize MTP activation");
@@ -82,126 +53,77 @@ void project(Fp8Weight weight, const DraftWorkspace& work, Bf16* output, cudaStr
                         stream), "Run MTP FP8 projection");
 }
 
+bool prepare_streaming_projection(int device) {
+    if (!read_cuda_backend_device(device).policy.uses_b200_operators) return false;
+    check(cudaGetLastError(), "Check draft projection setup status");
+    const auto status = draft_stream::prepare();
+    if (status == cudaSuccess) return true;
+    const auto recorded = cudaGetLastError();
+    if (CudaError::terminal(status)) check(status, "Prepare Blackwell MTP projections");
+    if (CudaError::terminal(recorded)) check(recorded, "Prepare Blackwell MTP projections");
+    return false;
 }
 
-struct MtpDraftWeights::State {
-    State(const std::filesystem::path& directory, int device,
-          std::shared_ptr<const Allocations> target_weights, const Bf16* embedding,
-          Bf16Weight lm_head, DraftOperatorCapabilities capabilities)
-        : device(device), capabilities(capabilities), target_weights(std::move(target_weights)),
-          memory(device), embedding(embedding), lm_head(lm_head) {
-        if (!this->target_weights || !embedding || !lm_head.values ||
-            lm_head.rows != vocab_size || lm_head.columns != hidden_size) {
-            throw std::invalid_argument("Invalid MTP target embedding or LM head");
-        }
-        DeviceScope selected_device(device);
-        auto& checkpoint = memory.transfers().checkpoint;
-        checkpoint = std::make_unique<Checkpoint>(directory);
-        memory.open_stream();
-        QwenWeightUpload upload(*checkpoint, memory, memory.stream());
-        embedding_norm = upload.bf16("mtp.pre_fc_norm_embedding.weight", {hidden_size});
-        hidden_norm = upload.bf16("mtp.pre_fc_norm_hidden.weight", {hidden_size});
-        fc = upload.bf16_matrix("mtp.fc.weight", hidden_size, 2 * hidden_size);
-        input_norm = upload.bf16("mtp.layers.0.input_layernorm.weight", {hidden_size});
-        attention_norm = upload.bf16("mtp.layers.0.post_attention_layernorm.weight", {hidden_size});
-        const std::string attention = "mtp.layers.0.self_attn.";
-        gqa = {
-            upload.fp8_matrix(attention + "q_proj", text_gqa_q_gate_width, hidden_size),
-            upload.fp8_matrix(attention + "k_proj", text_gqa_kv_width, hidden_size),
-            upload.fp8_matrix(attention + "v_proj", text_gqa_kv_width, hidden_size),
-            upload.bf16(attention + "q_norm.weight", {mxfp8_head_dim}),
-            upload.bf16(attention + "k_norm.weight", {mxfp8_head_dim}),
-            upload.fp8_matrix(attention + "o_proj", hidden_size, text_gqa_q_width),
-        };
-        const std::string mlp = "mtp.layers.0.mlp.";
-        mlp_gate = upload.fp8_matrix(mlp + "gate_proj", intermediate_size, hidden_size);
-        mlp_up = upload.fp8_matrix(mlp + "up_proj", intermediate_size, hidden_size);
-        mlp_down = upload.fp8_matrix(mlp + "down_proj", hidden_size, intermediate_size);
-        final_norm = upload.bf16("mtp.norm.weight", {hidden_size});
-        if (capabilities.int8_head) {
-            auto* values = memory.allocate<std::uint8_t>(
-                static_cast<std::size_t>(vocab_size) * hidden_size);
-            auto* maxima = memory.allocate<float>(vocab_size);
-            check(quantize_draft_head_int8(lm_head.values, vocab_size, values, maxima,
-                                          memory.stream()), "Quantize MTP vocabulary head");
-            quantized_head = values;
-            quantized_head_maxima = maxima;
-            shared_vocab = prepare_tc_vocab(lm_head.values, values, maxima, memory);
-        }
-        memory.close_stream();
-        if (capabilities.int8_head) {
-            std::vector<float> maxima(vocab_size);
-            check(cudaMemcpy(maxima.data(), quantized_head_maxima, maxima.size() * sizeof(float),
-                             cudaMemcpyDeviceToHost), "Read INT8 MTP vocabulary row maxima");
-            for (int token = 0; token < vocab_size; ++token) {
-                if (!std::isfinite(maxima[token])) {
-                    throw std::runtime_error("Nonfinite INT8 MTP vocabulary weight at token " +
-                                             std::to_string(token));
-                }
+}
+
+MtpDraftWeights::State::State(const std::filesystem::path& directory, int device,
+                             std::shared_ptr<const Allocations> target_weights,
+                             const Bf16* embedding, Bf16Weight lm_head,
+                             DraftOperatorCapabilities capabilities)
+    : device(device), capabilities(capabilities), target_weights(std::move(target_weights)),
+      memory(device), embedding(embedding), lm_head(lm_head) {
+    if (!this->target_weights || !embedding || !lm_head.values ||
+        lm_head.rows != vocab_size || lm_head.columns != hidden_size) {
+        throw std::invalid_argument("Invalid MTP target embedding or LM head");
+    }
+    DeviceScope selected_device(device);
+    streaming_projection = prepare_streaming_projection(device);
+    auto& checkpoint = memory.transfers().checkpoint;
+    checkpoint = std::make_unique<Checkpoint>(directory);
+    memory.open_stream();
+    QwenWeightUpload upload(*checkpoint, memory, memory.stream());
+    embedding_norm = upload.bf16("mtp.pre_fc_norm_embedding.weight", {hidden_size});
+    hidden_norm = upload.bf16("mtp.pre_fc_norm_hidden.weight", {hidden_size});
+    fc = upload.bf16_matrix("mtp.fc.weight", hidden_size, 2 * hidden_size);
+    input_norm = upload.bf16("mtp.layers.0.input_layernorm.weight", {hidden_size});
+    attention_norm = upload.bf16("mtp.layers.0.post_attention_layernorm.weight", {hidden_size});
+    const std::string attention = "mtp.layers.0.self_attn.";
+    gqa = {
+        upload.fp8_matrix(attention + "q_proj", text_gqa_q_gate_width, hidden_size),
+        upload.fp8_matrix(attention + "k_proj", text_gqa_kv_width, hidden_size),
+        upload.fp8_matrix(attention + "v_proj", text_gqa_kv_width, hidden_size),
+        upload.bf16(attention + "q_norm.weight", {mxfp8_head_dim}),
+        upload.bf16(attention + "k_norm.weight", {mxfp8_head_dim}),
+        upload.fp8_matrix(attention + "o_proj", hidden_size, text_gqa_q_width),
+    };
+    const std::string mlp = "mtp.layers.0.mlp.";
+    mlp_gate = upload.fp8_matrix(mlp + "gate_proj", intermediate_size, hidden_size);
+    mlp_up = upload.fp8_matrix(mlp + "up_proj", intermediate_size, hidden_size);
+    mlp_down = upload.fp8_matrix(mlp + "down_proj", hidden_size, intermediate_size);
+    final_norm = upload.bf16("mtp.norm.weight", {hidden_size});
+    if (capabilities.int8_head) {
+        auto* values = memory.allocate<std::uint8_t>(std::size_t(vocab_size) * hidden_size);
+        auto* maxima = memory.allocate<float>(vocab_size);
+        check(quantize_draft_head_int8(lm_head.values, vocab_size, values, maxima,
+                                      memory.stream()), "Quantize MTP vocabulary head");
+        quantized_head = values;
+        quantized_head_maxima = maxima;
+        shared_vocab = prepare_tc_vocab(lm_head.values, values, maxima, memory);
+    }
+    memory.close_stream();
+    if (capabilities.int8_head) {
+        std::vector<float> maxima(vocab_size);
+        check(cudaMemcpy(maxima.data(), quantized_head_maxima, maxima.size() * sizeof(float),
+                         cudaMemcpyDeviceToHost), "Read INT8 MTP vocabulary row maxima");
+        for (int token = 0; token < vocab_size; ++token) {
+            if (!std::isfinite(maxima[token])) {
+                throw std::runtime_error("Nonfinite INT8 MTP vocabulary weight at token " +
+                                         std::to_string(token));
             }
         }
-        selected_device.restore();
     }
-
-    int device;
-    const DraftOperatorCapabilities capabilities;
-    std::shared_ptr<const Allocations> target_weights;
-    Allocations memory;
-    const Bf16* embedding;
-    Bf16Weight lm_head;
-    const std::uint8_t* quantized_head = nullptr;
-    const float* quantized_head_maxima = nullptr;
-    std::shared_ptr<const TcVocabWeights> shared_vocab;
-    const Bf16* embedding_norm;
-    const Bf16* hidden_norm;
-    Bf16Weight fc;
-    const Bf16* input_norm;
-    const Bf16* attention_norm;
-    GqaLayer gqa;
-    Fp8Weight mlp_gate;
-    Fp8Weight mlp_up;
-    Fp8Weight mlp_down;
-    const Bf16* final_norm;
-};
-
-struct MtpDraftRequest::State {
-    State(std::shared_ptr<const MtpDraftWeights> weights, int capacity, RequestBlockCache* cache);
-    void validate(int position, int token, const Bf16* hidden) const;
-    void embed(int shifted_token, const Bf16* hidden, cudaStream_t stream,
-               const Bf16* feature = nullptr);
-    void prepare_attention(cudaStream_t stream);
-    void append(int position, bool score, const MropePosition* mrope, int rotary_position,
-                cudaStream_t stream);
-    DraftAttentionRow attention_row(int position);
-    void gate_attention(cudaStream_t stream);
-    void prepare_mlp(cudaStream_t stream);
-    void activate_mlp(cudaStream_t stream);
-    void normalize_output(cudaStream_t stream);
-    void score(cudaStream_t stream, const ConstraintWorkspace* scratch,
-               const ConstraintCandidates* allowed);
-    void select_score(cudaStream_t stream, const ConstraintWorkspace* scratch,
-                      const ConstraintCandidates* allowed);
-    bool prepare_mapped_score(cudaStream_t stream);
-    int score_token();
-    static void score_wave(State* const* batch, int count, cudaStream_t stream);
-    static void select_wave(State* const* batch, int count, cudaStream_t stream);
-
-    std::shared_ptr<const MtpDraftWeights> weights;
-    Allocations memory;
-    DraftWorkspace work;
-    int capacity;
-    Mxfp8KvCache cache;
-    Mxfp8PageTable pages;
-    int prefix = 0;
-    bool scored = false;
-    bool constrained_score = false;
-    bool int8_score = false;
-    bool retried_score = false;
-    bool mapped_score = false;
-    TextLogitCandidate* device_score = nullptr;
-    TextLogitCandidate retry_winner{};
-    bool failed = false;
-};
+    selected_device.restore();
+}
 
 MtpDraftRequest::State::State(std::shared_ptr<const MtpDraftWeights> weights, int capacity,
                               RequestBlockCache* block_cache)
@@ -465,19 +387,34 @@ const Bf16* MtpDraftRequest::enqueue_impl(int position, int shifted_token, const
     const auto& model = *request.weights->state_;
     const auto& gqa = model.gqa;
     try {
+        const bool streaming = use_streaming_projection(model.streaming_projection, stream);
         request.embed(shifted_token, hidden, stream, feature);
-        check(text_bf16_gemv(model.fc.values, work.concatenated, model.fc.rows, model.fc.columns,
-                             work.residual, stream), "Run BF16 MTP FC");
+        if (streaming) {
+            const TextBf16Projection row{work.concatenated, work.residual};
+            check_draft_submission(draft_stream::project_fc(model.fc.values, &row, 1, stream),
+                                   "Run streaming BF16 MTP FC");
+        } else {
+            check(text_bf16_gemv(model.fc.values, work.concatenated, model.fc.rows,
+                                 model.fc.columns, work.residual, stream), "Run BF16 MTP FC");
+        }
         request.prepare_attention(stream);
         if (score) {
             project(gqa.q_gate, work, work.q_gate, stream);
         }
-        project(gqa.key, work, work.keys, stream);
-        project(gqa.value, work, work.values, stream);
+        if (streaming) {
+            const TextFp8ActivationView input{work.activation.values, work.activation.scales};
+            const TextFp8Projection rows[]{{input, work.keys}, {input, work.values}};
+            check_draft_submission(draft_stream::project_kv(gqa.key.values, gqa.key.scales,
+                gqa.value.values, gqa.value.scales, rows, 1, stream), "Run joined MTP KV");
+        } else {
+            project(gqa.key, work, work.keys, stream);
+            project(gqa.value, work, work.values, stream);
+        }
         request.append(position, score, mrope, rotary_position, stream);
         if (score) {
-            check(mtp_gqa_attention(request.cache, request.pages, position, work.rope_queries,
-                                    work.attention, work.attention_scores(), stream),
+            const DraftAttentionRow attention = request.attention_row(position);
+            check(mtp_gqa_attention_batch(&attention, 1, model.capabilities.online_attention,
+                                          stream),
                   "Read MTP MXFP8 attention");
             request.gate_attention(stream);
             project(gqa.output, work, work.branch, stream);
@@ -503,7 +440,8 @@ void MtpDraftRequest::enqueue_wave(MtpDraftInput* rows, int count, bool score,
 }
 
 void MtpDraftRequest::enqueue_wave_impl(MtpDraftInput* rows, int count, bool score,
-                                       cudaStream_t stream, bool defer_score, Bf16* packed) {
+                                       cudaStream_t stream, bool defer_score, Bf16* packed,
+                                       bool exact) {
     if (count == 0) return;
     static_assert(draft_wave_rows == decoder_batch_max_mtp_lanes);
     if (!rows || count < 0 || (count > draft_wave_rows &&
@@ -530,7 +468,6 @@ void MtpDraftRequest::enqueue_wave_impl(MtpDraftInput* rows, int count, bool sco
         states[index] = &request;
     }
     const auto& model = *weights->state_;
-    DraftProjectionBatch<State, DraftWorkspace> batch(states.data(), count, packed, stream);
     const auto apply = [&](void (State::* function)(cudaStream_t)) {
         for (int index = 0; index < count; ++index) {
             std::invoke(function, states[index], stream);
@@ -542,6 +479,10 @@ void MtpDraftRequest::enqueue_wave_impl(MtpDraftInput* rows, int count, bool sco
             return !row.mrope && rotary < text_attention_max_tokens;
         });
     try {
+        const bool streaming = use_streaming_projection(
+            count == 2 && !packed && model.streaming_projection, stream);
+        DraftProjectionBatch<State, DraftWorkspace> batch(states.data(), count, packed, stream,
+                                                           exact, streaming);
         batch.prepare_fc(rows, model.embedding, model.embedding_norm, model.hidden_norm, model.fc);
         if (packed) {
             batch.rms_activation(&DraftWorkspace::residual, model.input_norm, false);
@@ -600,16 +541,18 @@ void MtpDraftRequest::enqueue_wave_impl(MtpDraftInput* rows, int count, bool sco
 }
 
 bool MtpDraftRequest::prepare_depth(MtpDraftRequest& lane, DraftDepthScratch& scratch,
-                                    std::uint8_t* activation, cudaStream_t stream) {
+                                    std::uint8_t* activation, bool tensor_parallel,
+                                    cudaStream_t stream) {
     const auto& model = *lane.state_->weights->state_;
     if (!model.quantized_head || !activation) return false;
     if (scratch.activation == activation) return scratch.ready;
     static_assert(wide_mtp_rows * intermediate_size >=
-                  decoder_batch_max_lanes * (hidden_size + sizeof(float)));
+                  decoder_batch_max_lanes * (hidden_size + sizeof(float)) +
+                      draft_depth_winner_bytes);
     static_assert((decoder_batch_max_lanes * hidden_size) % alignof(float) == 0);
     scratch.activation = activation;
     scratch.maxima = reinterpret_cast<float*>(activation + decoder_batch_max_lanes * hidden_size);
-    const auto status = prepare_draft_depth(scratch, model.quantized_head, stream);
+    const auto status = prepare_draft_depth(scratch, model.quantized_head, tensor_parallel, stream);
     if (status && *status != cudaSuccess) {
         scratch.activation = nullptr;
         check(*status, "Prepare depth-major INT8 MTP vocabulary projection");
@@ -673,6 +616,23 @@ void MtpDraftRequest::enqueue_depth(MtpDraftInput* rows, int count,
             }
             first += draft_wave_rows;
         }
+        constexpr int winner_rows = draft_depth_winner_rows;
+        if (count == winner_rows && active_count == winner_rows && scratch.fused_winner &&
+            weights->state_->capabilities.grouped_argmax &&
+            std::all_of(active.begin(), active.begin() + winner_rows, [stream](State* row) {
+                return row->prepare_mapped_score(stream);
+            })) {
+            std::array<TextLogitCandidate*, winner_rows> winners;
+            for (int row = 0; row < winner_rows; ++row) winners[row] = active[row]->device_score;
+            check(score_draft_depth16(scratch, weights->state_->quantized_head_maxima, vocab,
+                                      winners.data(), stream), "Score fused M16 draft vocabulary");
+            for (int row = 0; row < winner_rows; ++row) {
+                auto& state = *active[row];
+                state.mapped_score = state.scored = state.int8_score = true;
+                state.constrained_score = state.retried_score = false;
+            }
+            return;
+        }
         check(project_draft_depth(scratch, weights->state_->quantized_head_maxima, vocab,
                                   active_count, stream),
               "Run depth-major INT8 MTP vocabulary projection");
@@ -688,7 +648,7 @@ void MtpDraftRequest::enqueue_depth(MtpDraftInput* rows, int count,
 }
 
 void MtpDraftRequest::repair_wave(const DraftRepairs* repairs, int count, Bf16* packed,
-                                  cudaStream_t stream) {
+                                  cudaStream_t stream, bool exact) {
     if (!repairs || count <= 0 || (count > draft_wave_rows &&
                                   (!packed || count > draft_projection_rows ||
                                    count % draft_wave_rows != 0))) {
@@ -701,8 +661,14 @@ void MtpDraftRequest::repair_wave(const DraftRepairs* repairs, int count, Bf16* 
             if (const auto& row = repairs[lane][depth]; row.request) rows[size++] = row;
         }
         if (size == 0) break;
-        if (packed && size == count) {
-            enqueue_wave_impl(rows.data(), size, false, stream, false, packed);
+        const bool grouped = !exact || ((count == wide_mtp_lanes ||
+                                         count == draft_projection_rows) &&
+            std::all_of(rows.begin(), rows.begin() + size, [](const MtpDraftInput& row) {
+                const int rotary = row.rotary_position < 0 ? row.position : row.rotary_position;
+                return !row.mrope && rotary < text_attention_max_tokens;
+            }));
+        if (packed && size == count && grouped) {
+            enqueue_wave_impl(rows.data(), size, false, stream, false, packed, exact);
         } else if (count <= draft_wave_rows) {
             enqueue_wave(rows.data(), size, false, stream);
         } else {

@@ -204,11 +204,17 @@ def run(root):
             selected_checker = snapshot / checker.relative_to(root)
             if not selected_checker.is_file():
                 raise ValueError("Stage the rule checker before using the repository gate.")
+            comments = checker.with_name("comment_rules.py")
+            if not (snapshot / comments.relative_to(root)).is_file():
+                raise ValueError("Stage the comment rules before using the repository gate.")
         else:
             selected_checker = temporary / "check_rules.py"
             selected_checker.write_bytes(checker.read_bytes())
             selected_checker.with_name("gate_config.py").write_bytes(
                 checker.with_name("gate_config.py").read_bytes()
+            )
+            selected_checker.with_name("comment_rules.py").write_bytes(
+                checker.with_name("comment_rules.py").read_bytes()
             )
         full = any(
             shared_change(name) or gate_config.matches(

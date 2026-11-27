@@ -75,12 +75,16 @@ target("sglang_cuda")
     add_syslinks("cudart", {public = true})
     add_deps("sglang_prefill_fp8_sm100")
     add_files("src/mxfp8_gqa.cu", "src/text_decode_fp8.cu")
+    add_files("src/runtime/execution/tp_verify_graph.cu")
     add_files("src/text/draft_seed_fc.cu")
+    add_files("src/text/bf16_head_projection.cu")
     add_files("src/text/target_fp8.cu")
     add_files("src/text/gdn_verify.cu")
+    add_files("src/runtime/execution/verification_row_copy.cu")
     add_files("src/mxfp8_gqa_prefill.cu")
     add_files("src/text_decode_bandwidth.cu")
-    add_files("src/text_ops.cu", "src/text_attention_gdn.cu", "src/text_attention_gqa.cu")
+    add_files("src/text_ops.cu", "src/text_attention_gdn.cu",
+              "src/text/text_gdn_batched_replay.cu", "src/text_attention_gqa.cu")
     add_files("src/text_normalization.cu")
     add_files("src/decoder_sampling.cu", "src/decoder_constraint.cu",
               "src/text/decoder_logprobs.cu")
@@ -417,5 +421,125 @@ if has_config("generated-logprobs-check") then
         add_deps("sglang_decoder")
         add_rpathdirs(path.join(prefix, "lib"), path.join(toolkit, "lib"))
         add_files("tests/text/generated_logprobs_check.cpp")
+    target_end()
+end
+local nccl_wheel = (os.dirs(path.join(prefix, "lib/python*/site-packages/nvidia/nccl")) or {})[1]
+if not nccl_wheel then
+    raise("pixi env is missing the nvidia/nccl wheel " ..
+          "(expected $CONDA_PREFIX/lib/python*/site-packages/nvidia/nccl)")
+end
+
+target("sglang_decoder")
+    add_sysincludedirs(path.join(nccl_wheel, "include"))
+    add_ldflags(path.join(nccl_wheel, "lib/libnccl.so.2"), {force = true, public = true})
+    add_ldflags("-Wl,-rpath," .. path.join(nccl_wheel, "lib"), {force = true, public = true})
+    add_files("src/runtime/backend/tensor_parallel.cpp")
+    add_files("src/runtime/cache/lmcache_group.cpp")
+    add_files("src/decoder_tp.cpp")
+    add_files("src/runtime/execution/decoder_forward_tp.cpp")
+    add_files("src/runtime/execution/tp_verify_graph.cpp")
+    add_files("src/runtime/execution/peer_draft_repair.cpp")
+    add_files("src/runtime/execution/decoder_batch_prefix.cpp")
+target_end()
+
+option("tp2-collective-check")
+    set_default(false)
+option_end()
+
+if has_config("tp2-collective-check") and os.isfile("tests/decoder/tp2/collective_check.cpp") then
+    target("tp2-collective-check")
+        set_kind("binary")
+        set_toolchains("host-pixi")
+        set_targetdir("$(builddir)/bin")
+        add_sysincludedirs(path.join(nccl_wheel, "include"))
+        add_deps("sglang_decoder")
+        add_rpathdirs(path.join(prefix, "lib"), path.join(toolkit, "lib"))
+        add_files("tests/decoder/tp2/collective_check.cpp")
+    target_end()
+end
+
+option("tp2-verification-row-copy-check")
+    set_default(false)
+option_end()
+
+if has_config("tp2-verification-row-copy-check") then
+    target("tp2-verification-row-copy-check")
+        set_kind("binary")
+        set_toolchains("host-pixi")
+        set_targetdir("$(builddir)/bin")
+        add_deps("sglang_cuda")
+        add_files("tests/decoder/tp2/verification_row_copy_check.cpp")
+    target_end()
+end
+
+local flashinfer_root = os.getenv("SGLANG_FLASHINFER_ROOT")
+if not flashinfer_root or flashinfer_root == "" then
+    local host_root = os.getenv("SGLANG_HOST_ROOT") or "/data1/shared/dongwu.chen"
+    flashinfer_root = path.join(host_root,
+        "environments/vllm-81a8cb063e62/venv/lib/python3.12/site-packages/flashinfer")
+end
+local mnnvl_vendor_header =
+    path.join(flashinfer_root, "data/include/flashinfer/comm/trtllm_mnnvl_allreduce.cuh")
+local mnnvl_spdlog_header =
+    path.join(flashinfer_root, "data/spdlog/include/spdlog/spdlog.h")
+if os.isfile(mnnvl_vendor_header) and os.isfile(mnnvl_spdlog_header)
+    and os.isfile("include/sglang/runtime/backend/mnnvl_ar.h")
+    and os.isfile("src/runtime/backend/mnnvl_ar.cu") then
+    target("sglang_mnnvl_ar")
+        set_kind("static")
+        set_toolchains("host-pixi")
+        set_targetdir("$(builddir)/lib")
+        set_values("cuda.rdc", false)
+        add_cugencodes("sm_100a")
+        add_cuflags("--dependency-target-name=", {force = true})
+        add_cuflags("--expt-relaxed-constexpr", {force = true})
+        add_includedirs("include", path.join(toolkit, "include"))
+        add_sysincludedirs(path.join(flashinfer_root, "data/include"),
+                           path.join(flashinfer_root, "data/spdlog/include"))
+        add_syslinks("cuda", {public = true})
+        add_files("src/runtime/backend/mnnvl_ar.cu")
+    target_end()
+    target("sglang_decoder")
+        add_deps("sglang_mnnvl_ar")
+        add_defines("SGLANG_MNNVL_AR=1")
+    target_end()
+end
+
+local host_root_default = os.getenv("SGLANG_HOST_ROOT") or "/data1/shared/dongwu.chen"
+local gdn_vendor_dir = path.join(host_root_default, "environments",
+                                 "vllm-81a8cb063e62", "gdn_vendor_object")
+local gdn_vendor_archive = path.join(gdn_vendor_dir, "libgdn_cute_bf16_8_24.a")
+local site_packages = path.directory(flashinfer_root)
+local tvm_ffi_include = path.join(site_packages, "tvm_ffi", "include")
+local tvm_ffi_lib = path.join(site_packages, "tvm_ffi", "lib")
+local cute_dsl_lib = path.join(site_packages, "nvidia_cutlass_dsl", "cu13", "lib")
+local tvm_ffi_header = path.join(tvm_ffi_include, "tvm", "ffi", "c_api.h")
+local tvm_ffi_so = path.join(tvm_ffi_lib, "libtvm_ffi.so")
+local cute_dsl_so = path.join(cute_dsl_lib, "libcute_dsl_runtime.so")
+if os.getenv("SGLANG_GDN_VENDOR_BUILD") ~= "0"
+    and os.isfile(gdn_vendor_archive)
+    and os.isfile(tvm_ffi_header) and os.isfile(tvm_ffi_so) and os.isfile(cute_dsl_so)
+    and os.isfile("include/sglang/runtime/backend/gdn_vendor_prefill.h")
+    and os.isfile("src/runtime/backend/gdn_vendor_prefill.cu") then
+    print("vendor GDN prefill: enabled (archive " .. gdn_vendor_archive .. ")")
+    target("sglang_gdn_vendor")
+        set_kind("static")
+        set_toolchains("host-pixi")
+        set_targetdir("$(builddir)/lib")
+        set_values("cuda.rdc", false)
+        add_cugencodes("sm_100a")
+        add_cuflags("--expt-relaxed-constexpr", {force = true})
+        add_defines("SGLANG_GDN_VENDOR=1")
+        add_includedirs("include", path.join(toolkit, "include"))
+        add_sysincludedirs(tvm_ffi_include)
+        add_linkdirs(tvm_ffi_lib, cute_dsl_lib, gdn_vendor_dir)
+        add_links("tvm_ffi", "cute_dsl_runtime", "gdn_cute_bf16_8_24",
+                  {public = true})
+        add_rpathdirs(tvm_ffi_lib, cute_dsl_lib, {public = true})
+        add_files("src/runtime/backend/gdn_vendor_prefill.cu")
+    target_end()
+    target("sglang_decoder")
+        add_deps("sglang_gdn_vendor")
+        add_defines("SGLANG_GDN_VENDOR=1")
     target_end()
 end

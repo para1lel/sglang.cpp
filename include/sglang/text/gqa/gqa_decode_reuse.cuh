@@ -84,6 +84,7 @@ void reuse_split_kernel(const __grid_constant__ ReusePacket input) {
 bool same_cache(const decoder::PagedDecodeLane& a, const decoder::PagedDecodeLane& b) {
     return a.pages.device_pages == b.pages.device_pages &&
            a.pages.page_count == b.pages.page_count &&
+           a.cache.kv_heads == b.cache.kv_heads &&
            a.cache.key_payload == b.cache.key_payload &&
            a.cache.value_payload == b.cache.value_payload &&
            a.cache.key_scales == b.cache.key_scales &&
@@ -161,7 +162,7 @@ std::optional<cudaError_t> launch_reuse(const EagerTargetBatch& batch, int count
                                          reuse_kernel_unavailable(status));
     }
     void* arguments[] = {&packet};
-    const dim3 blocks(max_splits, mxfp8_kv_heads, reuse_requests);
+    const dim3 blocks(max_splits, packet.rows[0][0].cache.kv_heads, reuse_requests);
     status = cudaLaunchKernel(kernel, blocks, reuse_threads, arguments, sizeof(ReuseStorage),
                               stream);
     if (status != cudaSuccess) {

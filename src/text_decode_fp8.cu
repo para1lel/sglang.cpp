@@ -18,6 +18,8 @@ constexpr int fp8_groups_per_warp = warp_width * fp8_pack_bytes / text_fp8_group
 constexpr int decode_hidden_width = 5120;
 constexpr int decode_attention_width = 6144;
 constexpr int decode_intermediate_width = 17408;
+constexpr int decode_local_attention_width = decode_attention_width / 2;
+constexpr int decode_local_intermediate_width = decode_intermediate_width / 2;
 
 constexpr int divide_up(int count, int tile) {
     return count / tile + (count % tile != 0);
@@ -181,10 +183,13 @@ __global__ void fp8_decode_gate_up_kernel(TextFp8ActivationView input, DecodeFp8
                                        __float2bfloat16_rn(up_sum));
     }
 }
+static_assert(decode_hidden_width % (text_fp8_group_size * fp8_groups_per_warp) == 0);
 
 template <int Width, bool Qkv>
 cudaError_t launch_decode_projection(TextFp8ActivationView input, DecodeFp8Projections projections,
                                      int rows, cudaStream_t stream) {
+    static_assert(Width % (text_fp8_group_size * fp8_groups_per_warp) == 0,
+                  "packed decode kernel requires groups % fp8_groups_per_warp == 0");
     void* args[] = {&input, &projections};
     return cudaLaunchKernel(fp8_decode_projection_kernel<Width, Qkv>,
                             divide_up(rows, fp8_packed_warps),
@@ -290,6 +295,12 @@ cudaError_t decode_fp8_project(TextFp8ActivationView input, DecodeFp8Projection 
             case decode_intermediate_width:
                 return launch_decode_projection<decode_intermediate_width, false>(
                     input, {projection, {}, {}}, projection.rows, stream);
+            case decode_local_attention_width:
+                return launch_decode_projection<decode_local_attention_width, false>(
+                    input, {projection, {}, {}}, projection.rows, stream);
+            case decode_local_intermediate_width:
+                return launch_decode_projection<decode_local_intermediate_width, false>(
+                    input, {projection, {}, {}}, projection.rows, stream);
         }
     }
     return unfused_projection(input, projection, width, stream);
@@ -302,8 +313,13 @@ cudaError_t decode_fp8_qkv(TextFp8ActivationView input, DecodeFp8Projection quer
     if (!valid_buffers(input, width, projections)) {
         return cudaErrorInvalidValue;
     }
-    if (width == decode_hidden_width && query.rows == text_gqa_q_gate_width &&
-        key.rows == text_gqa_kv_width && value.rows == text_gqa_kv_width &&
+    const bool tp1_geometry = query.rows == 2 * decode_attention_width &&
+                              key.rows == text_gqa_kv_width &&
+                              value.rows == text_gqa_kv_width;
+    const bool tp2_geometry = query.rows == decode_attention_width &&
+                              key.rows == text_gqa_kv_width / 2 &&
+                              value.rows == text_gqa_kv_width / 2;
+    if ((tp1_geometry || tp2_geometry) && width == decode_hidden_width &&
         aligned(input.values, fp8_pack_bytes) && aligned(query.values, fp8_pack_bytes) &&
         aligned(key.values, fp8_pack_bytes) && aligned(value.values, fp8_pack_bytes)) {
         return launch_decode_projection<decode_hidden_width, true>(
@@ -320,7 +336,9 @@ cudaError_t decode_fp8_qkv(TextFp8ActivationView input, DecodeFp8Projection quer
 
 cudaError_t decode_fp8_gate_up(TextFp8ActivationView input, DecodeFp8Projection gate,
                                DecodeFp8Projection up, int width, cudaStream_t stream) {
-    const bool fused = width == decode_hidden_width && gate.rows == decode_intermediate_width &&
+    const bool fused = width == decode_hidden_width &&
+        (gate.rows == decode_intermediate_width ||
+         gate.rows == decode_local_intermediate_width) &&
         aligned(input.values, fp8_pack_bytes) && aligned(gate.values, fp8_pack_bytes) &&
         aligned(up.values, fp8_pack_bytes);
     const DecodeFp8Projection projections[]{gate, up};

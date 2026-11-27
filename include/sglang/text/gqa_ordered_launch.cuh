@@ -8,28 +8,34 @@ cudaError_t launch_exact_attention(
     if (!queries || !output || capacity <= 0 || capacity > text_attention_max_tokens) {
         return cudaErrorInvalidValue;
     }
-    constexpr int max_score_blocks = 32;
-    const int blocks = std::min(max_score_blocks, (capacity + score_warps - 1) / score_warps);
+    const int query_heads = [&] {
+        if constexpr (std::is_pointer_v<Cache>) {
+            return mxfp8_query_heads;
+        } else {
+            return gqa_query_heads(cache.kv_heads);
+        }
+    }();
+    const int blocks = std::min(32, (capacity + score_warps - 1) / score_warps);
     const auto status = launch_gqa_kernel(
         exact_scores_kernel<Narrow, SkipTargetSplit, Position, Cache, Pages, Scores>,
-        dim3(blocks, mxfp8_query_heads), score_warps * mxfp8_group_size, stream,
+        dim3(blocks, query_heads), score_warps * mxfp8_group_size, stream,
         cache, pages, position, queries, workspace, split_end);
     if (status != cudaSuccess) {
         return status;
     }
     if constexpr (Prefill) {
         return launch_gqa_kernel(prefill_replay_kernel,
-            dim3(mxfp8_query_heads, mxfp8_head_dim / replay_channels),
+            dim3(query_heads, mxfp8_head_dim / replay_channels),
             prefill_replay_threads, stream, cache, pages, position, workspace, output);
     } else if constexpr (Vector) {
         return launch_gqa_kernel(
             vector_replay_kernel<SkipTargetSplit, Position, Cache, Pages, Scores>,
-            dim3(mxfp8_query_heads, mxfp8_head_dim / vector_replay_channels),
+            dim3(query_heads, mxfp8_head_dim / vector_replay_channels),
             vector_replay_threads, stream, cache, pages, position, workspace, output, split_end);
     } else {
         return launch_gqa_kernel(
             exact_replay_kernel<Narrow, Position, Cache, Pages, Scores>,
-            dim3(mxfp8_query_heads, mxfp8_head_dim / replay_channels),
+            dim3(query_heads, mxfp8_head_dim / replay_channels),
             replay_threads, stream, cache, pages, position, workspace, queries, output);
     }
 }

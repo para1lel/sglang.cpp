@@ -1,4 +1,3 @@
-// One QK instruction sequence per cache page, with two ordered K64 PV updates.
 constexpr int staged_page_keys = mxfp8_page_size;
 static_assert(staged_page_keys == 2 * flash_keys &&
               tmem_scores + 2 * staged_page_keys == tmem_cols);
@@ -21,13 +20,14 @@ static_assert(offsetof(StagedPageTile, key) % 1024 == 0 &&
 static_assert(sizeof(StagedPageTile) == sizeof(StagedSingleTile));
 
 __device__ void stage_page_keys(StagedPageTile& tile, const StagedPairMaps& maps,
-                               const int* invalid, int page_base, int kv_head, int pages) {
+                               const int* invalid, int page_base, int kv_head, int pages,
+                               int kv_heads) {
     for (int page = 0; page < pages; ++page) {
         if (page) {
             const int previous = page - 1;
             tmem_copy_wait(tmem_smem(&tile.scores_ready[previous & 1]), (previous >> 1) & 1);
         }
-        const int page_head = (page_base + page) * mxfp8_kv_heads + kv_head;
+        const int page_head = (page_base + page) * kv_heads + kv_head;
         const int bad = invalid[page_head];
         if (bad != INT_MAX) atomicMin(&tile.bad_key, bad);
         const Word barrier = tmem_smem(&tile.key_ready[page & 1]);
@@ -81,17 +81,21 @@ __device__ void issue_page_values(StagedPageTile& tile, int chunk) {
     if (cute::elect_one_sync()) tmem_commit(tmem_smem(&tile.output_ready[stage]));
 }
 
+template <bool ScoreLookahead>
 __device__ void issue_page_mmas(StagedPageTile& tile, int chunks) {
     issue_page_scores(tile, 0);
     for (int chunk = 0; chunk < chunks; ++chunk) {
         const int stage = chunk & 1;
         const Word phase = (chunk >> 1) & 1;
+        if constexpr (ScoreLookahead) {
+            if (stage == 0 && chunk + 2 < chunks) issue_page_scores(tile, (chunk >> 1) + 1);
+        }
         tmem_copy_wait(tmem_smem(&tile.value_ready[stage]), phase);
         tmem_mma_wait(tmem_smem(&tile.probability_ready[stage]), phase);
         issue_page_values(tile, chunk);
-        // Current P was published after the prior PV completed. The next score page
-        // can overwrite the preceding page while the current page is still live.
-        if (stage == 0 && chunk + 2 < chunks) issue_page_scores(tile, (chunk >> 1) + 1);
+        if constexpr (!ScoreLookahead) {
+            if (stage == 0 && chunk + 2 < chunks) issue_page_scores(tile, (chunk >> 1) + 1);
+        }
     }
 }
 
@@ -130,7 +134,7 @@ __device__ void staged_page_softmax(StagedPageTile& tile, const Attention& reque
     tmem_store_output<true>(row_address, state, request, row, head, active_rows);
 }
 
-template <int Count>
+template <int Count, bool ScoreLookahead = false>
 __global__ __launch_bounds__(256, 1) void tmem_staged_page_attention(
     const __grid_constant__ StagedRequests<Count> requests,
     const __grid_constant__ StagedPairMaps maps, const int* invalid) {
@@ -168,12 +172,13 @@ __global__ __launch_bounds__(256, 1) void tmem_staged_page_attention(
     if (threadIdx.x < flash_queries) {
         staged_page_softmax(tile, request, row, head, position, active_rows, chunks);
     } else if (threadIdx.x == 128) {
-        stage_page_keys(tile, maps, invalid, page_base, head / ratio, (chunks + 1) / 2);
+        stage_page_keys(tile, maps, invalid, page_base, head / ratio, (chunks + 1) / 2,
+                        request.cache.kv_heads);
     } else if (threadIdx.x == 160) {
-        single_stage<false>(tile, maps, invalid, page_base, head / ratio, end);
+        single_stage<false>(tile, maps, invalid, page_base, head / ratio,
+                            request.cache.kv_heads, end);
     } else if (warp == 6) {
-        // CuTe elects an issuer within the converged warp for each MMA.
-        issue_page_mmas(tile, chunks);
+        issue_page_mmas<ScoreLookahead>(tile, chunks);
     }
     __syncthreads();
     if (warp == 0) {

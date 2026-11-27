@@ -2,8 +2,11 @@
 
 #include "sglang/decoder_cuda.cuh"
 #include "sglang/decoder_internal.h"
+#include "sglang/prefill_fp8.h"
 #include "sglang/text/text_cuda_primitives.cuh"
-#include "sglang/text/quantize_warp.cuh"
+#include "sglang/text/quantization/quantize_warp.cuh"
+#include "sglang/text/quantization/rms_quantize.cuh"
+#include "sglang/text/quantization/prefill_rms_vector.cuh"
 #include "sglang/text/mtp/draft_batch_ops.h"
 #include "sglang/text/mtp/tc_vocab.h"
 
@@ -13,14 +16,6 @@ namespace sglang {
 namespace {
 
 using namespace text_kernel;
-
-constexpr float rms_epsilon = 1.0e-6f;
-
-__device__ float residual_sum(const __nv_bfloat16* branch, const __nv_bfloat16* residual,
-                              std::size_t col) {
-    const float value = __bfloat162float(branch[col]);
-    return residual == nullptr ? value : value + __bfloat162float(residual[col]);
-}
 
 __device__ __forceinline__ void rms_norm_row(const __nv_bfloat16* branch,
                                              const __nv_bfloat16* residual,
@@ -79,8 +74,6 @@ __global__ void rms_norm_pair_rows_kernel(const __nv_bfloat16* first, const __nv
                  output + 2 * offset + blockIdx.y * static_cast<std::size_t>(width), nullptr);
 }
 
-constexpr int rms_hidden_width = 5120;
-
 __device__ void stage_rms_vector(const __nv_bfloat16* input, __nv_bfloat16* shared,
                                  __nv_bfloat16* output = nullptr) {
     const uint4 vector = load_128(input);
@@ -89,32 +82,6 @@ __device__ void stage_rms_vector(const __nv_bfloat16* input, __nv_bfloat16* shar
     asm("st.shared.v4.b32 [%0], {%1, %2, %3, %4};"
         :: "r"(address), "r"(vector.x), "r"(vector.y), "r"(vector.z), "r"(vector.w)
         : "memory");
-}
-
-__device__ void stage_rms_vector_async(const __nv_bfloat16* input, __nv_bfloat16* shared) {
-    const auto address = static_cast<unsigned int>(__cvta_generic_to_shared(shared));
-    asm volatile("cp.async.ca.shared.global [%0], [%1], 16;"
-                 :: "r"(address), "l"(input) : "memory");
-}
-
-__device__ __forceinline__ float rms_inverse(float squares, int width) {
-    __shared__ float warp_squares[block_warps];
-    __shared__ float inverse_rms;
-    const int lane = threadIdx.x % warp_width;
-    const int warp = threadIdx.x / warp_width;
-    squares = warp_sum(squares);
-    if (lane == 0) {
-        warp_squares[warp] = squares;
-    }
-    __syncthreads();
-    if (warp == 0) {
-        squares = warp_sum(lane < block_warps ? warp_squares[lane] : 0.0f);
-        if (lane == 0) {
-            inverse_rms = rsqrtf(squares / static_cast<float>(width) + rms_epsilon);
-        }
-    }
-    __syncthreads();
-    return inverse_rms;
 }
 
 __device__ void store_rms(float value, float inverse_rms, const __nv_bfloat16* weight,
@@ -215,67 +182,11 @@ __global__ void packed_vocab_rms_kernel(const __grid_constant__ decoder::TcVocab
                                       nullptr, packed + blockIdx.x * rms_hidden_width);
 }
 
-__device__ float4 rms_quant_values(uint2 bits) {
-    return {__uint_as_float(bits.x << 16), __uint_as_float(bits.x & 0xffff0000u),
-            __uint_as_float(bits.y << 16), __uint_as_float(bits.y & 0xffff0000u)};
-}
-
-__device__ float rms_quant_maximum(float4 values) {
-    return fmaxf(fmaxf(fabsf(values.x), fabsf(values.y)),
-                 fmaxf(fabsf(values.z), fabsf(values.w)));
-}
-
-__device__ __nv_fp8x4_storage_t rms_quant_pack(float4 values, float reciprocal) {
-    const float4 scaled{values.x * reciprocal, values.y * reciprocal,
-                        values.z * reciprocal, values.w * reciprocal};
-    return __nv_fp8x4_e4m3(scaled).__x;
-}
-
-__device__ void rms_quantize_subwarps(const __nv_bfloat16* normalized,
-                                      TextFp8Activation activation) {
-    constexpr int lanes = 8;
-    constexpr int half_group = text_fp8_group_size / 2;
-    constexpr int groups = rms_hidden_width / text_fp8_group_size;
-    constexpr int values_per_lane = half_group / lanes;
-    constexpr int groups_per_block = block_threads / lanes;
-    static_assert(values_per_lane == 8);
-    static_assert(warp_width % lanes == 0 && groups % (warp_width / lanes) == 0);
-    const int lane = threadIdx.x % lanes;
-    for (int group = threadIdx.x / lanes; group < groups; group += groups_per_block) {
-        const int col = group * text_fp8_group_size + lane * values_per_lane;
-        const auto lower = *reinterpret_cast<const uint4*>(normalized + col);
-        const auto upper = *reinterpret_cast<const uint4*>(normalized + col + half_group);
-        const float4 first = rms_quant_values({lower.x, lower.y});
-        const float4 second = rms_quant_values({lower.z, lower.w});
-        const float4 third = rms_quant_values({upper.x, upper.y});
-        const float4 fourth = rms_quant_values({upper.z, upper.w});
-        float maximum = fmaxf(fmaxf(rms_quant_maximum(first), rms_quant_maximum(second)),
-                              fmaxf(rms_quant_maximum(third), rms_quant_maximum(fourth)));
-        for (int delta = lanes / 2; delta > 0; delta /= 2) {
-            maximum = fmaxf(maximum, __shfl_down_sync(warp_mask, maximum, delta, lanes));
-        }
-        float reciprocal = 0.0f;
-        if (lane == 0) {
-            const float scale = __fdiv_rn(fmaxf(quant_epsilon, maximum), fp8_max);
-            activation.scales[group] = scale;
-            reciprocal = __fdiv_rn(1.0f, scale);
-        }
-        reciprocal = __shfl_sync(warp_mask, reciprocal, 0, lanes);
-        auto* packed = reinterpret_cast<uint2*>(activation.values + col);
-        *packed = {rms_quant_pack(first, reciprocal), rms_quant_pack(second, reciprocal)};
-        packed[half_group / sizeof(uint2)] =
-            {rms_quant_pack(third, reciprocal), rms_quant_pack(fourth, reciprocal)};
-    }
-}
-
 template <bool HasResidual, bool PackedGroups = false, bool LaunchDependents = false,
           bool AsyncStage = PackedGroups>
 __device__ __forceinline__ void rms_quantize(const __nv_bfloat16* branch, __nv_bfloat16* residual,
                                      const __nv_bfloat16* weight, __nv_bfloat16* normalized,
                                      TextFp8Activation activation) {
-    constexpr int values_per_thread = rms_hidden_width / block_threads;
-    constexpr int groups = rms_hidden_width / text_fp8_group_size;
-    constexpr int values_per_lane = text_fp8_group_size / warp_width;
     constexpr int vector_width = sizeof(uint4) / sizeof(__nv_bfloat16);
     __shared__ alignas(16) __nv_bfloat16 branch_values[rms_hidden_width];
     __shared__ alignas(16) __nv_bfloat16 residual_values[HasResidual ? rms_hidden_width : 1];
@@ -304,57 +215,8 @@ __device__ __forceinline__ void rms_quantize(const __nv_bfloat16* branch, __nv_b
     if constexpr (LaunchDependents) {
         asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
     }
-    float values[values_per_thread];
-    float squares = 0.0f;
-#pragma unroll
-    for (int index = 0; index < values_per_thread; ++index) {
-        const int col = threadIdx.x + index * block_threads;
-        const auto value = residual_sum(branch_values, HasResidual ? residual_values : nullptr,
-                                        col);
-        values[index] = value;
-        squares = fmaf(value, value, squares);
-    }
-    const float inverse_rms = rms_inverse(squares, rms_hidden_width);
-#pragma unroll
-    for (int index = 0; index < values_per_thread; ++index) {
-        const int col = threadIdx.x + index * block_threads;
-        const float value = values[index];
-        const float gain = 1.0f + __bfloat162float(gains[col]);
-        const auto element = __float2bfloat16_rn((value * inverse_rms) * gain);
-        normalized[col] = element;
-        branch_values[col] = element;
-        if constexpr (HasResidual) {
-            residual[col] = __float2bfloat16_rn(value);
-        }
-    }
-    __syncthreads();
-    if constexpr (PackedGroups) {
-        rms_quantize_subwarps(branch_values, activation);
-        return;
-    }
-    const int lane = threadIdx.x % warp_width;
-    const int warp = threadIdx.x / warp_width;
-    for (int group = warp; group < groups; group += block_warps) {
-        const int col = group * text_fp8_group_size + lane;
-        float maximum = quant_epsilon;
-        float elements[values_per_lane];
-#pragma unroll
-        for (int part = 0; part < values_per_lane; ++part) {
-            elements[part] = __bfloat162float(branch_values[col + part * warp_width]);
-            maximum = fmaxf(maximum, fabsf(elements[part]));
-        }
-        const float amax = __shfl_sync(warp_mask, warp_max(maximum), 0);
-        const float scale = __fdiv_rn(amax, fp8_max);
-        const float reciprocal = __fdiv_rn(1.0f, scale);
-        if (lane == 0) {
-            activation.scales[group] = scale;
-        }
-#pragma unroll
-        for (int part = 0; part < values_per_lane; ++part) {
-            activation.values[col + part * warp_width] =
-                __nv_cvt_float_to_fp8(elements[part] * reciprocal, __NV_SATFINITE, __NV_E4M3);
-        }
-    }
+    rms_quantize_staged<HasResidual, PackedGroups>(branch_values, residual_values, gains,
+                                                  residual, normalized, activation);
 }
 
 template <bool HasResidual, bool PackedGroups = false, bool LaunchDependents = false,
@@ -434,6 +296,14 @@ cudaError_t decoder::verify_quantize_fp8(VerifyQuantizeRows rows, int width, cud
     return launch_verify_quantize(rows, fused_verify_rows, width, stream);
 }
 
+cudaError_t decoder::verify_quantize_partial_fp8(VerifyQuantizeRows rows, int count, int width,
+                                                 cudaStream_t stream) {
+    if (count < 3 || count >= fused_verify_rows || width <= 0 || width % text_fp8_group_size) {
+        return cudaErrorInvalidValue;
+    }
+    return launch_verify_quantize(rows, count, width, stream);
+}
+
 cudaError_t decoder::verify_quantize_fp8_wide(WideVerifyQuantizeRows rows, int count, int width,
                                              cudaStream_t stream) {
     if (count <= fused_verify_rows || count > WideVerifyQuantizeRows::capacity ||
@@ -451,6 +321,15 @@ cudaError_t decoder::verify_rms_quantize(VerifyRmsQuantizeRows rows, const __nv_
     return cudaLaunchKernel(kernel, fused_verify_rows, block_threads, args, 0, stream);
 }
 
+cudaError_t decoder::verify_rms_quantize_partial(VerifyRmsQuantizeRows rows, int count,
+                                                 const __nv_bfloat16* weight, cudaStream_t stream) {
+    if (count < 3 || count >= fused_verify_rows) return cudaErrorInvalidValue;
+    void* args[] = {&rows, &weight};
+    const auto kernel = rows.entries[0].residual ? verify_rms_kernel<true, VerifyRmsQuantizeRows>
+                                                 : verify_rms_kernel<false, VerifyRmsQuantizeRows>;
+    return cudaLaunchKernel(kernel, count, block_threads, args, 0, stream);
+}
+
 cudaError_t decoder::verify_rms_quantize_wide(WideVerifyRmsQuantizeRows rows, int count,
                                              const __nv_bfloat16* weight, cudaStream_t stream) {
     if (count <= fused_verify_rows || count > WideVerifyRmsQuantizeRows::capacity) {
@@ -462,6 +341,59 @@ cudaError_t decoder::verify_rms_quantize_wide(WideVerifyRmsQuantizeRows rows, in
         : verify_rms_kernel<false, WideVerifyRmsQuantizeRows>;
     return wide_verify_launch_status(cudaLaunchKernel(kernel, count, block_threads, args, 0,
                                                        stream));
+}
+
+namespace {
+
+bool aligned_prefill_norm(const decoder::PrefillPeerNormRow& row) {
+    return row.branch && row.gain && row.activation.values && row.activation.scales &&
+        aligned(row.branch, alignof(uint4)) && aligned(row.residual, alignof(uint4)) &&
+        aligned(row.gain, alignof(uint4)) && aligned(row.normalized, alignof(uint4)) &&
+        aligned(row.activation.values, alignof(uint2)) &&
+        aligned(row.activation.scales, alignof(float));
+}
+
+template <bool Peer>
+cudaError_t launch_prefill_norm_vector(decoder::PrefillPeerNormRow row,
+                                       const __nv_bfloat16* remote, cudaStream_t stream) {
+    const auto pending = cudaGetLastError();
+    if (pending != cudaSuccess) return pending;
+    using decoder::prefill_rms_detail::vector_rms;
+    const auto kernel = (Peer || row.residual)
+        ? (row.normalized ? vector_rms<true, true, Peer> : vector_rms<true, false, Peer>)
+        : (row.normalized ? vector_rms<false, true, Peer> : vector_rms<false, false, Peer>);
+    void* args[] = {
+        &row.branch, &row.residual, &row.gain, &row.normalized, &row.activation, &remote};
+    const auto submitted = cudaLaunchKernel(kernel, grouped_prefill_max_rows,
+                                            block_threads, args, 0, stream);
+    const auto recorded = cudaGetLastError();
+    if (decoder::CudaError::terminal(recorded) && !decoder::CudaError::terminal(submitted)) {
+        return recorded;
+    }
+    return submitted == cudaSuccess ? recorded : submitted;
+}
+
+}
+
+bool decoder::aligned_prefill_peer_norm(const PrefillPeerNormRow& row) {
+    return row.residual && aligned_prefill_norm(row);
+}
+
+cudaError_t decoder::prefill_peer_rms_quantize(PrefillPeerNormRow row, const __nv_bfloat16* peer,
+                                              cudaStream_t stream) {
+    return launch_prefill_norm_vector<true>(row, peer, stream);
+}
+
+std::optional<cudaError_t> decoder::try_prefill_rms_quantize_vector(
+    const __nv_bfloat16* branch, __nv_bfloat16* residual, const __nv_bfloat16* weight,
+    __nv_bfloat16* normalized, TextFp8Activation activation, cudaStream_t stream) {
+    const PrefillPeerNormRow row{branch, residual, weight, normalized, activation};
+    if (!aligned_prefill_norm(row)) return std::nullopt;
+    cudaStreamCaptureStatus capture{};
+    const auto query = cudaStreamIsCapturing(stream, &capture);
+    if (query != cudaSuccess) return query;
+    if (capture != cudaStreamCaptureStatusNone) return std::nullopt;
+    return launch_prefill_norm_vector<false>(row, nullptr, stream);
 }
 
 cudaError_t decoder::tensor_core_prefill_rms_quantize(

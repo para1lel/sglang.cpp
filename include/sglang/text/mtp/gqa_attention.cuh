@@ -10,15 +10,65 @@ __global__ void recompute_replay_kernel(
     ordered_replay<true>(cache, pages, position, nullptr, queries, output);
 }
 
+using decoder::DraftAttentionRow;
+using decoder::PagedDecodeLane;
+
+bool valid_draft_attention(const DraftAttentionRow& row, std::int64_t visible) {
+    return row.queries && row.output && cache_covers(row.cache, row.pages, visible) &&
+           gqa_geometry_matches(gqa_full_geometry, row.cache);
+}
+
+bool draft_split_workspace(const DraftAttentionRow& row, std::int64_t visible) {
+    static_assert(sizeof(float) * mxfp8_query_heads * (draft_score_chunk + draft_carry_per_head)
+                  >= sizeof(gqa_decode::Partial) * gqa_decode::max_splits * mxfp8_query_heads);
+    return row.workspace.scores && visible > decoder::target_split_first_position &&
+           visible <= text_attention_max_tokens &&
+           row.workspace.capacity >= draft_score_chunk + draft_carry_per_head;
+}
+
+std::optional<PagedDecodeLane> bind_online_draft(const DraftAttentionRow& row) {
+    const PagedDecodeLane lane{row.cache, row.pages, row.position,
+                              {row.queries, row.output, row.workspace.scores}};
+    if (!gqa_decode::valid_buffers(lane.buffers) || !gqa_decode::tensor_aligned(lane)) {
+        return std::nullopt;
+    }
+    return lane;
+}
+
+std::optional<cudaError_t> try_grouped_draft_attention(const DraftAttentionRow* rows,
+                                                       cudaStream_t stream) {
+    constexpr int count = decoder::draft_attention_batch_rows;
+    static_assert(count <= decoder::target_split_eager_max_rows);
+    static_assert(count % decoder::draft_wave_rows == 0);
+    gqa_decode::EagerTargetBatch batch{{}, text_attention_max_tokens};
+    for (int index = 0; index < count; ++index) {
+        const auto& row = rows[index];
+        const auto visible = static_cast<std::int64_t>(row.position) + 1;
+        if (row.position < gqa_decode::long_min_position || !valid_draft_attention(row, visible) ||
+            !draft_split_workspace(row, visible)) return std::nullopt;
+        const auto lane = bind_online_draft(row);
+        if (!lane) return std::nullopt;
+        batch.lanes[index] = *lane;
+    }
+    cudaStreamCaptureStatus capture;
+    const auto status = cudaStreamIsCapturing(stream, &capture);
+    if (status != cudaSuccess) return status;
+    if (capture != cudaStreamCaptureStatusNone) return std::nullopt;
+    const auto split = gqa_decode::launch_multistage(batch, count, stream);
+    return split == cudaSuccess ? launch_target_batch_combine(batch, count, stream) : split;
+}
+
 }
 
 cudaError_t decoder::mtp_gqa_attention(Mxfp8KvCache cache, Mxfp8PageTable pages, int position,
                                       const __nv_bfloat16* queries, __nv_bfloat16* output,
-                                      ExactGqaWorkspace workspace, cudaStream_t stream) {
+                                      ExactGqaWorkspace workspace, cudaStream_t stream,
+                                      GqaGeometry geometry) {
     constexpr int min_tiled_tokens = 8;
     constexpr int max_tiled_tokens = 2 * mxfp8_page_size;
     const auto visible = static_cast<std::int64_t>(position) + 1;
-    if (!queries || !output || !cache_covers(cache, pages, visible)) {
+    if (!queries || !output || !cache_covers(cache, pages, visible)
+        || !gqa_geometry_matches(geometry, cache)) {
         return cudaErrorInvalidValue;
     }
     if (visible > max_tiled_tokens && workspace.scores && visible <= workspace.capacity) {
@@ -34,15 +84,26 @@ cudaError_t decoder::mtp_gqa_attention(Mxfp8KvCache cache, Mxfp8PageTable pages,
     }
     if (visible < min_tiled_tokens || visible > max_tiled_tokens) {
         return mxfp8_gqa_attention(cache, pages, static_cast<int>(visible), position, 1,
-                                  queries, output, stream);
+                                  queries, output, stream, geometry);
     }
     return launch_gqa_kernel(recompute_replay_kernel,
-        dim3(mxfp8_query_heads, mxfp8_head_dim / replay_channels),
+        dim3(gqa_query_heads(cache.kv_heads), mxfp8_head_dim / replay_channels),
         replay_threads, stream, cache, pages.device_pages, position, queries, output);
 }
 
 cudaError_t decoder::mtp_gqa_attention_batch(const DraftAttentionRow* rows, int count, bool b200,
                                              cudaStream_t stream) {
+    if (rows && count == draft_attention_batch_rows) {
+        if (b200) {
+            if (const auto status = try_grouped_draft_attention(rows, stream)) return *status;
+        }
+        for (int first = 0; first < count; first += draft_wave_rows) {
+            const auto status = mtp_gqa_attention_batch(rows + first, draft_wave_rows, b200,
+                                                        stream);
+            if (status != cudaSuccess) return status;
+        }
+        return cudaSuccess;
+    }
     if (!rows || count <= 0 || count > draft_wave_rows) {
         return cudaErrorInvalidValue;
     }
@@ -54,30 +115,27 @@ cudaError_t decoder::mtp_gqa_attention_batch(const DraftAttentionRow* rows, int 
     for (int index = 0; index < count; ++index) {
         const auto& row = rows[index];
         const auto visible = static_cast<std::int64_t>(row.position) + 1;
-        if (!row.queries || !row.output || !cache_covers(row.cache, row.pages, visible)) {
+        if (!valid_draft_attention(row, visible)) {
             return cudaErrorInvalidValue;
         }
-        if (row.workspace.scores && visible > row.workspace.capacity &&
-            visible <= text_attention_max_tokens &&
-            row.workspace.capacity >= draft_score_chunk + draft_carry_per_head && count > 1) {
-            static_assert(sizeof(float) * mxfp8_query_heads *
-                          (draft_score_chunk + draft_carry_per_head) >=
-                          sizeof(gqa_decode::Partial) * gqa_decode::max_splits * mxfp8_query_heads);
-            const PagedDecodeLane lane{row.cache, row.pages, row.position,
-                {row.queries, row.output, row.workspace.scores}};
-            if (b200 && gqa_decode::valid_buffers(lane.buffers) &&
-                gqa_decode::tensor_aligned(lane)) {
-                online_lanes[online_count++] = lane;
+        const bool long_row = visible > row.workspace.capacity;
+        if (draft_split_workspace(row, visible)) {
+            if (b200) {
+                if (const auto lane = bind_online_draft(row)) {
+                    online_lanes[online_count++] = *lane;
+                    continue;
+                }
+            }
+            if (long_row) {
+                long_rows.rows[long_count++] = row;
+                longest = std::max(longest, static_cast<int>(visible));
                 continue;
             }
-            long_rows.rows[long_count++] = row;
-            longest = std::max(longest, static_cast<int>(visible));
-        } else {
-            const auto status = mtp_gqa_attention(row.cache, row.pages, row.position, row.queries,
-                                                  row.output, row.workspace, stream);
-            if (status != cudaSuccess) {
-                return status;
-            }
+        }
+        const auto status = mtp_gqa_attention(row.cache, row.pages, row.position, row.queries,
+                                              row.output, row.workspace, stream);
+        if (status != cudaSuccess) {
+            return status;
         }
     }
     if (online_count > 0) {

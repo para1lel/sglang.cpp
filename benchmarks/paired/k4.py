@@ -15,6 +15,7 @@ from benchmarks.concurrent import client as concurrent
 from benchmarks.streaming import check_vllm, client as streaming
 import cold_cache
 import default_evidence as defaults
+from driver_health import require_healthy_driver_log
 import workload_suite
 from identity import verify_stream_end
 from makespan import cohort_makespan_ns, compare, makespan_criterion, validate_cohort
@@ -489,6 +490,9 @@ def assess(row, fixtures, directory):
             verify_arm_receipts(measurement.parent, identity, opt_in=selected is not None,
                                 version=version)
         binding = arm_binding(measurement, arm, selected, version)
+        server_log = measurement.parent / "server.log"
+        require(server_log.is_file(), f"{arm}: missing server log")
+        require_healthy_driver_log(server_log.read_text(), arm)
         verify_request_files(measurement, lanes)
         tags = schedule(row, arm, identity)
         require({path.name for path in measurement.glob("*.json.gz")}
@@ -560,24 +564,36 @@ def vllm_worker_evidence(row, run, reservation, checkpoint, *, before_measuremen
                             before_measurement=before_measurement, prefix_cache=prefix_cache,
                             max_seqs=max_seqs, paired_budget=token_budget)
     worker = evidence["effective"]
+    config = load(run / "server-info.json")["vllm_config"]
+    if lmcache:
+        defaults.require_vllm_local_apc(config, command(run, "server", cpus))
+    verify_vllm_model(worker, config, checkpoint, token_budget, prefix_cache)
+    return evidence, attention_kernels(run)
+
+
+def verify_vllm_model(worker, config, checkpoint, token_budget, prefix_cache, *, tp=1):
     reference = concurrent.reference()["observed_vllm_settings"]
     require(all(worker[key] == reference[key] for key in ("vllm", "torch", "torch_cuda"))
             and worker["scheduler"]["max_num_scheduled_tokens_effective"] == token_budget,
             "Unexpected vLLM runtime or target row cap")
-    check_vllm.audit(load(run / "effective-worker.json"), speculative=True,
-                     prefix_cache=prefix_cache)
-    config = load(run / "server-info.json")["vllm_config"]
+    check_vllm.audit({"results": [worker]}, speculative=True, prefix_cache=prefix_cache)
     if token_budget == workload_suite.V4_TOKEN_BUDGET:
         defaults.vllm_budget(config, worker, token_budget)
-    if lmcache:
-        defaults.require_vllm_local_apc(config, command(run, "server", cpus))
     spec = config["speculative_config"]
     attention = config["attention_config"]
     if prefix_cache:
         cache = config["cache_config"]
-        require(all(cache[key] == worker["cache"][key] for key in (
-            "enable_prefix_caching", "mamba_cache_mode", "block_size", "mamba_block_size")),
-            "vLLM API and worker disagree about resolved hybrid prefix caching")
+        keys = ("enable_prefix_caching", "mamba_cache_mode", "block_size")
+        require(all(cache[key] == worker["cache"][key] for key in keys),
+                "vLLM API and worker disagree about resolved hybrid prefix caching")
+        if tp == 2:
+            require(cache["mamba_cache_mode"] == "align" and not cache["user_specified_block_size"]
+                    and worker["cache"]["mamba_block_size"] == cache["block_size"]
+                    and cache["mamba_block_size"] in (64, cache["block_size"]),
+                    "Incorrect TP2 worker-local aligned Mamba pages")
+        else:
+            require(cache["mamba_block_size"] == worker["cache"]["mamba_block_size"],
+                    "vLLM API and worker disagree about resolved hybrid prefix caching")
     require(spec["method"] == "mtp" and type(spec["num_speculative_tokens"]) is int
             and spec["num_speculative_tokens"] == 4
             and Path(spec["model"]).resolve() == checkpoint
@@ -585,13 +601,16 @@ def vllm_worker_evidence(row, run, reservation, checkpoint, *, before_measuremen
             and attention["use_trtllm_attention"] is True
             and attention["disable_flashinfer_q_quantization"] is True,
             "Unexpected resolved vLLM model, MTP, or attention configuration")
+
+
+def attention_kernels(run):
     kernels = re.findall(r"FlashInfer resolved query dtypes: ([^\n]+)",
                          (run / "server.log").read_text())
     require(kernels and all(line.startswith(
         "prefill=torch.bfloat16, decode=torch.bfloat16, decode_backend=trtllm-gen")
         and "torch.float8_e4m3fn" in line for line in kernels),
         "Unexpected FlashInfer attention kernel")
-    return evidence, kernels
+    return kernels
 
 
 def check_vllm_worker(row, run, reservation, checkpoint, *, before_measurement=False):

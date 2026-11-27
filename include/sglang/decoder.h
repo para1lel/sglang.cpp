@@ -23,6 +23,24 @@ namespace decoder {
 struct CudaBackendPolicy;
 struct PrefixCacheRead;
 struct PrefixDeviceTransfer;
+struct TpRuntimeInfo;
+struct TpArCounters;
+
+struct TpRuntimeInfo {
+    struct Rank {
+        int local_rank = -1;
+        int cuda_device = -1;
+        char uuid[16] = {};
+        long pid = 0;
+        bool nccl_established = false;
+        std::size_t weight_bytes = 0;
+        bool lm_head = false;
+        bool mtp = false;
+    };
+    int world_size = 0;
+    Rank ranks[2]{};
+};
+
 }
 
 inline constexpr int decoder_max_mtp_steps = 4;
@@ -66,13 +84,8 @@ struct DecoderOptions {
     std::function<int(const int*, int, bool)> text_stop = {};
     std::function<bool()> claim_completion = {};
     std::shared_ptr<const decoder::PrefixCacheRead> prefix_cache_read = nullptr;
-    // Return a valid, independently completing future. Completion ends all access to the
-    // transfer. False or a non-CUDA exception triggers cold prefill. CUDA errors propagate.
     std::function<std::shared_future<bool>(const decoder::PrefixDeviceTransfer&)> restore_prefix;
-    // False means retry when capacity becomes available. A synchronous caller must arrange
-    // independent progress, including after claim_completion accepts the terminal result.
     std::function<bool(std::shared_ptr<void>&)> reserve_prefix_store;
-    // Increment the shared counter once per acknowledged STORE, even after lane retirement.
     std::function<void(decoder::PrefixDeviceTransfer&&, const int*, int,
                        std::shared_ptr<void>, std::shared_ptr<std::atomic_uint64_t>)> store_prefix;
     bool publish_prefix_checkpoints = true;
@@ -173,6 +186,8 @@ class Decoder {
 public:
     explicit Decoder(const std::filesystem::path& checkpoint, int cuda_device = 0);
     Decoder(const std::filesystem::path& checkpoint, int cuda_device, bool enable_mtp);
+    Decoder(const std::filesystem::path& checkpoint, int cuda_device, bool enable_mtp,
+            int tensor_parallel);
     ~Decoder();
 
     Decoder(const Decoder&) = delete;
@@ -181,7 +196,6 @@ public:
     DecoderResult generate(const std::vector<int>& prompt_token_ids,
                            const DecoderOptions& options = DecoderOptions{},
                            const DecoderCallbacks& callbacks = DecoderCallbacks{}) const;
-    /// Supply feature views in the same order as wrapped media pads in the prompt.
     DecoderResult generate_multimodal(const std::vector<int>& template_token_ids,
                                       const std::vector<DecoderMedia>& media,
                                       const DecoderOptions& options = DecoderOptions{},
@@ -193,6 +207,8 @@ public:
     bool has_int8_draft_head() const;
     bool has_certified_vocab() const;
     int paired_prefill_threshold() const;
+    const decoder::TpRuntimeInfo* tensor_parallel_info() const;
+    decoder::TpArCounters tp_ar_counters() const;
 
 private:
     friend class DecoderBatch;
@@ -204,7 +220,10 @@ private:
                                            const DecoderCallbacks& callbacks,
                                            const std::vector<int>* teacher) const;
     struct Model;
+    struct TpRuntime;
     std::unique_ptr<Model> model_;
+    std::unique_ptr<TpRuntime> tp_;
+    decoder::TpRuntimeInfo tp_info_{};
 };
 
 namespace decoder {

@@ -22,6 +22,12 @@ inline constexpr int weight_bytes = tile_rows * 128;
 template <int Columns>
 inline constexpr int stage_bytes = weight_bytes + Columns * 128;
 
+inline constexpr int bf16_chunk_elements = 64;
+
+constexpr int bf16_columns(int rows) {
+    return rows <= 16 ? 16 : (rows <= 32 ? 32 : tile_cols);
+}
+
 template <int Slots>
 struct DecodePipeline {
     unsigned long long copy_ready[Slots];
@@ -237,6 +243,56 @@ __device__ void multiply(DecodePipeline<Slots>& pipe, unsigned shared, int count
             commit_mma(&pipe.accum_ready[slot]);
         }
     }
+}
+
+template <int Columns>
+__device__ void collect_bf16(Pipeline& pipe, int active, float (&result)[Columns]) {
+    const int warp = threadIdx.x / warp_size;
+    const unsigned lane_base = pipe.tmem + (static_cast<unsigned>(warp * warp_size) << 16);
+    wait_barrier(&pipe.accum_ready[0], 0);
+    fence_after_sync();
+    if (active == 1) {
+        result[0] = load_tmem1(lane_base);
+        fence_before_sync();
+        return;
+    }
+    #pragma unroll
+    for (int block = 0; block < Columns; block += 16) {
+        if (block < active) {
+            unsigned partial[16];
+            load_tmem16(lane_base + block, partial);
+            #pragma unroll
+            for (int col = 0; col < 16; ++col) {
+                result[block + col] = __uint_as_float(partial[col]);
+            }
+        }
+    }
+    fence_before_sync();
+}
+
+template <int Columns>
+__device__ __forceinline__ void bf16_tile(Pipeline& pipe, unsigned char* tiles,
+                                        const CUtensorMap* weight, const CUtensorMap* input,
+                                        int token, int row, int first, int count, int active,
+                                        float (&result)[Columns]) {
+    constexpr unsigned instruction = ((tile_rows / 16) << 24) | ((Columns / 8) << 17) |
+                                     (1u << 10) | (1u << 7) | (1u << 4);
+    const int warp = threadIdx.x / warp_size;
+    if (threadIdx.x == 0) init_pipeline(pipe);
+    if (warp == mma_warp) allocate_tmem<Columns>(pipe);
+    __syncthreads();
+    const unsigned shared = shared_address(tiles);
+    if (warp < consumer_warps) {
+        collect_bf16(pipe, active, result);
+    } else if (warp == mma_warp && threadIdx.x % warp_size == 0) {
+        multiply<instruction, false, Columns>(pipe, shared, count);
+    } else if (warp == copy_warp && threadIdx.x % warp_size == 0) {
+        produce<bf16_chunk_elements, Columns>(pipe, shared, weight, input, token, row,
+                                              first, count);
+    }
+    wait_dependencies();
+    __syncthreads();
+    if (warp == mma_warp) free_tmem<Columns>(pipe);
 }
 
 __device__ __forceinline__ void cluster_sync() {

@@ -1,6 +1,6 @@
 # Matched B200 benchmark agreement
 
-Use the same B200 devices and immutable checkpoint. Freeze workloads, controls, and arm order. [Paired driver](../benchmarks/paired/README.md#matched-k4-timing-protocol)
+Use the same B200 devices and immutable checkpoint. Freeze workloads, controls, and arm order. The [TP2 target](serving/tp2.md) covers two-GPU acceptance: all five rows miss at `168fdb1a`. [Paired driver](../benchmarks/paired/README.md#matched-k4-timing-protocol)
 
 ## Implementations and controls
 
@@ -19,9 +19,9 @@ Match checkpoint, tokenizer, template, processor, weight precision, sampling, ca
 Use MTP4, 32,768 tokens per step, eight slots per GPU, and cold prefixes.
 
 - **Pinned vLLM.** Set `--max-num-batched-tokens 32768 --max-num-scheduled-tokens 32768` and enable `--async-scheduling`. Match `--max-num-seqs` to the active capacity. Verify MTP4 and the effective aligned GDN cache settings at the API and worker.
-- **Native.** Use the default direct GPU LMCache path. The paired driver starts a private LMCache 0.5.8 daemon with 64 GiB CPU L1 on the same physical GPU. [Daemon launcher](../benchmarks/paired/lmcache_arm.sh#L35)<!-- prefix: "start_lmcach" -->
+- **Native.** Use the default direct GPU LMCache path. The paired driver starts a private LMCache 0.5.8 daemon with 64 GiB CPU L1 on the same physical GPU. [Daemon launcher](../benchmarks/paired/lmcache_arm.sh#L36)<!-- prefix: "start_lmcach" -->
 
-The pinned vLLM arm uses its local prefix cache. Verify `kv_transfer=false` and `kv_offloading_size=null` in the worker receipt. The same check requires zero CPU weight offload. [Worker receipt check](../benchmarks/paired/saved_evidence.py#L223)<!-- prefix: "and worker[\"" -->
+The pinned vLLM arm uses its local prefix cache. Verify `kv_transfer=false` and `kv_offloading_size=null` in the worker receipt. The same check requires zero CPU weight offload. [Worker receipt check](https://github.com/para1lel/sglang.cpp/blob/03ee22d849e6ef7bca723595a7c8e63c47187749/benchmarks/paired/saved_evidence.py#L223)<!-- prefix: "and worker[\"" -->
 
 The pinned vLLM scheduler scans its running list before its FCFS waiting queue. That list can include an unfinished prompt. Native [reserves ready decode rows before FCFS prefill](batch-graphs.md#runtime-path). Match workload and capacity settings across the engines. [Pinned vLLM running scan](https://github.com/vllm-project/vllm/blob/81a8cb063e6247fe254d7caf7e98a6691d71022a/vllm/v1/core/sched/scheduler.py#L767) · [Waiting scan](https://github.com/vllm-project/vllm/blob/81a8cb063e6247fe254d7caf7e98a6691d71022a/vllm/v1/core/sched/scheduler.py#L1029)
 
@@ -57,7 +57,7 @@ Use the [matched K4 protocol](../benchmarks/paired/README.md#matched-k4-timing-p
 
 Require native makespan ≤1.10× pinned vLLM on each W1–W5 row. Stop tuning when all pass. Freeze scheduling and workloads. Tune kernels, programmatic dependent launch (PDL), streams, and CUDA Graph replay.
 
-Run one warmup and one measured cohort per item and engine. Use the measured verdict and retain the first miss. Profile long rows separately. W4 can open a campaign. W5 requires a W4 pass in that campaign. Run W1–W3 in order, advancing on each pass. Validate device, launch settings, and each stream’s request, counts, finish, usage, and drain. Measured IDs must match the engine’s warmup. [Matched K4 timing protocol](../benchmarks/paired/README.md#matched-k4-timing-protocol)
+Run one warmup and one measured cohort per item and engine. Use the measured verdict and retain the first miss. Profile long rows separately. W4 can open a campaign. W5 requires a W4 pass in that campaign. Run W1–W3 in order, advancing on each pass. Validate device, launch settings, and each stream’s request, counts, finish, usage, and drain. Under TP1, measured IDs must match the engine’s warmup; [TP2](serving/tp2.md) content is reference only. [Matched K4 timing protocol](../benchmarks/paired/README.md#matched-k4-timing-protocol)
 
 Use one streaming client and monotonic clock from earliest submission to last valid `[DONE]`. Preconnect lanes, release one barrier, and send all bodies within 50 ms and before any completion. Retain submit times, headers, token events, completion times, counts, and failures. Exclude [SSE keepalives](http-server.md#completion-streams) and empty events from token counts.
 
@@ -71,25 +71,25 @@ Report output tokens/s, TTFT, TPOT, end-to-end latency, and whether every lane s
 | End-to-end latency (ms) | Time from request submission to its terminal response. Record stream chunking when multiple tokens arrive together. |
 | Requests/s and aggregate tokens/s | Completed requests per cohort second, and total input plus output tokens per cohort second, respectively. |
 
-Exclude startup, model load, JIT, and graph capture. Drain both engines and require acknowledged resets before each cohort, zero cached tokens per request, and unchanged hit counters. Direct GPU replay checks periodic and terminal store counts, written positions, transfer counters, zero GQA/GDN/draft reuse, and no new declines or I/O errors. Report makespan and throughput as point estimates. Give the latency sample count and percentile method. [Cold reset](../benchmarks/paired/cold_cache.py#L108)<!-- prefix: "def before_c" --> · [Post-stream drain](../benchmarks/paired/cold_cache.py#L123)<!-- prefix: "def after_co" --> · [Drain verification](../benchmarks/paired/cold_cache.py#L130)<!-- prefix: "def verify_l" -->
+Exclude startup, model load, JIT, and graph capture. Drain both engines and require acknowledged resets before each cohort, zero cached tokens per request, and unchanged hit counters. Direct GPU replay checks periodic and terminal store counts, written positions, transfer counters, zero GQA/GDN/draft reuse, and no new declines or I/O errors. Report makespan and throughput as point estimates. Give the latency sample count and percentile method. [Cold reset](../benchmarks/paired/cold_cache.py#L112)<!-- prefix: "def before_c" --> · [Post-stream drain](../benchmarks/paired/cold_cache.py#L127)<!-- prefix: "def after_co" --> · [Drain verification](../benchmarks/paired/cold_cache.py#L134)<!-- prefix: "def verify_l" -->
 
 After stream capture, the client records `settled_ns` when running requests, waiting requests, and `lmcache_pending_stores` reach zero. Polling contributes to this interval. Use settled counters for cache accounting and stream timestamps for the timing ratio.
 
 Report absolute metrics and successful/attempted request counts per engine, workload, and mode. Diagnose with paired throughput ratios and latency differences. Archived receipts retain their original checks.
 
-For new offline timing, use `--warmup 1 --repeats 1` and omit `--top-logits`. `load_ms` covers model initialization. `request_ms` includes request allocation and graph capture. Allocation metrics include resident storage on the serial graph path. Keep JSON, invocation, binary hash, and device UUID. [Generator measurement](../apps/sglang-generate.cpp#L216)<!-- prefix: "Measurements" -->
+For new offline timing, use `--warmup 1 --repeats 1` and omit `--top-logits`. `load_ms` covers model initialization. `request_ms` includes request allocation and graph capture. Allocation metrics include resident storage on the serial graph path. Keep JSON, invocation, binary hash, and device UUID. [Generator measurement](../apps/sglang-generate.cpp#L247)<!-- prefix: "Measurements" -->
 
 ### Operator qualification
 
-Operators may reorder arithmetic within their numerical contract. Compare outputs and state with an independent mathematical reference under the operation's established error criteria. Check causality where the operation uses token history. Check model quality on frozen inputs and shared token histories. Record free-running divergence separately. Require bitwise equality for copied bytes, exact replay, and comparisons that preserve arithmetic.
+Operators may reorder arithmetic within their numerical contract. Compare outputs and state with an independent mathematical reference under the operation's established error criteria. Check causality where the operation uses token history, and model quality on frozen inputs and shared token histories. Record free-running divergence separately. Require bitwise equality for copied bytes, exact replay, and comparisons that preserve arithmetic.
 
-Use repeated matched measurements to choose the fastest validated implementation for each supported case. Keep one production implementation per case. Use validated fallbacks where shape, device, or available resources prevent the primary route. Keep frozen fixtures and timing gates unchanged.
+Use repeated matched measurements to choose the fastest validated implementation per supported case. Keep one production implementation per case. Use validated fallbacks where shape, device, or resources prevent the primary route. Keep frozen fixtures and timing gates unchanged.
 
 ### Native text completions
 
 Reuse the current workload `benchmark` requests, token-ID SSE clients, and timing definitions under the [scheduler policy](#scheduler-and-reporting-policy). Compare cross-engine output IDs for diagnosis. Run [text verification](text-serving.md#verification) separately.
 
-For raw text, freeze UTF-8 requests, checkpoint and tokenizer hashes, serving flags, output budget, and stop IDs. Match prompt IDs across engines. Time cold tokenizer load separately from steady tokenization. Record streaming, usage, and diagnostic ID settings. Text can lag IDs. A text event can span several IDs, and an ID can produce no text. Count tokens from usage or diagnostic IDs. Calculate TTFT and TPOT from ID timestamps when available. Otherwise, mark them unavailable. Report time to first visible text separately. Give raw text its own result rows.
+For raw text, freeze UTF-8 requests, checkpoint and tokenizer hashes, serving flags, output budget, and stop IDs. Match prompt IDs across engines. Time cold tokenizer load separately from steady tokenization. Record streaming, usage, and diagnostic ID settings. A text event can span several IDs, and an ID can produce no text. Count tokens from usage or diagnostic IDs. Calculate TTFT and TPOT from ID timestamps when available. Otherwise, mark them unavailable. Report time to first visible text separately. Give raw text its own result rows.
 
 ### Serial W1 and W2 comparisons
 
@@ -123,8 +123,6 @@ Record pool used and reserved bytes after synchronization. Require zero live scr
 
 Use a fresh process for cold allocator timing. Warm pools with a multirow request. Record tiles, lanes, and order. Report model load, tokenizer warmup, graph state, and prefix state separately.
 
-Qualify each production configuration under its applicable protocol.
-
 ### FP8 tensor-core prefill
 
 For the native control, use `--mtp-steps 0`. Record commands, binary and source
@@ -154,17 +152,17 @@ To isolate layer-major verification, compare with row-wise MTP at the same depth
 
 Alternate paired arms on one reserved B200. Match warmups and repeats. Report samples, medians, ranges, and paired ratios. The W3-MTP variant uses four 8,192-token prompts with 1,024 outputs each. Its K1 start exceeds the verification graph's visible limit. [W3-MTP fixture](../benchmarks/variants/README.md) · [Graph limit](mtp.md#target-verification-graph)
 
-Positive depth adds counters for the first measured request. `mtp_drafted_tokens` counts proposals read back. `mtp_accepted_tokens` counts matching proposals appended to the output. `mtp_rounds` counts rounds that produced at least one proposal. Count committed `output_token_ids` including first, correction, and bonus tokens. Report accepted/drafted and accepted/rounds for positive denominators. [JSON fields](../apps/sglang-generate.cpp#L242)<!-- prefix: "void write_r" --> · [Proposal loop](../src/decoder_verify.cpp#L190)<!-- prefix: "bool MtpRoun" --> · [Generator counters](../src/decoder_batch.cpp#L949)<!-- prefix: "result.mtp_r" -->
+Positive depth adds counters for the first measured request. `mtp_drafted_tokens` counts proposals read back. `mtp_accepted_tokens` counts matching proposals appended to the output. `mtp_rounds` counts rounds that produced at least one proposal. Count committed `output_token_ids` including first, correction, and bonus tokens. Report accepted/drafted and accepted/rounds for positive denominators. [JSON fields](../apps/sglang-generate.cpp#L273)<!-- prefix: "void write_r" --> · [Proposal loop](../src/decoder_verify.cpp#L157)<!-- prefix: "bool MtpRoun" --> · [Generator counters](../src/decoder_batch.cpp#L846)<!-- prefix: "result.mtp_r" -->
 
-Use `--trace-batches` at any capacity in a separate run. Check `accepted ≤ compared ≤ drafted` and `drafted ≤ rounds × K`. Count the first mismatch as compared. Computed rows can exceed consumed rows after mismatch or stop. In normal completion, consumed decode rows equal committed outputs minus the initial token. Zero or one output requires zero drafts. [Consumption](../src/decoder_verify.cpp#L312)<!-- prefix: "bool MtpRoun" -->
+Use `--trace-batches` at any capacity in a separate run. Check `accepted ≤ compared ≤ drafted` and `drafted ≤ rounds × K`. Count the first mismatch as compared. Computed rows can exceed consumed rows after mismatch or stop. In normal completion, consumed decode rows equal committed outputs minus the initial token. Zero or one output requires zero drafts. [Consumption](../src/decoder_verify.cpp#L279)<!-- prefix: "bool MtpRoun" -->
 
 Batch traces sum verifier lanes and computed rows across all groups in the step. Per slot, `drafted` counts proposals read back and `accepted` counts matching outputs committed before publication. `verified` counts computed target rows. `replayed` counts rows replayed on partial consumption. A one-output eager `boundary` records zero speculative counts. Client-visible output can be shorter after cancellation. [Batch trace](../include/sglang/server/batch_trace.h#L14)<!-- prefix: "inline void " -->
 
-See the [verifier storage bound](mtp.md#constraints-and-failure-behavior). The generator adds peak request, prefill, and selection bytes to model bytes. Batch `peak_request_bytes` includes prefill scratch or live request storage before retirement. Record peak HBM separately. [Generator accounting](../src/decoder_batch.cpp#L946)<!-- prefix: "result.peak_" --> · [Batch accounting](../src/decoder_batch.cpp#L847)<!-- prefix: "if (stats) c" -->
+See the [verifier storage bound](mtp.md#constraints-and-failure-behavior). The generator adds peak request, prefill, and selection bytes to model bytes. Batch `peak_request_bytes` includes prefill scratch or live request storage before retirement. Record peak HBM separately. [Generator accounting](../src/decoder_batch.cpp#L843)<!-- prefix: "result.peak_" --> · [Batch accounting](../src/decoder_batch.cpp#L742)<!-- prefix: "if (stats) c" -->
 
 ## Correctness, memory, and diagnosis
 
-Performance acceptance requires [native implementation correctness](development.md#verification), repeatability, and comparable memory and feature settings. Run correctness checks separately when instrumentation changes timing. Apply the remaining proposed checks at their applicable milestones.
+Performance acceptance requires [native implementation correctness](development.md#verification), repeatability, and comparable memory and feature settings. Run correctness checks separately when instrumentation changes timing. Apply remaining proposed checks at their applicable milestones.
 
 - **Memory.** Record HBM after load and peak HBM during prefill and decode. Budget weights and scales, GQA KV pages, GDN live state and checkpoints, activations, workspaces, graph pools, vision weights and buffers, and runtime allocations. State the measurement method, capacity, and headroom for each input length and concurrency.
 - **Cache.** Record reusable prefix tokens divided by eligible prompt tokens, the initial cache state, page occupancy, evictions, and recurrent checkpoint restores and replay lengths. Compare cold and primed continuations with fresh execution. Check reclamation after cancellation and memory pressure.

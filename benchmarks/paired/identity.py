@@ -16,6 +16,7 @@ from saved_evidence import (
     arg, artifact_hashes, command, device, digest, fields, load, observed_device, require,
     saved_worker,
 )
+from driver_health import require_healthy_driver_log
 
 
 COLLECTOR = "measure_concurrent.py"
@@ -201,6 +202,9 @@ def replay_streams(run, report, protocol, freeze_baseline):
 
 def replay_arm(run, group, cpus, counts, report, protocol, lanes, hashes, freeze_baseline):
     client_args = command(run, "client", cpus)
+    server_log = run / "server.log"
+    require(server_log.is_file(), f"{run.name}: missing server log")
+    require_healthy_driver_log(server_log.read_text(), run.name)
     if group == "W1-W2":
         require(("--freeze-baseline" in client_args) == freeze_baseline and any(
             item.endswith("/benchmarks/streaming/client.py") for item in client_args),

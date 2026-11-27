@@ -2,7 +2,9 @@
 
 #include "sglang/decoder_media.h"
 #include "sglang/runtime/cache/lmcache_client.h"
+#include "sglang/runtime/cache/mxfp8_cache_geometry.h"
 #include "sglang/tokenizer/digest.h"
+
 
 #include <array>
 #include <cstddef>
@@ -14,6 +16,7 @@
 
 namespace sglang::decoder {
 
+struct PrefixCacheLayout;
 inline constexpr int prefix_gqa_chunk_tokens = 256;
 enum class PrefixPayloadKind { gqa, gdn, draft };
 
@@ -35,6 +38,7 @@ struct PrefixDeviceMxfp8 {
     int end = 0;
     int layers = 0;
     int page_count = 0;
+    int kv_heads = mxfp8_kv_heads;
     std::array<PrefixDeviceAddress, 4> planes{};
 };
 
@@ -54,7 +58,6 @@ struct PrefixDeviceLayout {
     PrefixDeviceGdn gdn;
 };
 
-// A STORE owns its native blocks. The caller keeps a borrowed GET destination alive.
 struct PrefixDeviceTransfer {
     LmCacheGpuTransfer transfer;
     PrefixDeviceLayout layout;
@@ -63,11 +66,14 @@ struct PrefixDeviceTransfer {
 };
 
 std::size_t prefix_payload_bytes(PrefixPayloadKind kind, int begin, int end);
+std::size_t prefix_payload_bytes(PrefixPayloadKind kind, int begin, int end,
+                                 const PrefixCacheLayout& layout);
 
 class PrefixCacheKeys {
 public:
     PrefixCacheKeys(const std::vector<int>& prompt, std::string_view salt,
-                    const std::vector<DecoderMedia>* media = nullptr);
+                    const std::vector<DecoderMedia>* media = nullptr,
+                    const PrefixCacheLayout* layout = nullptr);
 
     int tokens() const { return tokens_; }
     int cacheable_tokens() const { return static_cast<int>(keys_.size()) - 1; }

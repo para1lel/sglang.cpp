@@ -453,7 +453,6 @@ extern "C" cudaError_t __wrap_cudaStreamSynchronize(cudaStream_t stream) {
     if (status == cudaSuccess && worker_release.memory && stream == worker_release.stream) {
         ++worker_release.completed;
         if (inject_sync_error) {
-            // Complete the actual release before creating a recoverable error on this worker.
             worker_release.sync_error = __real_cudaEventRecord(nullptr, stream);
             return worker_release.sync_error;
         }
@@ -651,7 +650,7 @@ void check_detached_accounting() {
             free_gate.store(nullptr);
             watched_free.store(nullptr);
         }
-    } gate;  // Outlive the reclaimer, including a late entry into cudaFreeAsync.
+    } gate;
     RequestBlockCache retired(0, true);
     Allocations original(0, &retired);
     auto* memory = original.allocate<std::byte>(bytes);
@@ -803,9 +802,10 @@ void check_checkpoint_faults(const Lane& lane, const LmCacheClient& cache,
 void check_worker_release(const Lane& lane, const LmCacheClient& cache,
                           const PrefixCacheKeys& keys, cudaStream_t stream) {
     server::BatchCache worker(std::make_unique<LmCacheClient>(cache), "", 1);
+    auto pairing = std::make_shared<server::BatchStorePairing>();
+    const std::vector rank_keys{std::make_shared<PrefixCacheKeys>(keys)};
     for (const bool fail_sync : {false, true}) {
         last_allocation = nullptr;
-        // Export only the versioned GDN planes so the worker owns this exact allocation.
         auto view = export_prefix_view(lane.request, prompt_end, prompt_end - 1, prompt_end,
                                        stream, &lane.draft);
         auto* const data = last_allocation;
@@ -821,7 +821,8 @@ void check_worker_release(const Lane& lane, const LmCacheClient& cache,
         std::promise<bool> done;
         worker_allocation = data;
         inject_sync_error = fail_sync;
-        worker.store(keys, std::move(view), std::move(reservation), stores, [&] {
+        worker.store(pairing, rank_keys, nullptr, 0, std::move(view), std::move(reservation),
+                     stores, [&] {
             const auto release = std::exchange(worker_release, WorkerRelease{});
             done.set_value(std::this_thread::get_id() != caller && release.memory == data &&
                 release.stream == cudaStreamPerThread && release.queued == 1 &&

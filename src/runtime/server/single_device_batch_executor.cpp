@@ -72,6 +72,9 @@ void SingleDeviceBatchExecutor::join() noexcept {
 }
 
 BatchTopology SingleDeviceBatchExecutor::topology() const noexcept {
+    if (decoder_.tensor_parallel_info()) {
+        return BatchTopology{1, 2, 1};
+    }
     return single_device_batch_topology;
 }
 
@@ -81,7 +84,8 @@ void SingleDeviceBatchExecutor::run(Ready ready, Process process, std::promise<v
         const auto& config = options();
         session.emplace(decoder_, DecoderBatchOptions{
             config.cuda_graphs, config.max_active, config.prefix_cache_entries,
-            config.max_num_batched_tokens, std::numeric_limits<std::size_t>::max()});
+            config.max_num_batched_tokens, std::numeric_limits<std::size_t>::max(),
+            config.tp_verification_graphs});
         ready(*session);
     } catch (...) {
         started.set_exception(std::current_exception());

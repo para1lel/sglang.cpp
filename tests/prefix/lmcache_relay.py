@@ -14,6 +14,8 @@ from time import monotonic, perf_counter_ns, sleep, time_ns
 HEADER = struct.Struct("!4sIQ")
 MAGIC = b"SLC3"
 READY, LOOKUP, GET, PUT, RESET, ERASE, PREFIX, LEASE = range(1, 9)
+PREFIX_DETAIL, RANK_GET, RANK_PUT = range(9, 12)
+TRANSFERS = (GET, PUT, RANK_GET, RANK_PUT)
 ADMISSION = struct.Struct("!16s16sI")
 RECEIPT = struct.Struct("!QQQI")
 GQA, GDN, DRAFT = range(1, 4)
@@ -84,7 +86,7 @@ def frame_metadata(opcode, payload):
         return number(1), read_field()
 
     entry = {"opcode": opcode, "namespace": read_field().decode(), "keys": []}
-    if opcode in (GET, PUT):
+    if opcode in TRANSFERS:
         entry["device"] = read(16).hex()
         read(64)
         entry["allocations"] = number(4)
@@ -94,11 +96,12 @@ def frame_metadata(opcode, payload):
             begin, end = number(4), number(4)
             if begin == end == 0:
                 continue
+            kv_heads = number(4) if opcode in (RANK_GET, RANK_PUT) else 4
             read(4 + 4 * 12)
             for start in range(begin, end, 256):
                 entry["keys"].append((family, read(64)))
                 tokens = min(256, end - start)
-                records.append({"bytes": tokens * layers * 2112, "tokens": tokens})
+                records.append({"bytes": tokens * layers * kv_heads * 528, "tokens": tokens})
         endpoint = number(4)
         if endpoint:
             entry["keys"].append((GDN, read(64)))
@@ -108,7 +111,7 @@ def frame_metadata(opcode, payload):
                 size += number(8)
             records.append({"bytes": size, "tokens": 0, "endpoint": endpoint})
         entry["records"] = records
-    elif opcode == PREFIX:
+    elif opcode in (PREFIX, PREFIX_DETAIL):
         count, limit, draft = struct.unpack("!IIB", read(9))
         read(64 * count)
         entry["coverage_query"] = {"count": count, "limit": limit, "draft": draft}
@@ -186,7 +189,7 @@ class Request(socketserver.BaseRequestHandler):
                 remote.settimeout(TIMEOUT)
                 remote.connect(str(self.server.upstream))
                 remote.sendall(raw + payload)
-                if opcode in (GET, PUT):
+                if opcode in TRANSFERS:
                     result = self.forward_arm(remote, entry)
                     if result is None:
                         return
@@ -198,6 +201,12 @@ class Request(socketserver.BaseRequestHandler):
                     body = receive(remote, length)
                     if opcode == PREFIX and status == 0:
                         entry["coverage"] = struct.unpack("!IIII", body)
+                    elif opcode == PREFIX_DETAIL and status == 0:
+                        gqa, matched, total, listed = struct.unpack("!IIII", body[:16])
+                        ends = list(struct.iter_unpack("!IB", body[16:]))
+                        if len(ends) != listed:
+                            raise ValueError("Invalid ranked prefix response length")
+                        entry["coverage"] = (gqa, matched, total, ends)
                 entry.update(status=status, response_bytes=len(body), reply_ns=perf_counter_ns())
                 if self.deliver(entry, "reply"):
                     self.request.sendall(reply + body)
@@ -270,7 +279,6 @@ class Relay(socketserver.ThreadingUnixStreamServer):
 
 
 def arm_device_fence(directory):
-    # Give each GET its own signals, including when reusing a daemon after a failed run.
     attempt = Path(mkdtemp(prefix="get-", dir=directory))
     marker = attempt / "arm"
     marker.symlink_to(attempt.resolve())
@@ -302,7 +310,6 @@ def install_device_fence(directory):
         with claim:
             armed = path / "arm"
             try:
-                # Rename consumes exactly the published marker, even if another process rearms.
                 claimed = armed.replace(path / f"claimed-{os.getpid()}")
             except FileNotFoundError:
                 return

@@ -10,9 +10,25 @@ __global__ void target_split_combine(const __grid_constant__ Binding binding) {
         return;
     }
     const int head = blockIdx.x;
+    if (head >= gqa_query_heads(lane.cache.kv_heads)) {
+        return;
+    }
     if (!gqa_decode::tensor_aligned(lane) || !gqa_decode::combine_head<FixedSplits>(lane, head)) {
         wide_decode_head(lane, head);
     }
+}
+
+int target_split_heads(const decoder::PagedDecodeLane& lane) {
+    return gqa_query_heads(lane.cache.kv_heads);
+}
+
+int target_split_heads(const decoder::BoundPagedDecodeLane&) {
+    return mxfp8_query_heads;
+}
+
+int target_split_heads(const gqa_decode::TargetLane& lane) {
+    return lane.bound.position ? target_split_heads(lane.bound)
+                               : target_split_heads(lane.eager);
 }
 
 cudaError_t launch_target_split(gqa_decode::TargetLane lane, cudaStream_t stream) {
@@ -20,19 +36,21 @@ cudaError_t launch_target_split(gqa_decode::TargetLane lane, cudaStream_t stream
     if (status != cudaSuccess) {
         return status;
     }
-    target_split_combine<<<mxfp8_query_heads, mxfp8_head_dim, 0, stream>>>(lane);
+    target_split_combine<<<target_split_heads(lane), mxfp8_head_dim, 0, stream>>>(lane);
+    return cudaGetLastError();
+}
+
+template <typename Batch>
+cudaError_t launch_target_batch_combine(const Batch& batch, int count, cudaStream_t stream) {
+    target_split_combine<<<dim3(target_split_heads(batch.lanes[0]), 1, count),
+                          mxfp8_head_dim, 0, stream>>>(batch);
     return cudaGetLastError();
 }
 
 template <typename Batch>
 cudaError_t launch_target_batch(const Batch& batch, int count, cudaStream_t stream) {
     const auto status = gqa_decode::launch(batch, count, stream);
-    if (status != cudaSuccess) {
-        return status;
-    }
-    target_split_combine<<<dim3(mxfp8_query_heads, 1, count), mxfp8_head_dim, 0, stream>>>(
-        batch);
-    return cudaGetLastError();
+    return status == cudaSuccess ? launch_target_batch_combine(batch, count, stream) : status;
 }
 
 bool valid_target_lane(const decoder::PagedDecodeLane& lane, int end) {
@@ -47,15 +65,13 @@ bool valid_target_binding(const decoder::BoundPagedDecodeLane& lane) {
 
 int eager_target_batch_width(const decoder::PagedDecodeLane* lanes, int count, int end) {
     constexpr int reference_width = text_gdn_max_verify_rows;
-    constexpr int max_average_chunks_per_split = 10;
     if (end != text_attention_max_tokens || count < 2 * reference_width) {
         return reference_width;
     }
     for (int index = 0; index < count; ++index) {
         const auto& lane = lanes[index];
-        const int chunks = lane.position / gqa_decode::split_chunk_tokens + 1;
         if (!gqa_decode::tensor_aligned(lane) ||
-            chunks > max_average_chunks_per_split * gqa_decode::split_count(lane.position)) {
+            !gqa_decode::supports_eager_wide_split(lane.position)) {
             return reference_width;
         }
     }
@@ -123,7 +139,8 @@ cudaError_t decoder::target_split_gqa(const PagedDecodeLane* lanes, int count, i
             if (*status != cudaSuccess) {
                 return *status;
             }
-            target_split_combine<<<dim3(mxfp8_query_heads, 1, count), mxfp8_head_dim, 0, stream>>>(
+            target_split_combine<<<
+                dim3(target_split_heads(batch.lanes[0]), 1, count), mxfp8_head_dim, 0, stream>>>(
                 batch);
             return cudaGetLastError();
         }
@@ -142,13 +159,15 @@ cudaError_t decoder::target_split_gqa(const PagedDecodeLane* lanes, int count, i
     return cudaSuccess;
 }
 
-cudaError_t gqa_decode::combine_long_decode(const LongBatch& batch, int requests,
+cudaError_t gqa_decode::combine_long_decode(const LongBatch& batch, int requests, int splits,
                                             cudaStream_t stream) {
-    // The long verifier starts beyond the position that saturates split_count.
     static_assert(long_min_position >= (max_splits - 1) * min_split_chunks * split_chunk_tokens);
     void* arguments[] = {const_cast<LongBatch*>(&batch)};
-    return cudaLaunchKernel(target_split_combine<LongBatch, max_splits>,
-                            dim3(mxfp8_query_heads, 1, requests * long_rows),
+    const auto kernel = splits == long_rank_wide_splits
+        ? target_split_combine<LongBatch, long_rank_wide_splits>
+        : target_split_combine<LongBatch, max_splits>;
+    return cudaLaunchKernel(kernel, dim3(gqa_query_heads(batch.requests[0].cache.kv_heads),
+                                        1, requests * long_rows),
                             mxfp8_head_dim, arguments, 0, stream);
 }
 
@@ -159,6 +178,14 @@ __global__ void gqa_verify_append_kernel(
     const __grid_constant__ decoder::GqaVerifyRows<decoder::GqaVerifyAppendRow, Capacity> batch) {
     const auto& row = batch.rows[blockIdx.x];
     append_head(row.cache, row.pages.device_pages, row.position, 0, row.keys, row.values);
+}
+
+__global__ void live_append(
+    const __grid_constant__ decoder::GqaVerifyRows<decoder::GqaVerifyAppendRow> batch,
+    const decoder::tp_verify_graph::GqaBinding* live) {
+    const auto& row = batch.rows[blockIdx.x];
+    const auto& read = live->reads[blockIdx.x];
+    append_head(read.cache, read.pages.device_pages, read.position, 0, row.keys, row.values);
 }
 
 }
@@ -172,13 +199,22 @@ cudaError_t decoder::gqa_verify_append(const GqaVerifyRows<GqaVerifyAppendRow, C
     for (int index = 0; index < count; ++index) {
         const auto& row = batch.rows[index];
         if (row.position < 0 || !row.keys || !row.values ||
+            row.cache.kv_heads != batch.rows[0].cache.kv_heads ||
             !cache_covers(row.cache, row.pages, static_cast<std::int64_t>(row.position) + 1)) {
             return cudaErrorInvalidValue;
         }
     }
     void* arguments[] = {const_cast<GqaVerifyRows<GqaVerifyAppendRow, Capacity>*>(&batch)};
-    return cudaLaunchKernel(gqa_verify_append_kernel<Capacity>, dim3(count, mxfp8_kv_heads),
+    return cudaLaunchKernel(gqa_verify_append_kernel<Capacity>,
+                            dim3(count, batch.rows[0].cache.kv_heads),
                             mxfp8_head_dim, arguments, 0, stream);
+}
+
+cudaError_t decoder::tp_verify_graph::append(const GqaVerifyRows<GqaVerifyAppendRow>& batch,
+                                            const GqaBinding* live, int kv_heads,
+                                            cudaStream_t stream) {
+    live_append<<<dim3(rows, kv_heads), mxfp8_head_dim, 0, stream>>>(batch, live);
+    return cudaPeekAtLastError();
 }
 
 template cudaError_t decoder::gqa_verify_append(

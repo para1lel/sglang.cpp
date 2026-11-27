@@ -17,11 +17,10 @@ static_assert(text_gdn_qkv_width % mlp_verify_outputs == 0 &&
 
 bool is_fp8_mlp_or_gdn_shape(int out_width, int in_width) {
     if (in_width == decoder::hidden_size) {
-        return out_width == decoder::intermediate_size || out_width == text_gdn_qkv_width ||
-               out_width == text_gdn_value_width;
+        return out_width > 0 && out_width % mlp_verify_outputs == 0;
     }
     return out_width == decoder::hidden_size &&
-           (in_width == decoder::intermediate_size || in_width == text_gdn_value_width);
+           text_fp8_group_count(in_width) % mlp_verify_groups == 0;
 }
 
 struct Fp8MlpStage {

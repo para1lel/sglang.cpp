@@ -15,8 +15,6 @@ struct Fp8DecodeInputProducer {
     cudaError_t (*launch)(const void* context, bool prefetch_weights);
 };
 
-/// Swap-AB tcgen05 decode projections for SM 10.0. An empty result means the
-/// device, shape or alignment is unsupported and the caller should fall back.
 std::optional<cudaError_t> try_text_fp8_decode_sm100(const TextFp8DecodeTarget* targets,
                                                      int count, TextFp8ActivationView input,
                                                      int in_width, int rows,
@@ -35,7 +33,7 @@ std::optional<cudaError_t> try_text_bf16_decode_sm100(
 std::optional<cudaError_t> try_text_bf16_decode_gates(
     const __nv_bfloat16* weight_b, const __nv_bfloat16* weight_a,
     const __nv_bfloat16* input, int rows, __nv_bfloat16* output_b,
-    __nv_bfloat16* output_a, cudaStream_t stream);
+    __nv_bfloat16* output_a, int channels, cudaStream_t stream);
 
 namespace decode_proj {
 
@@ -56,9 +54,15 @@ struct SplitPlan {
 
 cudaError_t configure(const void* kernel, int slot, int device, int& limit);
 
+std::optional<cudaError_t> prepare_gate_cluster(const void* kernel, const LaunchTarget& target,
+                                                int clusters, int shared_bytes);
+
 cudaError_t plan_splits(const void* kernel, int slot, const LaunchTarget& target,
                         int row_blocks, int k_blocks, int fixed_bytes, int bytes_per_block,
                         SplitPlan& plan);
+
+std::optional<cudaError_t> prepare_bf16_single_split(const LaunchTarget& target, int row_blocks,
+                                                     int chunks);
 
 CUresult encode_map(const LaunchTarget& target, CUtensorMap& map, const void* data,
                     CUtensorMapDataType type, int element_bytes, int rows, int width,
@@ -66,6 +70,8 @@ CUresult encode_map(const LaunchTarget& target, CUtensorMap& map, const void* da
 
 cudaError_t launch_split(const void* kernel, dim3 grid, int shared_bytes, void** args,
                          cudaStream_t stream, unsigned cluster);
+cudaError_t launch_split(const void* kernel, dim3 grid, int shared_bytes, void** args,
+                         cudaStream_t stream, unsigned cluster, int block_threads);
 
 }
 

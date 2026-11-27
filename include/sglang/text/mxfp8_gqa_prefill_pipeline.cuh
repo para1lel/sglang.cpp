@@ -218,7 +218,8 @@ std::optional<cudaError_t> prepare_flash_kernel(
 cudaError_t launch_pipeline(Attention& request, CUtensorMap& keys, CUtensorMap& values,
                             int rows, cudaStream_t stream) {
     void* args[] = {&request, &keys, &values, &rows};
-    const dim3 blocks((rows + pipeline_rows - 1) / pipeline_rows, head_pairs);
+    const dim3 blocks((rows + pipeline_rows - 1) / pipeline_rows,
+                      gqa_head_pairs(request.cache));
     return cudaLaunchKernel(tmem_pipeline_attention, blocks, pipeline_threads, args,
                             sizeof(TmemPipelineTile), stream);
 }

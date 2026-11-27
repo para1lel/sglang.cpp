@@ -40,7 +40,8 @@ struct GqaVerifyRows {
 template <int Capacity>
 cudaError_t gqa_verify_preprocess(const GqaVerifyRows<GqaVerifyPreprocessRow, Capacity>& batch,
                                   int count, const __nv_bfloat16* q_norm,
-                                  const __nv_bfloat16* k_norm, cudaStream_t stream);
+                                  const __nv_bfloat16* k_norm, cudaStream_t stream,
+                                  GqaGeometry geometry = gqa_full_geometry);
 
 template <int Capacity>
 cudaError_t gqa_verify_append(const GqaVerifyRows<GqaVerifyAppendRow, Capacity>& batch,
@@ -48,7 +49,8 @@ cudaError_t gqa_verify_append(const GqaVerifyRows<GqaVerifyAppendRow, Capacity>&
 
 template <int Capacity>
 cudaError_t gqa_verify_postgate(const GqaVerifyRows<GqaVerifyGateRow, Capacity>& batch,
-                                int count, cudaStream_t stream);
+                                int count, cudaStream_t stream,
+                                GqaGeometry geometry = gqa_full_geometry);
 
 inline bool cache_covers(Mxfp8KvCache cache, Mxfp8PageTable pages, std::int64_t token_count) {
     if (token_count <= 0 || token_count > std::numeric_limits<int>::max()) {
@@ -68,13 +70,13 @@ inline bool try_gqa_verify_batch(const GqaLayer& layer, const VerificationRow* r
                                  int cache_index, bool vector_attention, int split_end,
                                  cudaStream_t stream) {
     if (!vector_attention || split_end != text_attention_max_tokens ||
-        count <= 1 || count > target_split_eager_max_rows) {
+        count <= 1 || count > max_wide_mtp_rows) {
         return false;
     }
-    GqaVerifyRows<GqaVerifyPreprocessRow> preprocess{};
-    GqaVerifyRows<GqaVerifyAppendRow> append{};
-    GqaVerifyRows<GqaVerifyGateRow> gate{};
-    std::array<PagedDecodeLane, target_split_eager_max_rows> reads;
+    GqaVerifyRows<GqaVerifyPreprocessRow, max_wide_mtp_rows> preprocess{};
+    GqaVerifyRows<GqaVerifyAppendRow, max_wide_mtp_rows> append{};
+    GqaVerifyRows<GqaVerifyGateRow, max_wide_mtp_rows> gate{};
+    std::array<PagedDecodeLane, max_wide_mtp_rows> reads;
     for (int index = 0; index < count; ++index) {
         const auto& row = rows[index];
         if (!target_split_position(row.position, split_end)) {
@@ -89,12 +91,63 @@ inline bool try_gqa_verify_batch(const GqaLayer& layer, const VerificationRow* r
         reads[index] = {cache, pages, row.position, paged_gqa_buffers(work)};
         gate.rows[index] = {work.q_gate, work.attention};
     }
-    check(gqa_verify_preprocess(preprocess, count, layer.query_norm, layer.key_norm, stream),
+    const auto& geometry_cache = rows[0].request->caches[cache_index];
+    const GqaGeometry geometry{gqa_query_heads(geometry_cache.kv_heads),
+                               geometry_cache.kv_heads};
+    check(gqa_verify_preprocess(preprocess, count, layer.query_norm, layer.key_norm, stream,
+                               geometry),
           "Normalize and rotate grouped target Q/K");
     check(gqa_verify_append(append, count, stream), "Append grouped target MXFP8 KV");
-    check(target_split_gqa(reads.data(), count, split_end, stream),
+    for (int first = 0; first < count; first += target_split_eager_max_rows) {
+        const int size = std::min(target_split_eager_max_rows, count - first);
+        check(target_split_gqa(reads.data() + first, size, split_end, stream),
+              "Read grouped target MXFP8 attention");
+    }
+    check(gqa_verify_postgate(gate, count, stream, geometry), "Gate grouped target attention");
+    return true;
+}
+
+inline bool try_gqa_verify_short(const GqaLayer& layer, const VerificationRow* rows, int count,
+                                 int cache_index, bool vector_attention, cudaStream_t stream) {
+    if (!vector_attention || count <= 1 || count > target_split_eager_max_rows ||
+        rows[0].binding) {
+        return false;
+    }
+    const auto kv_heads = rows[0].request->caches[cache_index].kv_heads;
+    std::array<PagedDecodeLane, target_split_eager_max_rows> reads;
+    for (int index = 0; index < count; ++index) {
+        const auto& row = rows[index];
+        if (row.constrained || row.binding ||
+            row.request->caches[cache_index].kv_heads != kv_heads) {
+            return false;
+        }
+        auto& work = *row.work;
+        reads[index] = {row.request->caches[cache_index], row.request->pages, row.position,
+                        paged_gqa_buffers(work)};
+    }
+    if (!decoder::short_verify_supported(reads.data(), count)) {
+        return false;
+    }
+    GqaVerifyRows<GqaVerifyPreprocessRow> preprocess{};
+    GqaVerifyRows<GqaVerifyAppendRow> append{};
+    GqaVerifyRows<GqaVerifyGateRow> gate{};
+    for (int index = 0; index < count; ++index) {
+        const auto& row = rows[index];
+        auto& work = *row.work;
+        preprocess.rows[index] = {work.q_gate, work.keys, work.rope_queries, work.rope_keys,
+                                  row.rotary_position < 0 ? row.position : row.rotary_position};
+        append.rows[index] = {row.request->caches[cache_index], row.request->pages, work.rope_keys,
+                              work.values, row.position};
+        gate.rows[index] = {work.q_gate, work.attention};
+    }
+    const GqaGeometry geometry{gqa_query_heads(kv_heads), kv_heads};
+    check(gqa_verify_preprocess(preprocess, count, layer.query_norm, layer.key_norm, stream,
+                               geometry),
+          "Normalize and rotate grouped target Q/K");
+    check(gqa_verify_append(append, count, stream), "Append grouped target MXFP8 KV");
+    check(decoder::short_verify_gqa(reads.data(), count, stream),
           "Read grouped target MXFP8 attention");
-    check(gqa_verify_postgate(gate, count, stream), "Gate grouped target attention");
+    check(gqa_verify_postgate(gate, count, stream, geometry), "Gate grouped target attention");
     return true;
 }
 
@@ -134,6 +187,23 @@ inline int collect_long_verify_sequences(const VerificationRow* rows, int count,
     return sequence_count;
 }
 
+inline constexpr int rank_batch_min_position = 8191;
+
+inline bool is_rank_long_verify_batch(const VerificationRow* rows, int count, int cache_index,
+    const std::array<LongVerifySequence, gqa_decode::long_requests>& sequences,
+    int sequence_count) {
+    return count == wide_mtp_rows && sequence_count == wide_mtp_lanes &&
+        std::all_of(sequences.begin(), sequences.begin() + sequence_count,
+                    [&](const LongVerifySequence& sequence) {
+        const auto& first = rows[sequence.indices[0]];
+        return sequence.count == gqa_decode::long_rows &&
+               first.position >= rank_batch_min_position &&
+               gqa_decode::supports_eager_wide_split(
+                   rows[sequence.indices[gqa_decode::long_rows - 1]].position) &&
+               first.request->caches[cache_index].kv_heads == gqa_rank_geometry.kv_heads;
+    });
+}
+
 template <typename Remainder>
 bool try_gqa_verify_long(const GqaLayer& layer, const VerificationRow* rows, int count,
                          int cache_index, bool vector_attention, int split_end,
@@ -146,6 +216,9 @@ bool try_gqa_verify_long(const GqaLayer& layer, const VerificationRow* rows, int
 
     std::array<LongVerifySequence, long_requests> sequences;
     const int sequence_count = collect_long_verify_sequences(rows, count, sequences);
+    const bool rank_batch = is_rank_long_verify_batch(rows, count, cache_index, sequences,
+                                                     sequence_count);
+    const int minimum_position = rank_batch ? rank_batch_min_position : long_min_position;
 
     LongBatch read{};
     std::array<bool, max_wide_mtp_rows> selected{};
@@ -155,7 +228,7 @@ bool try_gqa_verify_long(const GqaLayer& layer, const VerificationRow* rows, int
         const auto& sequence = sequences[lane];
         int begin = 0;
         while (begin < sequence.count &&
-               rows[sequence.indices[begin]].position < long_min_position) ++begin;
+               rows[sequence.indices[begin]].position < minimum_position) ++begin;
         if (begin == sequence.count) continue;
         const auto& seed = rows[sequence.indices[begin]];
         auto& request = read.requests[requests];
@@ -176,10 +249,13 @@ bool try_gqa_verify_long(const GqaLayer& layer, const VerificationRow* rows, int
         for (int i = begin; i < sequence.count; ++i) selected[sequence.indices[i]] = true;
         selected_count += request.count;
     }
-    if (!requests) return false;
+    if (!requests || (rank_batch && selected_count != count)) return false;
+
+    const auto& geometry_cache = rows[0].request->caches[cache_index];
+    const GqaGeometry geometry{gqa_query_heads(geometry_cache.kv_heads),
+                               geometry_cache.kv_heads};
 
     check(cudaPeekAtLastError(), "Prepare long grouped target attention");
-    // Earlier rows of a crossing request must append before its selected suffix reads KV.
     if (selected_count != count) attend_remainder(selected);
 
     GqaVerifyRows<GqaVerifyPreprocessRow, max_wide_mtp_rows> preprocess{};
@@ -197,7 +273,7 @@ bool try_gqa_verify_long(const GqaLayer& layer, const VerificationRow* rows, int
         gate.rows[next++] = {work.q_gate, work.attention};
     }
     check(long_decode_status(gqa_verify_preprocess(preprocess, next, layer.query_norm,
-                                                  layer.key_norm, stream)),
+                                                  layer.key_norm, stream, geometry)),
           "Normalize and rotate long grouped target Q/K");
     check(long_decode_status(gqa_verify_append(append, next, stream)),
           "Append long grouped target MXFP8 KV");
@@ -218,7 +294,7 @@ bool try_gqa_verify_long(const GqaLayer& layer, const VerificationRow* rows, int
                   "Read grouped target MXFP8 attention");
         }
     }
-    check(long_decode_status(gqa_verify_postgate(gate, next, stream)),
+    check(long_decode_status(gqa_verify_postgate(gate, next, stream, geometry)),
           "Gate long grouped target attention");
     return true;
 }

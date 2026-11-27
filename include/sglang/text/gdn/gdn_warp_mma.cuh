@@ -120,47 +120,80 @@ struct Stage {
     float beta[rows];
 };
 
+constexpr int value_stage_warps = 4;
+
+struct ValueStage : Stage {
+    alignas(32) Bf16 values[rows * value_stage_warps * columns];
+};
+
+struct PipelinedStage : ValueStage {
+    alignas(32) Bf16 scaled[rows * key_stride];
+};
+
 __device__ __forceinline__ void copy_async(Bf16* target, const Bf16* source, int bytes) {
     const auto address = static_cast<unsigned int>(__cvta_generic_to_shared(target));
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;"
                  :: "r"(address), "l"(source), "r"(bytes) : "memory");
 }
 
-__device__ __forceinline__ void prefetch(Stage& target, const Matrices& matrix,
-                                         const Bf16* convolved, int first, int valid, int head) {
+template <typename S, int BlockWarps, typename Frame>
+__device__ __forceinline__ void prefetch(Frame& target, const Matrices& matrix,
+                                         const Bf16* convolved, int first, int valid, int head,
+                                         int first_feature, int thread) {
     constexpr int vectors_per_row = dimension / vector_elements;
-    for (int vector = threadIdx.x; vector < 2 * rows * vectors_per_row; vector += block_threads) {
+    for (int vector = thread; vector < 2 * rows * vectors_per_row; vector += BlockWarps * 32) {
         const int row = vector / vectors_per_row;
         const int position = row % rows;
         const int column = vector % vectors_per_row * vector_elements;
         const int plane = row / rows;
-        const int feature = plane * text_gdn_qk_width + head / group * dimension + column;
+        const int feature = plane * S::qk_width + head / S::heads_per_qk * dimension + column;
         const auto offset = static_cast<std::size_t>(first + min(position, valid - 1));
-        const auto* source = convolved + offset * text_gdn_qkv_width + feature;
+        const auto* source = convolved + offset * S::qkv_width + feature;
         copy_async(target.qk + row * key_stride + column, source,
                    position < valid ? sizeof(uint4) : 0);
     }
-    for (int index = threadIdx.x * vector_elements; index < rows * rows;
-         index += block_threads * vector_elements) {
+    if constexpr (std::is_base_of_v<ValueStage, Frame>) {
+        static_assert(BlockWarps == value_stage_warps);
+        constexpr int width = BlockWarps * columns;
+        constexpr int vectors = width / vector_elements;
+        static_assert(rows * vectors == BlockWarps * 32);
+        const int position = thread / vectors;
+        const int component = thread % vectors * vector_elements;
+        const auto offset = static_cast<std::size_t>(first + min(position, valid - 1));
+        const auto* source = convolved + offset * S::qkv_width + 2 * S::qk_width +
+                             first_feature + component;
+        copy_async(target.values + position * width + component, source,
+                   position < valid ? sizeof(uint4) : 0);
+    }
+    for (int index = thread * vector_elements; index < rows * rows;
+         index += BlockWarps * 32 * vector_elements) {
         const int offset = index / rows * matrix_stride + index % rows;
         copy_async(target.inverse + offset, matrix.inverse + index, sizeof(uint4));
         copy_async(target.scores + offset, matrix.scores + index, sizeof(uint4));
     }
-    if (threadIdx.x < rows) {
-        target.initial[threadIdx.x] = matrix.initial[threadIdx.x];
-        target.tail[threadIdx.x] = matrix.tail[threadIdx.x];
-        target.beta[threadIdx.x] = matrix.beta[threadIdx.x];
+    if (thread < rows) {
+        target.initial[thread] = matrix.initial[thread];
+        target.tail[thread] = matrix.tail[thread];
+        target.beta[thread] = matrix.beta[thread];
     }
     asm volatile("cp.async.commit_group;" ::: "memory");
 }
 
 constexpr int dynamic_bytes = 2 * sizeof(Stage);
+constexpr int value_dynamic_bytes = 2 * sizeof(ValueStage);
+constexpr int pipeline_dynamic_bytes = 2 * sizeof(PipelinedStage);
+constexpr int value_warp_static_bytes = sizeof(Bf16) *
+    value_stage_warps * (dimension + rows) * columns;
+constexpr int local_static_bytes = sizeof(Bf16) * rows * key_stride + value_warp_static_bytes;
+constexpr int local_shared_bytes = dynamic_bytes + local_static_bytes;
+constexpr int value_shared_bytes = value_dynamic_bytes + local_static_bytes;
+constexpr int pipeline_shared_bytes = pipeline_dynamic_bytes + value_warp_static_bytes;
 
-template<bool Grouped>
-__device__ __forceinline__ void scale_keys(const Stage& stage, Bf16* scaled_keys) {
+template<bool Grouped, int BlockWarps>
+__device__ __forceinline__ void scale_keys(const Stage& stage, Bf16* scaled_keys, int thread) {
     constexpr int elements = Grouped ? 2 : 1;
-    for (int index = elements * threadIdx.x; index < rows * dimension;
-         index += elements * block_threads) {
+    for (int index = elements * thread; index < rows * dimension;
+         index += elements * BlockWarps * 32) {
         const int position = index / dimension;
         const int offset = position * key_stride + index % dimension;
         const auto* key = stage.qk + rows * key_stride + offset;
@@ -175,8 +208,25 @@ __device__ __forceinline__ void scale_keys(const Stage& stage, Bf16* scaled_keys
     }
 }
 
-template<bool Grouped>
-__device__ __forceinline__ void write_residual(const Stage& stage, const Bf16* convolved,
+template <typename S, int BlockWarps>
+__device__ __forceinline__ void stage_tiles(int count, int head, int first_feature,
+                                             const Bf16* convolved, const Matrices* matrices,
+                                             PipelinedStage* frames) {
+    constexpr int producer_threads = BlockWarps * 32;
+    const int thread = threadIdx.x - producer_threads;
+    for (int first = 0; first < count; first += rows) {
+        const int chunk = first / rows;
+        auto& frame = frames[chunk % 2];
+        prefetch<S, BlockWarps>(frame, matrices[chunk * S::value_heads + head], convolved,
+                                first, min(count - first, rows), head, first_feature, thread);
+        asm volatile("cp.async.wait_group 0; bar.sync 1, %0;" :: "n"(producer_threads) : "memory");
+        scale_keys<true, BlockWarps>(frame, frame.scaled, thread);
+        asm volatile("bar.sync 2;" ::: "memory");
+    }
+}
+
+template <typename S, bool Grouped, typename Frame>
+__device__ __forceinline__ void write_residual(const Frame& stage, const Bf16* convolved,
                                               const Result (&projection)[2 * time_tiles],
                                               int first, int valid, int feature, int lane,
                                               Bf16* work) {
@@ -190,8 +240,13 @@ __device__ __forceinline__ void write_residual(const Stage& stage, const Bf16* c
             if (position < valid) {
                 const int token = first + position;
                 const auto* target = convolved +
-                    static_cast<std::size_t>(token) * text_gdn_qkv_width +
-                    2 * text_gdn_qk_width + feature + result_column(lane, element);
+                    static_cast<std::size_t>(token) * S::qkv_width +
+                    2 * S::qk_width + feature + result_column(lane, element);
+                if constexpr (std::is_base_of_v<ValueStage, Frame>) {
+                    constexpr int width = value_stage_warps * columns;
+                    target = stage.values + position * width + (threadIdx.x / 32) * columns +
+                             result_column(lane, element);
+                }
                 const float beta = stage.beta[position];
                 const float initial = stage.initial[position];
                 const auto& projected = projection[time_tiles + task];
@@ -211,7 +266,7 @@ __device__ __forceinline__ void write_residual(const Stage& stage, const Bf16* c
     }
 }
 
-template<bool Grouped>
+template <typename S, bool Grouped>
 __device__ __forceinline__ void write_observable(const Stage& stage, const Bf16* work,
                                                 const Result (&projection)[2 * time_tiles],
                                                 int first, int valid, int feature, int lane,
@@ -228,7 +283,7 @@ __device__ __forceinline__ void write_observable(const Stage& stage, const Bf16*
                 const float first_value = fmaf(stage.initial[position],
                     projection[task].fragments[element], output[task].fragments[element]);
                 auto* target = observable +
-                    static_cast<std::size_t>(first + position) * text_gdn_value_width +
+                    static_cast<std::size_t>(first + position) * S::value_width +
                     feature + result_column(lane, element);
                 if constexpr (Grouped) {
                     const float second_value = fmaf(stage.initial[position],
@@ -266,23 +321,33 @@ __device__ __forceinline__ void advance_state(const Bf16* scaled_keys, const Bf1
     }
 }
 
-template<bool Grouped>
+template <typename S, bool Grouped, int BlockWarps = block_warps, typename Frame = Stage>
 __device__ __forceinline__ void recur_segment(int count, const Bf16* convolved,
                                               const Matrices* matrices, float* recurrent,
                                               Bf16* observable) {
     alignas(32) extern __shared__ unsigned char dynamic_frames[];
-    auto* frames = reinterpret_cast<Stage*>(dynamic_frames);
+    auto* frames = reinterpret_cast<Frame*>(dynamic_frames);
     __shared__ alignas(32) Bf16 scaled_keys[rows * key_stride];
-    __shared__ alignas(32) Bf16 states[block_warps][dimension * columns];
-    __shared__ alignas(32) Bf16 workspace[block_warps][rows * columns];
+    __shared__ alignas(32) Bf16 states[BlockWarps][dimension * columns];
+    __shared__ alignas(32) Bf16 workspace[BlockWarps][rows * columns];
     const int warp = threadIdx.x / 32;
     const int lane = threadIdx.x % 32;
     const int head = blockIdx.x;
-    const int feature = head * dimension + (blockIdx.y * block_warps + warp) * columns;
+    constexpr bool pipelined = std::is_same_v<Frame, PipelinedStage>;
+    const int first_feature = head * dimension + blockIdx.y * BlockWarps * columns;
+    if constexpr (pipelined) {
+        if (warp >= BlockWarps) {
+            stage_tiles<S, BlockWarps>(count, head, first_feature, convolved, matrices, frames);
+            return;
+        }
+    } else {
+        prefetch<S, BlockWarps>(frames[0], matrices[head], convolved, 0, min(count, rows), head,
+                                first_feature, threadIdx.x);
+    }
+    const int feature = first_feature + warp * columns;
     auto* carry = recurrent + feature * dimension;
     auto* state = states[warp];
     auto* work = workspace[warp];
-    prefetch(frames[0], matrices[head], convolved, 0, min(count, rows), head);
     Result accumulator[key_tiles];
     #pragma unroll
     for (int key = 0; key < key_tiles; ++key) {
@@ -299,18 +364,22 @@ __device__ __forceinline__ void recur_segment(int count, const Bf16* convolved,
         const int valid = min(count - first, rows);
         const int chunk = first / rows;
         const auto& stage = frames[chunk % 2];
-        asm volatile("cp.async.wait_group 0;" ::: "memory");
-        __syncthreads();
-        if (first + rows < count) {
-            prefetch(frames[(chunk + 1) % 2], matrices[(chunk + 1) * heads + head], convolved,
-                     first + rows, min(count - first - rows, rows), head);
+        if constexpr (pipelined) {
+            asm volatile("bar.sync 2;" ::: "memory");
+        } else {
+            asm volatile("cp.async.wait_group 0;" ::: "memory");
+            __syncthreads();
+            if (first + rows < count) {
+                prefetch<S, BlockWarps>(frames[(chunk + 1) % 2],
+                    matrices[(chunk + 1) * S::value_heads + head], convolved, first + rows,
+                    min(count - first - rows, rows), head, first_feature, threadIdx.x);
+            }
+            scale_keys<Grouped, BlockWarps>(stage, scaled_keys, threadIdx.x);
         }
-
-        scale_keys<Grouped>(stage, scaled_keys);
 
         Result projection[2 * time_tiles];
         project(stage.qk, state, lane, projection);
-        write_residual<Grouped>(stage, convolved, projection, first, valid, feature, lane, work);
+        write_residual<S, Grouped>(stage, convolved, projection, first, valid, feature, lane, work);
         __syncwarp();
         Result correction[time_tiles];
         solve(stage.inverse, work, lane, correction);
@@ -321,10 +390,14 @@ __device__ __forceinline__ void recur_segment(int count, const Bf16* convolved,
         }
         __syncwarp();
 
-        write_observable<Grouped>(stage, work, projection, first, valid, feature, lane, observable);
-        __syncthreads();
-
-        advance_state(scaled_keys, work, stage.initial[rows - 1], lane, accumulator);
+        write_observable<S, Grouped>(stage, work, projection, first, valid, feature, lane,
+                                     observable);
+        if constexpr (pipelined) {
+            advance_state(stage.scaled, work, stage.initial[rows - 1], lane, accumulator);
+        } else {
+            __syncthreads();
+            advance_state(scaled_keys, work, stage.initial[rows - 1], lane, accumulator);
+        }
         if (first + rows < count) {
             #pragma unroll
             for (int key = 0; key < key_tiles; ++key) {
@@ -342,23 +415,36 @@ __device__ __forceinline__ void recur_segment(int count, const Bf16* convolved,
     }
 }
 
+template <typename S = GdnFull, int BlockWarps = block_warps, bool Vector = false,
+          bool StageValues = false, bool Pipelined = false>
 __global__ void recur_warp(int count, const Bf16* convolved, const Matrices* matrices,
                            float* recurrent, Bf16* observable) {
-    recur_segment<false>(count, convolved, matrices, recurrent, observable);
+    using Frame = std::conditional_t<Pipelined, PipelinedStage,
+                                     std::conditional_t<StageValues, ValueStage, Stage>>;
+    recur_segment<S, Vector, BlockWarps, Frame>(count, convolved, matrices, recurrent, observable);
 }
 
+template <typename S = GdnFull>
 __global__ __launch_bounds__(block_threads, 3)
 void recur_segments(const __grid_constant__ Segments segments) {
     const auto& segment = segments.values[blockIdx.z];
-    recur_segment<true>(segment.count, segment.convolved, segment.matrices, segment.recurrent,
-                        segment.observable);
+    recur_segment<S, true>(segment.count, segment.convolved, segment.matrices,
+                          segment.recurrent, segment.observable);
 }
 #else
 constexpr int dynamic_bytes = 0;
+constexpr int value_dynamic_bytes = 0;
+constexpr int local_shared_bytes = 0;
+constexpr int value_shared_bytes = 0;
+constexpr int pipeline_dynamic_bytes = 0;
+constexpr int pipeline_shared_bytes = 0;
 
+template <typename S = GdnFull, int BlockWarps = block_warps, bool Vector = false,
+          bool StageValues = false, bool Pipelined = false>
 __global__ void recur_warp(int, const Bf16*, const Matrices*, float*, Bf16*) {
     __trap();
 }
+template <typename S = GdnFull>
 __global__ void recur_segments(Segments) {
     __trap();
 }

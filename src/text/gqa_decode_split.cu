@@ -46,7 +46,6 @@ struct Stage {
     alignas(16) std::uint8_t value_scales[chunk_tokens * mxfp8_groups];
 };
 
-/// Per-token scale factors of one warp tile, laid out [group][token].
 struct WarpScales {
     float key[mxfp8_groups][tile_tokens];
     float value[mxfp8_groups][tile_tokens];
@@ -77,8 +76,6 @@ static_assert(sizeof(Merge) <= sizeof(Stage) && sizeof(Stage) % 16 == 0);
 static_assert(2 * (sizeof(Shared<stages>) + 1024) <= 233472);
 static_assert(3 * (sizeof(Shared<1>) + 1024) <= 233472);
 
-/// Online state of one warp. `out` holds sum(p * v) * 2^(142 - R_g) for group g, where
-/// R_g is the largest value-scale byte seen in that group (packed bytes in `reference`).
 struct Running {
     float out[value_tiles][4];
     float maximum;
@@ -118,7 +115,6 @@ __device__ __forceinline__ void mma(float (&sum)[4], unsigned int a0, unsigned i
         : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 }
 
-/// Converts four E4M3 bytes to two exact bf16x2 words: bytes 0-1 to `low`, bytes 2-3 to `high`.
 __device__ __forceinline__ void expand(unsigned int bytes, unsigned int& low, unsigned int& high) {
     asm("{\n.reg .b16 l, h;\nmov.b32 {l, h}, %2;\n"
         "cvt.rn.bf16x2.e4m3x2 %0, l;\ncvt.rn.bf16x2.e4m3x2 %1, h;\n}"
@@ -144,8 +140,9 @@ __device__ void issue_warp_tile(const int* pages, Stage& stage,
     const int half = chunk % chunks_per_page;
     const auto physical = static_cast<std::size_t>(pages[chunk / chunks_per_page - first_page]);
     const int first = chunk * chunk_tokens;
-    const std::size_t payload = physical * mxfp8_payload_bytes_per_page +
-        (static_cast<std::size_t>(half * chunk_tokens) * mxfp8_kv_heads + kv_head) *
+    const std::size_t payload =
+        physical * gqa_payload_bytes_per_page(lane.cache.kv_heads) +
+        (static_cast<std::size_t>(half * chunk_tokens) * lane.cache.kv_heads + kv_head) *
             mxfp8_head_dim;
     #pragma unroll
     for (int step = 0; step < tile_tokens * copies_per_token / 32; ++step) {
@@ -153,7 +150,7 @@ __device__ void issue_warp_tile(const int* pages, Stage& stage,
         const int token = warp * tile_tokens + index / copies_per_token;
         const int column = index % copies_per_token * 16;
         const bool valid = first + token <= lane.position;
-        const auto source = payload + token * mxfp8_kv_heads * mxfp8_head_dim + column;
+        const auto source = payload + token * lane.cache.kv_heads * mxfp8_head_dim + column;
         copy_16(stage.keys + token * key_stride + column, lane.cache.key_payload + source, valid);
         copy_16(stage.values + token * value_stride + column, lane.cache.value_payload + source,
                 valid);
@@ -164,7 +161,7 @@ __device__ void issue_warp_tile(const int* pages, Stage& stage,
                        token / mxfp8_group_size * mxfp8_groups;
     const bool value = lane_id >= tile_tokens;
     const std::size_t source =
-        (physical * mxfp8_kv_heads + kv_head) * mxfp8_scale_bytes_per_page / mxfp8_kv_heads +
+        (physical * lane.cache.kv_heads + kv_head) * mxfp8_page_size * mxfp8_groups +
         token % mxfp8_group_size * (mxfp8_page_size / mxfp8_group_size) * mxfp8_groups +
         half * scale_row + token / mxfp8_group_size * mxfp8_groups;
     const auto dest = __cvta_generic_to_shared(
@@ -174,7 +171,6 @@ __device__ void issue_warp_tile(const int* pages, Stage& stage,
                  :: "r"(static_cast<unsigned int>(dest)), "l"(source_ptr) : "memory");
 }
 
-/// Loads one BF16 query head per MMA row and flags operands outside the FP32 score range.
 __device__ void load_query(Query& query, const __nv_bfloat16* queries, int kv_head, int lane) {
     const int row = lane / 4;
     const int quad = lane % 4;
@@ -223,8 +219,6 @@ __device__ void raise_reference(Running& run, const unsigned int (&next)[2]) {
     run.reference[1] = next[1];
 }
 
-/// Lane l decodes the scales of token l / 2, groups 4 * (l % 2) .. +3, into `scales`.
-/// Key factors are 2^(e - 97); value factors are 2^(e - R_g + 15) and zero for dead tokens.
 __device__ int prepare_scales(const Stage& stage, WarpScales& scales, Running& run, int first,
                               int position, int warp, int lane) {
     const int local = lane / 2;
@@ -292,8 +286,6 @@ __device__ void tile_scores(const Stage& stage, const WarpScales& scales, const 
     }
 }
 
-// Use the 16 MMA rows for keys and the eight columns for query heads.
-// Reduce K32 groups in the original order before restoring the score lane layout.
 __device__ void transposed_scores(const Stage& stage, const WarpScales& scales,
                                   const Query& query, int warp, int row, int quad,
                                   float (&score)[4]) {
@@ -377,7 +369,6 @@ __device__ void update(Running& run, const float (&score)[4], float min_delta,
     }
 }
 
-/// O^T += V^T P'. Rows of a value tile are channels 32g + 4r (+1) and 32g + 4r + 2 (+3).
 template <bool SharedTail = false>
 __device__ void accumulate(const Stage& stage, const WarpScales& scales, const float (&weight)[4],
                            int warp, int row, int quad, Running& run, int last = 0) {
@@ -437,7 +428,6 @@ __device__ void process_tile(const Stage& stage, WarpScales& scales, const Query
     accumulate<SharedTail>(stage, scales, weight, warp, row, quad, run, position - first);
 }
 
-/// Writes the warp state to `merge` at true scale: out * 2^(R_g - 142).
 __device__ void store_warp(Merge& merge, const Running& run, int warp, int row, int quad) {
     float mass = run.mass;
     mass += __shfl_xor_sync(full_mask, mass, 1);
@@ -550,6 +540,9 @@ split_kernel(const __grid_constant__ Input input) {
         return;
     }
     const int kv_head = static_cast<int>(blockIdx.y);
+    if (kv_head >= lane.cache.kv_heads) {
+        return;
+    }
     const int first = split * chunks / splits;
     const int last = (split + 1) * chunks / splits;
     const int first_page = first / chunks_per_page;
@@ -611,6 +604,18 @@ split_kernel(const __grid_constant__ Input input) {
     }
 }
 
+int input_kv_heads(const TargetLane& lane) {
+    return lane.bound.position ? mxfp8_kv_heads : lane.eager.cache.kv_heads;
+}
+
+int input_kv_heads(const TargetBatch&) {
+    return mxfp8_kv_heads;
+}
+
+int input_kv_heads(const EagerTargetBatch& batch) {
+    return batch.lanes[0].cache.kv_heads;
+}
+
 template <bool SingleStage = false, typename Input>
 cudaError_t launch_split(const Input& input, int count, cudaStream_t stream) {
     constexpr std::size_t shared_bytes = sizeof(Shared<SingleStage ? 1 : stages>);
@@ -621,7 +626,7 @@ cudaError_t launch_split(const Input& input, int count, cudaStream_t stream) {
         return status;
     }
     split_kernel<Input, SingleStage>
-        <<<dim3(max_splits, mxfp8_kv_heads, count), threads, shared_bytes, stream>>>(input);
+        <<<dim3(max_splits, input_kv_heads(input), count), threads, shared_bytes, stream>>>(input);
     return cudaGetLastError();
 }
 
@@ -646,6 +651,10 @@ cudaError_t launch(const EagerTargetBatch& batch, int count, cudaStream_t stream
     if (count >= 2 * text_gdn_max_verify_rows && batch.end == text_attention_max_tokens) {
         return launch_split<true>(batch, count, stream);
     }
+    return launch_multistage(batch, count, stream);
+}
+
+cudaError_t launch_multistage(const EagerTargetBatch& batch, int count, cudaStream_t stream) {
     return launch_split(batch, count, stream);
 }
 

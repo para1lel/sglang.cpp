@@ -1,5 +1,7 @@
 #include "sglang/runtime/server/batch_service_state.h"
 
+#include "sglang/runtime/cache/prefix_cache_layout.h"
+
 #include <algorithm>
 #include <limits>
 #include <utility>
@@ -16,13 +18,20 @@ void BatchService::State::begin_cache_read(int slot, const std::shared_ptr<Job>&
                        !options.label_token_ids;
     auto cancelled = std::make_shared<std::atomic_bool>(false);
     const std::weak_ptr<Job> weak = job;
-    lmcache->lookup([weak](std::string_view identity) {
+    lmcache->lookup([weak, world = lmcache->world_size()](std::string_view identity) {
         const auto current = weak.lock();
-        if (!current) return std::shared_ptr<decoder::PrefixCacheKeys>{};
+        if (!current) return std::vector<std::shared_ptr<decoder::PrefixCacheKeys>>{};
         std::string domain = std::to_string(identity.size()) + ':';
         domain.append(identity).append(current->options.prefix_cache_salt);
-        return std::make_shared<decoder::PrefixCacheKeys>(current->prompt, domain,
-                                                          &current->media);
+        std::vector<std::shared_ptr<decoder::PrefixCacheKeys>> keys;
+        keys.reserve(static_cast<std::size_t>(world));
+        for (int rank = 0; rank < world; ++rank) {
+            const auto layout = decoder::tp2_prefix_cache_layout(rank);
+            keys.push_back(std::make_shared<decoder::PrefixCacheKeys>(
+                current->prompt, domain, &current->media,
+                world == 1 ? nullptr : &layout));
+        }
+        return keys;
     }, max_restore, draft, cancelled, [this, slot, weak](BatchCacheRead result) {
         const auto job = weak.lock();
         if (!job) return;
@@ -46,18 +55,21 @@ void BatchService::State::cancel_cache_read(Job& job) {
 }
 
 void BatchService::State::configure_checkpoint(Job& job) {
-    if (!job.cache_keys) return;
+    if (job.cache_keys.empty()) return;
     job.options.prefix_cache_read = std::shared_ptr<const decoder::PrefixCacheRead>(
         job.cache_read, &job.cache_read->match);
+    const auto& lead_keys = *job.cache_keys.front();
     job.options.publish_prefix_checkpoints =
-        job.cache_keys->tokens() == job.cache_keys->cacheable_tokens();
+        lead_keys.tokens() == lead_keys.cacheable_tokens();
     auto notify = [this] {
         const std::lock_guard lock(mutex);
         changed.notify_all();
     };
     job.options.restore_prefix = [this, current = &job, notify](
             const decoder::PrefixDeviceTransfer& view) {
-        auto completion = lmcache->restore(current->cache_keys, view, notify);
+        if (!current->restore_join) current->restore_join = lmcache->begin_restore();
+        auto completion = lmcache->restore(current->restore_join, current->cache_keys, view,
+                                           notify);
         const std::lock_guard lock(mutex);
         current->prefix_operation = completion;
         return completion;
@@ -68,9 +80,11 @@ void BatchService::State::configure_checkpoint(Job& job) {
     job.options.store_prefix = [this, current = &job, notify](
             decoder::PrefixDeviceTransfer&& view, const int* generated, int count,
             std::shared_ptr<void> reservation, std::shared_ptr<std::atomic_uint64_t> stores) {
-        auto& keys = *current->cache_keys;
-        for (int i = 0; i < count; ++i) keys.append(generated[i]);
-        lmcache->store(keys, std::move(view), std::move(reservation), std::move(stores), notify);
+        if (!current->store_pairing) {
+            current->store_pairing = std::make_shared<BatchStorePairing>();
+        }
+        lmcache->store(current->store_pairing, current->cache_keys, generated, count,
+                       std::move(view), std::move(reservation), std::move(stores), notify);
     };
 }
 
@@ -80,7 +94,7 @@ bool BatchService::State::poll_prefix(BatchSession& batch, int slot,
         const std::lock_guard lock(mutex);
         if (job->discard_deferred_store()) {
             job->prefix_pending = false;
-            return true;  // Let ordinary cancellation retire the unsubmitted checkpoint.
+            return true;
         }
         if (!prefix_ready(*job)) return false;
     }

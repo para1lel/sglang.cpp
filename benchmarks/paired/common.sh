@@ -129,7 +129,6 @@ prepare_fixtures() {
     fi
 }
 
-# Run in the background. The shell's $! stays the session leader across exec.
 launch_session() {
     exec "$client_python" -IB -c '
 import os
@@ -165,9 +164,8 @@ stop_group() {
     fi
 }
 
-start_group() {
+server_preflight() {
     local run=$1
-    shift
     if [[ -z ${lmcache_pid:-} ]]; then
         check_idle || return
     fi
@@ -175,6 +173,12 @@ start_group() {
     if [[ -n ${lmcache_pid:-} ]]; then
         check_compute_owners "$run/compute-before.csv" "$lmcache_pid" || return
     fi
+}
+
+start_group() {
+    local run=$1
+    shift
+    server_preflight "$run" || return
     if curl --noproxy '*' -fsS --max-time 1 "$url/health" >/dev/null 2>&1; then
         echo "A server already responds on $url" >&2
         return 1
@@ -227,4 +231,65 @@ measure_group() {
     printf '%s\n' "$status" >"$run/client-exit-code.txt"
     record_compute "$run/compute-measurement-end.csv" || return
     return "$status"
+}
+
+start_vllm() {
+    local run=$1
+    shift
+    mkdir "$run"/{cache,config,tmp}
+    cp -aL --reflink=auto "$seed_cache/." "$run/cache/"
+    "${client[@]}" cubins "$run/cache" "$run"
+    local -x VLLM_HAS_FLASHINFER_CUBIN=1 VLLM_NO_USAGE_STATS=1 HF_HUB_OFFLINE=1
+    local -x OMP_NUM_THREADS=2 MAX_JOBS=2
+    local -x XDG_CACHE_HOME="$run/cache" XDG_CONFIG_HOME="$run/config" TMPDIR="$run/tmp"
+    local -x VLLM_CACHE_ROOT="$XDG_CACHE_HOME/vllm" VLLM_CONFIG_ROOT="$XDG_CONFIG_HOME/vllm"
+    local -x HF_HOME="$XDG_CACHE_HOME/huggingface" CUDA_CACHE_PATH="$XDG_CACHE_HOME/cuda"
+    local -x TRITON_CACHE_DIR="$XDG_CACHE_HOME/triton" FLASHINFER_WORKSPACE_BASE="$XDG_CACHE_HOME"
+    local -x VLLM_RPC_BASE_PATH=tmp VLLM_WORKER_MULTIPROC_METHOD=spawn VLLM_SERVER_DEV_MODE=1
+    local -x CUDA_HOME=/usr/local/cuda-13.2
+    local -x PATH="$vllm_root/venv/bin:$CUDA_HOME/bin:$PATH"
+    local -x LD_LIBRARY_PATH="$compat" CC=/usr/bin/gcc CXX=/usr/bin/g++ PYTHONDONTWRITEBYTECODE=1
+    local -x PYTHONPATH="$paired_dir:$project"
+    local env_prefixes='CUDA_|VLLM_|FLASHINFER_|HF_|TRITON_|OMP_NUM_THREADS=|MAX_JOBS=|XDG_'
+    env_prefixes+='|LD_LIBRARY_PATH=|CC=|CXX=|TMPDIR=|PYTHONPATH='
+    local environment=(env -u PYTHONHOME -u CFLAGS -u CXXFLAGS -u CPPFLAGS -u LDFLAGS)
+    if [[ $native_defaults == true ]]; then
+        local names=(CUDA_VISIBLE_DEVICES CUDA_DEVICE_ORDER CUDA_HOME CUDA_CACHE_PATH
+            VLLM_{HAS_FLASHINFER_CUBIN,NO_USAGE_STATS,CACHE_ROOT,CONFIG_ROOT,RPC_BASE_PATH}
+            VLLM_{WORKER_MULTIPROC_METHOD,SERVER_DEV_MODE} HF_{HUB_OFFLINE,HOME}
+            OMP_NUM_THREADS MAX_JOBS XDG_{CACHE_HOME,CONFIG_HOME} TMPDIR TRITON_CACHE_DIR
+            FLASHINFER_WORKSPACE_BASE LD_LIBRARY_PATH CC CXX PYTHONDONTWRITEBYTECODE PYTHONPATH)
+        local name
+        mkdir "$run"/{home,tools}
+        ln -s "$uv" "$run/tools/uv"
+        environment=(env -i "PATH=$vllm_root/venv/bin:$CUDA_HOME/bin:$run/tools:/usr/bin:/bin"
+            "HOME=$run/home" LANG=C.UTF-8 "VIRTUAL_ENV=$vllm_root/venv"
+            UV_NO_CACHE=1 UV_OFFLINE=1)
+        for name in "${names[@]}"; do
+            environment+=("$name=${!name}")
+        done
+        printf '%s\n' "${environment[@]:2}" >"$run/effective-environment.txt"
+    else
+        env | LC_ALL=C sort | sed -nE "/^($env_prefixes)/p" >"$run/effective-environment.txt"
+    fi
+    local attention_config='{"backend":"FLASHINFER","disable_flashinfer_q_quantization":true,'
+    attention_config+='"use_trtllm_attention":true}'
+    local cache_flags=(--no-enable-prefix-caching)
+    if [[ $cache_on == true ]]; then
+        cache_flags=(--enable-prefix-caching)
+    fi
+    start_group "$run" "${environment[@]}" "$python" -B -m vllm.entrypoints.openai.api_server \
+        --host 127.0.0.1 --port "$port" --model "$checkpoint" --served-model-name benchmark \
+        "$@" --dtype bfloat16 --kv-cache-dtype fp8_e4m3 --mamba-cache-dtype bfloat16 \
+        --mamba-ssm-cache-dtype float32 \
+        --attention-config "$attention_config" \
+        --compilation-config '{"mode":"NONE","cudagraph_mode":"FULL_AND_PIECEWISE"}' \
+        --language-model-only --skip-tokenizer-init --generation-config vllm --seed 0 \
+        "${cache_flags[@]}" --enable-prompt-tokens-details --enable-chunked-prefill \
+        --max-model-len "$context" --max-num-batched-tokens "$token_budget" \
+        --max-num-seqs "$max_seqs" \
+        --max-num-scheduled-tokens "$token_budget" --async-scheduling \
+        --kv-cache-memory-bytes "$kv_bytes" --stream-interval 1 \
+        --worker-extension-cls vllm_worker.PairedBaselineObserver \
+        --speculative-config '{"method":"mtp","num_speculative_tokens":4}'
 }

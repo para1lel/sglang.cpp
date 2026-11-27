@@ -25,6 +25,25 @@ BatchService::State::State(std::unique_ptr<BatchExecutor> owner, bool trace, int
                                                       max_active);
 }
 
+BatchService::State::State(std::unique_ptr<BatchExecutor> owner, bool trace, int mtp_steps,
+                           const decoder::LmCacheConfig& cache,
+                           std::vector<std::array<std::uint8_t, 16>> devices,
+                           std::string identity)
+    : trace(trace), cuda_graphs(owner->options().cuda_graphs), mtp_steps(mtp_steps),
+      max_active(owner->options().max_active),
+      prefix_cache_entries(owner->options().prefix_cache_entries),
+      max_num_batched_tokens(owner->options().max_num_batched_tokens), executor(std::move(owner)) {
+    if (max_active < 1 || max_active > decoder_batch_max_lanes) {
+        throw std::invalid_argument("Invalid decoder batch service capacity");
+    }
+    counters.cache_capacity = prefix_cache_entries;
+    if (devices.size() < 2) {
+        throw std::invalid_argument("Ranked LMCache requires at least two rank devices");
+    }
+    lmcache = std::make_unique<BatchCache>(cache, std::move(devices), std::move(identity),
+                                           max_active);
+}
+
 void BatchService::State::start() {
     executor->start(
         [this](BatchSession& batch) { counters.cache = batch.prefix_cache_stats(); },
@@ -339,7 +358,6 @@ void BatchService::State::process(BatchSession& batch) {
         }
         int width = std::count(selected.begin(), selected.end(), true);
         const int capacity = std::min(max_active, max_num_batched_tokens) - width;
-        // Pick up already-published arrivals once before the first long prefill grant.
         if (cold && starts_long_prefill && has_empty_slot && capacity > 0) {
             const auto added = refresh_prefill_roster(*snapshot, capacity);
             for (const int slot : snapshot->admission) {
@@ -682,6 +700,16 @@ BatchService::BatchService(std::unique_ptr<BatchExecutor> executor, bool trace, 
     state_->start();
 }
 
+BatchService::BatchService(std::unique_ptr<BatchExecutor> executor, bool trace, int mtp_steps,
+                           const decoder::LmCacheConfig& cache,
+                           std::vector<std::array<std::uint8_t, 16>> rank_devices,
+                           std::string identity) {
+    if (!executor) throw std::invalid_argument("Missing decoder batch executor");
+    state_ = std::make_unique<State>(std::move(executor), trace, mtp_steps, cache,
+                                     std::move(rank_devices), std::move(identity));
+    state_->start();
+}
+
 BatchService::~BatchService() = default;
 
 void BatchService::stop_cache_restores() noexcept {
@@ -746,11 +774,16 @@ BatchMetrics BatchService::metrics() const {
     auto metrics = state_->counters;
     if (auto* cache = state_->lmcache.get()) {
         metrics.lmcache = cache->metrics();
-        // Transport receipts can arrive after the scheduler published its final step.
         metrics.cache.stores = metrics.lmcache.stores;
+    }
+    if (tp_ar_source_ != nullptr) {
+        metrics.tp_ar = tp_ar_source_->tp_ar_counters();
+        metrics.tp_ar_present = true;
     }
     return metrics;
 }
+
+void BatchService::set_tp_ar_source(const Decoder* decoder) { tp_ar_source_ = decoder; }
 
 BatchRuntimeState BatchService::runtime_state() const {
     const std::lock_guard lock(state_->mutex);

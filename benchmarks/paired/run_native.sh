@@ -66,7 +66,8 @@ printf '%s\n' "warmups=$warmups" "measured=$measured" \
     "allow_count_mismatch=${PAIRED_ALLOW_COUNT_MISMATCH:-0}" \
     "mode=${mode:-unpaired}" "max_num_batched_tokens=$token_budget" \
     >"$output/comparison-inputs.txt"
-sha256sum "$binary" "$paired_dir"/{run_native.sh,identity.py} >"$output/native.sha256"
+sha256sum "$binary" "$paired_dir"/{run_native.sh,identity.py} \
+    "$paired_dir"/driver_health.py >"$output/native.sha256"
 export CUDA_VISIBLE_DEVICES=$gpu_uuid CUDA_DEVICE_ORDER=PCI_BUS_ID
 export LD_LIBRARY_PATH="$compat${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 mkdir "$output/cuda-cache"

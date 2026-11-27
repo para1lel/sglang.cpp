@@ -2,10 +2,13 @@
 
 #include "sglang/decoder_media.h"
 #include "sglang/runtime/server/batch_executor.h"
+#include "sglang/runtime/backend/tensor_parallel.h"
 #include "sglang/runtime/server/batch_cache.h"
 
+#include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 
 namespace sglang::server {
 
@@ -18,7 +21,10 @@ struct BatchMetrics {
     std::uint64_t generation_tokens = 0;
     std::uint64_t prefill_requests = 0;
     LmCacheMetrics lmcache;
+    decoder::TpArCounters tp_ar;
+    bool tp_ar_present = false;
 };
+
 
 struct BatchRuntimeState {
     bool ready;
@@ -132,6 +138,10 @@ public:
     BatchService(std::unique_ptr<BatchExecutor> executor, bool trace, int mtp_steps = 0);
     BatchService(std::unique_ptr<BatchExecutor> executor, bool trace, int mtp_steps,
                  std::unique_ptr<decoder::LmCacheClient> cache, std::string cache_identity);
+    BatchService(std::unique_ptr<BatchExecutor> executor, bool trace, int mtp_steps,
+                 const decoder::LmCacheConfig& cache,
+                 std::vector<std::array<std::uint8_t, 16>> rank_devices,
+                 std::string cache_identity);
     ~BatchService();
     DecoderResult generate(int slot, const std::vector<int>& prompt, const DecoderOptions& options,
                            const DecoderCallbacks& callbacks,
@@ -154,10 +164,12 @@ public:
     bool start_profile(std::string name, std::size_t iterations);
     std::optional<BatchProfile> stop_profile();
     BatchTopology topology() const noexcept;
+    void set_tp_ar_source(const Decoder* decoder);
 
 private:
     struct State;
     std::unique_ptr<State> state_;
+    const Decoder* tp_ar_source_ = nullptr;
 };
 
 }

@@ -200,6 +200,67 @@ void write_loads(const Socket& connection, const HttpRequest& request, LoadSnaps
     write_snapshot(connection, snapshot, *present, *queues, filters.prometheus);
 }
 
+namespace {
+
+void append_tp_ar_metrics(std::string& text, const decoder::TpArCounters& counters) {
+    const auto emit_rank = [&text](std::string_view name, std::size_t rank, auto value) {
+        text += name;
+        text += "{engine=\"0\",rank=\"";
+        text += std::to_string(rank);
+        text += "\"} ";
+        text += std::to_string(value);
+        text += '\n';
+    };
+    const auto emit_width = [&text](std::string_view name, std::size_t rank,
+                                    std::uint64_t width, std::string_view transport,
+                                    auto value) {
+        text += name;
+        text += "{engine=\"0\",rank=\"";
+        text += std::to_string(rank);
+        text += "\",width=\"";
+        text += std::to_string(width);
+        if (!transport.empty()) {
+            text += "\",transport=\"";
+            text += transport;
+        }
+        text += "\"} ";
+        text += std::to_string(value);
+        text += '\n';
+    };
+    for (std::size_t rank = 0; rank < counters.per_rank.size(); ++rank) {
+        const auto& per_rank = counters.per_rank[rank];
+        emit_rank("tp2_ar_calls_total", rank, per_rank.ar_calls_total);
+        emit_rank("tp2_ar_mnnvl_oneshot_total", rank, per_rank.ar_mnnvl_oneshot_total);
+        emit_rank("tp2_ar_mnnvl_twoshot_total", rank, per_rank.ar_mnnvl_twoshot_total);
+        emit_rank("tp2_ar_nccl_total", rank, per_rank.ar_nccl_total);
+        emit_rank("tp2_ar_fallback_disabled_total", rank, per_rank.ar_fallback_disabled_total);
+        emit_rank("tp2_ar_fallback_setup_unavailable_total", rank,
+                  per_rank.ar_fallback_setup_unavailable_total);
+        emit_rank("tp2_ar_fallback_oversize_total", rank, per_rank.ar_fallback_oversize_total);
+        emit_rank("tp2_ar_fallback_capture_mismatch_total", rank,
+                  per_rank.ar_fallback_capture_mismatch_total);
+        emit_rank("tp2_ar_fallback_unaligned_total", rank,
+                  per_rank.ar_fallback_unaligned_total);
+        emit_rank("tp2_ar_fallback_after_error_total", rank,
+                  per_rank.ar_fallback_after_error_total);
+        emit_rank("tp2_ar_vendor_failed_total", rank, per_rank.ar_vendor_failed_total);
+        emit_rank("tp2_ar_bytes_payload_total", rank, per_rank.ar_bytes_payload_total);
+        emit_rank("tp2_ar_bytes_aggregated_total", rank, per_rank.ar_bytes_aggregated_total);
+    }
+    for (const auto& width : counters.widths) {
+        for (std::size_t rank = 0; rank < width.mnnvl_calls_total.size(); ++rank) {
+            emit_width("tp2_ar_width_calls_total", rank, width.width, "mnnvl",
+                       width.mnnvl_calls_total[rank]);
+            emit_width("tp2_ar_width_calls_total", rank, width.width, "nccl",
+                       width.nccl_calls_total[rank]);
+            emit_width("tp2_ar_width_payload_bytes_total", rank, width.width, "",
+                       width.bytes_payload_total[rank]);
+        }
+    }
+}
+
+}
+
 std::string format_metrics(const BatchMetrics& metrics, int running, std::size_t waiting) {
     std::string text = "# Native sglang.cpp metrics with frozen W3-prefix compatibility names\n";
     const auto emit = [&text](std::string_view name, auto value) {
@@ -252,6 +313,29 @@ std::string format_metrics(const BatchMetrics& metrics, int running, std::size_t
     emit("sglang_cpp:lmcache_lookup_nanoseconds_total", metrics.lmcache.lookup_ns);
     emit("sglang_cpp:lmcache_write_nanoseconds_total", metrics.lmcache.write_ns);
     emit("sglang_cpp:lmcache_restore_nanoseconds_total", metrics.lmcache.restore_ns);
+    for (std::size_t rank = 0; rank < metrics.lmcache.rank_stores.size(); ++rank) {
+        const auto prefix = "sglang_cpp:lmcache_rank" + std::to_string(rank);
+        emit(prefix + "_stores_total", metrics.lmcache.rank_stores[rank]);
+        if (rank < metrics.lmcache.rank_restores.size()) {
+            emit(prefix + "_restores_total", metrics.lmcache.rank_restores[rank]);
+        }
+        if (rank < metrics.lmcache.rank_read_bytes.size()) {
+            emit(prefix + "_gqa_read_bytes_total", metrics.lmcache.rank_read_bytes[rank][0]);
+            emit(prefix + "_gdn_read_bytes_total", metrics.lmcache.rank_read_bytes[rank][1]);
+            emit(prefix + "_draft_read_bytes_total", metrics.lmcache.rank_read_bytes[rank][2]);
+        }
+        if (rank < metrics.lmcache.rank_written_bytes.size()) {
+            emit(prefix + "_gqa_written_bytes_total",
+                 metrics.lmcache.rank_written_bytes[rank][0]);
+            emit(prefix + "_gdn_written_bytes_total",
+                 metrics.lmcache.rank_written_bytes[rank][1]);
+            emit(prefix + "_draft_written_bytes_total",
+                 metrics.lmcache.rank_written_bytes[rank][2]);
+        }
+    }
+    if (metrics.tp_ar_present) {
+        append_tp_ar_metrics(text, metrics.tp_ar);
+    }
     return text;
 }
 

@@ -20,10 +20,6 @@ The following roles and their resources are bundled with this checkout.
 - [Test](.agents/skills/test-mode/SKILL.md) independently reviews, tests and preserves evidence.
 - [Doc](.agents/skills/doc-mode/SKILL.md) maintains the other project documents under `docs/`.
 
-For new workers, use `group/glm-5.3` with high effort for `coding-mode` and `doc-mode`.
-Use `group/gpt-6.2-astra` with high effort for `research-mode` and `test-mode`.
-Let existing workers continue with their current settings.
-
 For kernel work pass [Blackwell](.agents/skills/principle-blackwell/SKILL.md).
 For model or serving behavior pass [inference](.agents/skills/principle-inference/SKILL.md).
 For benchmarking pass [performance](.agents/skills/principle-performance/SKILL.md).
@@ -44,8 +40,12 @@ Keep weights at `/data0/shared/Qwen3.8-27B-FP8`.
 
 Install local hooks with `git config --local core.hooksPath .githooks` and install
 `.agents/checks/requirements.txt` with the default Pixi Python. Hooks check the selected
-index and commit message. Perform semantic and English review separately. Keep raw results
-in `artifacts/`.
+index and commit message. Keep comments out of project code files: the pre-commit hook
+rejects any added or changed code file whose staged content contains a comment, including
+comments that predate the change. Shebangs, preprocessor directives, quoted literals, and
+here-documents are not comments. Remove comments only from code files you actually touch;
+do not clean up untouched legacy files. Perform semantic and English review separately.
+Keep raw results in `artifacts/`.
 
 Run tests only when concrete evidence strongly supports the expected outcome.
 Prioritize operator and framework tuning and focused local measurements.

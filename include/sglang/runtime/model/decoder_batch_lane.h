@@ -16,11 +16,15 @@ struct Lane {
     RequestProgress progress{};
     std::unique_ptr<MtpDraftRequest> draft = nullptr;
     std::unique_ptr<TargetVerification> verification = nullptr;
+    std::unique_ptr<Request> peer_request = nullptr;
+    std::unique_ptr<TargetVerification> peer_verification = nullptr;
+    std::unique_ptr<PendingBatchPrefix> peer_prefix = nullptr;
     std::optional<SamplingParameters> sampling = std::nullopt;
     std::optional<MtpConstraintRound> constraint_round{};
     bool checkpoints() const {
         return options.publish_prefix_checkpoints && bool(options.store_prefix);
     }
+    const Workspace* peer_checkpoint_row = nullptr;
     bool restored_prompt = false;
     std::shared_ptr<const MultimodalInput> media = nullptr;
     DecoderPromptLogprobs prompt_logprobs = {};
@@ -60,7 +64,6 @@ struct Lane {
     void record_decode_input(cudaStream_t stream) {
         prompt.push_back(progress.last_token);
         if (!draft || draft->valid_prefix() >= progress.position) return;
-        // The last ordinary target step does not enter the verifier's draft preparation.
         MtpRound tail{};
         tail.draft = draft.get();
         tail.media = media ? &media_prefill : nullptr;
@@ -71,7 +74,8 @@ struct Lane {
 
     void finish_round(MtpRound& round, DecoderBatchStep& result, cudaStream_t stream,
                       SerialOutput* output, const MtpRound::Cancel& cancel,
-                      MtpDraftInput* repair, const Workspace** committed_row) {
+                      MtpDraftInput* repair, const Workspace** committed_row,
+                      TextGdnReplayBatch* gdn_batch = nullptr) {
         result.mtp_drafted_tokens = round.drafted;
         result.mtp_verified_rows = round.rows();
         try {
@@ -96,7 +100,7 @@ struct Lane {
                 if (row + 1 == stop && result.finish_reason != DecoderFinishReason::cancelled)
                     result.finish_reason = DecoderFinishReason::stop;
                 return !result.finish_reason;
-            }, stream, cancel, repair, committed_row);
+            }, stream, cancel, repair, committed_row, gdn_batch);
             if (!completed) {
                 result.finish_reason = DecoderFinishReason::cancelled;
             }
@@ -113,7 +117,6 @@ struct Lane {
         result.mtp_replayed_rows = round.consumed < round.rows() ? round.consumed : 0;
         progress.advance(round.consumed);
         if (committed_row) {
-            // The final sampled ID is the unprocessed input of the next turn.
             prompt.insert(prompt.end(), round.tokens.begin(),
                           round.tokens.begin() + round.consumed);
         }

@@ -10,6 +10,7 @@
 #include "sglang/runtime/cache/kv_residency_policy.h"
 #include "sglang/runtime/execution/decoder_execution_policy.h"
 #include "sglang/runtime/model/qwen_request.h"
+#include "sglang/runtime/model/qwen_weight_shard.h"
 
 #include <algorithm>
 #include <array>
@@ -37,12 +38,16 @@ struct PromptLogprobCapture;
 struct MediaPrefill;
 struct MultimodalInput;
 class TargetVerification;
-struct TcVocabWeights;
+class TensorParallel;
 struct TcVocabScratch;
+struct TcVocabWeights;
+struct TpPartials;
 struct VerificationSequence;
 struct VerificationRow;
 struct VerificationGraph;
 struct MtpRound;
+class PeerDraftRepair;
+namespace tp_verify_graph { class Graph; }
 struct GeneratedLogprobReadback;
 
 class SerialOutput {
@@ -101,7 +106,7 @@ struct AdjustedLogitsWorkspace {
 };
 
 struct RequestProgress {
-    // Target prefix length, excluding unconsumed verification rows.
+    
     int position = 0;
     int generated = 0;
     int last_token = -1;
@@ -173,22 +178,59 @@ struct BatchGraphScratch {
     std::array<BatchDecodeBinding, decoder_batch_max_graph_lanes> bindings{};
 };
 
+
+
+
+
+
+
+struct TpPartials {
+    Bf16* attention = nullptr;  
+    Bf16* hidden = nullptr;     
+};
+constexpr int tp_max_forward_lanes = 160;  
 }
 
 namespace sglang {
 
 struct Decoder::Model {
-    Model(const std::filesystem::path& checkpoint, int cuda_device);
+    Model(const std::filesystem::path& checkpoint, int cuda_device,
+          const decoder::WeightSharding& sharding = decoder::WeightSharding{});
 
     bool is_b200() const { return backend.uses_b200_operators; }
     int target_split_end() const { return backend.target_split_end; }
     void forward(const decoder::ForwardLane* lanes, int count, cudaStream_t stream) const;
+    void forward_tp(const Model& peer, const decoder::ForwardLane* primary_lanes,
+                    const decoder::ForwardLane* peer_lanes, int count, cudaStream_t stream,
+                    cudaStream_t peer_stream, decoder::TensorParallel& group,
+                    const decoder::TpPartials& primary_partials,
+                    const decoder::TpPartials& peer_partials) const;
     bool verify_mtp(decoder::MtpRound* rounds, int count,
                     const decoder::ConstraintWorkspace& scratch, void* sampling_scratch,
                     cudaStream_t stream, decoder::VerificationGraph* graph,
                     const decoder::TcVocabScratch* vocabulary,
                     std::uint8_t* packed_activation = nullptr,
                     void* logprob_workspace = nullptr) const;
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    bool verify_mtp_tp(const Model& peer, decoder::MtpRound* rounds,
+                       const decoder::MtpRound* peer_rounds, int count,
+                       const decoder::ConstraintWorkspace& scratch, void* sampling_scratch,
+                       cudaStream_t stream, cudaStream_t peer_stream,
+                       decoder::TensorParallel& group,
+                       const decoder::TpPartials& primary_partials,
+                       const decoder::TpPartials& peer_partials,
+                       const decoder::TcVocabScratch* vocabulary,
+                       std::uint8_t* primary_packed, std::uint8_t* peer_packed,
+                       void* logprob_workspace,
+                       bool capture, decoder::PeerDraftRepair* peer_repair) const;
     bool forward_verify(const decoder::VerificationSequence* sequences, int count,
                         cudaStream_t stream, decoder::VerificationGraph* graph,
                         const decoder::TcVocabScratch* vocabulary,
@@ -207,6 +249,16 @@ struct Decoder::Model {
                        int logical_capacity = 0) const;
     void prefill_grants(const decoder::PrefillGrant* grants, int count, cudaStream_t stream,
                         DecoderBatchStepStats& stats) const;
+    
+    
+    
+    
+    
+    void prefill_grants_tp(const Model& peer, const decoder::PrefillGrant* grants,
+                           const decoder::PrefillGrant* peer_grants, int count,
+                           cudaStream_t stream, cudaStream_t peer_stream,
+                           decoder::TensorParallel& group,
+                           DecoderBatchStepStats& stats) const;
     void decode_graph(decoder::Request& request) const;
     void capture_batch_decode(const decoder::BatchGraphLane* lanes, int count,
                               cudaStream_t stream) const;
@@ -246,6 +298,26 @@ struct Decoder::Model {
     void forward_layers(const Lane* lanes, int count, cudaStream_t stream,
                         std::uint8_t* packed_activation = nullptr) const;
 
+    
+    
+    
+    template <typename Lane>
+    bool forward_layers_tp(const Model& peer, const Lane* primary_lanes,
+                           const Lane* peer_lanes, int count, cudaStream_t stream,
+                           cudaStream_t peer_stream, decoder::TensorParallel& group,
+                           const decoder::TpPartials& primary_partials,
+                           const decoder::TpPartials& peer_partials,
+                           std::uint8_t* primary_packed = nullptr,
+                           std::uint8_t* peer_packed = nullptr,
+                           bool singleton_verify = false) const;
+    decoder::tp_verify_graph::Graph* forward_verification_tp(
+        const Model& peer, const decoder::VerificationRow* rows,
+        const decoder::VerificationRow* peer_rows, int count, int total,
+        cudaStream_t stream, cudaStream_t peer_stream, decoder::TensorParallel& group,
+        const decoder::TpPartials& primary_partials, const decoder::TpPartials& peer_partials,
+        std::uint8_t* primary_packed, std::uint8_t* peer_packed, bool greedy, bool capture,
+        bool& eager_replicated) const;
+
     int device;
     std::string accelerator_name;
     decoder::CudaBackendPolicy backend{};
@@ -257,11 +329,38 @@ struct Decoder::Model {
     decoder::Bf16Weight lm_head{};
     std::shared_ptr<const decoder::MtpDraftWeights> mtp_weights;
     std::shared_ptr<const decoder::TcVocabWeights> tc_vocab;
+    
+    const TpRuntime* tp = nullptr;
     mutable std::atomic_flag request_in_use = ATOMIC_FLAG_INIT;
     mutable std::unique_ptr<decoder::Request> decode_request;
 };
 
-// Names the private decoder model for the decode-step runner in src/text/.
+
+
+
+
+
+struct Decoder::TpRuntime {
+    int device = 0;
+    int peer_device = 0;
+    cudaStream_t stream = nullptr;
+    cudaStream_t peer_stream = nullptr;
+    std::unique_ptr<Decoder::Model> peer;
+    std::unique_ptr<decoder::TensorParallel> group;
+    decoder::TpPartials partials[2]{};
+    
+    
+    
+    
+    
+    std::uint8_t* packed[2] = {};
+    mutable std::shared_ptr<decoder::tp_verify_graph::Graph> verification_capture;
+    mutable cudaStream_t verification_capture_stream = nullptr;
+    mutable bool verification_capture_disabled = false;
+    ~TpRuntime();
+};
+
+
 struct DecoderModelAccess {
     using Model = Decoder::Model;
 };
@@ -288,8 +387,8 @@ struct DecodeRunOptions {
     bool narrow_allowed;
 };
 
-// Enqueues one decode step for lanes. ready[index] names the workspace that already holds logits
-// and the greedy winner for lanes[index]; a null entry leaves scoring to the caller.
+
+
 DecodeRun run_decode_lanes(const DecoderModel& model, Allocations& execution,
                            DecodeGraphs& graphs, ForwardLane* lanes, int count,
                            DecodeRunOptions options);

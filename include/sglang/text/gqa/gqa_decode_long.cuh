@@ -8,6 +8,11 @@ namespace sglang::gqa_decode {
 inline constexpr int long_rows = text_gdn_max_verify_rows;
 inline constexpr int long_requests = decoder::max_wide_mtp_lanes;
 inline constexpr int long_min_position = 32768;
+inline constexpr int long_rank_wide_requests = 2 * decoder::wide_mtp_lanes;
+inline constexpr int long_rank_wide_splits = 18;
+inline constexpr int long_rank_wide_end = long_min_position + 4096;
+static_assert(sizeof(Partial) * long_rank_wide_splits * gqa_rank_geometry.query_heads <=
+              decoder::paged_decode_scratch_bytes);
 
 struct LongRequest {
     Mxfp8KvCache cache;
@@ -29,7 +34,8 @@ struct LongBatch {
 cudaError_t long_decode_status(cudaError_t status);
 std::optional<cudaError_t> launch_long_decode(const LongBatch& batch, int requests,
                                              cudaStream_t stream);
-cudaError_t combine_long_decode(const LongBatch& batch, int requests, cudaStream_t stream);
+cudaError_t combine_long_decode(const LongBatch& batch, int requests, int splits,
+                                cudaStream_t stream);
 
 #ifdef __CUDACC__
 __device__ inline decoder::PagedDecodeLane resolve(const LongBatch& batch) {

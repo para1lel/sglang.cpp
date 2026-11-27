@@ -66,24 +66,27 @@ class NativeMxfp8:
     layers: int
     pages: int
     planes: tuple
+    kv_heads: int
 
     @classmethod
-    def parse_records(cls, request, allocations, family, key):
+    def parse_records(cls, request, allocations, family, key, legacy=True):
         begin, end = request.number(4), request.number(4)
         if begin == end == 0:
             return []
+        kv_heads = 4 if legacy else request.number(4)
         pages = request.number(4)
         planes = tuple((request.number(4), request.number(8)) for _ in range(4))
         layers = 16 if family == 1 else 1
         if not begin < end <= MAX_TOKENS or begin % PREFIX_CHUNK or not end <= pages * 128:
             raise ValueError("invalid native MXFP8 extent")
-        if not 0 < pages <= MAX_TOKENS // 128:
+        if not 0 < pages <= MAX_TOKENS // 128 or not 0 < kv_heads <= 128:
             raise ValueError("invalid native MXFP8 geometry")
-        for (allocation, offset), row_bytes in zip(planes, (1024, 1024, 32, 32), strict=True):
+        row_bytes = (kv_heads * 256, kv_heads * 256, kv_heads * 8, kv_heads * 8)
+        for (allocation, offset), plane_bytes in zip(planes, row_bytes, strict=True):
             if allocation >= len(allocations) or \
-                    offset + layers * pages * 128 * row_bytes > allocations[allocation][1]:
+                    offset + layers * pages * 128 * plane_bytes > allocations[allocation][1]:
                 raise ValueError("native MXFP8 plane exceeds allocation")
-        view = cls(layers, pages, planes)
+        view = cls(layers, pages, planes, kv_heads)
         return [NativeRecord(key(family, request.read(DIGEST_BYTES)),
                              min(PREFIX_CHUNK, end - start), start, view)
                 for start in range(begin, end, PREFIX_CHUNK)]
@@ -91,11 +94,11 @@ class NativeMxfp8:
     def regions(self, begin, rows):
         offset = 0
         for index, (allocation, address) in enumerate(self.planes):
-            row_bytes = 1024 if index < 2 else 32
+            row_bytes = self.kv_heads * 256 if index < 2 else self.kv_heads * 8
             width = rows * row_bytes
             pitch = self.pages * 128 * row_bytes
             origin = address + begin * row_bytes
-            full = width if index < 2 else rows // 128 * 4096
+            full = width if index < 2 else rows // 128 * 128 * self.kv_heads * 8
             if full:
                 yield Region(allocation, origin, pitch, offset, width, full, self.layers)
             if full < width:
@@ -105,10 +108,11 @@ class NativeMxfp8:
                     complete = (rows % 128) // 32 * 8
                     tail = rows % 32
                     if complete:
-                        yield Region(allocation, device, 32, record, complete, complete, 128)
-                        record += complete * 128
+                        yield Region(allocation, device, 32, record, complete, complete,
+                                     self.kv_heads * 32)
+                        record += complete * self.kv_heads * 32
                     if tail:
-                        for head in range(4):
+                        for head in range(self.kv_heads):
                             yield Region(allocation, device + head * 1024 + complete,
                                          32, record, 8, 8, tail)
                             record += tail * 8
@@ -124,7 +128,7 @@ class NativeRecord:
 
     @property
     def size(self):
-        return self.tokens * self.view.layers * 2 * (1024 + 32)
+        return self.tokens * self.view.layers * 2 * self.view.kv_heads * (256 + 8)
 
     @property
     def regions(self):
@@ -139,7 +143,7 @@ class Transfer:
     records: list
 
     @classmethod
-    def parse(cls, request, key):
+    def parse(cls, request, key, legacy=True):
         device = bytes(request.read(16))
         event = bytes(request.read(64))
         count = request.number(4)
@@ -150,8 +154,8 @@ class Transfer:
             raise ValueError("invalid CUDA IPC allocation size")
         if len({handle for handle, _ in allocations}) != count:
             raise ValueError("duplicate CUDA IPC allocation")
-        records = NativeMxfp8.parse_records(request, allocations, 1, key)
-        records += NativeMxfp8.parse_records(request, allocations, 3, key)
+        records = NativeMxfp8.parse_records(request, allocations, 1, key, legacy)
+        records += NativeMxfp8.parse_records(request, allocations, 3, key, legacy)
         gdn = GdnRecord.parse(request, allocations, key)
         if gdn:
             records.append(gdn)

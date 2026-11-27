@@ -312,6 +312,11 @@ void check_singleton_owner(const Decoder& decoder) {
 namespace sglang {
 
 struct Decoder::Model {};
+#define SGLANG_TEST_TP_HEADER "sglang/runtime/execution/decoder_tp.h"
+#if __has_include(SGLANG_TEST_TP_HEADER)
+struct Decoder::TpRuntime {};
+const decoder::TpRuntimeInfo* Decoder::tensor_parallel_info() const { return nullptr; }
+#endif
 Decoder::Decoder(const std::filesystem::path&, int, bool) {}
 Decoder::~Decoder() = default;
 
@@ -372,8 +377,18 @@ DecoderBatch::advance_chunked(const std::array<bool, decoder_batch_max_lanes>& s
 
 }
 
-int main() {
+int main(int argc, char** argv) {
     const Decoder decoder({}, 0, false);
+    if (argc == 2) {
+        std::vector<std::array<std::uint8_t, 16>> devices(2);
+        devices[0][0] = 1;
+        devices[1][0] = 2;
+        BatchService service(std::make_unique<SingleDeviceBatchExecutor>(decoder,
+            BatchExecutor::Options{false, 2, 0, decoder_default_max_num_batched_tokens}),
+            false, 0, decoder::LmCacheConfig{argv[1], "service", 2000}, devices, "service");
+        check_results(service.generate_batch(0, prompts(90, 1), {}), 90, 1);
+        return 0;
+    }
     check_tickets();
     check_two_owners(decoder);
     check_refill(decoder);

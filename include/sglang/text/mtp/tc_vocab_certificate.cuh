@@ -111,7 +111,8 @@ struct Interval {
     float upper;
 };
 
-__device__ Interval interval(int raw, const Stats& weight, const Stats& input) {
+__device__ Interval interval(int raw, const Stats& weight, const Stats& input,
+                             float rounding_error = 0x1p-16f) {
     if (!(weight.scale > 0 && input.scale > 0)) {
         return {-CUDART_INF_F, CUDART_INF_F};
     }
@@ -119,8 +120,8 @@ __device__ Interval interval(int raw, const Stats& weight, const Stats& input) {
     const float weight_error = __fmul_ru(weight.error_norm, input.value_norm);
     const float input_error = __fmul_ru(weight.approx_norm, input.error_norm);
     const float norm_product = __fmul_ru(weight.value_norm, input.value_norm);
-    const float legacy_error = __fmaf_ru(norm_product, 0x1p-16f, 0x1p-100f);
-    const float error = __fadd_ru(__fadd_ru(weight_error, input_error), legacy_error);
+    const float rounding = __fmaf_ru(norm_product, rounding_error, 0x1p-100f);
+    const float error = __fadd_ru(__fadd_ru(weight_error, input_error), rounding);
     const float lower = __double2float_rd(__dsub_rd(__dmul_rd(raw, product), error));
     const float upper = __double2float_ru(__dadd_ru(__dmul_ru(raw, product), error));
     return {__bfloat162float(__float2bfloat16_rn(lower)),

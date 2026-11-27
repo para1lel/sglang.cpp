@@ -44,7 +44,6 @@ struct DecoderBatchStep {
         extra_generated_logprobs{};
     std::shared_ptr<const DecoderPromptLogprobs> prompt_logprobs = nullptr;
     std::shared_ptr<const std::vector<double>> label_logprobs = nullptr;
-    // The producer is waiting for space to submit its checkpoint, before any IPC begins.
     bool prefix_pending = false;
 };
 
@@ -69,6 +68,7 @@ struct DecoderBatchOptions {
     int prefix_cache_entries = 0;
     int max_num_batched_tokens = decoder_default_max_num_batched_tokens;
     std::optional<std::size_t> resident_memory_limit = std::nullopt;
+    bool tp_verification_graphs = false;
 };
 
 struct DecoderPrefixCacheStats {
@@ -89,36 +89,21 @@ struct DecoderPrefixCacheStats {
     std::uint64_t gqa_computed_tokens = 0;
 };
 
-/// The Decoder must outlive the batch. Use one host thread to operate a batch.
-/// Each slot owns its request until cancellation or a finishing step, including submission
-/// of any deferred final checkpoint.
 class DecoderBatch {
 public:
     explicit DecoderBatch(const Decoder& decoder);
     DecoderBatch(const Decoder& decoder, DecoderBatchOptions options);
     ~DecoderBatch();
 
-    /// Return the restored prompt length. Use poll_prefix() to resolve a pending restore.
     int admit(int slot, std::vector<int> prompt, const DecoderOptions& options);
     int admit_multimodal(int slot, std::vector<int> prompt, const DecoderOptions& options,
                          const std::vector<DecoderMedia>& media);
     void cancel(int slot);
-    /// Poll after admitting a restore or receiving prefix_pending from a step. When pending
-    /// clears, restored holds the cached token count for a completed restore (zero on a miss).
     DecoderBatchPrefixUpdate poll_prefix(int slot);
 
-    /// Advance each selected slot by one position or one speculative round.
-    /// Consume token and the first extra_token_count entries of extra_tokens in order.
-    /// extra_token mirrors the first extra token for callers using depth one.
-    /// A zero-budget slot finishes without work. A failed selection retires only its slot.
-    /// If an advance throws, check available(). After a recoverable failure, slots with
-    /// outstanding restores stay occupied. Poll each of those slots with poll_prefix() until
-    /// pending clears before readmitting it. All other slots have been retired.
     std::array<DecoderBatchStep, decoder_batch_max_lanes>
     advance(const std::array<bool, decoder_batch_max_lanes>& selected);
 
-    /// Reserve target rows for ready decode before granting the remaining budget to prompts.
-    /// Prompts use as many legal rows as possible in successful admission order.
     std::array<DecoderBatchStep, decoder_batch_max_lanes>
     advance_chunked(const std::array<bool, decoder_batch_max_lanes>& selected,
                     DecoderBatchStepStats* stats = nullptr);
@@ -136,6 +121,7 @@ private:
                       const std::vector<DecoderMedia>* media = nullptr);
     int admit_impl(int slot, std::vector<int> prompt, const DecoderOptions& options,
                    const std::vector<DecoderMedia>* media);
+    struct TpDriver;
     struct State;
     std::unique_ptr<State> state_;
 };

@@ -21,6 +21,12 @@ inline constexpr int gdn_layers = qwen_text_model.gdn_layers();
 inline constexpr std::size_t gdn_history_elements = text_gdn_qkv_width * text_gdn_history_taps;
 inline constexpr std::size_t gdn_state_elements =
     text_gdn_value_heads * text_gdn_head_dim * text_gdn_head_dim;
+inline constexpr std::size_t gdn_local_history_elements =
+    text_gdn_qkv_width / 2 * text_gdn_history_taps;
+inline constexpr std::size_t gdn_local_state_elements =
+    text_gdn_value_heads / 2 * text_gdn_head_dim * text_gdn_head_dim;
+static_assert(gdn_local_history_elements * 2 == gdn_history_elements);
+static_assert(gdn_local_state_elements * 2 == gdn_state_elements);
 
 static_assert(mxfp8_query_heads == qwen_text_model.query_heads);
 static_assert(mxfp8_kv_heads == qwen_text_model.kv_heads);
@@ -33,16 +39,16 @@ static_assert(text_attention_max_tokens == qwen_text_model.max_position_embeddin
 static_assert(text_fp8_group_size == qwen_text_model.fp8_weight_block_size);
 
 struct Fp8Weight {
-    const std::uint8_t* values;
-    const Bf16* scales;
-    int rows;
-    int columns;
+    const std::uint8_t* values = nullptr;
+    const Bf16* scales = nullptr;
+    int rows = 0;
+    int columns = 0;
 };
 
 struct Bf16Weight {
-    const Bf16* values;
-    int rows;
-    int columns;
+    const Bf16* values = nullptr;
+    int rows = 0;
+    int columns = 0;
 };
 
 struct GdnLayer {

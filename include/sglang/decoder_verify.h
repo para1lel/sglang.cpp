@@ -1,6 +1,7 @@
 #pragma once
 
 #include "sglang/decoder_internal.h"
+#include "sglang/text/gdn/gdn_replay_batch.h"
 
 namespace sglang::decoder {
 
@@ -48,8 +49,39 @@ void project_verification_bf16(Bf16Weight weight, const VerificationRow* rows, i
                                Bf16* Workspace::*output, cudaStream_t stream);
 
 struct VerificationWorkspace {
-    VerificationWorkspace(Allocations& memory, int rows);
-    void bind_gdn(int layer, int rows);
+    VerificationWorkspace(Allocations& memory, int rows) {
+        const int layer_elements = 2 * rows * (text_gdn_qkv_width + text_gdn_value_heads);
+        auto* storage = memory.allocate<Bf16>(gdn_layers * layer_elements);
+        for (auto& layer : replay) {
+            const int qkv = rows * text_gdn_qkv_width;
+            const int gates = rows * text_gdn_value_heads;
+            layer.inputs = {storage, storage + qkv, storage + 2 * qkv,
+                            storage + 2 * qkv + gates};
+            storage += layer_elements;
+        }
+        auto* z = memory.allocate<Bf16>(rows * text_gdn_value_width);
+        auto* attention = memory.allocate<Bf16>(rows * text_gdn_value_width);
+        observable = memory.allocate<Bf16>(rows * text_gdn_value_width);
+        winners = memory.allocate<TextLogitCandidate>(rows);
+        bf16_head_packed = memory.allocate<Bf16>(
+            static_cast<std::size_t>(verification_packet_rows) * (hidden_size + vocab_size));
+        bf16_head_packed_logits =
+            bf16_head_packed + static_cast<std::size_t>(verification_packet_rows) * hidden_size;
+        work.reserve(rows);
+        for (int index = 0; index < rows; ++index) {
+            auto& row = work.emplace_back(memory, attention + index * text_gdn_value_width,
+                                          winners + index);
+            row.gdn_z = z + index * text_gdn_value_width;
+        }
+    }
+    void bind_gdn(int layer, int rows) {
+        const auto inputs = replay[layer].inputs;
+        for (int index = 0; index < rows; ++index) {
+            work[index].gdn_qkv = inputs.qkv + index * text_gdn_qkv_width;
+            work[index].gdn_b = inputs.b + index * text_gdn_value_heads;
+            work[index].gdn_a = inputs.a + index * text_gdn_value_heads;
+        }
+    }
 
     struct ReplayLayer {
         TextGdnReplayRows inputs;
@@ -58,8 +90,10 @@ struct VerificationWorkspace {
 
     std::array<ReplayLayer, gdn_layers> replay;
     std::vector<Workspace> work;
-    Bf16* observable;
-    TextLogitCandidate* winners;
+Bf16* observable;
+TextLogitCandidate* winners;
+    Bf16* bf16_head_packed = nullptr;
+    Bf16* bf16_head_packed_logits = nullptr;
 };
 
 struct VerificationGraphBinding {
@@ -92,7 +126,6 @@ struct VerificationGraph {
     bool warmed = false;
 };
 
-// Holds candidate uploads for draft and target scores on one speculative branch.
 class MtpConstraintRound {
 public:
     MtpConstraintRound(Request& request, const TokenConstraint& constraint, int rows);
@@ -145,7 +178,8 @@ struct MtpRound {
                               cudaStream_t stream);
     int text_stop_after(const DecoderOptions& options, const RequestProgress& progress) const;
     bool commit(const Emit& emit, cudaStream_t stream, const Cancel& cancel,
-                MtpDraftInput* repair, const Workspace** committed_row = nullptr);
+                MtpDraftInput* repair, const Workspace** committed_row = nullptr,
+                TextGdnReplayBatch* gdn_batch = nullptr);
 };
 
 class TargetVerification {
@@ -153,9 +187,10 @@ public:
     TargetVerification(Request& request, int capacity, int prefix, int rows, bool logits,
                        cudaStream_t stream = nullptr,
                        std::shared_ptr<TextLogitCandidate> winners = nullptr,
-                       int generated_top_logprobs = -1);
+                       int generated_top_logprobs = -1, bool rank_local_gdn = false);
 
     void begin(int position, int count, cudaStream_t stream);
+    bool can_begin(int position, int count, cudaStream_t stream) const;
     VerificationRow row(int index);
     const Workspace* checkpoint_row(int index);
     bool graph_eligible(const VerificationSequence& sequence) const;
@@ -170,14 +205,23 @@ public:
     void enqueue_generated_logprobs(void* scratch);
     void read();
     static void read_all(TargetVerification* const* verifiers, int count, cudaStream_t stream);
-    void commit(int count);
+    void commit(int count, TextGdnReplayBatch* gdn_batch = nullptr);
 
     int winner(int index, bool sampled = false, bool constrained = false) const;
     bool needs_logits() const { return host_logits_ != nullptr; }
     const Bf16* logits(int index) const;
     bool needs_generated_logprobs() const { return host_generated_logprobs_ != nullptr; }
     std::shared_ptr<const DecoderTokenLogprobs> generated_logprobs(int index) const;
+    int pending_rows() const { return pending_rows_; }
+    bool rank_local_gdn() const { return rank_local_gdn_; }
+    cudaStream_t stream() const { return stream_; }
 
+    Bf16* bf16_head_staging() const {
+        return active_workspace_ ? active_workspace_->bf16_head_packed : nullptr;
+    }
+    Bf16* bf16_head_logits_staging() const {
+        return active_workspace_ ? active_workspace_->bf16_head_packed_logits : nullptr;
+    }
 private:
     void enqueue_results();
     VerificationWorkspace& workspace() { return *active_workspace_; }
@@ -195,6 +239,7 @@ private:
     Bf16* host_logits_;
     GeneratedLogprobReadback* host_generated_logprobs_ = nullptr;
     int generated_top_logprobs_;
+    bool rank_local_gdn_ = false;
 };
 
 std::shared_ptr<TextLogitCandidate> prepare_verification_winners(int slots);

@@ -31,6 +31,7 @@ HEADER = struct.Struct("!4sIQ")
 MAX_METADATA = 64 << 20
 MAX_KEYS = 1 << 20
 LOOKUP_BATCH = 4096
+MAX_DETAIL = 4096
 WORKERS = 16
 REQUEST_TIMEOUT = 10
 LOG = init_logger(__name__)
@@ -51,7 +52,6 @@ class GdnEndpoints(L1ManagerListener):
         self.counts = Counter()
 
     def snapshot(self, limit):
-        # L1 callbacks take this lock, so release it before reserving any L1 reads.
         with self.lock:
             ends = tuple(self.counts)
         return sorted((end for end in ends if end <= limit), reverse=True)
@@ -140,6 +140,18 @@ class PrefixLookup:
         return limit // PREFIX_CHUNK * PREFIX_CHUNK
 
     def resolve(self):
+        gqa, matched, eligible = self.coverage()
+        if not self.draft:
+            end = eligible[0][0] if eligible else 0
+            return gqa, end, 0, matched
+        end = next((candidate for candidate, draft_ok in eligible if draft_ok), 0)
+        return gqa, end, end - 1 if end else 0, matched
+
+    def detail(self):
+        gqa, matched, eligible = self.coverage()
+        return gqa, matched, len(eligible), eligible[:MAX_DETAIL]
+
+    def coverage(self):
         full = self.full_coverage(1, self.count)
         tail = range(min(self.count, full + PREFIX_CHUNK - 1), full, -1)
         gqa = next((end for end, found in zip(tail, self.present(1, tail)) if found), full)
@@ -147,18 +159,16 @@ class PrefixLookup:
         states = [end for end, found in zip(ends, self.present(2, ends)) if found]
         matched = states[0] if states else 0
         maximum = min(self.limit, gqa)
-        eligible = [end for end in states if end <= maximum]
-        if not self.draft:
-            return gqa, eligible[0] if eligible else 0, 0, matched
-        if eligible:
+        if self.draft:
             draft_full = self.full_coverage(3, maximum - 1)
-            eligible = [end for end in eligible if end <= draft_full + PREFIX_CHUNK]
-            tails = [end - 1 for end in eligible if (end - 1) % PREFIX_CHUNK]
+            states = [end for end in states if end <= draft_full + PREFIX_CHUNK]
+            tails = [end - 1 for end in states if (end - 1) % PREFIX_CHUNK]
             usable = {end for end, found in zip(tails, self.present(3, tails)) if found}
-            for end in eligible:
-                if (end - 1) % PREFIX_CHUNK == 0 or end - 1 in usable:
-                    return gqa, end, end - 1, matched
-        return gqa, 0, 0, matched
+            eligible = [(end, (end - 1) % PREFIX_CHUNK == 0 or end - 1 in usable)
+                        for end in states]
+        else:
+            eligible = [(end, False) for end in states]
+        return gqa, matched, [(end, draft_ok) for end, draft_ok in eligible if end <= maximum]
 
 
 class Request:
@@ -235,7 +245,6 @@ class Request:
         self.armed = True
 
     def release_reply(self, status, data=b""):
-        # GPU IPC leases end after device synchronization and unmapping, even after a deadline.
         self.peer.settimeout(REQUEST_TIMEOUT)
         self.peer.sendall(HEADER.pack(MAGIC, status, len(data)) + data)
 
@@ -274,8 +283,6 @@ class DmaReservations(L1ManagerListener):
         self.delete_l1 = manager.delete
         manager.clear = self.clear
         manager.delete = self.delete
-        # These 0.5.8 callbacks run under _lock. Capture the reservation before
-        # another notification can fail and interrupt the StorageManager call.
         with manager._lock:
             manager._registered_listeners.insert(0, self)
 
@@ -298,8 +305,6 @@ class DmaReservations(L1ManagerListener):
     def reclaim(self, operation, force, *args):
         if not force:
             return operation(*args)
-        # The upstream force path bypasses the L1 lock state. Serialize only
-        # that path with reservation creation and refuse it while any are live.
         with self.activity_lock:
             if self.active:
                 raise RuntimeError("Cannot force reclaim during an active sglang DMA reservation")
@@ -337,8 +342,6 @@ class DmaReservations(L1ManagerListener):
         with self.manager._lock:
             pending = {key: lock for key, (entry, lock) in entries.items()
                        if self.manager._objects.get(key) is entry and entry.read_lock is lock}
-        # A pin prevents ordinary eviction until finish_read consumes it. Other
-        # readers finishing on different threads still release their native TTL lock.
         self.finishing.locks = set(pending.values())
         try:
             if pending:
@@ -469,7 +472,6 @@ class Records:
 
     def store(self, request, transfer):
         keys = [record.key for record in transfer.records]
-        # Serialize writers to keep immutable records and their state marker coherent.
         with self.writes, self.read(keys) as resident:
             pending = [record for record in transfer.records if record.key not in resident]
             if any(not self.fits(resident, record) for record in transfer.records
@@ -527,7 +529,6 @@ class SocketServer(OwnedUnixStreamServer):
         self.pending_mutations = 0
         self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS)
         self.slots = threading.BoundedSemaphore(WORKERS)
-        # Armed GPU operations cannot occupy every worker needed to report lease status.
         self.gpu_slots = threading.BoundedSemaphore(WORKERS - 4)
         super().__init__(endpoint, Handler)
 
@@ -640,15 +641,17 @@ class Handler(socketserver.BaseRequestHandler):
         records = self.server.records
         if request.op == 2:
             records.lookup(request, namespace)
-        elif request.op in (3, 4):
+        elif request.op in (3, 4, 10, 11):
             if not self.server.gpu_slots.acquire(blocking=False):
                 request.reply(3)
                 return
             try:
                 metadata = TransferMetadata(request)
+                legacy = request.op in (3, 4)
                 transfer = Transfer.parse(metadata, lambda family, identity, endpoint=0:
-                                          object_key(namespace, family, identity, endpoint))
-                operation = records.retrieve if request.op == 3 else records.store
+                                          object_key(namespace, family, identity, endpoint),
+                                          legacy)
+                operation = records.retrieve if request.op in (3, 10) else records.store
                 with self.server.lease(request):
                     result = operation(request, transfer)
                 request.release_reply(*result)
@@ -665,9 +668,15 @@ class Handler(socketserver.BaseRequestHandler):
             request.check_mutation()
             _, skipped = records.storage.delete_l1_keys([key])
             request.reply(1 if skipped else 0)
-        elif request.op == 7:
+        elif request.op in (7, 9):
             query = PrefixLookup(request, namespace, records)
-            request.reply(0, struct.pack("!IIII", *query.resolve()))
+            if request.op == 7:
+                request.reply(0, struct.pack("!IIII", *query.resolve()))
+            else:
+                gqa, matched, total, entries = query.detail()
+                request.reply(0, struct.pack("!IIII", gqa, matched, total, len(entries)) +
+                              b"".join(struct.pack("!IB", end, draft_ok)
+                                       for end, draft_ok in entries))
         else:
             raise ValueError("unknown LMCache operation")
 

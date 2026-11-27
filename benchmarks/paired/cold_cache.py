@@ -55,6 +55,10 @@ def metrics(text, engine):
         names += (*LMCACHE_METRICS, STORES)
         if engine == LMCACHE_DRAIN:
             names += LMCACHE_DRAIN_METRICS
+    return parse_metrics(text, names)
+
+
+def parse_metrics(text, names):
     result = {}
     for line in text.splitlines():
         match = METRIC.fullmatch(line)
@@ -139,8 +143,6 @@ def verify_lmcache_drain(snapshots, requests, previous):
             "LMCache declined a checkpoint store during the cold cohort")
     require(all(after[name] == cleared[name] for name in LMCACHE_READ_ACTIVITY),
             "LMCache issued a restore during the cold cohort")
-    # The last emitted token has not entered the model. A terminal store at
-    # a periodic boundary is the same checkpoint, so round the cursor up once.
     ends = [request["usage"]["prompt_tokens"] + request["usage"]["completion_tokens"] - 1
             for request in requests]
     expected = sum((end + CHECKPOINT_INTERVAL - 1) // CHECKPOINT_INTERVAL for end in ends)

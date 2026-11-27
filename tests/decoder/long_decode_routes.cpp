@@ -1,6 +1,7 @@
 #include "sglang/testing/prefix_fixture.h"
 #include "sglang/decoder_internal.h"
 #include "sglang/text_ops.h"
+#include "sglang/text/gqa_verify_batch.h"
 #include "sglang/tokenizer/tokenizer.h"
 
 #include <cuda.h>
@@ -14,6 +15,8 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <memory>
+#include <numeric>
 #include <sstream>
 #include <stdexcept>
 #include <string_view>
@@ -46,6 +49,8 @@ struct MtpRoutes {
     int merges = 0;
     int legacy = 0;
     unsigned requests = slots;
+    unsigned splits = gqa_decode::max_splits;
+    unsigned kv_heads = mxfp8_kv_heads;
 };
 MtpRoutes* mtp_routes = nullptr;
 int* serial_reads = nullptr;
@@ -293,6 +298,148 @@ void check_crossing_tokens(const DecoderBatchStep& result, int& ordinal) {
     for (int index = 0; index < result.extra_token_count; ++index) {
         check(result.extra_tokens[index] == cycle[ordinal++ % cycle.size()], "W5 draft ID changed");
     }
+}
+
+template <typename Setup, typename Expect>
+void check_mtp_w4(Setup setup_lane, Expect expect, decoder::VerificationRow& last) {
+    constexpr int lanes = gqa_decode::long_rank_wide_requests;
+    constexpr int steps = decoder::target_verify_max_rows;
+    constexpr int full = lanes * steps;
+    constexpr auto extra_splits = gqa_decode::long_rank_wide_splits;
+    expect(full, lanes, 0, extra_splits);
+    expect(full - 1, lanes, 0);
+    setup_lane(0, gqa_decode::long_min_position - 1);
+    expect(full, lanes, 1);
+    for (int lane = 0; lane < lanes; ++lane) {
+        setup_lane(lane, gqa_decode::long_rank_wide_end - 1);
+    }
+    expect(full, lanes, 0, extra_splits);
+    setup_lane(0, gqa_decode::long_rank_wide_end);
+    expect(full, lanes, 0);
+    setup_lane(0, gqa_decode::long_rank_wide_end - 1);
+    ++last.position;
+    expect(full, 0, 0);
+    --last.position;
+    const decoder::VerificationGraphBinding binding{};
+    last.binding = &binding;
+    expect(full, 0, 0);
+    last.binding = nullptr;
+    last.constrained = true;
+    expect(full, lanes - 1, steps);
+}
+
+template <typename Setup, typename Expect>
+void check_mtp_w3(Setup setup_lane, Expect expect, decoder::Request& first,
+                  decoder::Request& last, decoder::VerificationRow& row) {
+    constexpr int lanes = decoder::wide_mtp_lanes;
+    constexpr int steps = decoder::target_verify_max_rows;
+    constexpr int full = lanes * steps;
+    expect(full, lanes, 0);
+    expect(full - 1, 0, 0);
+    const auto saved_pages = last.pages;
+    last.pages = first.pages;
+    expect(full, 0, 0);
+    last.pages = saved_pages;
+    last.caches[0].kv_heads = mxfp8_kv_heads;
+    expect(full, 0, 0);
+    last.caches[0].kv_heads = gqa_rank_geometry.kv_heads;
+    last.pages.page_count = 64;
+    expect(full, 0, 0);
+    last.pages = saved_pages;
+    row.constrained = true;
+    expect(full, 0, 0);
+    row.constrained = false;
+    setup_lane(0, 8190);
+    expect(full, 0, 0);
+    setup_lane(0, 10235);
+    expect(full, lanes, 0);
+    setup_lane(0, 10236);
+    expect(full, 0, 0);
+    setup_lane(0, gqa_decode::long_min_position - 1);
+    expect(full, 1, full - steps + 1);
+}
+
+template <bool W4>
+void mtp_rank_long() {
+    using namespace decoder;
+    constexpr int lanes = W4 ? gqa_decode::long_rank_wide_requests : wide_mtp_lanes;
+    constexpr int steps = target_verify_max_rows;
+    constexpr int last_position = W4 ? gqa_decode::long_rank_wide_end + steps - 1
+                                     : gqa_decode::long_min_position;
+    constexpr int logical_pages = last_position / mxfp8_page_size + 1;
+    constexpr int physical_pages = lanes * logical_pages;
+    constexpr int kv_heads = gqa_rank_geometry.kv_heads;
+    constexpr auto payload = physical_pages * gqa_payload_bytes_per_page(kv_heads);
+    constexpr auto scales = physical_pages * gqa_scale_bytes_per_page(kv_heads);
+    Allocations memory(0);
+    memory.open_stream();
+    const auto stream = memory.stream();
+    const auto zeros = [&]<typename T>(std::size_t count) {
+        auto* buffer = memory.allocate<T>(count);
+        zero_cuda_async(buffer, count * sizeof(T), stream, "Initialize ranked fixture");
+        return buffer;
+    };
+    const Mxfp8KvCache cache{zeros.template operator()<std::uint8_t>(payload),
+                             zeros.template operator()<std::uint8_t>(payload),
+                             zeros.template operator()<std::uint8_t>(scales),
+                             zeros.template operator()<std::uint8_t>(scales), physical_pages,
+                             kv_heads};
+    std::array<std::int32_t, physical_pages> page_ids;
+    std::iota(page_ids.begin(), page_ids.end(), 0);
+    auto* table = memory.allocate<std::int32_t>(physical_pages);
+    copy_cuda_async(table, page_ids.data(), sizeof(page_ids), cudaMemcpyHostToDevice, stream,
+                    "Upload ranked page tables");
+    std::array<std::unique_ptr<Request>, lanes> requests;
+    std::array<Workspace, lanes * steps> work;
+    std::array<VerificationRow, lanes * steps> rows;
+    const auto setup_lane = [&](int lane, int position) {
+        for (int step = 0; step < steps; ++step) {
+            const int packet = lane / decoder_batch_max_mtp_lanes;
+            const int row = packet * verification_packet_rows +
+                            step * decoder_batch_max_mtp_lanes + lane % decoder_batch_max_mtp_lanes;
+            rows[row] = {requests[lane].get(), &work[row], position + step, nullptr, step == 0};
+        }
+    };
+    for (int lane = 0; lane < lanes; ++lane) {
+        requests[lane] = std::make_unique<Request>(0);
+        requests[lane]->pages = {table + lane * logical_pages, logical_pages};
+        requests[lane]->caches[0] = cache;
+        setup_lane(lane, W4 ? gqa_decode::long_min_position : 8191 + lane);
+    }
+    for (auto& row : work) {
+        row = Workspace(memory);
+        zero_cuda_async(row.q_gate, text_gqa_q_gate_width * sizeof(Bf16), stream, "Clear Q/gate");
+        zero_cuda_async(row.keys, text_gqa_kv_width * sizeof(Bf16), stream, "Clear K");
+        zero_cuda_async(row.values, text_gqa_kv_width * sizeof(Bf16), stream, "Clear V");
+    }
+    GqaLayer layer{};
+    layer.query_norm = layer.key_norm = zeros.template operator()<Bf16>(mxfp8_head_dim);
+    const auto expect = [&](int count, unsigned readers, int left,
+                            unsigned splits = gqa_decode::max_splits) {
+        MtpRoutes launches;
+        launches.requests = readers;
+        launches.splits = splits;
+        launches.kv_heads = kv_heads;
+        int remaining = 0;
+        mtp_routes = &launches;
+        const bool launched = try_gqa_verify_long(layer, rows.data(), count, 0, true,
+            text_attention_max_tokens, stream, [&](const auto& selected) {
+                remaining = std::count(selected.begin(), selected.begin() + count, false);
+            });
+        mtp_routes = nullptr;
+        check(launched == (readers != 0) && launches.readers == int(readers != 0) &&
+                  launches.merges == launches.readers && !launches.legacy && remaining == left,
+              "Unexpected ranked shared-KV routing or remainder");
+    };
+    if constexpr (W4) {
+        check_mtp_w4(setup_lane, expect, rows.back());
+        synchronize_cuda(stream, "Complete W4 route regression");
+        std::cout << "w4_shared_kv_routes=pass\n";
+        return;
+    }
+    check_mtp_w3(setup_lane, expect, *requests.front(), *requests.back(), rows.back());
+    synchronize_cuda(stream, "Complete W3 route regression");
+    std::cout << "w3_shared_kv_routes=pass\n";
 }
 
 void mtp_crossings(const char* checkpoint, const char* fixture) {
@@ -566,13 +713,15 @@ static void record_launch(std::string_view symbol, dim3 grid, dim3 block) {
                              symbol.find("split_kernel") != symbol.npos && grid.z != 4) ||
                             symbol.find("reuse_split_kernel") != symbol.npos;
         if (reader) {
-            check(grid.x == 16 && grid.y == 4 && grid.z == mtp_routes->requests && block.x == 480,
+            check(grid.x == mtp_routes->splits && grid.y == mtp_routes->kv_heads &&
+                      grid.z == mtp_routes->requests && block.x == 480,
                   "Unexpected MTP long reader geometry");
             check(mtp_routes->readers == mtp_routes->merges, "Missing previous MTP merge");
             ++mtp_routes->readers;
         }
         if (merge) {
-            check(grid.x == 24 && grid.y == 1 && block.x == 256 &&
+            check(grid.x == unsigned(gqa_query_heads(mtp_routes->kv_heads)) &&
+                      grid.y == 1 && block.x == 256 &&
                       mtp_routes->readers == mtp_routes->merges + 1, "Unexpected MTP merge");
             ++mtp_routes->merges;
         }
@@ -644,6 +793,14 @@ extern "C" cudaError_t __wrap_cudaLaunchKernel(const void* function, dim3 grid, 
 }
 
 int main(int argc, char** argv) try {
+    if (argc == 2 && std::string_view(argv[1]) == "--mtp-w3") {
+        mtp_rank_long<false>();
+        return 0;
+    }
+    if (argc == 2 && std::string_view(argv[1]) == "--mtp-w4") {
+        mtp_rank_long<true>();
+        return 0;
+    }
     if (argc == 4 && std::string_view(argv[2]) == "--mtp-crossings") {
         mtp_crossings(argv[1], argv[3]);
         return 0;
@@ -658,7 +815,8 @@ int main(int argc, char** argv) try {
     }
     check(argc >= 3 && argc <= 5,
           "Usage: long-decode-routes CHECKPOINT "
-          "{PROMPT [LOGITS [TEACHER]]|--mtp-crossings W5|--mtp-mixed IDS|--serial-prefill IDS}");
+          "{PROMPT [LOGITS [TEACHER]]|--mtp-crossings W5|--mtp-mixed IDS|--serial-prefill IDS} "
+          "or long-decode-routes --mtp-w3|--mtp-w4");
     const Decoder decoder(argv[1], 0, false);
     check(decoder.uses_b200_operators(), "Long decode route check requires a B200");
     const DecoderBatchOptions options{.cuda_graphs = true, .max_lanes = slots,

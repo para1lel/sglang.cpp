@@ -259,6 +259,19 @@ bool health_control(std::string_view name) {
 }
 
 struct Decoder::Model {};
+#define SGLANG_TEST_TP_HEADER "sglang/runtime/execution/decoder_tp.h"
+#if __has_include(SGLANG_TEST_TP_HEADER)
+struct Decoder::TpRuntime {};
+
+Decoder::Decoder(const std::filesystem::path& checkpoint, int device, bool mtp, int ranks)
+    : Decoder(checkpoint, device, mtp) {
+    if (ranks != 1) throw std::invalid_argument("CPU decoder fixture supports one rank");
+}
+
+const decoder::TpRuntimeInfo* Decoder::tensor_parallel_info() const {
+    return nullptr;
+}
+#endif
 
 Decoder::Decoder(const std::filesystem::path&, int, bool) {}
 Decoder::~Decoder() = default;

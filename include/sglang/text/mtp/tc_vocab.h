@@ -14,6 +14,7 @@ struct TcVocabScratch;
 inline constexpr int tc_vocab_rows = 20;
 inline constexpr int tc_vocab_wide_rows = 2 * tc_vocab_rows;
 inline constexpr int tc_vocab_narrow_rows = 5;
+inline constexpr int tc_vocab_short_rows = 2 * tc_vocab_narrow_rows;
 
 struct TcVocabRow {
     const __nv_bfloat16* input;
@@ -36,9 +37,11 @@ std::shared_ptr<const TcVocabWeights> prepare_tc_vocab(const __nv_bfloat16* orig
                                                        const std::uint8_t* quantized,
                                                        const float* maxima, Allocations& memory);
 std::shared_ptr<const TcVocabScratch> prepare_tc_vocab_scratch(Allocations& memory, bool wide,
-                                                               bool resident);
+                                                               bool resident, bool short_packet);
 bool try_tc_vocab(const TcVocabWeights& weights, const TcVocabScratch& scratch,
                   const TcVocabRow* batch, int count, cudaStream_t stream);
+bool try_tc_vocab_short(const TcVocabWeights& weights, const TcVocabScratch& scratch,
+                        const TcVocabRow* batch, cudaStream_t stream);
 bool try_tc_vocab_final(const TcVocabWeights& weights, const TcVocabScratch& scratch,
                         const TcVocabRow* batch, const TcVocabRmsRows& rms,
                         const __nv_bfloat16* gain, cudaStream_t stream);

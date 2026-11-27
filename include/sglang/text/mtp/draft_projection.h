@@ -4,6 +4,7 @@
 #include "sglang/text/decode_proj.h"
 #include "sglang/text/gqa_verify_batch.h"
 #include "sglang/text/mtp/draft_batch_ops.h"
+#include "sglang/text/mtp/draft_stream.h"
 #include "sglang/text/target_fp8.h"
 
 #include <algorithm>
@@ -26,8 +27,10 @@ public:
     using Output = decltype(&Work::attention);
     using Projection = std::pair<Fp8Weight, Output>;
 
-    DraftProjectionBatch(State* const* states, int count, Bf16* packed, cudaStream_t stream)
-        : states_(states), count_(count), packed_(packed), stream_(stream) {}
+    DraftProjectionBatch(State* const* states, int count, Bf16* packed, cudaStream_t stream,
+                         bool exact, bool streaming)
+        : states_(states), count_(count), packed_(packed), stream_(stream), exact_(exact),
+          streaming_(streaming) {}
 
     void prepare_fc(const MtpDraftInput* input, const Bf16* embedding,
                     const Bf16* embedding_norm, const Bf16* hidden_norm, Bf16Weight fc) {
@@ -44,14 +47,16 @@ public:
             check_draft_submission(normalize_draft_inputs(embeddings, hidden, embedding_norm,
                                    hidden_norm, count_, stream_),
                                    "Normalize grouped MTP FC inputs");
-            auto* output = packed_ + draft_fc_input_values;
-            if (const auto status = try_text_bf16_decode_sm100(fc.values, packed_, fc.rows,
-                                    fc.columns, count_, output, stream_)) {
-                check_draft_submission(*status, "Run dense BF16 MTP FC");
-                dense_residual_ = output;
-                return;
+            if (!exact_) {
+                auto* output = packed_ + draft_fc_input_values;
+                if (const auto status = try_text_bf16_decode_sm100(fc.values, packed_, fc.rows,
+                                        fc.columns, count_, output, stream_)) {
+                    check_draft_submission(*status, "Run dense BF16 MTP FC");
+                    dense_residual_ = output;
+                    return;
+                }
+                check(cudaGetLastError(), "Check declined dense MTP FC status");
             }
-            check(cudaGetLastError(), "Check declined dense MTP FC status");
         }
         std::array<TextBf16Projection, draft_projection_rows> projections;
         for (int lane = 0; lane < count_; ++lane) {
@@ -61,8 +66,15 @@ public:
                                                : state.work.concatenated;
             projections[lane] = {concatenated, state.work.residual};
         }
-        for (int first = 0; first < count_; first += draft_wave_rows) {
-            const int size = std::min(count_ - first, draft_wave_rows);
+        if (streaming_) {
+            check_draft_submission(draft_stream::project_fc(fc.values, projections.data(), 2,
+                                                           stream_),
+                                   "Run streaming batched BF16 MTP FC");
+            return;
+        }
+        const int width = exact_ ? count_ : draft_wave_rows;
+        for (int first = 0; first < count_; first += width) {
+            const int size = std::min(count_ - first, width);
             check_draft_submission(text_bf16_gemm(fc.values, fc.rows, fc.columns,
                 projections.data() + first, size, stream_), "Run batched BF16 MTP FC");
         }
@@ -82,7 +94,7 @@ public:
             ++target;
         }
         const int columns = stage.begin()->first.columns;
-        if (packed_) {
+        if (packed_ && !exact_) {
             check(cudaGetLastError(), "Check draft projection stream status");
             const auto status = try_target_fp8_tc(targets.data(), target, columns, rows.data(),
                                                  count_, packed_, stream_);
@@ -91,11 +103,18 @@ public:
                 return;
             }
         }
+        if (streaming_ && (target == 2 || target == 3) &&
+            stage.begin()[target - 2].second == &Work::keys &&
+            stage.begin()[target - 1].second == &Work::values) {
+            submit_joined_kv(targets.data(), rows.data(), target - 2, columns);
+            return;
+        }
         target = 0;
+        const int width = exact_ ? count_ : draft_wave_rows;
         for (const auto& projection : stage) {
             const auto& weight = projection.first;
-            for (int first = 0; first < count_; first += draft_wave_rows) {
-                const int size = std::min(count_ - first, draft_wave_rows);
+            for (int first = 0; first < count_; first += width) {
+                const int size = std::min(count_ - first, width);
                 check_draft_submission(text_fp8_gemm(weight.values, weight.scales, weight.rows,
                     weight.columns, rows.data() + target * count_ + first, size, stream_),
                     "Run batched MTP FP8");
@@ -150,16 +169,11 @@ public:
     }
 
     void read_attention(const MtpDraftInput* rows, bool online) const {
-        for (int first = 0; first < count_; first += draft_wave_rows) {
-            const int size = std::min(count_ - first, draft_wave_rows);
-            std::array<DraftAttentionRow, draft_wave_rows> attention;
-            for (int index = 0; index < size; ++index) {
-                const int lane = first + index;
-                attention[index] = states_[lane]->attention_row(rows[lane].position);
-            }
-            check_draft_submission(mtp_gqa_attention_batch(attention.data(), size, online, stream_),
-                                   "Read batched MTP MXFP8 attention");
+        if (online && count_ == draft_attention_batch_rows) {
+            read_attention_packets<draft_attention_batch_rows>(rows, online);
+            return;
         }
+        read_attention_packets<draft_wave_rows>(rows, online);
     }
 
     void gate_attention() const {
@@ -184,6 +198,34 @@ public:
     }
 
 private:
+    template <int Width>
+    void read_attention_packets(const MtpDraftInput* rows, bool online) const {
+        for (int first = 0; first < count_; first += Width) {
+            const int size = std::min(count_ - first, Width);
+            std::array<DraftAttentionRow, Width> attention;
+            for (int index = 0; index < size; ++index) {
+                const int lane = first + index;
+                attention[index] = states_[lane]->attention_row(rows[lane].position);
+            }
+            check_draft_submission(mtp_gqa_attention_batch(attention.data(), size, online, stream_),
+                                   "Read batched MTP MXFP8 attention");
+        }
+    }
+
+    void submit_joined_kv(const TextFp8DecodeTarget* targets, const TextFp8Projection* rows,
+                          int first, int columns) const {
+        if (first == 1) {
+            const auto& q = targets[0];
+            check_draft_submission(text_fp8_gemm(q.weight, q.weight_scales, q.out_width, columns,
+                rows, count_, stream_), "Run batched MTP Q");
+        }
+        const auto& key = targets[first];
+        const auto& value = targets[first + 1];
+        check_draft_submission(draft_stream::project_kv(key.weight, key.weight_scales,
+            value.weight, value.weight_scales, rows + first * count_, count_, stream_),
+            "Run joined MTP KV");
+    }
+
     Bf16* residual(int lane) const {
         return dense_residual_ ? dense_residual_ + lane * hidden_size
                                : states_[lane]->work.residual;
@@ -194,6 +236,8 @@ private:
     Bf16* packed_;
     Bf16* dense_residual_ = nullptr;
     cudaStream_t stream_;
+    bool exact_;
+    bool streaming_;
 };
 
 }

@@ -19,17 +19,18 @@ int pages_for(int capacity) {
     return (capacity + mxfp8_page_size - 1) / mxfp8_page_size;
 }
 
-std::size_t kv_bytes(int pages) {
+std::size_t kv_bytes(int pages, int kv_heads) {
     return 2 * full_attention_layers * pages *
-        (mxfp8_payload_bytes_per_page + mxfp8_scale_bytes_per_page);
+        (gqa_payload_bytes_per_page(kv_heads) + gqa_scale_bytes_per_page(kv_heads));
 }
 
-std::array<Mxfp8KvCache, full_attention_layers> allocate_kv(Allocations& memory, int page_count) {
-    const auto payload_per_layer = page_count * mxfp8_payload_bytes_per_page;
-    const auto scales_per_layer = page_count * mxfp8_scale_bytes_per_page;
+std::array<Mxfp8KvCache, full_attention_layers> allocate_kv(Allocations& memory, int page_count,
+                                                            int kv_heads) {
+    const auto payload_per_layer = page_count * gqa_payload_bytes_per_page(kv_heads);
+    const auto scales_per_layer = page_count * gqa_scale_bytes_per_page(kv_heads);
     const auto scale_bytes = full_attention_layers * scales_per_layer;
     const auto payload_bytes = full_attention_layers * payload_per_layer;
-    auto* keys = memory.allocate<std::uint8_t>(kv_bytes(page_count));
+    auto* keys = memory.allocate<std::uint8_t>(kv_bytes(page_count, kv_heads));
     auto* values = keys + payload_bytes;
     auto* key_scales = values + payload_bytes;
     auto* val_scales = key_scales + scale_bytes;
@@ -38,7 +39,7 @@ std::array<Mxfp8KvCache, full_attention_layers> allocate_kv(Allocations& memory,
         caches[index] = {
             keys + index * payload_per_layer, values + index * payload_per_layer,
             key_scales + index * scales_per_layer, val_scales + index * scales_per_layer,
-            page_count,
+            page_count, kv_heads,
         };
     }
     return caches;
@@ -74,8 +75,10 @@ std::size_t request_resident_bytes(int capacity, int verification_rows, bool dra
         (gdn_history_elements * sizeof(Bf16) + gdn_state_elements * sizeof(float));
     constexpr std::size_t workspace_allowance = 16 * 1024 * 1024;
     const int pages = pages_for(capacity);
-    const auto target = kv_bytes(pages) + pages * sizeof(std::int32_t) + gdn_bytes;
-    const auto draft_kv = kv_bytes(pages) / full_attention_layers + pages * sizeof(std::int32_t);
+    const auto target = kv_bytes(pages, mxfp8_kv_heads) + pages * sizeof(std::int32_t) +
+                        gdn_bytes;
+    const auto draft_kv = kv_bytes(pages, mxfp8_kv_heads) / full_attention_layers +
+                          pages * sizeof(std::int32_t);
     const auto verifier = verification_rows ? gdn_bytes + verification_rows * workspace_allowance
                                             : 0;
     return target + workspace_allowance + (draft ? draft_kv + workspace_allowance : 0) + verifier;
@@ -233,12 +236,13 @@ ExactGqaWorkspace Request::batch_graph_scores() {
     return *long_graph_scores;
 }
 
-void allocate_gdn(Allocations& memory, GdnBank& states) {
-    auto* history = memory.allocate<Bf16>(gdn_layers * gdn_history_elements);
-    auto* recurrent = memory.allocate<float>(gdn_layers * gdn_state_elements);
+void allocate_gdn(Allocations& memory, GdnBank& states, std::size_t history_elements,
+                  std::size_t state_elements) {
+    auto* history = memory.allocate<Bf16>(gdn_layers * history_elements);
+    auto* recurrent = memory.allocate<float>(gdn_layers * state_elements);
     for (int index = 0; index < gdn_layers; ++index) {
-        states[index] = {history + index * gdn_history_elements,
-                         recurrent + index * gdn_state_elements};
+        states[index] = {history + index * history_elements,
+                         recurrent + index * state_elements};
     }
 }
 
@@ -253,21 +257,25 @@ Request::Request(int device, int capacity, std::shared_ptr<const void> owners, b
     initialize(capacity, memory.stream(), maximum_kv);
 }
 
-void Request::initialize(int capacity, cudaStream_t stream, int maximum_kv) {
+void Request::initialize(int capacity, cudaStream_t stream, int maximum_kv, int kv_heads) {
     cached_gqa_tokens = 0;
     kv_limit = maximum_kv;
-    const int page_count = pages_for(capacity);
-    const int table_pages = std::max(page_count, pages_for(maximum_kv));
-    auto* table = memory.allocate<std::int32_t>(table_pages);
-    auto& logical_pages = memory.transfers().logical_pages;
-    logical_pages.resize(table_pages);
-    std::iota(logical_pages.begin(), logical_pages.end(), 0);
-    copy_cuda_async(table, logical_pages.data(), table_pages * sizeof(std::int32_t),
-                    cudaMemcpyHostToDevice, stream, "Upload MXFP8 page table");
-    pages = {table, page_count};
-    caches = allocate_kv(memory, page_count);
-    allocate_gdn(memory, states);
-}
+    cache_kv_heads = kv_heads;
+    const bool rank_local = kv_heads != mxfp8_kv_heads;
+    gdn_history_stride = rank_local ? gdn_local_history_elements : gdn_history_elements;
+    gdn_state_stride = rank_local ? gdn_local_state_elements : gdn_state_elements;
+     const int page_count = pages_for(capacity);
+     const int table_pages = std::max(page_count, pages_for(maximum_kv));
+     auto* table = memory.allocate<std::int32_t>(table_pages);
+     auto& logical_pages = memory.transfers().logical_pages;
+     logical_pages.resize(table_pages);
+     std::iota(logical_pages.begin(), logical_pages.end(), 0);
+     copy_cuda_async(table, logical_pages.data(), table_pages * sizeof(std::int32_t),
+                     cudaMemcpyHostToDevice, stream, "Upload MXFP8 page table");
+     pages = {table, page_count};
+    caches = allocate_kv(memory, page_count, cache_kv_heads);
+    allocate_gdn(memory, states, gdn_history_stride, gdn_state_stride);
+ }
 
 void Request::grow_kv(int positions, int written, cudaStream_t stream) {
     written = std::max(written, cached_gqa_tokens);
@@ -280,10 +288,10 @@ void Request::grow_kv(int positions, int written, cudaStream_t stream) {
         throw std::logic_error("Invalid decoder KV cache growth");
     }
     const int next = std::min(pages_for(kv_limit), std::max(needed, 2 * previous));
-    const auto replacement = allocate_kv(memory, next);
+    const auto replacement = allocate_kv(memory, next, cache_kv_heads);
     if (written) {
-        const auto payload = pages_for(written) * mxfp8_payload_bytes_per_page;
-        const auto scales = pages_for(written) * mxfp8_scale_bytes_per_page;
+        const auto payload = pages_for(written) * gqa_payload_bytes_per_page(cache_kv_heads);
+        const auto scales = pages_for(written) * gqa_scale_bytes_per_page(cache_kv_heads);
         for (int layer = 0; layer < full_attention_layers; ++layer) {
             const auto& old = caches[layer];
             const auto& fresh = replacement[layer];
@@ -295,7 +303,7 @@ void Request::grow_kv(int positions, int written, cudaStream_t stream) {
     }
     synchronize_cuda(stream, "Complete MXFP8 cache growth");
     memory.discard_graph();
-    memory.free_block(caches.front().key_payload, kv_bytes(previous));
+    memory.free_block(caches.front().key_payload, kv_bytes(previous, cache_kv_heads));
     if (long_graph_scores && long_graph_scores->scores) {
         memory.free_block(long_graph_scores->scores,
                           long_graph_scores->capacity * mxfp8_query_heads * sizeof(float));
@@ -306,8 +314,8 @@ void Request::grow_kv(int positions, int written, cudaStream_t stream) {
 }
 
 void Request::reset(cudaStream_t stream) {
-    zero(states.front().history, gdn_layers * gdn_history_elements, stream);
-    zero(states.front().recurrent, gdn_layers * gdn_state_elements, stream);
+    zero(states.front().history, gdn_layers * gdn_history_stride, stream);
+    zero(states.front().recurrent, gdn_layers * gdn_state_stride, stream);
 }
 
 void Request::reset() {

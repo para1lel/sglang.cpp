@@ -19,7 +19,7 @@ for name in state graph; do
         wrap=(-Wl,--wrap="$append" -Wl,--wrap=cudaMemcpyAsync -Wl,--wrap=cudaFreeAsync
               -Wl,--wrap=cudaFree -Wl,--wrap=cudaMalloc -Wl,--wrap=cudaEventRecord
               -Wl,--wrap=cudaStreamSynchronize -Wl,--wrap=cudaGetErrorString)
-        extra_sources=(apps/server/batch_cache.cpp)
+        extra_sources=(apps/server/batch_cache.cpp src/runtime/cache/lmcache_group.cpp)
     fi
     "${CXX:-c++}" -std=c++17 -O3 -pthread -Iinclude -I"$toolkit/include" \
         "tests/prefix/lmcache_$name.cpp" src/runtime/cache/lmcache_client.cpp \
@@ -29,7 +29,6 @@ for name in state graph; do
         "${wrap[@]}" -lsglang_decoder -lsglang_checkpoint -lsglang_cuda \
         -lsglang_prefill_fp8_sm100 -lsglang_tokenizer -lsglang_json \
         -lcudart -lcudadevrt -lcudart_static -lrt -ldl -o "$output/lmcache-$name"
-    # A STORE can hold IPC leases indefinitely. Bound the test process, including its workers.
     CUDA_VISIBLE_DEVICES="$gpu" timeout --verbose --kill-after=5s "${LMCACHE_TEST_TIMEOUT:-5m}" \
         "$output/lmcache-$name" "$checkpoint" 2>&1 | tee "$output/$name.log"
 done

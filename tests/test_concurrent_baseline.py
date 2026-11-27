@@ -19,17 +19,17 @@ from benchmarks.concurrent.replay import replay_cohort
 from benchmarks.streaming.client import json_bytes, request_body
 
 
-def wire_fixture():
+def wire_fixture(output_tokens=3):
     lanes = []
     for lane in range(2):
-        case = {"prompt_token_ids": [100 + lane, 200], "output_tokens": 3}
+        case = {"prompt_token_ids": [100 + lane, 200], "output_tokens": output_tokens}
         body = json_bytes(request_body(case))
         lanes.append(({"lane": lane, "request_sha256": digest(body)}, body, case))
     return lanes
 
 
 @contextmanager
-def loopback(lanes, status_oom=False):
+def loopback(lanes, status_oom=False, *, cached_tokens=0):
     submitted = threading.Barrier(len(lanes), timeout=3)
     emitted = threading.Barrier(len(lanes), timeout=3)
     received = []
@@ -41,7 +41,9 @@ def loopback(lanes, status_oom=False):
         def do_POST(self):
             body = self.rfile.read(int(self.headers["Content-Length"]))
             received.append((self.path, body))
-            prompt = json.loads(body)["prompt"]
+            request = json.loads(body)
+            prompt = request["prompt"]
+            output = list(range(1, request["max_tokens"] + 1))
             lane = prompt[0] - 100
             submitted.wait()
             if status_oom and lane == 0:
@@ -53,7 +55,7 @@ def loopback(lanes, status_oom=False):
             meta = {"id": f"lane-{lane}", "model": "benchmark", "object": "text_completion"}
             echo = {"index": 0, "token_ids": [], "prompt_token_ids": prompt,
                     "text": "", "finish_reason": None}
-            first = {"index": 0, "token_ids": [1, 2], "text": "é", "finish_reason": None}
+            first = {"index": 0, "token_ids": output[:2], "text": "é", "finish_reason": None}
             frames = b"".join(b"data: " + json_bytes(meta | {"choices": [choice]}) + b"\r\n\r\n"
                               for choice in (echo, first))
             split = frames.index("é".encode()) + 1
@@ -64,9 +66,10 @@ def loopback(lanes, status_oom=False):
             if not status_oom:
                 emitted.wait()
                 threading.Event().wait(.025)
-            last = {"index": 0, "token_ids": [3], "text": "", "finish_reason": "length"}
-            usage = {"prompt_tokens": len(prompt), "completion_tokens": 3, "total_tokens": 5,
-                     "prompt_tokens_details": {"cached_tokens": 0}}
+            last = {"index": 0, "token_ids": output[2:], "text": "", "finish_reason": "length"}
+            usage = {"prompt_tokens": len(prompt), "completion_tokens": len(output),
+                     "total_tokens": len(prompt) + len(output),
+                     "prompt_tokens_details": {"cached_tokens": cached_tokens}}
             last_choice = json_bytes(meta | {"choices": [last]})
             usage_frame = json_bytes(meta | {"choices": [], "usage": usage})
             self.wfile.write(b"data: " + last_choice + b"\n\n"
@@ -122,6 +125,21 @@ def test_overlapping_streams_and_round_replay(captured, tmp_path):
                       lanes, expected, policy)
 
 
+def test_prefix_cohort_replays_one_token_and_checks_cache_range():
+    identity, body, case = wire_fixture(output_tokens=1)[0]
+    lanes = [(identity, body, case | {"cached_token_range": (1, 2)})]
+    policy = reference()["policy"]
+    with loopback(lanes, cached_tokens=2) as (url, _):
+        raw = capture_cohort(url, "W3", lanes, "prime", policy)
+    report, records = client.replay_cohort(raw, lanes, policy)
+    record, = records
+    assert record["output_ids"] == [1]
+    assert record["usage"]["prompt_tokens_details"]["cached_tokens"] == 2
+    assert report["request_latencies"][0]["tpot_ms"] is None
+    with pytest.raises(ValueError, match="Unexpected cached prompt rows"):
+        validate_cohort(raw, [(identity, body, case | {"cached_token_range": (0, 0)})], policy)
+
+
 def test_oom_records_failed_and_successful_requests():
     lanes, policy = wire_fixture(), reference()["policy"]
     with loopback(lanes, status_oom=True) as (url, _):
@@ -144,6 +162,8 @@ def mutate_payload(record, event, field, value):
     ((0, "prompt_token_ids", [999]), "Prompt IDs"),
     ((1, "id", "different"), "Completion ID changed"),
     ((2, "stop_reason", 13), "stop reason"),
+    ((2, "finish_reason", "stop"), "Expected length completion"),
+    ((2, "token_ids", []), "Expected length completion"),
     ((3, "prompt_tokens_details", {"cached_tokens": 1}), "zero reused"),
     ((3, "total_tokens", 6), "Usage total"),
 ])

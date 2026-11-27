@@ -222,6 +222,12 @@ to the common prefix. Its block geometry determines how much it can reuse.
 The last reset must make the identical prime cold again. Use the diagnostic
 as untimed support evidence for `matched-k4-prefix-reuse-v2`.
 
+The historical [W3 prefix and K1 recipe](https://github.com/para1lel/sglang.cpp/blob/a5974ba4eb99bd8e8f890c2e7262a27dbc3aace1/benchmarks/variants/README.md)
+replays the archived 6,400-token prefix and one-draft-position captures. Use that
+checkout with its saved evidence. The
+[frozen comparison](https://github.com/para1lel/sglang.cpp/blob/a5974ba4eb99bd8e8f890c2e7262a27dbc3aace1/benchmarks/variants/comparison.json#L13)
+records both rows and their original gates.
+
 ## Replay the historical GPU 2 arm
 
 On the benchmark host, `artifacts/test-bench-baseline` holds the saved 32,768-token vLLM arm

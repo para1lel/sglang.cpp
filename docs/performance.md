@@ -60,7 +60,7 @@ Report output tokens/s, TTFT, TPOT, end-to-end latency, and whether every lane s
 | Metric | Definition for one measured cohort |
 | --- | --- |
 | Output tokens/s | Sum of emitted output tokens divided by elapsed cohort seconds. Exclude input, padding, and rejected drafts. |
-| TTFT (ms) | Submission to first output token, including queueing and prefill. Unavailable for zero output tokens. [Client calculation](../benchmarks/streaming/client.py#L202)<!-- prefix: "\"ttft_ms\": (" --> |
+| TTFT (ms) | Submission to first output token, including queueing and prefill. Unavailable for zero output tokens. [Client calculation](../benchmarks/streaming/client.py#L207)<!-- prefix: "\"ttft_ms\": (" --> |
 | TPOT (ms/token) | `(last token time − first token time) / (output token count − 1)`, per request. Mark unavailable for fewer than two tokens. |
 | End-to-end latency (ms) | Time from request submission to its terminal response. Record stream chunking when multiple tokens arrive together. |
 | Requests/s and aggregate tokens/s | Completed requests per cohort second, and total input plus output tokens per cohort second, respectively. |

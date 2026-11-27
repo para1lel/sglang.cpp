@@ -84,8 +84,10 @@ export CUDA_HOME=/usr/local/cuda-13.2
 export PATH="$root/venv/bin:$CUDA_HOME/bin:$PATH"
 export LD_LIBRARY_PATH="$base/software/cuda-compat-13.4/usr/local/cuda-13.4/compat"
 export CC=/usr/bin/gcc CXX=/usr/bin/g++ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=$run
-export http_proxy=http://127.0.0.1:12233 https_proxy=http://127.0.0.1:12233
-export HTTP_PROXY=$http_proxy HTTPS_PROXY=$https_proxy ALL_PROXY=$https_proxy
+proxy=${all_proxy:-${ALL_PROXY:-http://127.0.0.1:7890}}
+export http_proxy=${http_proxy:-${HTTP_PROXY:-$proxy}}
+export https_proxy=${https_proxy:-${HTTPS_PROXY:-$proxy}}
+export HTTP_PROXY=$http_proxy HTTPS_PROXY=$https_proxy ALL_PROXY=$proxy all_proxy=$proxy
 export no_proxy=localhost,127.0.0.1,::1 NO_PROXY=localhost,127.0.0.1,::1
 unset PYTHONHOME CFLAGS CXXFLAGS CPPFLAGS LDFLAGS
 environment_keys='CUDA_|VLLM_|FLASHINFER_|HF_|TRITON_|OMP_NUM_THREADS=|MAX_JOBS='

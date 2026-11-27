@@ -29,7 +29,8 @@ environment record the installed packages and the hashes of vLLM shared objects.
 | Checkpoint manifest SHA-256 | `b54fe44144f1701a9369e8b912997ee5cab77cd176c8f97ad3fe63e78cf3c303` |
 
 Setup uses `git`, `curl`, `jq`, `flock`, and `uv` from the host. Every package installation names
-the isolated interpreter explicitly. Network access uses the HTTP proxy at `127.0.0.1:12233`.
+the isolated interpreter explicitly. Network access defaults to `http://127.0.0.1:7890`
+and accepts the usual HTTP, HTTPS, and all-proxy environment overrides.
 The runner verifies the provisioned wheel and native vLLM hashes and hashes the local checkpoint
 before loading. It sets Hugging Face offline mode. vLLM and kernel libraries can download
 or compile kernels during initialization. The runner keeps generated kernels, autotuning data,

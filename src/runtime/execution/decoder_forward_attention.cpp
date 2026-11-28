@@ -14,20 +14,18 @@ void each_lane(const LayerBatch<Lane>& batch, Function function) {
     }
 }
 
-constexpr int gdn_packet_rows = verification_packet_rows;
-
 void project_gdn_gates(const GdnLayer& layer, const LayerBatch<VerificationRow>& batch,
-                              bool batched) {
-    if (!batch.target_tc || batch.count < 2 ||
-        layer.b.rows != batch.gdn_gate_heads() || layer.a.rows != batch.gdn_gate_heads() ||
-        layer.b.columns != hidden_size || layer.a.columns != hidden_size) {
+                       bool batched) {
+    if (!batch.target_tc || batch.count < 2 || layer.b.rows != batch.gdn_gate_heads() ||
+        layer.a.rows != batch.gdn_gate_heads() || layer.b.columns != hidden_size ||
+        layer.a.columns != hidden_size) {
         project_verification_bf16(layer.b, batch.lanes, batch.count, &Workspace::gdn_b,
                                   batch.stream);
         project_verification_bf16(layer.a, batch.lanes, batch.count, &Workspace::gdn_a,
                                   batch.stream);
         return;
     }
-    std::array<VerifyGdnGateRow, gdn_packet_rows> gates;
+    std::array<VerifyGdnGateRow, max_wide_mtp_rows> gates{};
     const auto fill = [&](int first, int rows) {
         for (int index = 0; index < rows; ++index) {
             const auto& work = workspace(batch.lanes[first + index]);
@@ -37,18 +35,10 @@ void project_gdn_gates(const GdnLayer& layer, const LayerBatch<VerificationRow>&
             batch.tensor_parallel ? try_verify_bf16_gdn_gates_local : try_verify_bf16_gdn_gates;
         return gates_kernel(layer.b.values, layer.a.values, gates.data(), rows, batch.stream);
     };
-    if (batched) {
-        bool dedicated = (batch.count >= 2 && batch.count <= text_fp8_max_batch) ||
-                         batch.count % gdn_packet_rows == 0;
-        for (int first = 0; dedicated && first < batch.count; first += gdn_packet_rows) {
-            const int rows = std::min(gdn_packet_rows, batch.count - first);
-            if (const auto status = fill(first, rows)) {
-                check(*status, "Run wide verification GDN gate projections");
-            } else {
-                dedicated = false;
-            }
-        }
-        if (dedicated) {
+    if (batched && batch.count <= max_wide_mtp_rows &&
+        (batch.count <= text_fp8_max_batch || batch.count % verification_packet_rows == 0)) {
+        if (const auto status = fill(0, batch.count)) {
+            check(*status, "Run wide verification GDN gate projections");
             return;
         }
     }

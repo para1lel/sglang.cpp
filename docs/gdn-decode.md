@@ -12,7 +12,9 @@ Decode reads the checkpoint and committed log, then advances with the current ro
 
 ### Packed eager and captured verification
 
-The verifier launches convolution, recurrence and finish in order. Eager groups use single-lane or packed jobs of up to 16 lanes per submission. TP1 and TP2 graphs bind live request state and use the same ReplaySSM transitions. The verifier applies acceptance outside capture. [Dispatch](../src/runtime/execution/decoder_forward_attention.cpp#L75)<!-- prefix: "void run_gdn" --> · [Kernel sequence](../src/text/gdn_replay_ssm.cu#L554)<!-- prefix: "cudaError_t " --> · [TP2 bindings](../src/runtime/execution/tp_verify_graph.cpp#L247)<!-- prefix: "return true;" -->
+The verifier launches convolution, recurrence and finish in order. Eager groups use single-lane or packed jobs of up to 16 lanes per submission. TP1 and TP2 graphs bind live request state and use the same ReplaySSM transitions. The verifier applies acceptance outside capture. [Dispatch](../src/runtime/execution/decoder_forward_attention.cpp#L65)<!-- prefix: "void run_gdn" --> · [Kernel sequence](../src/text/gdn_replay_ssm.cu#L554)<!-- prefix: "cudaError_t " --> · [TP2 bindings](../src/runtime/execution/tp_verify_graph.cpp#L247)<!-- prefix: "return true;" -->
+
+Packed target Tensor Core verification can project B/A together in one launch. It requires matching gate dimensions and aligned weights and inputs. It accepts 2–5 rows or whole 20-row packets up to 160 rows. Each wide block assigns one warp per row and grid Y selects the packet. TP1 and TP2 use the same BF16 dot products and reduction order as separate projection. Declined wide shapes keep the grouped projections and separate B/A fallback. [Gate dispatch](../src/runtime/execution/decoder_forward_attention.cpp#L38)<!-- prefix: "if (batched " --> · [Packet launch](../src/text_decode_bandwidth.cu#L605)<!-- prefix: "const int pa" -->
 
 The replay log stays in the request. Terminal LMCache stores materialize committed GDN into the usual convolution and recurrent spans on each rank. Prefill captures the state at each selected prompt endpoint. [Materialization](../src/runtime/model/qwen_request.cpp#L430)<!-- prefix: "void Request" --> · [Checkpoint boundaries](prefix-cache.md#checkpoint-boundaries)
 
@@ -27,6 +29,8 @@ CUDA submission errors propagate. An execution failure can leave request state a
 ## Verification
 
 For current ReplaySSM, compare outputs and materialized checkpoints against an independent recurrence. Exercise zero, partial and full consumption, replacement rows, rollover, and mixed-length packed lanes. Rebind requests before replaying each captured path and verify that an actual graph launch occurred. Compare fixed-history logits and continuation across restore. Report free-running output differences separately. [Operator qualification](performance.md#operator-qualification)
+
+Check bitwise gate output and intact guards at both rank widths for 2–5, 20, 40, 60, 80 and 160 rows. Require one launch for eligible shapes and zero submissions for invalid tails or misalignment. In isolated TP2 80-row tests, 48 layers took 0.822288 ms with grouped launches and 0.290915 ms with one launch per layer. See `artifacts/pool-w6/verification/w6-prefill-nsys.H85aZmFJ/w4-gate.VoIJ7bEg/final-paired-timing.log`. [Gate checks](../tests/decoder/decode_bandwidth_check.cpp#L109)<!-- prefix: "void verific" -->
 
 ### Historical TP2 80-row caller replay
 

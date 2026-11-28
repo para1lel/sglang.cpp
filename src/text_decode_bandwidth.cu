@@ -408,6 +408,7 @@ __global__ void bf16_gdn_decode_shared(const __nv_bfloat16* weight_b,
 }
 
 constexpr int wide_gdn_gate_rows = decoder::verification_packet_rows;
+constexpr int max_gdn_gate_rows = decoder::max_wide_mtp_rows;
 
 template <int capacity>
 struct VerifyGdnGateArguments {
@@ -584,9 +585,9 @@ template <int Channels>
 std::optional<cudaError_t> try_verify_bf16_gdn_gates_impl(
     const __nv_bfloat16* weight_b, const __nv_bfloat16* weight_a,
     const decoder::VerifyGdnGateRow* rows, int count, cudaStream_t stream) {
-    if (count < 2 || (count > text_fp8_max_batch && count != wide_gdn_gate_rows) ||
-        !rows || !weight_b || !weight_a ||
-        !aligned(weight_b, 16) || !aligned(weight_a, 16)) {
+    if (count < 2 || count > max_gdn_gate_rows ||
+        (count > text_fp8_max_batch && count % wide_gdn_gate_rows != 0) || !rows || !weight_b ||
+        !weight_a || !aligned(weight_b, 16) || !aligned(weight_a, 16)) {
         return std::nullopt;
     }
     for (int index = 0; index < count; ++index) {
@@ -601,9 +602,14 @@ std::optional<cudaError_t> try_verify_bf16_gdn_gates_impl(
         }
         void* args[] = {&weight_b, &weight_a, &arguments};
         constexpr int capacity = sizeof(arguments.rows) / sizeof(*arguments.rows);
-        return cudaLaunchKernel(bf16_gdn_verify_gates<capacity, Channels>, 2 * Channels,
-                                count * warp_width, args, 0, stream);
+        const int packet = count <= wide_gdn_gate_rows ? count : wide_gdn_gate_rows;
+        const dim3 grid(2 * Channels, count / packet);
+        return cudaLaunchKernel(bf16_gdn_verify_gates<capacity, Channels>, grid,
+                                packet * warp_width, args, 0, stream);
     };
+    if (count > wide_gdn_gate_rows) {
+        return launch(VerifyGdnGateArguments<max_gdn_gate_rows>{});
+    }
     return count == wide_gdn_gate_rows ? launch(VerifyGdnGateArguments<wide_gdn_gate_rows>{})
                                        : launch(VerifyGdnGateArguments<text_fp8_max_batch>{});
 }

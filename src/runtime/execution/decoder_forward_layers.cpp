@@ -392,7 +392,9 @@ bool LayerBatch<Lane>::project_target_chunk(std::initializer_list<LayerProjectio
         : workspace(lanes[first]).logits;
     static_assert(text_target_fp8_max_rows * intermediate_size <= vocab_size * sizeof(Bf16));
     constexpr bool verification = std::is_same_v<Lane, VerificationRow>;
-    const bool ragged = verification && packed_activation && !tensor_parallel;
+    const bool ragged =
+        verification && packed_activation &&
+        (!tensor_parallel || (rows > text_target_fp8_m40_rows && rows < text_target_fp8_m80_rows));
     const bool supported_rows =
         rows <= text_target_fp8_max_rows || ragged || rows == text_target_fp8_m40_rows ||
         rows == text_target_fp8_m80_rows || rows == text_target_fp8_m160_rows;
@@ -421,6 +423,11 @@ void LayerBatch<Lane>::project_target(std::initializer_list<LayerProjection> lay
     constexpr bool verification = std::is_same_v<Lane, VerificationRow>;
     int first = 0;
     if constexpr (verification) {
+        if (tensor_parallel && packed_activation != nullptr && count > text_target_fp8_m40_rows &&
+            count < text_target_fp8_m80_rows &&
+            project_target_chunk<text_target_fp8_m80_rows>(layers, 0, count, false)) {
+            return;
+        }
         if (packed_activation != nullptr &&
             (!tensor_parallel || count % verification_packet_rows == 0)) {
             if (project_target_chunk<max_wide_mtp_rows>(layers, 0, count, false)) return;

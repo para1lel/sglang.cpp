@@ -18,10 +18,10 @@ std::optional<cudaError_t> launch_batched_ragged_tmem(
 
 }
 
-std::optional<cudaError_t> launch_tmem_prefill(
-    Mxfp8KvCache cache, Mxfp8PageTable pages, int position,
-    const __nv_bfloat16* queries, __nv_bfloat16* output, cudaStream_t stream, bool ordered,
-    int ragged_rows = 0, bool automatic = false);
+std::optional<cudaError_t> launch_tmem_prefill(Mxfp8KvCache cache, Mxfp8PageTable pages,
+                                               int position, const __nv_bfloat16* queries,
+                                               __nv_bfloat16* output, cudaStream_t stream,
+                                               int rows);
 
 std::optional<cudaError_t> launch_paired_tmem_prefill(
     Mxfp8KvCache cache, Mxfp8PageTable pages, int position,

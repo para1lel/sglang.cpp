@@ -2,7 +2,7 @@
 
 ## Responsibilities and sources of truth
 
-Model prefill appends uncovered KV and selects the attention path. The native dispatcher picks Flash, staged or direct ordered tiles, or protected single-row attention. Ordered attention owns causal FP32 scoring and token-ordered accumulation. [Caller](../src/runtime/execution/decoder_prefill_tiles.cpp#L324)<!-- prefix: "void Chunk::" --> · [Policy](../src/decoder_prefill.cpp#L632)<!-- prefix: "const bool t" --> · [Dispatch](../src/text/gqa/ordered_prefill.cu#L355)<!-- prefix: "cudaError_t " --> · [Score](../src/text/gqa/ordered_prefill.cu#L34)<!-- prefix: "__device__ v" --> · [Tile loop](../src/text/gqa/ordered_prefill.cu#L188)<!-- prefix: "for (int fir" -->
+Model prefill appends uncovered KV and selects the attention path. The native dispatcher picks Flash, staged or direct ordered tiles, or protected single-row attention. Ordered attention owns causal FP32 scoring and token-ordered accumulation. [Caller](../src/runtime/execution/decoder_prefill_tiles.cpp#L324)<!-- prefix: "void Chunk::" --> · [Policy](../src/decoder_prefill.cpp#L632)<!-- prefix: "const bool t" --> · [Dispatch](../src/text/gqa/ordered_prefill.cu#L354)<!-- prefix: "cudaError_t " --> · [Score](../src/text/gqa/ordered_prefill.cu#L34)<!-- prefix: "__device__ v" --> · [Tile loop](../src/text/gqa/ordered_prefill.cu#L188)<!-- prefix: "for (int fir" -->
 
 ## Runtime path
 
@@ -37,8 +37,8 @@ Visibility is `position + rows`.
 | Ordered fallback | Eligibility and tiling |
 | --- | --- |
 | Ragged TMEM | B200 text, 96–128 rows at 28,672–32,768 visible, with valid aligned buffers. Two physical tiles cover 128 queries with row-local causality. [Guard](../src/text/gqa/prefill_common.cu#L392)<!-- prefix: "bool default" --> |
-| Staged ordered | 2–143 rows at 8,192–262,144 visible tokens. Align both KV payloads to 16 B and both scales to 8 B. Use four-row tiles from 32 rows, two-row tiles for even 12–30 rows, otherwise one row. Protect each four-row remainder. [Eligibility](../src/text/gqa/ordered_prefill.cu#L333)<!-- prefix: "if (stage_pa" --> · [Tile size](../src/text/gqa/ordered_prefill.cu#L334)<!-- prefix: "if (rows >= " --> · [Remainder](../src/text/gqa/ordered_prefill.cu#L259)<!-- prefix: "if (tile \u003e= " --> |
-| Direct ordered | Through 32,768 visible, use two-row tiles for 64–127 rows and four-row from 128. Smaller grants, leftovers and longer prefixes use protected single-row if earlier routes decline. Staged and direct paths recover nonfinite visible scores by head and nonfinite quotients by channel in FP64. [Fallback](../src/text/gqa/ordered_prefill.cu#L343)<!-- prefix: "if (rows < m" --> · [Recovery](../include/sglang/mxfp8_gqa.h#L113)<!-- prefix: "cudaError_t " --> |
+| Staged ordered | 2–143 rows at 8,192–262,144 visible tokens. Align both KV payloads to 16 B and both scales to 8 B. Use four-row tiles from 32 rows, two-row tiles for even 12–30 rows, otherwise one row. Protect each four-row remainder. [Eligibility](../src/text/gqa/ordered_prefill.cu#L332)<!-- prefix: "if (stage_pa" --> · [Tile size](../src/text/gqa/ordered_prefill.cu#L333)<!-- prefix: "if (rows >= " --> · [Remainder](../src/text/gqa/ordered_prefill.cu#L259)<!-- prefix: "if (tile \u003e= " --> |
+| Direct ordered | Through 32,768 visible, use two-row tiles for 64–127 rows and four-row from 128. Smaller grants, leftovers and longer prefixes use protected single-row if earlier routes decline. Staged and direct paths recover nonfinite visible scores by head and nonfinite quotients by channel in FP64. [Fallback](../src/text/gqa/ordered_prefill.cu#L342)<!-- prefix: "if (rows < m" --> · [Recovery](../include/sglang/mxfp8_gqa.h#L113)<!-- prefix: "cudaError_t " --> |
 
 Zero rows succeed. For other inputs, negative positions, negative rows, and position-plus-row overflow return `cudaErrorInvalidValue`.
 

@@ -519,8 +519,6 @@ template __device__ float tmem_probabilities<false, true, true>(
     Word&, Word, int, int, FlashSoftmax&, Word, Word);
 template __device__ float tmem_softmax_chunk<true>(
     FlashProbability&, Word, int, int, FlashSoftmax&, Word, int);
-template __device__ float tmem_softmax_chunk<false>(
-    FlashProbability&, Word, int, int, FlashSoftmax&, Word, int);
 template __device__ float tmem_softmax_chunk<true>(
     PipelineProbability&, Word, int, int, FlashSoftmax&, Word, int);
 template __device__ void tmem_store_output<true>(

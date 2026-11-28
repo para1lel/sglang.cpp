@@ -303,8 +303,7 @@ std::optional<cudaError_t> try_ragged_prefill(const Attention& request, Mxfp8Pag
     const auto& [cache, _, position, queries, output] = request;
     if (visible > max_multirow_visible_tokens) {
         if (rows >= 1 && rows < flash_chunk && visible <= text_attention_max_tokens) {
-            return launch_tmem_prefill(cache, pages, position, queries, output, stream, true, rows,
-                                       true);
+            return launch_tmem_prefill(cache, pages, position, queries, output, stream, rows);
         }
         return std::nullopt;
     }
@@ -313,7 +312,7 @@ std::optional<cudaError_t> try_ragged_prefill(const Attention& request, Mxfp8Pag
                                                     max_multirow_visible_tokens);
     if (!ragged && !raw_pipeline_before_flash(cache, rows, visible))
         return std::nullopt;
-    return launch_tmem_prefill(cache, pages, position, queries, output, stream, true, rows, true);
+    return launch_tmem_prefill(cache, pages, position, queries, output, stream, rows);
 }
 
 template <int Rows, int Blocks, bool Staged = false>

@@ -72,42 +72,12 @@ __device__ void tmem_stage_kv(Decoded& decoded, int& bad_key, const FlashPayload
     }
 }
 
-__device__ __forceinline__ std::size_t tmem_partial_row(int part, int row, int head,
-                                                        int query_heads) {
-    return static_cast<std::size_t>(part) * flash_chunk * query_heads
-        + row * query_heads + head;
-}
-
-__device__ __forceinline__ void tmem_store_partial(
-    const TmemFlashTile& tile, Word row_address, FlashSoftmax state, int position,
-    float* partial, float2* statistics, int query_heads) {
-    const int member = threadIdx.x;
-    const int offset = member / ordered_heads;
-    const auto index = tmem_partial_row(blockIdx.z, blockIdx.x * flash_rows + offset,
-                                        blockIdx.y * ordered_heads + member % ordered_heads,
-                                        query_heads);
-    auto* output = partial + index * channels;
-    const bool bad = tile.bad_query[member] || tile.bad_key <= position + offset;
-    statistics[index] = make_float2(state.maximum, bad ? -1.0f : state.mass);
-    #pragma unroll 1
-    for (int column = 0; column < channels; column += 32) {
-        float accumulator[32];
-        tmem_load(row_address + column, accumulator);
-        #pragma unroll
-        for (int index = 0; index < 32; ++index) {
-            output[column + index] = accumulator[index];
-        }
-    }
-}
-
-template <bool Ordered>
 __device__ __forceinline__ void tmem_softmax_tile(TmemFlashTile& tile, Word row_address, Word mma,
-                                                 int position, int first, int begin,
-                                                 FlashSoftmax& state) {
+                                                  int position, int first, FlashSoftmax& state) {
     tmem_mma_wait(mma, 0);
-    const float history = tmem_softmax_chunk<Ordered>(tile.probability, row_address, position,
-                                                      first, state);
-    if (first != begin) {
+    const float history =
+        tmem_softmax_chunk<true>(tile.probability, row_address, position, first, state);
+    if (first != 0) {
         tmem_correct_output(row_address, history);
     }
     asm volatile("tcgen05.fence::before_thread_sync;\n"
@@ -288,18 +258,14 @@ cudaError_t launch_pipeline(Attention& request, CUtensorMap& keys, CUtensorMap& 
                             sizeof(TmemPipelineTile), stream);
 }
 
-template <bool Ordered, bool Ragged>
-__device__ __forceinline__ void tmem_flash_tile(
-    TmemFlashTile& tile, Attention request, const CUtensorMap& key_map,
-    const CUtensorMap& value_map, float* partial, float2* statistics, int rows, int row) {
+template <bool Ragged>
+__device__ __forceinline__ void tmem_flash_tile(TmemFlashTile& tile, Attention request,
+                                                const CUtensorMap& key_map,
+                                                const CUtensorMap& value_map, int rows, int row) {
     const int active_rows = Ragged ? min(flash_rows, rows - row) : flash_rows;
     const int head = blockIdx.y * ordered_heads;
     const int position = request.position + row;
-    const int part = blockIdx.z;
-    const int tiles = (position + flash_rows) / flash_keys;
-    const int begin = Ordered ? 0 : (tiles * part / tmem_parts) * flash_keys;
-    const int end = Ordered ? position + active_rows :
-                              (tiles * (part + 1) / tmem_parts) * flash_keys;
+    const int end = position + active_rows;
     const int kv_head = head / ratio;
     const int warp = threadIdx.x / 32;
     const bool softmax = warp < flash_queries / 32;
@@ -311,16 +277,16 @@ __device__ __forceinline__ void tmem_flash_tile(
     __syncthreads();
     const Word row_address = tile.tmem + ((warp * 32) << 16);
     FlashSoftmax state{-CUDART_INF_F, 0.0f};
-    if (!Ragged || end - begin >= flash_keys) {
-        flash_tma_prefetch(tile.raw[0], request, begin, kv_head, &key_map, &value_map, copy);
+    if (!Ragged || end >= flash_keys) {
+        flash_tma_prefetch(tile.raw[0], request, 0, kv_head, &key_map, &value_map, copy);
     }
     if (!softmax) {
-        tmem_stage_tile<true, Ragged>(tile, request, begin, end, kv_head, 0, copy);
+        tmem_stage_tile<true, Ragged>(tile, request, 0, end, kv_head, 0, copy);
     }
     __syncthreads();
-    for (int first = begin; first < end; first += flash_keys) {
+    for (int first = 0; first < end; first += flash_keys) {
         const int next = first + flash_keys;
-        const int buffer = ((first - begin) / flash_keys) & 1;
+        const int buffer = (first / flash_keys) % 2;
         if (next < end && (!Ragged || end - next >= flash_keys)) {
             flash_tma_prefetch(tile.raw[1 - buffer], request, next, kv_head,
                                &key_map, &value_map, copy);
@@ -329,13 +295,13 @@ __device__ __forceinline__ void tmem_flash_tile(
             tmem_query_key(tile, mma);
         }
         if (softmax) {
-            tmem_softmax_tile<Ordered>(tile, row_address, mma, position, first, begin, state);
+            tmem_softmax_tile(tile, row_address, mma, position, first, state);
         } else {
             tmem_stage_tile<false, Ragged>(tile, request, first, end, kv_head, buffer, copy);
         }
         __syncthreads();
         if (threadIdx.x == 0) {
-            tmem_probability_value(tile.tmem, tile.probability, tile.value, mma, first != begin);
+            tmem_probability_value(tile.tmem, tile.probability, tile.value, mma, first != 0);
         }
         if (!softmax && next < end) {
             tmem_stage_tile<true, Ragged>(tile, request, next, end, kv_head, 1 - buffer, copy);
@@ -344,33 +310,25 @@ __device__ __forceinline__ void tmem_flash_tile(
         __syncthreads();
     }
     if (softmax) {
-        if constexpr (Ordered) {
-            tmem_store_output(row_address, state, request, row, head, active_rows);
-        } else {
-            tmem_store_partial(tile, row_address, state, position, partial, statistics,
-                               gqa_query_heads(request.cache.kv_heads));
-        }
+        tmem_store_output(row_address, state, request, row, head, active_rows);
     }
     __syncthreads();
     if (warp == 0) {
         asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;"
                      :: "r"(tile.tmem), "r"(tmem_cols) : "memory");
     }
-    if constexpr (Ordered) {
-        tmem_repair_ordered(tile, request, row, head, active_rows);
-    }
+    tmem_repair_ordered(tile, request, row, head, active_rows);
 }
 
-template <bool Ordered, bool Ragged = false>
+template <bool Ordered, bool Ragged>
 __launch_bounds__(tmem_threads, 1)
-__global__ void tmem_flash_attention(Attention request,
-                                     const __grid_constant__ CUtensorMap key_map,
-                                     const __grid_constant__ CUtensorMap value_map,
-                                     float* partial, float2* statistics, int rows) {
+    __global__ void tmem_flash_attention(Attention request,
+                                         const __grid_constant__ CUtensorMap key_map,
+                                         const __grid_constant__ CUtensorMap value_map, int rows) {
+    static_assert(Ordered);
     alignas(1024) extern __shared__ unsigned char shared_tmem[];
-    tmem_flash_tile<Ordered, Ragged>(*reinterpret_cast<TmemFlashTile*>(shared_tmem),
-                                     request, key_map, value_map, partial, statistics, rows,
-                                     blockIdx.x * flash_rows);
+    tmem_flash_tile<Ragged>(*reinterpret_cast<TmemFlashTile*>(shared_tmem), request, key_map,
+                            value_map, rows, blockIdx.x * flash_rows);
 }
 
 __device__ void pair_copy_payload(const CUtensorMap* map, void* destination, Word barrier,
@@ -566,88 +524,6 @@ __global__ void tmem_pair_attention(Attention request, const __grid_constant__ P
     pair_repair(tile, request, pair, row, head);
 }
 
-__global__ void tmem_merge(Attention request, const float* partial, const float2* statistics) {
-    __shared__ OrderedScratch fallback;
-    const int row = blockIdx.x;
-    const int first_head = blockIdx.y * ordered_heads;
-    float2 stats[ordered_heads][tmem_parts];
-    bool bad = false;
-    #pragma unroll
-    for (int head = 0; head < ordered_heads; ++head) {
-        #pragma unroll
-        for (int part = 0; part < tmem_parts; ++part) {
-            stats[head][part] = statistics[tmem_partial_row(
-                part, row, first_head + head, gqa_query_heads(request.cache.kv_heads))];
-            bad |= stats[head][part].y < 0.0f;
-        }
-    }
-    if (bad) {
-        protected_attention(fallback, request, row, first_head);
-        return;
-    }
-    const int channel = threadIdx.x;
-    #pragma unroll
-    for (int head = 0; head < ordered_heads; ++head) {
-        float maximum = -CUDART_INF_F;
-        #pragma unroll
-        for (int part = 0; part < tmem_parts; ++part) {
-            maximum = fmaxf(maximum, stats[head][part].x);
-        }
-        float mass = 0.0f;
-        float numerator = 0.0f;
-        #pragma unroll
-        for (int part = 0; part < tmem_parts; ++part) {
-            const float weight = __expf(stats[head][part].x - maximum);
-            mass = fmaf(stats[head][part].y, weight, mass);
-            const auto index = tmem_partial_row(part, row, first_head + head,
-                                                gqa_query_heads(request.cache.kv_heads));
-            numerator = fmaf(partial[index * channels + channel], weight, numerator);
-        }
-        request.output[row_offset(gqa_query_heads(request.cache.kv_heads),
-                                  row, first_head + head) + channel] =
-            __float2bfloat16_rn(numerator / mass);
-    }
-}
-
-cudaError_t launch_split_tmem(Attention& request, CUtensorMap& key_map, CUtensorMap& value_map,
-                              cudaStream_t stream) {
-    const auto& cache = request.cache;
-    const auto partial_rows =
-        std::size_t{tmem_parts} * flash_chunk * gqa_query_heads(cache.kv_heads);
-    const std::size_t partial_values = partial_rows * channels;
-    void* scratch = nullptr;
-    const auto bytes = (partial_values * sizeof(float)) + (partial_rows * sizeof(float2));
-    auto status = cudaMallocAsync(&scratch, bytes, stream);
-    if (status != cudaSuccess) {
-        return status;
-    }
-    auto* partial = static_cast<float*>(scratch);
-    auto* statistics = reinterpret_cast<float2*>(partial + partial_values);
-    int active = flash_chunk;
-    void* args[] = {
-        &request,
-        &key_map,
-        &value_map,
-        static_cast<void*>(&partial),
-        static_cast<void*>(&statistics),
-        &active,
-    };
-    const dim3 blocks(flash_chunk / flash_rows, gqa_head_pairs(cache), tmem_parts);
-    status = cudaLaunchKernel(tmem_flash_attention<false>, blocks, tmem_threads, args,
-                              sizeof(TmemFlashTile), stream);
-    if (status == cudaSuccess) {
-        void* merge_args[] = {
-            &request,
-            static_cast<void*>(&partial),
-            static_cast<void*>(&statistics),
-        };
-        const dim3 merge_blocks(flash_chunk, gqa_head_pairs(cache));
-        status = cudaLaunchKernel(tmem_merge, merge_blocks, channels, merge_args, 0, stream);
-    }
-    const auto release = cudaFreeAsync(scratch, stream);
-    return status == cudaSuccess ? release : status;
-}
-
 struct TmemAttentionBatch {
     PagedAttentionBatch tiles;
     CUtensorMap key_maps[paged_batch_sequences];
@@ -659,10 +535,10 @@ __global__ void batched_ragged_tmem_attention(const __grid_constant__ TmemAttent
     alignas(1024) extern __shared__ unsigned char shared_tmem[];
     const int tile = blockIdx.x;
     const int index = batch.tiles.locate(tile);
-    tmem_flash_tile<true, true>(
-        *reinterpret_cast<TmemFlashTile*>(shared_tmem), batch.tiles.requests[index],
-        batch.key_maps[index], batch.value_maps[index], nullptr, nullptr,
-        batch.tiles.rows[index], batch.tiles.row(tile, index, flash_rows));
+    tmem_flash_tile<true>(*reinterpret_cast<TmemFlashTile*>(shared_tmem),
+                          batch.tiles.requests[index], batch.key_maps[index],
+                          batch.value_maps[index], batch.tiles.rows[index],
+                          batch.tiles.row(tile, index, flash_rows));
 }
 
 }
@@ -755,15 +631,12 @@ std::optional<cudaError_t> prepare_paired_kernel(const void* kernel,
 
 }
 
-std::optional<cudaError_t> launch_tmem_prefill(
-    Mxfp8KvCache cache, Mxfp8PageTable pages, int position,
-    const Bf16* queries, Bf16* output, cudaStream_t stream, bool ordered,
-    int ragged_rows, bool automatic) {
+std::optional<cudaError_t> launch_tmem_prefill(Mxfp8KvCache cache, Mxfp8PageTable pages,
+                                               int position, const Bf16* queries, Bf16* output,
+                                               cudaStream_t stream, int rows) {
     constexpr auto dynamic_shared = sizeof(TmemFlashTile);
     constexpr int max_physical_pages = INT_MAX / mxfp8_page_size + 1;
-    const int rows = ragged_rows ? ragged_rows : flash_chunk;
-    if (position < 0 || rows < 1 || rows > flash_chunk || position > INT_MAX - rows ||
-        (ragged_rows && !ordered)) {
+    if (position < 0 || rows < 1 || rows > flash_chunk || position > INT_MAX - rows) {
         return cudaErrorInvalidValue;
     }
     const int visible = position + rows;
@@ -786,38 +659,36 @@ std::optional<cudaError_t> launch_tmem_prefill(
     if (auto status = cudaGetDeviceProperties(&properties, device); status != cudaSuccess) {
         return status;
     }
-    if (properties.major != 10 || properties.minor != 0 ||
-        (automatic && properties.multiProcessorCount != 148) ||
-        (!ordered && !properties.memoryPoolsSupported)) {
+    if (properties.major != 10 || properties.minor != 0 || properties.multiProcessorCount != 148) {
         return std::nullopt;
     }
-    if (const auto pending = automatic ? cudaPeekAtLastError() : cudaSuccess;
-        pending != cudaSuccess) return pending;
-    const auto stock = ragged_rows ? tmem_flash_attention<true, true> :
-        ordered ? tmem_flash_attention<true> : tmem_flash_attention<false>;
-    const bool tune_pipeline = automatic && visible <= max_multirow_visible_tokens;
-    const bool before_flash =
-        tune_pipeline && raw_pipeline_before_flash(cache, ragged_rows, visible);
+    if (const auto pending = cudaPeekAtLastError(); pending != cudaSuccess) {
+        return pending;
+    }
+    const bool tune_pipeline = visible <= max_multirow_visible_tokens;
+    const bool before_flash = tune_pipeline && raw_pipeline_before_flash(cache, rows, visible);
     const bool one_wave = (rows + pipeline_rows - 1) / pipeline_rows
         * gqa_head_pairs(cache) <= properties.multiProcessorCount;
-    bool pipeline = tune_pipeline && (before_flash || ragged_rows == pipeline_query_rows ||
-                                      (ragged_rows > pipeline_query_rows && one_wave &&
-                                       default_ragged_prefill(cache, position, rows)));
-    const auto stock_kernel = reinterpret_cast<const void*>(stock);
+    bool pipeline =
+        tune_pipeline &&
+        (before_flash || rows == pipeline_query_rows ||
+         (rows > pipeline_query_rows && one_wave && default_ragged_prefill(cache, position, rows)));
+    const void* const stock_kernel =
+        reinterpret_cast<const void*>(tmem_flash_attention<true, true>);
     const auto pipeline_kernel = reinterpret_cast<const void*>(tmem_pipeline_attention);
     const void* kernel = pipeline ? pipeline_kernel : stock_kernel;
-    auto ready = prepare_flash_kernel(kernel, dynamic_shared, properties, automatic);
+    auto ready = prepare_flash_kernel(kernel, dynamic_shared, properties, true);
     if (pipeline && !ready) {
         if (before_flash) return std::nullopt;
         pipeline = false;
         kernel = stock_kernel;
-        ready = prepare_flash_kernel(kernel, dynamic_shared, properties, automatic);
+        ready = prepare_flash_kernel(kernel, dynamic_shared, properties, true);
     }
     if (!ready || *ready != cudaSuccess) {
         return ready;
     }
     CUtensorMap key_map{}, value_map{};
-    const auto encoded = encode_flash_maps(cache, key_map, value_map, automatic);
+    const auto encoded = encode_flash_maps(cache, key_map, value_map, true);
     if (!encoded || *encoded != cudaSuccess) {
         return encoded;
     }
@@ -826,15 +697,10 @@ std::optional<cudaError_t> launch_tmem_prefill(
         return consume_prefill_submission(
             launch_pipeline(request, key_map, value_map, rows, stream));
     }
-    if (ordered) {
-        float* partial = nullptr;
-        float2* statistics = nullptr;
-        int active = rows;
-        void* args[] = {&request, &key_map, &value_map, &partial, &statistics, &active};
-        const dim3 blocks((rows + flash_rows - 1) / flash_rows, gqa_head_pairs(cache));
-        return cudaLaunchKernel(kernel, blocks, tmem_threads, args, dynamic_shared, stream);
-    }
-    return launch_split_tmem(request, key_map, value_map, stream);
+    int active = rows;
+    void* args[] = {&request, &key_map, &value_map, &active};
+    const dim3 blocks((rows + flash_rows - 1) / flash_rows, gqa_head_pairs(cache));
+    return cudaLaunchKernel(kernel, blocks, tmem_threads, args, dynamic_shared, stream);
 }
 
 std::optional<cudaError_t> launch_paired_tmem_prefill(

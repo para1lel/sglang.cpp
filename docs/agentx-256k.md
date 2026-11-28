@@ -93,7 +93,7 @@ The client used seed `42` and dispatched for 1,800.000 s at both native widths. 
 | 2 | Native | 794 / 795 | 1,820.045293517 | 3,640.090587034 | 78,796,354 | 70,725,911 | 687,645 | 1,175,325 / 1,227,395 |
 | 2 | vLLM | 1,260 / 1,260 | 1,804.876589299 | 3,609.753178598 | 131,864,832 | 125,046,272 | 1,196,076 | 1,978,892 / 2,054,481 |
 
-Native TP1 engine counters matched finalized warmup and profiling SSE exactly. Native TP2 canceled one request at the 30-second grace deadline. The score excludes that request. Its drained counters included 136,993 input, 7,483 output, and 136,993 cached input tokens beyond finalized warmup and profiling SSE.
+Native TP1 engine counters matched finalized warmup and profiling SSE exactly. Native TP2 canceled one request at the 30-second grace deadline. That request had no exported raw row and was excluded from the score. TP2 whole-run engine counters exceeded finalized warmup and profiling SSE by 136,993 input, 7,483 output, and 136,993 cached input tokens. The audit found this gap consistent with the cancellation.
 
 ### Effective server and cache settings
 

@@ -657,7 +657,8 @@ WideMtpGroups DecoderBatch::State::prepare_wide_groups(const PrefillRows& decode
     auto groups = wide_mtp_groups(decode, candidates, wide_mtp_limit);
     if (tp) {
         contains_mtp = groups.largest > 0;
-        if (groups.largest) prepare_wide_mtp(groups.largest);
+        if (groups.largest != 0 && !groups.sampled)
+            prepare_wide_mtp(groups.largest);
         return groups;
     }
     while (groups.largest) {
@@ -768,11 +769,12 @@ void DecoderBatch::State::speculate_group(const PrefillRows& verification_rows, 
         commit_verification(rounds.data() + first, slots.data() + first, peer_rounds.data() + first,
                             size, results, stats, checkpoint_rows, stream, cancel);
     };
-    if (joined_replay) {
+    const bool joined_sampled = wide_groups.sampled && count > packet;
+    if (joined_replay || joined_sampled) {
         const bool replayed = verify(0, count);
         for (int first = 0; first < count; first += packet) {
             const int width = std::min(count - first, packet);
-            if (!replayed)
+            if (!replayed && !joined_sampled)
                 verify(first, width);
             commit(first, width);
         }

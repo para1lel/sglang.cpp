@@ -13,6 +13,8 @@ inline constexpr int max_lanes = 2 * wide_mtp_lanes;
 inline constexpr int max_rows = max_lanes * target_verify_max_rows;
 inline constexpr int short_capacity = target_split_first_position;
 
+int packet_rows(const VerificationRow* rows, int remaining);
+
 struct SplitGroup {
     int first;
     int count;

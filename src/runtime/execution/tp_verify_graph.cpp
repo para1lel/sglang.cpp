@@ -74,6 +74,16 @@ bool LaneLayout::operator==(const LaneLayout& other) const {
 }
 }
 
+int packet_rows(const VerificationRow* rows, int remaining) {
+    constexpr int lanes = decoder_batch_max_mtp_lanes;
+    const int packet = rows[0].binding_lane / lanes;
+    const int limit = std::min(remaining, verification_packet_rows);
+    int count = 1;
+    while (count < limit && rows[count].binding_lane / lanes == packet)
+        ++count;
+    return count;
+}
+
 bool SplitGroup::operator==(const SplitGroup& other) const {
     return first == other.first && count == other.count && variant == other.variant;
 }
@@ -204,11 +214,12 @@ void plan_attention(Layout& layout, const VerificationRow* packet, bool packed) 
             ++entry.long_start;
         }
     }
-    const int width = packed ? verification_packet_rows : layout.row_count;
-    for (int first = 0; first < layout.row_count; first += width) {
+    for (int first = 0; first < layout.row_count;) {
+        const int width =
+            packed ? packet_rows(packet + first, layout.row_count - first) : layout.row_count;
         std::array<PagedDecodeLane, verification_packet_rows> reads;
         const int start = layout.split_count;
-        for (int index = first; index < std::min(first + width, layout.row_count); ++index) {
+        for (int index = first; index < first + width; ++index) {
             if (layout.long_count != 0 && selected[index])
                 continue;
             const auto& row = packet[index];
@@ -230,6 +241,7 @@ void plan_attention(Layout& layout, const VerificationRow* packet, bool packed) 
                 gqa_decode::split_variant(reads.data(), count, text_attention_max_tokens);
             layout.splits[layout.split_groups++] = {start, count, variant};
         }
+        first += width;
     }
 }
 
@@ -237,7 +249,6 @@ std::optional<Layout> plan(const Input& input, int lanes, int rows,
                            const std::array<cudaStream_t, 2>& streams, bool singleton_fused,
                            bool packed) {
     if (lanes < 1 || lanes > max_lanes || rows < lanes || rows > max_rows ||
-        (packed && (lanes * target_verify_max_rows != rows || !wide_mtp_width(lanes))) ||
         (!packed && lanes > decoder_batch_max_mtp_lanes))
         return std::nullopt;
     Layout layout{};

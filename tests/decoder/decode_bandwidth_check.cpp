@@ -1,6 +1,7 @@
 #include "sglang/decoder_cuda.cuh"
 #include "sglang/decoder_verify.h"
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstring>
@@ -142,12 +143,31 @@ void verification_gates(int channels, decltype(&try_verify_bf16_gdn_gates) gate)
             throw std::runtime_error("Verification gate rejected a supported shape");
         }
     };
-    for (const int count : {2, 3, 4, 5, packet, 2 * packet, 3 * packet, 4 * packet, capacity}) {
+    for (const int count : {
+             2,
+             3,
+             4,
+             5,
+             6,
+             10,
+             packet - 1,
+             packet,
+             packet + 1,
+             packet + 3,
+             2 * packet,
+             3 * packet,
+             capacity - 2,
+             capacity - 1,
+             capacity,
+         }) {
         actual.reset();
         expected.reset();
         const int tile_rows = count < packet ? count : packet;
-        for (int first = 0; first < count; first += tile_rows) {
-            launch(reference.data() + first, tile_rows);
+        for (int first = 0; first < count;) {
+            const int remaining = count - first;
+            const int packet_rows = remaining == 6 ? 4 : std::min(remaining, 5);
+            launch(reference.data() + first, packet_rows);
+            first += packet_rows;
         }
         successful_launches = 0;
         launch(rows.data(), count);
@@ -156,13 +176,13 @@ void verification_gates(int channels, decltype(&try_verify_bf16_gdn_gates) gate)
                 1,
                 static_cast<unsigned>(2 * channels),
                 static_cast<unsigned>(32 * tile_rows),
-                static_cast<unsigned>(count / tile_rows),
+                static_cast<unsigned>((count + tile_rows - 1) / tile_rows),
             },
             "Verification gate grid mismatch");
         actual.match(expected, "Verification gates changed BF16 output or guards");
     }
     attempted_launches = 0;
-    for (const int count : {1, 6, 19, packet + 1, capacity - 1, capacity + 1}) {
+    for (const int count : {0, 1, capacity + 1}) {
         if (gate(weight_b.data, weight_a.data, rows.data(), count, nullptr)) {
             throw std::runtime_error("Verification gates accepted an unsupported tail");
         }

@@ -109,10 +109,39 @@ WideMtpGroups packed_mtp_groups(const PrefillRows& decode, const WideMtpCandidat
     return groups;
 }
 
+WideMtpGroups sampled_mtp_groups(const PrefillRows& decode, const WideMtpCandidates& candidates,
+                                 int limit) {
+    WideMtpGroups groups;
+    groups.sampled = true;
+    if (limit <= decoder_batch_max_mtp_lanes)
+        return groups;
+    int first = 0;
+    int width = 0;
+    const auto flush = [&] {
+        if (width > decoder_batch_max_mtp_lanes) {
+            groups.width[first] = static_cast<std::uint8_t>(width);
+            groups.largest = std::max(groups.largest, width);
+        }
+        width = 0;
+    };
+    for (int slot = 0; slot < decoder_batch_max_lanes; ++slot) {
+        const auto bit = std::uint32_t{1} << static_cast<unsigned>(slot);
+        if (decode[slot] == 0 || (candidates.sampled & bit) == 0)
+            continue;
+        if (width == 0)
+            first = slot;
+        if (++width == limit)
+            flush();
+    }
+    flush();
+    return groups;
+}
 }
 
 WideMtpGroups wide_mtp_groups(const PrefillRows& decode, const WideMtpCandidates& candidates,
                               int limit) {
+    if (candidates.sampled != 0 && candidates.sampled == candidates.speculative)
+        return sampled_mtp_groups(decode, candidates, limit);
     auto groups = packed_mtp_groups(decode, candidates, limit);
     group_replay_packets(decode, candidates, groups);
     return groups;

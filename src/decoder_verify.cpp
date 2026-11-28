@@ -782,8 +782,9 @@ void score_target_rows(const DecoderModel& model, const VerificationRow* rows, i
                 continue;
             }
         }
-        score_verification_packet(model, packet, verification_packet_rows, vocabulary, stream);
-        first += verification_packet_rows;
+        const int size = tp_verify_graph::packet_rows(packet, total - first);
+        score_verification_packet(model, packet, size, vocabulary, stream);
+        first += size;
     }
 }
 }
@@ -797,14 +798,17 @@ bool Decoder::Model::verify_mtp_tp(
     std::array<VerificationSequence, max_wide_mtp_lanes> sequences;
     std::array<TargetVerification*, max_wide_mtp_lanes> verifiers{};
     std::array<TargetVerification*, max_wide_mtp_lanes> peer_verifiers;
-    if (count < 1 || count > wide_mtp_lanes * 2 ||
-        (count > decoder_batch_max_mtp_lanes && !wide_mtp_width(count)) || !rounds ||
-        !peer_rounds) {
+    if (count < 1 || count > tp_verify_graph::max_lanes || rounds == nullptr ||
+        peer_rounds == nullptr) {
         throw std::invalid_argument("Invalid number of tensor-parallel MTP rounds");
     }
     if (count > decoder_batch_max_mtp_lanes && (!primary_packed || !peer_packed)) {
         throw std::invalid_argument("Wide tensor-parallel MTP requires packed activation staging");
     }
+    const bool sampled_wide = count > decoder_batch_max_mtp_lanes &&
+                              std::all_of(rounds, rounds + count, [](const MtpRound& round) {
+                                  return round.sampling != nullptr && round.constraint == nullptr;
+                              });
     int total = 0;
     int longest = 0;
     for (int index = 0; index < count; ++index) {
@@ -823,7 +827,8 @@ bool Decoder::Model::verify_mtp_tp(
         total += rows;
         longest = std::max(longest, rows);
     }
-    if (count > decoder_batch_max_mtp_lanes && !vocabulary) {
+    if (count > decoder_batch_max_mtp_lanes && !sampled_wide &&
+        (!wide_mtp_width(count) || vocabulary == nullptr)) {
         throw std::invalid_argument("Wide MTP requires full greedy verification rows");
     }
     for (int index = 0; index < count; ++index) {
@@ -848,6 +853,8 @@ bool Decoder::Model::verify_mtp_tp(
                                rows[index] = packet_row(sequence, *sequence.verification, depth);
                                peer_rows[index] =
                                    packet_row(sequence, *peer_verifiers[lane], depth);
+                               rows[index].binding_lane = lane;
+                               peer_rows[index].binding_lane = lane;
                                tokens.id[index] = sequence.tokens[depth];
                                inputs.destination[index] = rows[index].work->residual;
                                peer_inputs.destination[index] = peer_rows[index].work->residual;

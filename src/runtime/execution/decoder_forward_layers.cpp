@@ -1,4 +1,5 @@
 #include "sglang/runtime/execution/decoder_forward_layers.h"
+#include "sglang/runtime/execution/tp_verify_graph.h"
 #include <algorithm>
 #include <type_traits>
 
@@ -86,6 +87,10 @@ LayerBatch<Lane> LayerBatch<Lane>::verification_packet(int first) const {
     auto packet = *this;
     packet.lanes += first;
     packet.count = std::min(verification_packet_rows, count - first);
+    if constexpr (std::is_same_v<Lane, VerificationRow>) {
+        if (packet.lanes->binding != nullptr || tensor_parallel)
+            packet.count = tp_verify_graph::packet_rows(packet.lanes, count - first);
+    }
     return packet;
 }
 
@@ -386,10 +391,15 @@ bool LayerBatch<Lane>::project_target_chunk(std::initializer_list<LayerProjectio
         ? reinterpret_cast<Bf16*>(projection_activation(first, columns).values)
         : workspace(lanes[first]).logits;
     static_assert(text_target_fp8_max_rows * intermediate_size <= vocab_size * sizeof(Bf16));
-    const auto status = tensor_core_lane(first)
-        ? try_target_fp8_tc(targets.data(), target, columns, operands.data(),
-                            rows, scratch, stream)
-        : std::nullopt;
+    constexpr bool verification = std::is_same_v<Lane, VerificationRow>;
+    const bool ragged = verification && packed_activation && !tensor_parallel;
+    const bool supported_rows =
+        rows <= text_target_fp8_max_rows || ragged || rows == text_target_fp8_m40_rows ||
+        rows == text_target_fp8_m80_rows || rows == text_target_fp8_m160_rows;
+    const auto status = tensor_core_lane(first) && supported_rows
+                            ? try_target_fp8_tc(targets.data(), target, columns, operands.data(),
+                                                rows, scratch, stream)
+                            : std::nullopt;
     if (status) {
         check(*status, "Run target FP8 projection");
         return true;
@@ -411,17 +421,17 @@ void LayerBatch<Lane>::project_target(std::initializer_list<LayerProjection> lay
     constexpr bool verification = std::is_same_v<Lane, VerificationRow>;
     int first = 0;
     if constexpr (verification) {
-        if (packed_activation) {
+        if (packed_activation != nullptr &&
+            (!tensor_parallel || count % verification_packet_rows == 0)) {
             if (project_target_chunk<max_wide_mtp_rows>(layers, 0, count, false)) return;
-            if (count == wide_mtp_rows) {
-                project_verification_packets(layers, 0, count);
-            } else {
+            if (count % wide_mtp_rows == 0 && count > wide_mtp_rows) {
                 for (int first = 0; first < count; first += wide_mtp_rows) {
-                    if (!project_target_chunk<wide_mtp_rows>(layers, first, wide_mtp_rows,
-                                                             false)) {
+                    if (!project_target_chunk<wide_mtp_rows>(layers, first, wide_mtp_rows, false)) {
                         project_verification_packets(layers, first, wide_mtp_rows);
                     }
                 }
+            } else {
+                project_verification_packets(layers, 0, count);
             }
             return;
         }
@@ -459,13 +469,17 @@ void LayerBatch<Lane>::project_target(std::initializer_list<LayerProjection> lay
 template <typename Lane>
 void LayerBatch<Lane>::project_verification_packets(std::initializer_list<LayerProjection> layers,
                                                    int first, int size) const {
-    for (int end = first + size; first < end; first += verification_packet_rows) {
-        if (!project_target_chunk(layers, first, verification_packet_rows, false)) {
-            for (int row = first; row < first + verification_packet_rows;
-                 row += text_fp8_max_batch) {
-                project_target_chunk(layers, row, text_fp8_max_batch, true);
+    for (const int end = first + size; first < end;) {
+        const int width = std::min(verification_packet(first).count, end - first);
+        if (!project_target_chunk(layers, first, width, false)) {
+            const int groups = (width + text_fp8_max_batch - 1) / text_fp8_max_batch;
+            for (int group = 0, row = first; group < groups; ++group) {
+                const int rows = (width / groups) + static_cast<int>(group < width % groups);
+                project_target_chunk(layers, row, rows, true);
+                row += rows;
             }
         }
+        first += width;
     }
 }
 

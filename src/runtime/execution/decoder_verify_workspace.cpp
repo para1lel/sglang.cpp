@@ -172,7 +172,8 @@ VerificationRow bind_verification_row(VerificationRow row, const VerificationGra
     }
     const int packet = row.binding_lane / decoder_batch_max_mtp_lanes;
     row.graph_split = shape.split[packet];
-    row.graph_long_shape = shape.long_decode[shape.packed ? 0 : packet];
+    row.graph_long_group = shape.packed ? 0 : packet;
+    row.graph_long_shape = shape.long_decode[row.graph_long_group];
     return row;
 }
 
@@ -271,6 +272,8 @@ bool VerificationGraph::replay(const DecoderModel& model, const VerificationSequ
         return false;
 
     const auto shape = graph_shape(rows, total, packed, split_end);
+    const bool wide_forward =
+        packed || (count > decoder_batch_max_mtp_lanes && model.backend.tensor_core_decode);
     auto* slot = std::find_if(slots.begin(), slots.end(),
                               [&](const Slot& item) { return item.used && item.shape == shape; });
     if (slot == slots.end()) {
@@ -291,7 +294,7 @@ bool VerificationGraph::replay(const DecoderModel& model, const VerificationSequ
         [&] {
             if (!scratch)
                 scratch = std::make_unique<VerificationGraphScratch>(model.device);
-            scratch->prepare(model, count, packed);
+            scratch->prepare(model, count, wide_forward);
         },
         [&] {
             std::array<VerificationRow, max_wide_mtp_rows> captured;
@@ -303,7 +306,7 @@ bool VerificationGraph::replay(const DecoderModel& model, const VerificationSequ
             check(gather_verification_embeddings(model.embedding, scratch->device_binding->tokens,
                                                  inputs, total, stream),
                   "Look up bound verification inputs");
-            if (packed) {
+            if (wide_forward) {
                 model.forward_verification_layers(captured.data(), total, stream,
                                                   scratch->packed_activation);
                 return;

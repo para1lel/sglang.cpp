@@ -12,8 +12,7 @@
 namespace sglang {
 
 bool target_fp8_wide_rows(int count) {
-    return count == text_target_fp8_m40_rows || count == text_target_fp8_m80_rows ||
-           count == text_target_fp8_m160_rows;
+    return count > text_target_fp8_max_rows && count <= text_target_fp8_m160_rows;
 }
 
 namespace decode_proj {

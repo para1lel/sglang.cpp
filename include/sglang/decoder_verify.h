@@ -32,6 +32,7 @@ struct VerificationRow {
     int binding_row = 0;
     int binding_index = 0;
     gqa_decode::SplitVariant graph_split = gqa_decode::SplitVariant::multi_stage;
+    int graph_long_group = 0;
     gqa_decode::LongDecodeShape graph_long_shape{};
 };
 

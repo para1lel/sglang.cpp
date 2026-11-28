@@ -38,6 +38,8 @@ StepPlan plan_step(const BatchStorage& storage, const Selection& selected, int l
         if (wide && work[slot].decode && lane->draft && lane->remaining_output() > 1) {
             const auto bit = std::uint32_t{1} << slot;
             wide->speculative |= bit;
+            if (tensor_parallel && lane->sampling && !lane->options.constraint)
+                wide->sampled |= bit;
             if (storage.verification_graph && !lane->options.eager)
                 wide->replay |= bit;
             if (work[slot].proposals == decoder_batch_max_mtp_steps &&

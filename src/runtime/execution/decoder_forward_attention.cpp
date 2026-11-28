@@ -87,8 +87,7 @@ void each_lane(const LayerBatch<Lane>& batch, Function function) {
     }
 }
 
-void project_gdn_gates(const GdnLayer& layer, const LayerBatch<VerificationRow>& batch,
-                       bool batched) {
+void project_gdn_gates(const GdnLayer& layer, const LayerBatch<VerificationRow>& batch) {
     if (!batch.target_tc || batch.count < 2 || layer.b.rows != batch.gdn_gate_heads() ||
         layer.a.rows != batch.gdn_gate_heads() || layer.b.columns != hidden_size ||
         layer.a.columns != hidden_size) {
@@ -108,8 +107,7 @@ void project_gdn_gates(const GdnLayer& layer, const LayerBatch<VerificationRow>&
             batch.tensor_parallel ? try_verify_bf16_gdn_gates_local : try_verify_bf16_gdn_gates;
         return gates_kernel(layer.b.values, layer.a.values, gates.data(), rows, batch.stream);
     };
-    if (batched && batch.count <= max_wide_mtp_rows &&
-        (batch.count <= text_fp8_max_batch || batch.count % verification_packet_rows == 0)) {
+    if (batch.count <= max_wide_mtp_rows) {
         if (const auto status = fill(0, batch.count)) {
             check(*status, "Run wide verification GDN gate projections");
             return;
@@ -380,6 +378,35 @@ ShortVerifyRows shared_short_rows(const VerificationRow* rows, int count, bool b
     return selected;
 }
 
+void read_bound_long_verification(const LayerBatch<VerificationRow>& batch, int cache_index,
+                                  const std::array<int, max_wide_mtp_lanes>& long_lanes) {
+    const auto* binding = batch.lanes[0].binding;
+    gqa_decode::BoundLongBatch reads{};
+    int count = 0;
+    int group = -1;
+    gqa_decode::LongDecodeShape shape{};
+    const auto flush = [&] {
+        if (count == 0)
+            return;
+        const auto status = gqa_decode::launch_long_decode(
+            reads, count, batch.gqa_geometry().kv_heads, shape, batch.stream);
+        check(status.value_or(cudaErrorNotSupported), "Read bound long verification attention");
+        count = 0;
+    };
+    for (const int index : long_lanes) {
+        if (index == 0)
+            continue;
+        const auto& row = batch.lanes[index - 1];
+        if (row.graph_long_group != group) {
+            flush();
+            group = row.graph_long_group;
+            shape = row.graph_long_shape;
+        }
+        reads.requests[count++] = &binding->history[row.binding_lane][cache_index];
+    }
+    flush();
+}
+
 void attend_verify_gqa(const GqaLayer& layer, const LayerBatch<VerificationRow>& batch,
                               int cache_index) {
     const auto& first = batch.lanes[0];
@@ -402,27 +429,24 @@ void attend_verify_gqa(const GqaLayer& layer, const LayerBatch<VerificationRow>&
     check(gqa_verify_append_bound(append, live, batch.count, geometry.kv_heads, batch.stream),
           "Append bound verification MXFP8 KV");
 
-    gqa_decode::BoundLongBatch long_reads{};
-    int long_count = 0;
-    std::array<bool, max_wide_mtp_lanes> long_lanes{};
-    const int width = batch.packed_activation != nullptr ? verification_packet_rows : batch.count;
-    for (int offset = 0; offset < batch.count; offset += width) {
+    std::array<int, max_wide_mtp_lanes> long_lanes{};
+    const bool share_short = !batch.tensor_parallel && batch.ordered_attention &&
+                             batch.vector_attention &&
+                             batch.target_split_end == text_attention_max_tokens;
+    for (int offset = 0; offset < batch.count;) {
+        const int width = batch.verification_packet(offset).count;
         std::array<BoundPagedDecodeLane, verification_packet_rows> split{};
         int split_count = 0;
         std::array<int, verification_packet_rows> short_indices{};
         std::array<const void*, verification_packet_rows> short_requests{};
         int short_count = 0;
-        const int end = std::min(offset + width, batch.count);
-        const bool share_short = !batch.tensor_parallel && batch.ordered_attention &&
-                                 batch.vector_attention &&
-                                 batch.target_split_end == text_attention_max_tokens;
-        const auto shared = share_short
-                                ? shared_short_rows(batch.lanes + offset, end - offset, true)
-                                : ShortVerifyRows{};
+        const int end = offset + width;
+        const auto shared =
+            share_short ? shared_short_rows(batch.lanes + offset, width, true) : ShortVerifyRows{};
         for (int index = offset; index < end; ++index) {
             const auto& row = batch.lanes[index];
             if (row.graph_attention == VerificationAttention::long_context) {
-                long_lanes[row.binding_lane] = true;
+                long_lanes[row.binding_lane] = index + 1;
                 continue;
             }
             if (shared.test(static_cast<std::size_t>(index - offset))) {
@@ -458,16 +482,9 @@ void attend_verify_gqa(const GqaLayer& layer, const LayerBatch<VerificationRow>&
                       "Read bound split attention");
             }
         }
+        offset = end;
     }
-    for (int lane = 0; lane < static_cast<int>(long_lanes.size()); ++lane) {
-        if (long_lanes[lane])
-            long_reads.requests[long_count++] = &first.binding->history[lane][cache_index];
-    }
-    if (long_count != 0) {
-        const auto status = gqa_decode::launch_long_decode(
-            long_reads, long_count, geometry.kv_heads, first.graph_long_shape, batch.stream);
-        check(status.value_or(cudaErrorNotSupported), "Read bound long verification attention");
-    }
+    read_bound_long_verification(batch, cache_index, long_lanes);
     check(gqa_verify_postgate(gate, batch.count, batch.stream, geometry),
           "Gate bound grouped-query attention");
 }
@@ -650,17 +667,18 @@ void attend_eager_verification(const GqaLayer& layer,
                              attend_shared_short(layer, packet, cache_index));
         }
     };
-    const int width = batch.packed_activation ? verification_packet_rows : batch.count;
     const auto remainder = [&](const GqaVerifySelection& selected) {
         std::array<VerificationRow, verification_packet_rows> rows;
-        for (int first = 0; first < batch.count; first += width) {
-            auto packet = batch;
+        for (int first = 0; first < batch.count;) {
+            auto packet = batch.verification_packet(first);
+            const int width = packet.count;
             packet.lanes = rows.data();
             packet.count = 0;
-            for (int index = first; index < std::min(first + width, batch.count); ++index) {
+            for (int index = first; index < first + width; ++index) {
                 if (!selected[index]) rows[packet.count++] = batch.lanes[index];
             }
             if (packet.count) attend(packet);
+            first += width;
         }
     };
     const GqaVerifyRemainder pending{
@@ -675,8 +693,10 @@ void attend_eager_verification(const GqaLayer& layer,
         attend(batch);
         return;
     }
-    for (int first = 0; first < batch.count; first += width) {
-        attend(batch.verification_packet(first));
+    for (int first = 0; first < batch.count;) {
+        const auto packet = batch.verification_packet(first);
+        attend(packet);
+        first += packet.count;
     }
 }
 
@@ -747,7 +767,7 @@ void run_gdn(const GdnLayer& layer, const LayerBatch<VerificationRow>& batch,
         batch.quantize(&Workspace::normalized, hidden_size);
     }
     batch.project_group({{layer.qkv, &Workspace::gdn_qkv}, {layer.z, &Workspace::gdn_z}});
-    project_gdn_gates(layer, batch, batch.packed_activation != nullptr);
+    project_gdn_gates(layer, batch);
     run_gdn_verification(layer, batch, state_index);
     batch.quantize(&Workspace::attention, batch.gdn_attention_width());
     batch.project(layer.output, &Workspace::projected_attention);

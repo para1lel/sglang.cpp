@@ -71,7 +71,12 @@ template <int Columns, int Workers = tile_rows, typename Job>
 __device__ void load_scales(const Job& job, float* scales,
                             int act_row, int first, int count, int active) {
     constexpr int fragment = Columns == 8 ? 8 : 16;
-    const int padded = active == 1 ? 1 : (active + fragment - 1) / fragment * fragment;
+    constexpr bool compact =
+        Columns == m40_columns || Columns == m80_rows || Columns == text_target_fp8_m160_rows;
+    int padded = Columns;
+    if constexpr (!compact) {
+        padded = active == 1 ? 1 : ((active + fragment - 1) / fragment) * fragment;
+    }
     for (int index = threadIdx.x; index < count * padded; index += Workers) {
         const int col = index / count;
         const int group = index % count;
@@ -214,9 +219,9 @@ __device__ __forceinline__ float4 load_cluster4(const float* local, unsigned ran
 
 template <int Columns, typename Output, int Workers = threads>
 __device__ __noinline__ void reduce_compact(const float* partials, int splits, int row_base,
-                                           int out_width, const Output* output) {
+                                            int active, int out_width, const Output* output) {
     if (out_width % 4 != 0) {
-        reduce_store(partials, splits, Columns, row_base, out_width, output->output);
+        reduce_store(partials, splits, active, row_base, out_width, output->output);
         return;
     }
     constexpr int vectors = Columns * tile_rows / 4;
@@ -225,7 +230,8 @@ __device__ __noinline__ void reduce_compact(const float* partials, int splits, i
     for (int vector = first + threadIdx.x; vector < last; vector += Workers) {
         const int index = vector * 4;
         const int row = row_base + index % tile_rows;
-        if (row >= out_width) continue;
+        if (row >= out_width || index / tile_rows >= active)
+            continue;
         const auto* values = partials + index;
         auto sum = load_cluster4(values, 0);
         for (int source = 1; source < splits; ++source) {
@@ -274,17 +280,17 @@ __device__ void store_m80_halves(const float (&result)[m80_half], float* partial
     if (splits > 1) {
         cluster_sync();
         reduce_compact<m80_rows, Fp8RowPointers<m80_rows>, m80_threads>(
-            partials, splits, row_base, out_width, &output);
+            partials, splits, row_base, m80_rows, out_width, &output);
         cluster_sync();
     }
 }
 
 template <int Columns, typename Output>
 __device__ __forceinline__ void store_compact(const float (&result)[Columns], float* partials,
-                                               int splits, int row_base, int out_width,
-                                               const Output& output) {
+                                              int splits, int row_base, int active, int out_width,
+                                              const Output& output) {
     if (splits == 1) {
-        store_result(result, partials, 1, Columns, row_base, out_width, output.output);
+        store_result(result, partials, 1, active, row_base, out_width, output.output);
         return;
     }
     if (threadIdx.x < tile_rows) {
@@ -294,7 +300,7 @@ __device__ __forceinline__ void store_compact(const float (&result)[Columns], fl
         }
     }
     cluster_sync();
-    reduce_compact<Columns>(partials, splits, row_base, out_width, &output);
+    reduce_compact<Columns>(partials, splits, row_base, active, out_width, &output);
     cluster_sync();
 }
 
@@ -365,8 +371,7 @@ void fp8_decode(const __grid_constant__ Job job) {
     const int count = (split + 1) * job.groups / splits - first;
     const int act_row = blockIdx.z * Columns;
     constexpr bool compact = Columns == 80 || Columns == 160;
-    const int active = gate_up || packed_m10 ? m10_rows
-        : packed_m40 ? m40_rows : compact ? Columns : min(Columns, job.rows - act_row);
+    const int active = gate_up ? m10_rows : min(Columns, job.rows - act_row);
     const int warp = threadIdx.x / warp_size;
     constexpr bool halves = std::is_same_v<Job, Fp8M80Job>;
     constexpr int mma = halves ? m80_consumers : mma_warp;
@@ -425,7 +430,7 @@ void fp8_decode(const __grid_constant__ Job job) {
         store_gate_up(result, reinterpret_cast<__nv_bfloat16*>(tiles),
                       target, row_block, warp, job);
     } else if constexpr (compact || packed_m10 || packed_m40) {
-        store_compact(result, reinterpret_cast<float*>(tiles), splits, row_base,
+        store_compact(result, reinterpret_cast<float*>(tiles), splits, row_base, active,
                       job.out_width[target], job.lanes[target]);
     } else if constexpr (!std::is_same_v<Job, Fp8Job>) {
         store_result(result, reinterpret_cast<float*>(tiles), splits, active, row_base,
@@ -576,7 +581,7 @@ std::optional<cudaError_t> compact_status(std::optional<cudaError_t> status) {
 std::optional<cudaError_t> try_text_fp8_decode_sm100_rows(
     const TextFp8DecodeTarget* projections, int target_count, const std::uint8_t* packed_values,
     int in_width, const TextFp8Projection* rows, int count, cudaStream_t stream) {
-    const bool compact = count == text_target_fp8_m80_rows || count == text_target_fp8_m160_rows;
+    const bool compact = count > text_target_fp8_m40_rows;
     if (compact) {
         const auto pending = cudaGetLastError();
         if (pending != cudaSuccess) return pending;
@@ -592,8 +597,9 @@ std::optional<cudaError_t> try_text_fp8_decode_sm100_rows(
         const auto status = compact_status(prepared);
         return !prepared && status == cudaErrorNotSupported ? std::nullopt : status;
     }
-    if (count == text_target_fp8_m80_rows) {
-        if (tp2_m80_shape(projections, target_count, in_width)) {
+    if (count > text_target_fp8_m40_rows && count <= text_target_fp8_m80_rows) {
+        if (count == text_target_fp8_m80_rows &&
+            tp2_m80_shape(projections, target_count, in_width)) {
             if (auto packed = compact_status(launch_rows<m80_rows, 4, m80_rows, Fp8M80Job>(
                     target, projections, target_count, input, in_width, rows, count, stream))) {
                 return packed;
@@ -602,11 +608,11 @@ std::optional<cudaError_t> try_text_fp8_decode_sm100_rows(
         return compact_status(launch_rows<text_target_fp8_m80_rows, 4, text_target_fp8_m80_rows>(
             target, projections, target_count, input, in_width, rows, count, stream));
     }
-    if (count == text_target_fp8_m160_rows) {
+    if (count > text_target_fp8_m80_rows) {
         return compact_status(launch_rows<text_target_fp8_m160_rows, 3, text_target_fp8_m160_rows>(
             target, projections, target_count, input, in_width, rows, count, stream));
     }
-    if (count == text_target_fp8_m40_rows) {
+    if (count > text_target_fp8_max_rows) {
         if (in_width == hidden_width && target_count == 2 &&
             projections[0].out_width == intermediate_width &&
             projections[1].out_width == intermediate_width) {

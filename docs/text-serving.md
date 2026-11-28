@@ -88,7 +88,7 @@ CUDA orders scores descending, breaking ties by lowest token ID. It exponentiate
 
 Unseeded sampling resolves one seed with `std::random_device`. Text can use [sampled MTP](mtp.md#sampled-mtp), including constraints. K0 uses eager or [eligible graph logits](batch-graphs.md#runtime-path).
 
-Negative infinity masks a token. NaN, positive infinity, or no finite logits yields `DecoderSamplingError` in direct unconstrained generation and `sampling_failed` in batch mode. The failed lane retires and peers continue. See [HTTP failure mapping](http-server.md#completion-streams). [Seed resolution](../src/decoder.cpp#L123)<!-- prefix: "SamplingPara" --> · [Cutoff and draw](../src/decoder_sampling.cu#L218)<!-- prefix: "__global__ v" --> · [Batch dispatch](../apps/server/batch_service.cpp#L819)<!-- prefix: "DecoderResul" --> · [Sample readback](../src/decoder.cpp#L379)<!-- prefix: "int read_tok" --> · [Batch retirement](../src/decoder_batch.cpp#L839)<!-- prefix: "if (result.s" -->
+Negative infinity masks a token. NaN, positive infinity, or no finite logits yields `DecoderSamplingError` in direct unconstrained generation and `sampling_failed` in batch mode. The failed lane retires and peers continue. See [HTTP failure mapping](http-server.md#completion-streams). [Seed resolution](../src/decoder.cpp#L123)<!-- prefix: "SamplingPara" --> · [Cutoff and draw](../src/decoder_sampling.cu#L218)<!-- prefix: "__global__ v" --> · [Batch dispatch](../apps/server/batch_service.cpp#L819)<!-- prefix: "DecoderResul" --> · [Sample readback](../src/decoder.cpp#L379)<!-- prefix: "int read_tok" --> · [Batch retirement](../src/decoder_batch.cpp#L841)<!-- prefix: "if (result.s" -->
 
 ## Finite-choice constraints
 

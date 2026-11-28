@@ -47,7 +47,7 @@ If a ranked GET misses and includes GQA with GDN or draft state, the server retr
 
 Only a committed restore from resident GDN refreshes that checkpoint's GPU recency. Lookup and duplicate checkpoint reuse can find or hold a snapshot without touching recency. Matched GDN counters can include an endpoint deeper than the committed resume position. [Lookup accounting](../src/runtime/cache/prefix_residency.cpp#L609)<!-- prefix: "void PrefixR" --> · [Duplicate lookup](../src/runtime/cache/prefix_residency.cpp#L600)<!-- prefix: "PrefixSnapsh" --> · [Daemon recency](serving/lmcache.md#native-transport)
 
-`sglang_cpp:lmcache_gqa_computed_tokens_total` counts regenerated target GQA cache rows. Restored rows skip key normalization, rotary and MXFP8 cache append. A tile fully covered by GQA skips K/V projection; a tile crossing the boundary can still run packed QKV. [Tile projection](../src/runtime/execution/decoder_prefill_tiles.cpp#L250)<!-- prefix: "void Chunk::" --> · [Tile append](../src/runtime/execution/decoder_prefill_tiles.cpp#L265)<!-- prefix: "void Chunk::" --> · [Accounting](../src/decoder_batch.cpp#L850)<!-- prefix: "prefix_stats" -->
+`sglang_cpp:lmcache_gqa_computed_tokens_total` counts regenerated target GQA cache rows. Restored rows skip key normalization, rotary and MXFP8 cache append. A tile fully covered by GQA skips K/V projection; a tile crossing the boundary can still run packed QKV. [Tile projection](../src/runtime/execution/decoder_prefill_tiles.cpp#L250)<!-- prefix: "void Chunk::" --> · [Tile append](../src/runtime/execution/decoder_prefill_tiles.cpp#L265)<!-- prefix: "void Chunk::" --> · [Accounting](../src/decoder_batch.cpp#L852)<!-- prefix: "prefix_stats" -->
 
 A paired boundary at `P` seeds shifted draft row `P-1` with the first suffix ID on a partial hit or the first committed output on a full hit. Full hits score from restored hidden/residual rows using the request's [grammar](text-serving.md#finite-choice-constraints) and [sampler](text-serving.md#sampling). Restore and full-hit scoring do not charge [target rows](batch-graphs.md#runtime-path) or change other lanes' decode policy.
 
@@ -71,7 +71,7 @@ When a pending backup blocks all selected prefill and decode is idle, the schedu
 
 Abort can abandon LOOKUP. An armed GET or STORE retains its resources until matching lease release or original daemon exit. A timeout or replacement daemon leaves that lease live. Failed restores clear staged state before cold prefill. Terminal CUDA faults disable the batch. [Lease status](../tools/lmcache/sglang_lmcache.py#L668)<!-- prefix: "def lease_st" --> · [Restore handling](../src/runtime/execution/decoder_batch_prefix.cpp#L86)<!-- prefix: "DecoderBatch" -->
 
-Direct callers that supply explicit restore and store callbacks follow the transfer contract. They own callback capacity and wait for terminal submission when a store is required. [Direct MTP](../src/decoder_batch.cpp#L915)<!-- prefix: "void Decoder" -->
+Direct callers that supply explicit restore and store callbacks follow the transfer contract. They own callback capacity and wait for terminal submission when a store is required. [Direct MTP](../src/decoder_batch.cpp#L917)<!-- prefix: "void Decoder" -->
 
 ### Native HTTP controls
 

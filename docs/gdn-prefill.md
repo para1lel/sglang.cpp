@@ -27,7 +27,7 @@ Rank-local GDN prefill uses the native BF16 or FP8 path. [Frozen former opt-in a
 
 ## Grouped target verification
 
-Grouped target verification projects GDN inputs for each lane, then hands ordered rows to [ReplaySSM decode](gdn-decode.md#packed-eager-and-captured-verification). That path owns tentative history and commits each lane separately. Prefill builds the exact recurrent state for each needed prompt checkpoint. [Forward](../src/runtime/execution/decoder_forward_attention.cpp#L744)<!-- prefix: "void run_gdn" --> · [Capture](../src/runtime/execution/decoder_prefill_tiles.cpp#L519)<!-- prefix: "void capture" -->
+Grouped target verification projects GDN inputs for each lane, then hands ordered rows to [ReplaySSM decode](gdn-decode.md#packed-eager-and-captured-verification). That path owns tentative history and commits each lane separately. Prefill builds the exact recurrent state for each needed prompt checkpoint. [Forward](../src/runtime/execution/decoder_forward_attention.cpp#L764)<!-- prefix: "void run_gdn" --> · [Capture](../src/runtime/execution/decoder_prefill_tiles.cpp#L519)<!-- prefix: "void capture" -->
 
 Use the [batched target GDN check](../tests/decoder/README.md#batched-target-gdn) against scalar decode for zero through five consumed rows and a replacement. Compare compact against four-lane controls on identical verification inputs. Match BF16 scores, normalized output and raw history, FP32 carry and scales, and FP8 bytes. Check decline, error propagation, and reuse.
 
@@ -40,7 +40,7 @@ B/A fast paths need Tensor Core prefill and two BF16 48×5,120 weight matrices. 
 | B/A projection | Eligibility and fallback |
 | --- | --- |
 | SM100 | 512–4,096 rows, including partial 32-row tails. Nonnull buffers, weights/input/scratch aligned to 16 B, and supported TMA. Borrow 3,840 B per row from MLP gate; consume on the same stream before reuse. [Decoder dispatch](../src/runtime/execution/decoder_prefill_tiles.cpp#L166)<!-- prefix: "if (tensor_c" --> · [SM100 preflight](../src/text/prefill_gdn_gates_sm100.cu#L193)<!-- prefix: "std::optiona" --> |
-| Fused SIMT, then separate | On clean SM100 decline, try multiples of four from 16–65,535 rows with aligned weights/input. A further decline projects B then A separately. [SIMT preflight](../src/text_decode_bandwidth.cu#L520)<!-- prefix: "if (rows \u003c 1" --> · [Descriptor errors](../src/text/prefill_gdn_gates_sm100.cu#L133)<!-- prefix: "std::optiona" --> · [Separate fallback](../src/runtime/execution/decoder_prefill_tiles.cpp#L187)<!-- prefix: "project(laye" --> |
+| Fused SIMT, then separate | On clean SM100 decline, try multiples of four from 16–65,535 rows with aligned weights/input. A further decline projects B then A separately. [SIMT preflight](../src/text_decode_bandwidth.cu#L526)<!-- prefix: "if (rows \u003c 1" --> · [Descriptor errors](../src/text/prefill_gdn_gates_sm100.cu#L133)<!-- prefix: "std::optiona" --> · [Separate fallback](../src/runtime/execution/decoder_prefill_tiles.cpp#L187)<!-- prefix: "project(laye" --> |
 
 At absolute position zero the first GDN layer uses ordered recurrence. Later layers and tiles may use chunked recurrence. Resume uses the restored absolute position.
 

@@ -256,42 +256,38 @@ void optional_member(std::string& pattern, const Member& member, MemberComma com
     append_pattern(pattern, ")?");
 }
 
-void members_without_required(std::string& pattern, const std::vector<Member>& members,
-                              MemberSyntax syntax) {
-    append_pattern(pattern, "(?:");
-    if (syntax == MemberSyntax::xml)
-        append_pattern(pattern, "\n");
-    const auto comma = syntax == MemberSyntax::json ? MemberComma::before : MemberComma::none;
-    for (auto first = members.begin(); first != members.end(); ++first) {
-        append_pattern(pattern, "|");
-        append_pattern(pattern, first->pattern);
-        for (auto next = std::next(first); next != members.end(); ++next) {
-            optional_member(pattern, *next, comma);
+std::string member_sequence(const std::vector<Member>& members, MemberSyntax syntax) {
+    const bool xml = syntax == MemberSyntax::xml;
+    const std::string_view delimiter = xml ? "" : ",";
+    std::string pattern = xml ? "" : R"(\{)";
+    if (std::none_of(members.begin(), members.end(),
+                     [](const Member& member) { return member.required; })) {
+        append_pattern(pattern, xml ? "(?:\n" : "(?:");
+        const auto comma = xml ? MemberComma::none : MemberComma::before;
+        for (auto first = members.begin(); first != members.end(); ++first) {
+            append_pattern(pattern, "|");
+            append_pattern(pattern, first->pattern);
+            for (auto next = std::next(first); next != members.end(); ++next) {
+                optional_member(pattern, *next, comma);
+            }
         }
-    }
-    append_pattern(pattern, ")");
-}
-
-std::string member_sequence(const std::vector<Member>& members) {
-    std::string pattern = R"(\{)";
-    if (std::none_of(members.begin(), members.end(), [](Member const& member) {
-            return member.required;
-        })) {
-        members_without_required(pattern, members, MemberSyntax::json);
+        append_pattern(pattern, ")");
     } else {
-        bool started = false;
+        const auto after_required = xml ? MemberComma::none : MemberComma::before;
+        auto optional_comma = xml ? MemberComma::none : MemberComma::after;
+        std::string_view separator;
         for (const auto& member : members) {
             if (member.required) {
-                if (started) append_pattern(pattern, ",");
+                append_pattern(pattern, separator);
                 append_pattern(pattern, member.pattern);
-                started = true;
+                separator = delimiter;
+                optional_comma = after_required;
             } else {
-                optional_member(pattern, member,
-                                started ? MemberComma::before : MemberComma::after);
+                optional_member(pattern, member, optional_comma);
             }
         }
     }
-    append_pattern(pattern, R"(\})");
+    append_pattern(pattern, xml ? "" : R"(\})");
     return pattern;
 }
 
@@ -335,7 +331,7 @@ std::string Compiler::object(const json::OrderedObject& schema, int depth) {
         }
     }
     if (!required.empty()) invalid("required contains a name outside properties");
-    return member_sequence(members);
+    return member_sequence(members, MemberSyntax::json);
 }
 
 std::string Compiler::array(const json::OrderedObject& schema, int depth) {
@@ -415,21 +411,7 @@ std::string Compiler::xml_parameters(const json::Value& value) {
         }
     }
     if (!required.empty()) invalid("required contains a name outside properties");
-    const bool has_required = std::any_of(members.begin(), members.end(),
-                                         [](const auto& member) { return member.required; });
-    std::string pattern;
-    if (has_required) {
-        for (const auto& member : members) {
-            if (member.required) {
-                append_pattern(pattern, member.pattern);
-            } else {
-                optional_member(pattern, member, MemberComma::none);
-            }
-        }
-    } else {
-        members_without_required(pattern, members, MemberSyntax::xml);
-    }
-    return pattern;
+    return member_sequence(members, MemberSyntax::xml);
 }
 
 }

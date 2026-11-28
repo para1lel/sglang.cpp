@@ -71,6 +71,12 @@ struct Trigger {
     int destination;
 };
 
+bool matches_suffix(std::string_view prefix, std::string_view marker) {
+    const std::size_t length = marker.size() - 1;
+    return prefix.size() >= length &&
+           prefix.substr(prefix.size() - length) == marker.substr(0, length);
+}
+
 int plain_states(std::vector<regex::State>& states, const Trigger* triggers, int count) {
     const int start = static_cast<int>(states.size());
     std::vector<std::string_view> prefixes(1);
@@ -85,29 +91,20 @@ int plain_states(std::vector<regex::State>& states, const Trigger* triggers, int
     }
     for (const auto prefix : prefixes) {
         regex::State state{{}, true};
-        for (int byte = 0; byte < 256; ++byte) {
-            const auto next = std::string(prefix) + static_cast<char>(byte);
-            int destination = start;
-            std::size_t longest = 0;
-            for (std::size_t index = 1; index < prefixes.size(); ++index) {
-                if (prefixes[index].size() > longest &&
-                    next.size() >= prefixes[index].size() &&
-                    next.compare(next.size() - prefixes[index].size(), prefixes[index].size(),
-                                 prefixes[index]) == 0) {
-                    longest = prefixes[index].size();
-                    destination = start + static_cast<int>(index);
-                }
+        state.next.fill(start);
+        for (std::size_t index = 1; index < prefixes.size(); ++index) {
+            const auto candidate = prefixes[index];
+            auto& target = state.next[static_cast<unsigned char>(candidate.back())];
+            if (candidate.size() > prefixes[target - start].size() &&
+                matches_suffix(prefix, candidate)) {
+                target = start + static_cast<int>(index);
             }
-            for (int index = 0; index < count; ++index) {
-                const auto& trigger = triggers[index];
-                if (next.size() >= trigger.marker.size() &&
-                    next.compare(next.size() - trigger.marker.size(), trigger.marker.size(),
-                                 trigger.marker) == 0) {
-                    destination = trigger.destination;
-                    break;
-                }
+        }
+        for (int index = count; index > 0; --index) {
+            const auto& trigger = triggers[index - 1];
+            if (matches_suffix(prefix, trigger.marker)) {
+                state.next[static_cast<unsigned char>(trigger.marker.back())] = trigger.destination;
             }
-            state.next[byte] = destination;
         }
         states.push_back(state);
     }
@@ -115,7 +112,8 @@ int plain_states(std::vector<regex::State>& states, const Trigger* triggers, int
 }
 
 int literal_states(std::vector<regex::State>& states, std::string_view text, int next) {
-    for (const unsigned char byte : std::string(text.rbegin(), text.rend())) {
+    for (auto it = text.rbegin(); it != text.rend(); ++it) {
+        const auto byte = static_cast<unsigned char>(*it);
         regex::State state{{}, false};
         state.next.fill(regex::dead_state);
         state.next[byte] = next;
@@ -259,9 +257,10 @@ std::shared_ptr<const TokenConstraint> TokenConstraint::compile_states(
             node.edges.erase(std::remove_if(node.edges.begin(), node.edges.end(),
                                             [&](const Edge& edge) { return !live(edge.next); }),
                              node.edges.end());
-        }
-        for (auto& edge : node.edges) {
-            edge.next = live(edge.next) ? edge.next : regex::dead_state;
+        } else {
+            for (auto& edge : node.edges) {
+                edge.next = live(edge.next) ? edge.next : regex::dead_state;
+            }
         }
         const std::size_t candidates = node.fallback != regex::dead_state ? model_vocab_size :
             node.edges.size() + (node.accepting ? 2 : 0);

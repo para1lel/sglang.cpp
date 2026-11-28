@@ -26,20 +26,21 @@ std::vector<Range> normalize(std::vector<Range> ranges, bool negate) {
     std::sort(ranges.begin(), ranges.end(), [](Range left, Range right) {
         return left.first < right.first;
     });
-    std::vector<Range> merged;
+    std::size_t count = 0;
     for (const auto range : ranges) {
-        if (!merged.empty() && range.first <= merged.back().last + 1) {
-            merged.back().last = std::max(merged.back().last, range.last);
+        if (count != 0 && range.first <= ranges[count - 1].last + 1) {
+            ranges[count - 1].last = std::max(ranges[count - 1].last, range.last);
         } else {
-            merged.push_back(range);
+            ranges[count++] = range;
         }
     }
+    ranges.resize(count);
     if (!negate) {
-        return merged;
+        return ranges;
     }
     std::vector<Range> complement;
     char32_t first = 0;
-    for (const auto range : merged) {
+    for (const auto range : ranges) {
         if (first < range.first) {
             complement.push_back({first, range.first - 1});
         }
@@ -227,15 +228,16 @@ std::vector<Range> Parser::class_atom() {
 
 std::vector<Range> Parser::escape() {
     const char32_t value = next();
-    switch (value) {
-        case U'd': return {{U'0', U'9'}};
-        case U'D': return normalize({{U'0', U'9'}}, true);
-        case U'w': return {{U'0', U'9'}, {U'A', U'Z'}, {U'_', U'_'}, {U'a', U'z'}};
-        case U'W': return normalize({{U'0', U'9'}, {U'A', U'Z'}, {U'_', U'_'}, {U'a', U'z'}},
-                                    true);
-        case U's': return {{U'\t', U'\r'}, {U' ', U' '}};
-        case U'S': return normalize({{U'\t', U'\r'}, {U' ', U' '}}, true);
-        default: break;
+    const bool negate = value >= U'A' && value <= U'Z';
+    switch (negate ? value - (U'A' - U'a') : value) {
+    case U'd':
+        return normalize({{U'0', U'9'}}, negate);
+    case U'w':
+        return normalize({{U'0', U'9'}, {U'A', U'Z'}, {U'_', U'_'}, {U'a', U'z'}}, negate);
+    case U's':
+        return normalize({{U'\t', U'\r'}, {U' ', U' '}}, negate);
+    default:
+        break;
     }
     constexpr std::u32string_view letters = U"nrtfv";
     constexpr std::u32string_view controls = U"\n\r\t\f\v";
@@ -276,6 +278,10 @@ char32_t Parser::hex(int digits) {
     return scalar;
 }
 
+Expression parse_pattern(std::string_view pattern, bool tool) {
+    const auto scalars = read_utf8(pattern);
+    return Parser(scalars, tool).pattern();
+}
 }
 
 Expression parse(std::string_view pattern) {
@@ -286,13 +292,11 @@ Expression parse(std::string_view pattern) {
 }
 
 Expression parse_generated(std::string_view pattern) {
-    const auto scalars = read_utf8(pattern);
-    return Parser(scalars).pattern();
+    return parse_pattern(pattern, false);
 }
 
 Expression parse_tool_pattern(std::string_view pattern) {
-    const auto scalars = read_utf8(pattern);
-    return Parser(scalars, true).pattern();
+    return parse_pattern(pattern, true);
 }
 
 }

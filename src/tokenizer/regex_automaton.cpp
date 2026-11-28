@@ -51,8 +51,7 @@ private:
                     unsigned size, int start, int finish);
     void repeat(const Expression& expression, int start, int finish);
     void xml_text(int start, int finish);
-    std::vector<int> closure(std::vector<int> seeds) const;
-    std::vector<int> advance(const std::vector<int>& states, unsigned byte) const;
+    std::vector<int> subset(const std::vector<int>& states, unsigned byte) const;
 
     std::vector<Node> nodes_;
 };
@@ -224,37 +223,33 @@ void Nfa::emit(const Expression& expression, int start, int finish) {
     }
 }
 
-std::vector<int> Nfa::closure(std::vector<int> seeds) const {
+std::vector<int> Nfa::subset(const std::vector<int>& states, unsigned byte) const {
     std::bitset<max_nfa_states> seen;
-    std::vector<int> states;
+    std::vector<int> next;
     const auto enqueue = [&](int state) {
         if (!seen.test(state)) {
             seen.set(state);
-            states.push_back(state);
+            next.push_back(state);
         }
     };
-    for (const int state : seeds) {
-        enqueue(state);
+    if (states.empty()) {
+        enqueue(0);
     }
-    for (std::size_t index = 0; index < states.size(); ++index) {
-        for (const int next : nodes_[states[index]].empty) {
-            enqueue(next);
-        }
-    }
-    std::sort(states.begin(), states.end());
-    return states;
-}
-
-std::vector<int> Nfa::advance(const std::vector<int>& states, unsigned byte) const {
-    std::vector<int> next;
     for (const int state : states) {
         for (const auto edge : nodes_[state].bytes) {
             if (edge.first <= byte && byte <= edge.last) {
-                next.push_back(edge.next);
+                enqueue(edge.next);
             }
         }
     }
-    return closure(std::move(next));
+    std::size_t index = 0;
+    while (index < next.size()) {
+        for (const int state : nodes_[next[index++]].empty) {
+            enqueue(state);
+        }
+    }
+    std::sort(next.begin(), next.end());
+    return next;
 }
 
 std::vector<State> Nfa::determinize(int limit) const {
@@ -271,25 +266,27 @@ std::vector<State> Nfa::determinize(int limit) const {
             alphabet.push_back(byte);
         }
     }
-    std::vector<std::vector<int>> subsets{closure({0})};
-    std::map<std::vector<int>, int> indices{{subsets.front(), 0}};
+    std::map<std::vector<int>, int> indices;
+    const auto initial = indices.emplace(subset({}, 0), 0).first;
+    std::vector<const std::vector<int>*> subsets{&initial->first};
     std::vector<State> states;
     for (std::size_t index = 0; index < subsets.size(); ++index) {
-        State state{{}, std::binary_search(subsets[index].begin(), subsets[index].end(), 1)};
+        const auto& current = *subsets[index];
+        State state{{}, std::binary_search(current.begin(), current.end(), 1)};
         for (std::size_t letter = 1; letter < alphabet.size(); ++letter) {
             const unsigned start = alphabet[letter - 1];
-            auto next = advance(subsets[index], start);
+            auto next = subset(current, start);
             int target = dead_state;
             if (!next.empty()) {
                 const auto [entry, inserted] =
-                    indices.try_emplace(next, static_cast<int>(subsets.size()));
+                    indices.try_emplace(std::move(next), static_cast<int>(subsets.size()));
                 target = entry->second;
                 if (inserted) {
                     if (subsets.size() == static_cast<std::size_t>(limit)) {
                         throw std::invalid_argument(
                             "regex exceeds the " + std::to_string(limit) + "-state DFA limit");
                     }
-                    subsets.push_back(std::move(next));
+                    subsets.push_back(&entry->first);
                 }
             }
             std::fill(state.next.begin() + start, state.next.begin() + alphabet[letter], target);
@@ -324,9 +321,8 @@ std::vector<State> minimize(const std::vector<State>& states, std::size_t limit)
         }
         if (classes == next) {
             std::vector<State> result(groups.size());
-            for (std::size_t index = 0; index < states.size(); ++index) {
-                const auto key = signature(states[index], classes);
-                auto& state = result[classes[index]];
+            for (const auto& [key, index] : groups) {
+                auto& state = result[index];
                 state.accepting = key.front() != 0;
                 std::copy(key.begin() + 1, key.end(), state.next.begin());
             }
@@ -336,24 +332,23 @@ std::vector<State> minimize(const std::vector<State>& states, std::size_t limit)
     }
 }
 
+std::vector<State> build(const Expression& expression, int subset_limit) {
+    Nfa automaton;
+    automaton.emit(expression, 0, 1);
+    return automaton.determinize(subset_limit);
+}
 }
 
 std::vector<State> determinize(const Expression& expression) {
-    Nfa automaton;
-    automaton.emit(expression, 0, 1);
-    return automaton.determinize(max_dfa_states);
+    return build(expression, max_dfa_states);
 }
 
 std::vector<State> determinize_schema(const Expression& expression) {
-    Nfa automaton;
-    automaton.emit(expression, 0, 1);
-    return minimize(automaton.determinize(max_schema_subsets), max_dfa_states);
+    return minimize(build(expression, max_schema_subsets), max_dfa_states);
 }
 
 std::vector<State> determinize_tool(const Expression& expression) {
-    Nfa automaton;
-    automaton.emit(expression, 0, 1);
-    return minimize(automaton.determinize(max_tool_subsets), max_tool_dfa_states);
+    return minimize(build(expression, max_tool_subsets), max_tool_dfa_states);
 }
 
 }

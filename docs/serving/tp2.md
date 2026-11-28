@@ -10,7 +10,7 @@ Both ranks own target workers and store 16,896 target KV bytes per token per ran
 
 Each rank executes draft projections, KV append, attention and its vocabulary shard. Rank 0 selects from the rank-local winners with deterministic ties. Both ranks also seed and repair draft state. Eligible complete greedy groups can use packed M40/M80 target verification. Shortened, sampled, constrained and scored groups use ordinary packet layouts as required. Source and device proofs for two-rank proposals are distinct from [target-forward replay](../batch-graphs.md#tp2-target-verification-graph). [Proposal](../../src/decoder_tp.cpp#L244)<!-- prefix: "bool Decoder" --> · [Ranked draft forward](../../src/text/draft_projection.cpp#L387)<!-- prefix: "void MtpDraf" --> · [Winner merge](../../src/text/draft_projection.cpp#L556)<!-- prefix: "int MtpDraft" --> · [Repair](../../src/decoder_tp.cpp#L305)<!-- prefix: "void Decoder" --> · [Seeding](../../src/decoder_tp.cpp#L341)<!-- prefix: "void Decoder" -->
 
-Each rank gathers embeddings and scatters reduced states to row-owned buffers with one launch per stage. [Gather](../../src/decoder_verify.cpp#L834)<!-- prefix: "check(gather" --> · [Scatter](../../src/runtime/execution/decoder_forward_tp.cpp#L167)<!-- prefix: "check(scatte" -->
+Each rank gathers embeddings and scatters reduced states to row-owned buffers with one launch per stage. [Gather](../../src/decoder_verify.cpp#L855)<!-- prefix: "check(gather" --> · [Scatter](../../src/runtime/execution/decoder_forward_tp.cpp#L167)<!-- prefix: "check(scatte" -->
 
 ## Prerequisites and command
 

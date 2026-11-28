@@ -9,7 +9,7 @@ target model. It supports greedy decoding and sampling.
 | --- | --- | --- |
 | Generator and server | Set the proposal limit and pass request options to the decoder. | [Generator options](../apps/sglang-generate.cpp#L63)<!-- prefix: "void usage(s" --> · [Server dispatch](../apps/sglang-server.cpp#L468)<!-- prefix: "BatchService" --> |
 | MTP round | Draft proposals and commit target outputs in order. | [Proposals](../src/decoder_verify.cpp#L161)<!-- prefix: "bool MtpRoun" --> · [Commit](../src/decoder_verify.cpp#L291)<!-- prefix: "bool MtpRoun" --> |
-| Target verifier | Process causal rows by layer and commit each request's consumed prefix. | [Forward](../src/decoder_verify.cpp#L864)<!-- prefix: "bool Decoder" --> · [State commit](../src/runtime/execution/decoder_verify_workspace.cpp#L339)<!-- prefix: "void TargetV" --> |
+| Target verifier | Process causal rows by layer and commit each request's consumed prefix. | [Forward](../src/decoder_verify.cpp#L882)<!-- prefix: "bool Decoder" --> · [State commit](../src/runtime/execution/decoder_verify_workspace.cpp#L339)<!-- prefix: "void TargetV" --> |
 
 ## Runtime path
 
@@ -61,7 +61,7 @@ An item with active [output penalties](output-penalties.md) or [logit bias](serv
 
 The draft proposes greedy IDs. On each causal row the [target sampler](text-serving.md#sampling) draws `T` from its filtered law `P`, including the first output. Each draw uses the resolved seed and prospective output index. It emits `T`, accepting draft `d` if `T == d` (probability `P(d)`). The target draw supplies the correction directly. Full acceptance permits a bonus under the budget and stop rules.
 
-Discarded rows leave their output indices available on the corrected history. Identical effective rows, sampler settings, seeds, and output indices match K0. Prefill, forward precision, and batch grouping can change logits and draws. [Verifier sampler](../src/decoder_verify.cpp#L609)<!-- prefix: "void enqueue" -->
+Discarded rows leave their output indices available on the corrected history. Identical effective rows, sampler settings, seeds, and output indices match K0. Prefill, forward precision, and batch grouping can change logits and draws. [Verifier sampler](../src/decoder_verify.cpp#L609)<!-- prefix: "void read_ro" -->
 
 Independent unconstrained BF16 rows share the five selection kernel launches across each packet chunk. Each row retains its own settings, draw, scratch, and token result. The selector reuses projection staging after the score rows have been scattered. A single row or insufficient staging uses the scalar sampler. Rows with an active stop mask use the ordinary adjusted-score selector until their output position reaches the minimum. [Packet selection](../src/decoder_sampling.cu#L372)<!-- prefix: "cudaError_t " -->
 

@@ -20,6 +20,7 @@ struct Lane {
     int resident_target_end = 0;
     int resident_draft_end = 0;
     bool resident_prefix = false;
+    bool waiting_for_restore_slot = false;
     PrefixSnapshots desired_gdn{};
     ResidentPrefixRead restore_fallback{};
     int desired_gdn_tokens = 0;

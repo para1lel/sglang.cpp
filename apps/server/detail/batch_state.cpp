@@ -160,7 +160,7 @@ Job::~Job() {
 bool Job::aborted() const { return request_id && request_id->aborted(); }
 
 bool Job::discard_deferred_store() const {
-    return prefix_pending && !prefix_operation.valid() && (cancelled || aborted());
+    return admitted && prefix_pending && !prefix_operation.valid() && (cancelled || aborted());
 }
 
 bool Job::has_output() const { return !pending.empty() && !(output_overlapped && aborted()); }
@@ -213,6 +213,9 @@ bool BatchService::State::decode_cohort_ready(bool buffered, bool require_all) c
 
 bool BatchService::State::prefix_ready(const Job& job) const {
     if (!job.prefix_pending) return false;
+    if (job.prefix_restore_retry_at != Clock::time_point{}) {
+        return job.cancelled || job.aborted() || Clock::now() >= job.prefix_restore_retry_at;
+    }
     if (!job.prefix_operation.valid()) {
         return job.discard_deferred_store() || (lmcache && lmcache->store_capacity());
     }

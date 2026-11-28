@@ -7,6 +7,10 @@ int BatchTopology::device_count() const noexcept { return dp_size * tp_size * pp
 
 DecoderBatchPrefixUpdate BatchSession::poll_prefix(int) { return {}; }
 
+bool BatchSession::prefix_restore_waiting([[maybe_unused]] int slot) const {
+    return false;
+}
+
 BatchSession::~BatchSession() = default;
 
 BatchExecutor::~BatchExecutor() = default;

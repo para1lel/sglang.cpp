@@ -112,9 +112,12 @@ bool BatchService::State::admit(BatchSession& batch, int slot, Job& job) {
             job.media.clear();
         }
         job.options.prefix_cache_read.reset();
+        const bool waiting_for_slot = batch.prefix_restore_waiting(slot);
         const std::scoped_lock lock(mutex);
         job.admission_retry_at = {};
-        job.prefix_pending = job.prefix_operation.valid();
+        job.prefix_pending = waiting_for_slot || job.prefix_operation.valid();
+        if (waiting_for_slot)
+            job.prefix_restore_retry_at = Clock::now() + prefix_restore_retry;
         job.admitted = !job.prefix_pending;
         if (job.admitted)
             job.cache_read.reset();
@@ -197,6 +200,7 @@ void BatchService::State::configure_checkpoint(Job& job) {
 
 bool BatchService::State::poll_prefix(BatchSession& batch, int slot,
                                       const std::shared_ptr<Job>& job) {
+    bool cancel_slot_wait = false;
     {
         const std::lock_guard lock(mutex);
         if (job->discard_deferred_store()) {
@@ -204,11 +208,25 @@ bool BatchService::State::poll_prefix(BatchSession& batch, int slot,
             return true;
         }
         if (!prefix_ready(*job)) return false;
+        cancel_slot_wait = job->prefix_restore_retry_at != Clock::time_point{} &&
+                           (job->cancelled || job->aborted());
     }
     DecoderBatchPrefixUpdate update;
     try {
-        update = batch.poll_prefix(slot);
-        if (update.pending) return false;
+        if (cancel_slot_wait) {
+            batch.cancel(slot);
+        } else {
+            update = batch.poll_prefix(slot);
+        }
+        if (update.pending) {
+            const std::scoped_lock lock(mutex);
+            if (job->prefix_restore_retry_at != Clock::time_point{}) {
+                job->prefix_restore_retry_at = job->prefix_operation.valid()
+                                                   ? Clock::time_point{}
+                                                   : Clock::now() + prefix_restore_retry;
+            }
+            return false;
+        }
     } catch (...) {
         if (!batch.available()) throw;
         const auto error = std::current_exception();
@@ -216,6 +234,7 @@ bool BatchService::State::poll_prefix(BatchSession& batch, int slot,
         const std::lock_guard lock(mutex);
         job->prefix_pending = false;
         job->prefix_operation = {};
+        job->prefix_restore_retry_at = {};
         job->deferred_finish.reset();
         if (job->request_id && !job->request_id->finish()) {
             job->request_id->finish_abort();
@@ -230,6 +249,9 @@ bool BatchService::State::poll_prefix(BatchSession& batch, int slot,
     const std::lock_guard lock(mutex);
     job->prefix_pending = false;
     job->prefix_operation = {};
+    job->prefix_restore_retry_at = {};
+    if (cancel_slot_wait)
+        return true;
     if (job->retiring_prefix) {
         jobs[slot].reset();
         changed.notify_all();

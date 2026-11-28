@@ -18,10 +18,16 @@ service_sources=(
     "$source/src/media/multimodal_prompt.cpp" "$source/src/utf8.cpp"
 )
 
+service_features=()
+if [[ $(<"$source/include/sglang/decoder_batch.h") == *prefix_restore_waiting* ]]; then
+    service_features=(-DSGLANG_TEST_PREFIX_RESTORE_WAITING)
+fi
+
 build_service_fixture() {
     local fixture=$1
     shift
     "${CXX:-c++}" -std=c++17 -O2 -pthread -Wall -Wextra -Werror \
         -I"$source/include" -isystem "$sdk/targets/x86_64-linux/include" \
+        "${service_features[@]}" \
         "$tests/$fixture.cpp" "${service_sources[@]}" "$@" -o "$output"
 }

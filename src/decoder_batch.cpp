@@ -140,8 +140,8 @@ void DecoderBatch::State::initialize_prefix(Lane& lane, ResidentPrefixRead& reus
     const auto& opts = lane.options;
     auto read = lane.prefill_lookup;
     if (lane.resident_prefix) {
-        if (!stage_resident_restore(lane, reuse, read))
-            apply_resident_read(lane, reuse);
+        lane.restore_fallback = std::move(reuse);
+        initialize_resident_prefix(lane);
         return;
     }
     if (read && read->usable_gqa > 0 && opts.restore_prefix) {
@@ -802,7 +802,8 @@ Steps DecoderBatch::State::advance(const Selection& requested, bool chunked,
         auto selected = requested;
         for (int slot = 0; slot < options.max_lanes; ++slot) {
             auto& lane = slots[slot];
-            if (lane && (lane->prefix || lane->prefix_store)) selected[slot] = false;
+            if (lane && (lane->prefix || lane->prefix_store || lane->waiting_for_restore_slot))
+                selected[slot] = false;
             if (selected[slot] && lane && lane->remaining_prompt() != 0 && lane->checkpoints() &&
                 lane->prefill_endpoint_count < 0)
                 plan_prefill_checkpoints(*lane);
@@ -918,7 +919,7 @@ void DecoderBatch::generate_mtp(const std::vector<int>& prompt, const DecoderOpt
     result.output_token_ids.reserve(options.max_new_tokens);
     const auto model_bytes = result.peak_device_allocation_bytes;
     const auto& lane = state_->storage->slots[0];
-    bool prefix_pending = bool(lane->prefix);
+    bool prefix_pending = lane && (lane->prefix || lane->waiting_for_restore_slot);
     bool completion_claimed = false;
     while (completion_claimed || !state_->cancelled()) {
         if (prefix_pending) {

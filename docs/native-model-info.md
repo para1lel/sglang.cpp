@@ -2,7 +2,7 @@
 
 ## Responsibilities and sources of truth
 
-HTTP handles [model discovery](#model-discovery) and [server information](#server-information) outside the completion queue. The [startup writer](../apps/sglang-server.cpp#L248)<!-- prefix: "std::string " --> supplies metadata, and the [scheduler snapshot](../apps/server/batch_service.cpp#L771)<!-- prefix: "BatchRuntime" --> supplies live state under its mutex. [Implementation map](https://github.com/para1lel/sglang.cpp/blob/49a48f98e44223bd619e7b6f43569b45175504c0/docs/native-model-info.md#responsibilities-and-sources-of-truth)
+HTTP handles [model discovery](#model-discovery) and [server information](#server-information) outside the completion queue. The [startup writer](../apps/sglang-server.cpp#L248)<!-- prefix: "std::string " --> supplies metadata, and the [scheduler snapshot](../apps/server/batch_service.cpp#L775)<!-- prefix: "BatchRuntime" --> supplies live state under its mutex. [Implementation map](https://github.com/para1lel/sglang.cpp/blob/49a48f98e44223bd619e7b6f43569b45175504c0/docs/native-model-info.md#responsibilities-and-sources-of-truth)
 
 ## Runtime path
 
@@ -33,7 +33,7 @@ Both `GET /server_info` and deprecated `GET /get_server_info` return startup set
 | --- | --- |
 | `frontend`, `version`, `supports_inline_system` | `"cpp"`, `null`, and `false`. A system turn must be first. |
 | `host`, `port`, `device` | `"127.0.0.1"`, TCP port, and process-visible CUDA ordinal. |
-| `dp_size`, `tp_size`, `pp_size` | Integers reported by the batch executor. The single-device executor sets each to `1`. [Topology](../src/runtime/server/single_device_batch_executor.cpp#L77)<!-- prefix: "BatchTopolog" --> |
+| `dp_size`, `tp_size`, `pp_size` | Integers reported by the batch executor. The single-device executor sets each to `1`. [Topology](../src/runtime/server/single_device_batch_executor.cpp#L80)<!-- prefix: "BatchTopolog" --> |
 | `model_path`, `tokenizer_path`, `served_model_name` | Strings. Both paths expose the effective checkpoint directory. The served ID is `"Qwen3.8-27B-FP8"`. |
 | `launch_command` | String starting with `sglang-server`. It records explicit options in input order, including repeats. |
 | `max_running_requests`, `max_num_batched_tokens` | Lane limit and aggregate target tokens per step. Defaults are 8 and 32,768. |
@@ -111,7 +111,7 @@ The list ignores the query and returns 404 on a non-GET or nonempty body. Retrie
 
 ### Server-info targets
 
-Both aliases ignore queries and framed GET bodies, return 200 even with `ready: false`, and redirect trailing slashes to the corresponding alias. Unknown paths return 404. Apply the [same 405/HEAD rule](#model-info-targets). Invalid framing fails before the handler. [Query split](../apps/server/http.cpp#L143)<!-- prefix: "const auto s" --> · [Method reply](../apps/server/http.cpp#L585)<!-- prefix: "void write_m" --> · [Worker flag](../apps/server/batch_service.cpp#L690)<!-- prefix: "bool BatchSe" -->
+Both aliases ignore queries and framed GET bodies, return 200 even with `ready: false`, and redirect trailing slashes to the corresponding alias. Unknown paths return 404. Apply the [same 405/HEAD rule](#model-info-targets). Invalid framing fails before the handler. [Query split](../apps/server/http.cpp#L143)<!-- prefix: "const auto s" --> · [Method reply](../apps/server/http.cpp#L585)<!-- prefix: "void write_m" --> · [Worker flag](../apps/server/batch_service.cpp#L694)<!-- prefix: "bool BatchSe" -->
 
 ## Verification
 

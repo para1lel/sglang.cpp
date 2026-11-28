@@ -33,8 +33,9 @@ public:
     virtual void reset_prefix_cache() = 0;
     virtual std::size_t request_device_allocation_bytes() const = 0;
     virtual void release_retired_allocations() = 0;
+    virtual bool prefix_restore_waiting(int slot) const;
 
-protected:
+  protected:
     ~BatchSession();
 };
 

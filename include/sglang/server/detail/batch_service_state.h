@@ -45,6 +45,7 @@ struct Job {
     std::shared_future<bool> prefix_operation;
     std::optional<DecoderFinishReason> deferred_finish;
     std::chrono::steady_clock::time_point admission_retry_at;
+    std::chrono::steady_clock::time_point prefix_restore_retry_at;
 
     ~Job();
 
@@ -78,6 +79,7 @@ struct BatchJob {
 };
 using BatchJobs = std::array<BatchJob, decoder_batch_max_lanes>;
 inline constexpr auto disconnect_poll = std::chrono::milliseconds(10);
+inline constexpr auto prefix_restore_retry = std::chrono::milliseconds(1);
 inline constexpr auto mailbox_grace = std::chrono::milliseconds(1);
 inline constexpr int mailbox_min_lanes = 16;
 inline constexpr int wide_decode_min_ready = 25;

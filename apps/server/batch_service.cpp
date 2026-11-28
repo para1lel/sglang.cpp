@@ -125,15 +125,19 @@ bool BatchService::State::idle_for_health() const {
 
 bool BatchService::State::has_runnable_job(Clock::time_point& retry_at) const {
     retry_at = Clock::time_point::max();
+    bool capacity_blocked = false;
     for (const int slot : admission) {
         const auto& job = jobs[slot];
         if (!job)
             continue;
-        const bool capacity_blocked = retry_at != Clock::time_point::max();
         if (prefix_ready(*job) || job->ready(false, capacity_blocked))
             return true;
-        if (!capacity_blocked && job->awaiting_capacity())
-            retry_at = job->admission_retry_at;
+        if (job->prefix_restore_retry_at != Clock::time_point{})
+            retry_at = std::min(retry_at, job->prefix_restore_retry_at);
+        if (!capacity_blocked && job->awaiting_capacity()) {
+            capacity_blocked = true;
+            retry_at = std::min(retry_at, job->admission_retry_at);
+        }
     }
     return false;
 }

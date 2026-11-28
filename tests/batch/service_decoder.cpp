@@ -27,6 +27,11 @@ bool DecoderBatch::prefix_backup_pending() const {
     return prefix_cache_stats().pending_backups != 0;
 }
 DecoderBatchPrefixUpdate DecoderBatch::poll_prefix(int) { std::abort(); }
+#ifdef SGLANG_TEST_PREFIX_RESTORE_WAITING
+bool DecoderBatch::prefix_restore_waiting([[maybe_unused]] int slot) const {
+    return false;
+}
+#endif
 void DecoderBatch::release_retired_allocations() {}
 
 }

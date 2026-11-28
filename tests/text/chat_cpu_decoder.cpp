@@ -506,6 +506,12 @@ bool DecoderBatch::prefix_backup_pending() const {
 
 void DecoderBatch::reset_prefix_cache() {}
 
+#ifdef SGLANG_TEST_PREFIX_RESTORE_WAITING
+bool DecoderBatch::prefix_restore_waiting([[maybe_unused]] int slot) const {
+    return false;
+}
+#endif
+
 #ifdef SGLANG_TEST_LMCACHE
 DecoderBatchPrefixUpdate DecoderBatch::poll_prefix(int) {
     throw std::logic_error("Unexpected CPU prefix transfer");

@@ -103,8 +103,8 @@ struct DecoderBatch::State {
                                     const PrefillCheckpoint* peer);
     ResidentPrefixRead prepare_resident_read(const Lane& lane) const;
     void apply_resident_read(Lane& lane, const ResidentPrefixRead& hit);
-    bool stage_resident_restore(Lane& lane, ResidentPrefixRead& resident,
-                                const std::shared_ptr<const PrefixCacheRead>& cpu) const;
+    void initialize_resident_prefix(Lane& lane);
+    bool stage_resident_restore(Lane& lane) const;
     void finish_resident_restore(Lane& lane, bool transferred);
     void repair_resident_restore(Lane& lane, const PrefixDeviceLayout& layout,
                                  bool target_transferred, bool draft_transferred) const;

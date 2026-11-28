@@ -126,6 +126,7 @@ public:
                          const std::vector<DecoderMedia>& media);
     void cancel(int slot);
     DecoderBatchPrefixUpdate poll_prefix(int slot);
+    bool prefix_restore_waiting(int slot) const;
 
     std::array<DecoderBatchStep, decoder_batch_max_lanes>
     advance(const std::array<bool, decoder_batch_max_lanes>& selected);

@@ -76,6 +76,9 @@ fi
 if [[ "$batch_header" == *release_retired_allocations* ]]; then
     media_api+=(-DSGLANG_TEST_RETIRED_ALLOCATIONS)
 fi
+if [[ "$batch_header" == *prefix_restore_waiting* ]]; then
+    media_api+=(-DSGLANG_TEST_PREFIX_RESTORE_WAITING)
+fi
 if [[ $(<"$source/include/sglang/decoder.h") == *paired_prefill_threshold* ]]; then
     media_api+=(-DSGLANG_TEST_PAIRED_PREFILL_THRESHOLD)
 fi

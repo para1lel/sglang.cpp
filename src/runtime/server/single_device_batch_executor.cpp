@@ -43,6 +43,9 @@ public:
     }
 
     void release_retired_allocations() override { batch_.release_retired_allocations(); }
+    bool prefix_restore_waiting(int slot) const override {
+        return batch_.prefix_restore_waiting(slot);
+    }
 
 private:
     DecoderBatch batch_;

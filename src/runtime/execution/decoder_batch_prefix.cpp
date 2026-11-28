@@ -83,6 +83,11 @@ void DecoderBatch::reset_prefix_cache() {
         pool->reset();
 }
 
+bool DecoderBatch::prefix_restore_waiting(int slot) const {
+    const auto& lane = state_->slot_at(slot);
+    return lane && lane->waiting_for_restore_slot;
+}
+
 DecoderBatchPrefixUpdate DecoderBatch::poll_prefix(int slot) {
     state_->require_ready();
     auto& lane = state_->slot_at(slot);
@@ -93,6 +98,13 @@ DecoderBatchPrefixUpdate DecoderBatch::poll_prefix(int slot) {
             if (!state_->submit_checkpoint(*lane)) return {true, {}};
             state_->retire(lane);
             return {};
+        }
+        if (lane->waiting_for_restore_slot) {
+            state_->initialize_resident_prefix(*lane);
+            if (lane->waiting_for_restore_slot)
+                return {true, {}};
+            if (!lane->prefix)
+                return {false, lane->progress.position};
         }
         if (!lane->prefix) return {};
         const auto& prefix = *lane->prefix;
@@ -424,9 +436,17 @@ void DecoderBatch::State::restore_resident_checkpoint(Lane& lane,
     }
 }
 
-bool DecoderBatch::State::stage_resident_restore(
-    Lane& lane, ResidentPrefixRead& resident,
-    const std::shared_ptr<const PrefixCacheRead>& cpu) const {
+void DecoderBatch::State::initialize_resident_prefix(Lane& lane) {
+    lane.waiting_for_restore_slot = false;
+    if (!stage_resident_restore(lane)) {
+        apply_resident_read(lane, lane.restore_fallback);
+        lane.restore_fallback = {};
+    }
+}
+
+bool DecoderBatch::State::stage_resident_restore(Lane& lane) const {
+    auto& resident = lane.restore_fallback;
+    const auto& cpu = lane.prefill_lookup;
     if (!cpu || !lane.options.restore_prefix)
         return false;
     PrefixRestoreExtent extent;
@@ -450,12 +470,20 @@ bool DecoderBatch::State::stage_resident_restore(
                                           cpu->matched_gdn_endpoints.end(), coherent);
     PrefixSnapshots staged;
     if (cpu_end != cpu->matched_gdn_endpoints.begin() && *std::prev(cpu_end) > hot_end) {
-        staged = prefix_pool->reserve_checkpoint();
-        if (staged[0])
+        staged = prefix_pool->reserve_checkpoint(&lane.waiting_for_restore_slot);
+        if (lane.waiting_for_restore_slot)
+            return true;
+        if (staged.front())
             extent.gdn_end = *std::prev(cpu_end);
     }
-    if (extent.gqa_end == 0 && extent.draft_end == 0 && extent.gdn_end == 0)
+    if (extent.gqa_end == 0 && extent.draft_end == 0 && extent.gdn_end == 0) {
+        if (hot_end > resident.gdn_tokens) {
+            resident.gdn = std::move(hot);
+            resident.gdn_tokens = hot_end;
+            resident.matched_gdn = std::max(resident.matched_gdn, hot_end);
+        }
         return false;
+    }
     auto* const stream = execution.stream();
     if (tp_driver) {
         tp_driver->register_prefix_restore(lane, cpu, stream, staged, &extent);
@@ -466,7 +494,6 @@ bool DecoderBatch::State::stage_resident_restore(
     }
     lane.desired_gdn = std::move(hot);
     lane.desired_gdn_tokens = hot_end;
-    lane.restore_fallback = std::move(resident);
     return true;
 }
 

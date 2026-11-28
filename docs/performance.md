@@ -51,13 +51,13 @@ TP1 W4 uses the first eight archived W5 requests. TP1 W5 uses all four archived 
 
 Use `k = 1,024` tokens. Each arm at each width sends one independent warmup with 203,776 input tokens and 1,024 output tokens. Drain and reset prefix state after warmup. The measured chain starts with empty history.
 
-Each arm sends 20 measured requests. For request `i` from 1 through 20, append 9,216 frozen input IDs to that engine's complete history. After its response, append all 1,024 emitted output IDs to the history. Inputs contain `10,240 × i − 1,024` IDs, from 9,216 to 203,776. The final input and output total 204,800 tokens. Both engines use the same frozen added IDs and sampling controls. Each arm carries its own emitted output IDs forward.
+For each of 20 requests, append 9,216 frozen IDs to that engine’s history. Append its 1,024 emitted IDs after the response. Input `i` contains `10,240 × i − 1,024` IDs, from 9,216 to 203,776. The final request reaches 204,800 tokens with output. Both engines share the frozen additions and sampling controls.
 
-Validate final usage and `[DONE]`, then send the next request immediately after HTTP EOF. Keep prefix state between measured requests. Time from the first POST submission to the twentieth HTTP EOF on one monotonic clock, including handoffs. Save warmup separately. Retain added IDs, actual prompt and output IDs, usage, and separate `[DONE]` and EOF timestamps. A missing or invalid response invalidates the chain.
+Validate usage and `[DONE]`. Dispatch immediately after HTTP EOF, keeping prefix state. Time the first POST through the twentieth EOF on one monotonic clock. Retain warmup separately, actual IDs and usage, and both `[DONE]` and EOF clocks. An invalid response invalidates the chain.
 
-Use the same campaign identity as the passing W5 row at the corresponding width. The [paired driver runbook](../benchmarks/paired/README.md#matched-k4-timing-protocol) supplies common environment and checkpoint controls.
+Use the [paired driver’s shared controls](../benchmarks/paired/README.md#matched-k4-timing-protocol) and the same campaign as that width’s passing W5.
 
-Prepare the W6 fixture once with the checkpoint tokenizer and verify it before reusing it. Use `PAIRED_FIXTURES` as the shared fixture directory. Measure each width in its existing campaign after that width's W5 pass. [Fixture validation](../benchmarks/serial/fixture.py#L45)<!-- prefix: "def load_inp" --> · [Capture and replay](../benchmarks/serial/chain.py#L157)<!-- prefix: "def handle(" -->
+Prepare and verify the W6 fixture once in `PAIRED_FIXTURES`. [Fixture validation](../benchmarks/serial/fixture.py#L45)<!-- prefix: "def load_inp" --> · [Capture and replay](../benchmarks/serial/chain.py#L157)<!-- prefix: "def handle(" -->
 
 ```bash
 python -B -m benchmarks.serial.fixture prepare "$CHECKPOINT/tokenizer.json" "$PAIRED_FIXTURES"
@@ -70,11 +70,11 @@ Keep each engine's `warmup-01.json.gz` and `measured-01.json.gz` with the compar
 
 ## Measurement
 
-Require native makespan ≤1.10× pinned vLLM on every W1–W6 row independently at each TP width. Use one warmup and one measured cohort or chain per engine. Apply the gate to the measured makespan and stop at the first miss. W4 can open a campaign. Run W5 only after W4 passes in that campaign. Advance through W1–W3 in order on passes. Verify device, effective controls, stream identities, counts, finish, usage, and drain. For W1–W5 at TP1, require measured IDs to match each engine's warmup IDs. TP2 output content is diagnostic. [Matched K4 timing protocol](../benchmarks/paired/README.md#matched-k4-timing-protocol)
+Require native makespan ≤1.10× pinned vLLM for every row at each width. Run one warmup and one measurement per arm. Stop at the first miss. W4 may open the campaign and must pass before W5. Advance through W1–W3 in order on passes. Verify devices, settings, stream identities, counts, finish, usage, and drain. TP1 W1–W5 require each arm’s measured IDs to match its warmup. TP2 output content is diagnostic. [Matched K4 timing protocol](../benchmarks/paired/README.md#matched-k4-timing-protocol)
 
 Use `benchmarks/tp2/run.sh qualify` separately for readiness and a single native W1-shaped functional request. Use `measure` for full row and rank-cache receipts. W1 includes a separate native trace arm for K4 route activity. [TP2 cohort assessment](../benchmarks/tp2/cohorts.py#L138)<!-- prefix: "def assess(d" -->
 
-For W1–W5, measure from the earliest submission to the last valid `[DONE]` on one monotonic clock. Record each HTTP EOF separately to validate stream completion and place cache accounting after the wire closes. Preconnect lanes, release one barrier, and send all bodies within 50 ms and before any completion. Retain submit times, headers, token events, completion times, counts, and failures. Exclude [SSE keepalives](http-server.md#completion-streams) and empty events from token counts. W6 uses the [first POST through final EOF](#w6-serial-history). [Cohort score](../benchmarks/paired/makespan.py#L21)<!-- prefix: "def cohort_m" --> · [Cache receipt interval](../benchmarks/paired/cold_cache.py#L258)<!-- prefix: "def replay(" -->
+For W1–W5, time the earliest submission through the last valid `[DONE]` on one monotonic clock. Preconnect lanes and release one barrier. Send all bodies within 50 ms and before any completion. Retain submissions, headers, token events, counts, failures, and EOFs. EOF closes the stream and bounds cache accounting. Exclude [keepalives](http-server.md#completion-streams) and empty events from token counts. W6 uses the [first POST through final EOF](#w6-serial-history). [Cohort score](../benchmarks/paired/makespan.py#L21)<!-- prefix: "def cohort_m" --> · [Cache receipt interval](../benchmarks/paired/cold_cache.py#L258)<!-- prefix: "def replay(" -->
 
 Report output tokens/s, TTFT, TPOT, end-to-end latency, and whether every lane starts generating before the first completion for diagnosis.
 
@@ -169,11 +169,34 @@ Retain the run manifest, commands, environment, fixture hashes, raw samples, and
 
 ## Matched K4 evidence
 
+### Warm GQA release
+
+Native `cb8bcbd88423e1c490b0e0d5970a263828e52e48` produced server SHA-256 `70ebe3ea69abac61bbc0090a3cc136b04860f2798ca328ddc5274bcce8318c37`. Both arms in each pair used the same physical devices and CPU affinity.
+
+TP1 used GPU 0 on NUMA 0, with server CPUs 24–33 and client CPUs 34–35. TP2 used GPUs 4→5 on NUMA 1, with server CPUs 60–69 and client CPUs 70–71.
+
+Both engines used MTP4, a 32,768-token step cap, and eight active slots per GPU. Native used 0.88 memory utilization, automatic GPU pools, and LMCache. Pinned vLLM used local prefix caching with KV offload disabled.
+
+Eleven of the 12 measured cells passed the 1.10× makespan gate. TP2 W6 was the sole miss.
+
+| Row | TP1 native (ns) | TP1 vLLM (ns) | TP1 ratio | TP1 gate | TP2 native (ns) | TP2 vLLM (ns) | TP2 ratio | TP2 gate |
+| --- | ---: | ---: | ---: | --- | ---: | ---: | ---: | --- |
+| W1 | 596,229,817 | 719,055,072 | 0.829185× | Pass | 512,499,515 | 554,208,559 | 0.924741× | Pass |
+| W2 | 1,386,745,239 | 1,946,518,500 | 0.712423× | Pass | 1,378,491,577 | 1,433,758,974 | 0.961453× | Pass |
+| W3 | 4,309,660,405 | 4,288,206,133 | 1.005003× | Pass | 4,021,093,866 | 4,096,670,765 | 0.981552× | Pass |
+| W4 | 27,092,456,238 | 27,894,439,350 | 0.971249× | Pass | 28,901,584,619 | 26,305,747,222 | 1.098679× | Pass |
+| W5 | 38,859,281,539 | 36,692,970,883 | 1.059039× | Pass | 40,886,576,808 | 39,853,255,913 | 1.025928× | Pass |
+| W6 | 71,629,375,168 | 73,244,072,860 | 0.977955× | Pass | 60,470,550,356 | 53,080,326,387 | 1.139227× | Miss |
+
+TP2 W4 passed by 34.74 ms against the 1.10× limit. Each W6 arm completed 20 turns. Native TP1 W6 improved from 88.664 to 71.629 seconds. TP2 W6 exceeded the gate by 2.082 seconds.
+
+The campaign at `artifacts/pool-w6/campaign/official-cb8bcbd88423-70ebe3ea69ab/` retains both arms’ raw streams and comparisons. The independent replay and occupancy audit is `artifacts/pool-w6/verification/audit-formal-cb8bcbd88423.json`. [Earlier AgentX results](agentx-256k.md) predate these changes.
+
 ### Submitted HBM pool release
 
-Native source `0788856a586a6f484135bc627270ddc509a29687` produced server SHA-256 `6874dc330b996616128a897d7f26896b2891fc3485652879f41d585a61585a78`. Native used LMCache. Pinned vLLM used local prefix caching with KV offload disabled. The arms in each pair ran on the same B200 devices.
+Native `0788856a586a6f484135bc627270ddc509a29687` produced server SHA-256 `6874dc330b996616128a897d7f26896b2891fc3485652879f41d585a61585a78`. The matched B200 arms used LMCache for native and disabled KV offload for vLLM.
 
-The first attempt measured all six TP1 rows. W1–W5 passed. W6 reached 1.210904283× and missed the 1.10× limit. This build has no TP2 timings. Each arm ran one warmup and one timed cohort or chain per row. The ratio divides native makespan by vLLM makespan.
+W1–W5 passed at TP1. W6 reached 1.210904283× and missed the 1.10× gate. TP2 remained unmeasured.
 
 | Width | Row | Completed / attempted per arm | Native (ns) | vLLM (ns) | Ratio | Gate |
 | --- | --- | ---: | ---: | ---: | ---: | --- |
@@ -184,11 +207,11 @@ The first attempt measured all six TP1 rows. W1–W5 passed. W6 reached 1.210904
 | TP1 | W5 | 4 / 4 | 38,855,159,394 | 36,724,431,609 | 1.058019× | Pass |
 | TP1 | W6 | 20 / 20 | 88,663,772,515 | 73,221,123,885 | 1.210904× | Miss |
 
-W1–W5 span the earliest submission through the last valid `[DONE]`. W6 spans the first POST through the twentieth HTTP EOF. Each comparison has one measured makespan per arm. The W1–W5 `median_ns` fields hold that single sample. Warmups and occupancy sampling are outside the makespan calculation.
+The W1–W5 `median_ns` fields each hold one measured sample. Warmups and occupancy sampling sit outside both timing windows.
 
-Each TP1 W6 arm served 2,129,920 measured input tokens and emitted 20,480 output tokens. Native reported 1,945,581 cached prompt tokens. vLLM reported 1,925,248. The occupancy audit observed no foreign compute owner. The comparison SHA-256 is `658f2635617fdeb382dfeb315caf43437dd873034567e0bb45ab68abaae88c8f`.
+TP1 W6 served 2,129,920 input and 20,480 output tokens per arm. Native reported 1,945,581 cached input tokens and vLLM 1,925,248. The occupancy audit found no foreign compute owner. Comparison SHA-256 `658f2635617fdeb382dfeb315caf43437dd873034567e0bb45ab68abaae88c8f`.
 
-The campaign root is `artifacts/pool-w6/campaign/official-0788856a586a-6874dc330b99/`. Retained `comparison.json` and arm receipts give exact timings, streams, cache counters, and launch controls.
+The campaign at `artifacts/pool-w6/campaign/official-0788856a586a-6874dc330b99/` retains comparisons, streams, cache counters, and launch controls.
 
 ### Warm GQA diagnostics
 

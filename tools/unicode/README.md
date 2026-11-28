@@ -10,29 +10,23 @@ The native tokenizer verifies this digest before loading.
 See the [checkpoint authentication](../../docs/research/checkpoint.md#checkpoint-evidence)
 and the [text completion verification procedure](../../docs/text-serving.md#verification).
 
-The tokenizer uses Unicode 16.0 general categories, `White_Space` and simple
-case folds in its pretokenizer. It uses Unicode 9.0 combining classes,
-canonical decompositions and composition exclusions for NFC. These versions
-match the tokenizer for the pinned Qwen3.8-27B-FP8 checkpoint. The generator
-reads `UnicodeData.txt`, `PropList.txt`, `CaseFolding.txt` and
-`DerivedNormalizationProps.txt` from the Unicode Character Database.
+The native build uses ICU 78.3, which ships Unicode 17.0 data. The tokenizer
+limits general categories and `White_Space` to Unicode 16.0, NFC to the
+Unicode 9.0 repertoire, and full case folding for decision labels to
+Unicode 15.0. These limits preserve the pinned checkpoint and decision-label
+behavior. The pretokenizer recognizes the Unicode 16.0 simple folds that can
+form its Latin contractions.
 
-- [Unicode 16.0.0 UCD archive](https://www.unicode.org/Public/zipped/16.0.0/UCD.zip)
-- [Unicode 9.0.0 UCD archive](https://www.unicode.org/Public/zipped/9.0.0/UCD.zip)
+In the managed Pixi environment, ICU headers are in `$CONDA_PREFIX/include`
+and libraries are in `$CONDA_PREFIX/lib`. For a direct compile and link of
+the tokenizer sources, add `-isystem "$CONDA_PREFIX/include"` to compilation
+and put `-L"$CONDA_PREFIX/lib" -Wl,-rpath,"$CONDA_PREFIX/lib" -licuuc -licudata`
+after the object files or tokenizer archive on the link command. The xmake
+tokenizer target propagates the link dependency to its consumers.
+
+- [ICU 78 release and license](https://github.com/unicode-org/icu/tree/release-78.3)
+- [Unicode Character Database archives](https://www.unicode.org/ucd/)
 - [Unicode License v3](LICENSE)
-
-Save the original archives as `UCD-16.0.0.zip` and `UCD-9.0.0.zip` in one
-directory. The generator verifies their SHA-256 hashes before reading them.
-From the project root, regenerate the checked-in tables with the Python
-standard library.
-
-```sh
-python -B tools/unicode/generate.py /path/to/ucd include/sglang/tokenizer/unicode
-```
-
-The C++ build compiles the checked-in tables directly. The source archives and
-Python are required only for regeneration. Keep the Unicode license with the
-tables when distributing them.
 
 [tokenizer]: https://huggingface.co/Qwen/Qwen3.8-27B-FP8/blob/c3a462cc3d38cf351f3b26cbd763469eeb74ef81/tokenizer.json
 [checkpoint-license]: https://huggingface.co/Qwen/Qwen3.8-27B-FP8/blob/c3a462cc3d38cf351f3b26cbd763469eeb74ef81/LICENSE

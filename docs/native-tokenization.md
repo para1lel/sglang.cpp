@@ -12,7 +12,7 @@ prompt for the configured Qwen checkpoint.
 | --- | --- | --- |
 | HTTP transport | Match the routes, validate the media type, and admit requests to the shared queue. | [Route aliases](../apps/server/http.cpp#L419)<!-- prefix: "Tokenization" --> · [Media type](../apps/server/http.cpp#L208)<!-- prefix: "if ((tokeniz" --> · [Queue admission](../apps/server/prefix_controls.cpp#L617)<!-- prefix: "void Connect" --> |
 | Tokenization worker | Validate inputs and encode or decode with the checkpoint tokenizer. | [Request handler](../apps/server/tokenization.cpp#L863)<!-- prefix: "void serve_t" --> · [Tokenizer load](../apps/server/text_completion.cpp#L20)<!-- prefix: "const Tokeni" --> |
-| Chat renderer | Render the Qwen3.8 checkpoint format before encoding chat. | [Chat tokenization](../apps/server/tokenization.cpp#L598)<!-- prefix: "std::vector<" --> · [Renderer](../apps/server/qwen/qwen_chat_template.cpp#L560)<!-- prefix: "std::string " --> |
+| Chat renderer | Render the Qwen3.8 checkpoint format before encoding chat. | [Chat tokenization](../apps/server/tokenization.cpp#L598)<!-- prefix: "std::vector<" --> · [Renderer](../apps/server/qwen/qwen_chat_template.cpp#L555)<!-- prefix: "std::string " --> |
 
 ## Runtime path
 

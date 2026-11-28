@@ -23,11 +23,6 @@ using namespace server::qwen_tool_syntax;
 constexpr std::array schema_branches{"anyOf", "oneOf", "allOf"};
 constexpr std::string_view whitespace = " \t\r\n\f\v";
 
-const json::Value* field(const json::Value& value, std::string_view key) {
-    const auto* object = value.ordered_object();
-    return object ? json::get(*object, key) : nullptr;
-}
-
 std::string_view string_or(const json::Value* value, std::string_view fallback) {
     return value ? value->string().value_or(fallback) : fallback;
 }
@@ -65,13 +60,14 @@ void insert_properties(Properties& target, const json::OrderedObject& properties
 }
 
 void collect_properties(Properties& target, const json::Value& schema, const json::Value& root) {
-    if (const auto* properties = field(schema, "properties");
+    if (const auto* properties = get_ordered(schema, "properties");
         properties && properties->ordered_object()) {
         insert_properties(target, *properties->ordered_object(), root);
         return;
     }
     for (const auto keyword : schema_branches) {
-        if (const auto* branches = field(schema, keyword); branches && branches->array()) {
+        if (const auto* branches = get_ordered(schema, keyword);
+            branches != nullptr && branches->array() != nullptr) {
             for (const auto& branch : *branches->array()) {
                 collect_properties(target, branch, root);
             }
@@ -80,7 +76,8 @@ void collect_properties(Properties& target, const json::Value& schema, const jso
 }
 
 void optional_string(const json::Value& value, std::string_view key) {
-    if (const auto* entry = field(value, key); entry && !entry->is_null() && !entry->string()) {
+    if (const auto* entry = get_ordered(value, key);
+        entry != nullptr && !entry->is_null() && !entry->string()) {
         throw std::invalid_argument(std::string(key) + ": Input should be a valid string");
     }
 }
@@ -88,21 +85,21 @@ void optional_string(const json::Value& value, std::string_view key) {
 ToolSchemas read_tools(const json::Array& tools) {
     ToolSchemas schemas;
     for (const auto& tool : tools) {
-        const auto* function = field(tool, "function");
+        const auto* function = get_ordered(tool, "function");
         if (!function || !function->ordered_object()) {
             throw std::invalid_argument("tools.function: Input should be a valid dictionary");
         }
-        const auto* type = field(tool, "type");
+        const auto* type = get_ordered(tool, "type");
         if (type && !type->string()) {
             throw std::invalid_argument("tools.type: Input should be a valid string");
         }
         optional_string(*function, "name");
         optional_string(*function, "description");
-        const auto* parameters = field(*function, "parameters");
+        const auto* parameters = get_ordered(*function, "parameters");
         if (parameters && !parameters->is_null() && !parameters->ordered_object()) {
             throw std::invalid_argument("tools.function.parameters: Expected a dictionary");
         }
-        const auto* name = field(*function, "name");
+        const auto* name = get_ordered(*function, "name");
         if (string_or(type, "function") != "function" || !name || name->is_null()) {
             continue;
         }
@@ -110,7 +107,7 @@ ToolSchemas read_tools(const json::Array& tools) {
         if (inserted && parameters && parameters->ordered_object()) {
             auto& properties = entry->second;
             collect_properties(properties, *parameters, *parameters);
-            if (properties.empty() && !field(*parameters, "properties")) {
+            if (properties.empty() && get_ordered(*parameters, "properties") == nullptr) {
                 insert_properties(properties, *parameters->ordered_object(), *parameters);
             }
         }
@@ -159,7 +156,7 @@ std::string_view union_type(const json::Array& branches) {
 }
 
 std::string_view inferred_type(const json::Value& schema) {
-    if (const auto* type = field(schema, "type")) {
+    if (const auto* type = get_ordered(schema, "type")) {
         if (const auto text = type->string()) {
             return *text;
         }
@@ -172,18 +169,19 @@ std::string_view inferred_type(const json::Value& schema) {
             return "string";
         }
     }
-    const auto* branches = field(schema, "anyOf");
+    const auto* branches = get_ordered(schema, "anyOf");
     if (!branches || branches->is_null() || branches->boolean() == false ||
         branches->string() == "" || branches->number() == 0 ||
         (branches->array() && branches->array()->empty()) ||
         (branches->ordered_object() && branches->ordered_object()->empty())) {
-        branches = field(schema, "oneOf");
+        branches = get_ordered(schema, "oneOf");
     }
     if (branches && branches->array()) {
         const auto type = union_type(*branches->array());
         if (!type.empty()) return type;
     }
-    if (const auto* choices = field(schema, "enum"); choices && choices->array()) {
+    if (const auto* choices = get_ordered(schema, "enum");
+        choices != nullptr && choices->array() != nullptr) {
         const auto& values = *choices->array();
         if (!values.empty()) {
             const auto type = value_type(values.front());
@@ -194,15 +192,19 @@ std::string_view inferred_type(const json::Value& schema) {
         }
         return "string";
     }
-    if (const auto* all = field(schema, "allOf"); all && all->array()) {
+    if (const auto* all = get_ordered(schema, "allOf"); all != nullptr && all->array() != nullptr) {
         for (const auto& branch : *all->array()) {
             const auto type = inferred_type(branch);
             if (!type.empty() && type != "string") return type;
         }
         return "string";
     }
-    if (field(schema, "properties")) return "object";
-    if (field(schema, "items")) return "array";
+    if (get_ordered(schema, "properties") != nullptr) {
+        return "object";
+    }
+    if (get_ordered(schema, "items") != nullptr) {
+        return "array";
+    }
     return {};
 }
 
@@ -223,7 +225,8 @@ Conversion conversion_for(const json::Value& schema) {
         return Conversion::structured;
     }
     if ((type == "string" || type == "str" || type == "text" || type == "varchar" ||
-         type == "char" || type == "enum") && (field(schema, "anyOf") || field(schema, "oneOf"))) {
+         type == "char" || type == "enum") &&
+        (get_ordered(schema, "anyOf") != nullptr || get_ordered(schema, "oneOf") != nullptr)) {
         return Conversion::structured_union;
     }
     return Conversion::string;

@@ -7,7 +7,7 @@ Link `sglang_decoder` and call `Decoder::generate_multimodal` to generate from t
 | Part | Responsibility | Source |
 | --- | --- | --- |
 | Caller | Decode media, prepare and encode patches, render and tokenize the template, and retain feature storage. | [Media input](../include/sglang/decoder_media.h#L38)<!-- prefix: "struct Decod" --> |
-| Prompt planner | Expand wrapped placeholders, assign feature spans, and compute three-axis rotary positions. | [Layout](../include/sglang/multimodal_prompt.h#L10)<!-- prefix: "struct Decod" --> · [Planner](../src/media/multimodal_prompt.cpp#L100)<!-- prefix: "MultimodalPr" --> |
+| Prompt planner | Expand wrapped placeholders, assign feature spans, and compute three-axis rotary positions. | [Layout](../include/sglang/multimodal_prompt.h#L10)<!-- prefix: "struct Decod" --> · [Planner](../src/media/multimodal_prompt.cpp#L103)<!-- prefix: "MultimodalPr" --> |
 | Decoder | Replace placeholder embeddings, run the language model, and deliver committed output IDs. | [Public entry](../src/media/decoder_media.cpp#L94)<!-- prefix: "DecoderResul" --> · [Embedding substitution](../src/media/decoder_media.cpp#L32)<!-- prefix: "void MediaPr" --> |
 
 ## Runtime path
@@ -16,7 +16,7 @@ Link `sglang_decoder` and call `Decoder::generate_multimodal` to generate from t
 
 Use [CPU media preprocessing](media-preprocessing.md) for decoded RGB8 frames. Pass the resulting patches and raw `{T, H, W}` grid to the [vision encoder](vision-encoder.md). `T` counts temporal pairs. `H` and `W` count patches before spatial merging. Use the preprocessor's video pair centers to format timestamps for the pinned chat template. Tokenize each formatted timestamp with the checkpoint tokenizer.
 
-Render and tokenize the chat template before calling the decoder. Include one `<|vision_start|><|image_pad|><|vision_end|>` or `<|vision_start|><|video_pad|><|vision_end|>` per media item. Match each wrapped placeholder to a `DecoderMedia` in encounter order. Pass the same raw grid in `DecoderMedia::layout`. For an image, set `T` to one. Leave `video_timestamp_tokens` empty for images. For video, supply one nonempty timestamp token sequence per pair. [Placeholder expansion](../src/media/multimodal_prompt.cpp#L54)<!-- prefix: "void append_" -->
+Render and tokenize the chat template before calling the decoder. Include one `<|vision_start|><|image_pad|><|vision_end|>` or `<|vision_start|><|video_pad|><|vision_end|>` per media item. Match each wrapped placeholder to a `DecoderMedia` in encounter order. Pass the same raw grid in `DecoderMedia::layout`. For an image, set `T` to one. Leave `video_timestamp_tokens` empty for images. For video, supply one nonempty timestamp token sequence per pair. [Placeholder expansion](../src/media/multimodal_prompt.cpp#L57)<!-- prefix: "void append_" -->
 
 Pass a contiguous `[T * (H/2) * (W/2), 5120]` BF16 view for each item. Feature rows advance by temporal pair, then by merged spatial block in row-major order. Set `feature_elements` to the number of BF16 elements in the view. Use a shared owner that covers the entire view, including when the pointer is an alias into a larger allocation. Finish producer work on the decoder's CUDA device before the call. Keep features immutable until the decoder releases the shared owner. [Span checks](../src/media/decoder_media.cpp#L56)<!-- prefix: "std::shared_" --> · [Device checks](../src/media/decoder_media.cpp#L78)<!-- prefix: "void validat" -->
 
@@ -36,7 +36,7 @@ Here `finished_features` is the shared device owner and `callbacks` is a `Decode
 
 The planner preserves the outer template wrappers. It expands an image pad into one run of image pads. For video, it replaces the pad with one group per pair. Each group contains its timestamp tokens, a vision-start token, the video pad run, and a vision-end token. Each pad in a run maps to one visual feature row. The decoder substitutes those rows for the pad embeddings before language layer zero. This happens in both single-row and tiled prefill. The pinned checkpoint uses zero DeepStack levels. [Row path](../src/media/decoder_media.cpp#L24)<!-- prefix: "const Bf16* " --> · [Tiled path](../src/media/decoder_media.cpp#L32)<!-- prefix: "void MediaPr" -->
 
-Physical token indices advance by one for every expanded ID. KV writes and causal attention use these indices. Text and wrapper tokens assign the same scalar to all three rotary axes. Within a visual plane, merged row `r` and column `c` use `(base, base + r, base + c)`. The next scalar advances by the larger merged spatial dimension. The language model rotates Q and K with interleaved temporal, height, and width sections of `[11, 11, 10]`. [Plane positions](../src/media/multimodal_prompt.cpp#L38)<!-- prefix: "void append_" --> · [Rotary axis selection](../src/text_attention_gqa.cu#L35)<!-- prefix: "__device__ i" -->
+Physical token indices advance by one for every expanded ID. KV writes and causal attention use these indices. Text and wrapper tokens assign the same scalar to all three rotary axes. Within a visual plane, merged row `r` and column `c` use `(base, base + r, base + c)`. The next scalar advances by the larger merged spatial dimension. The language model rotates Q and K with interleaved temporal, height, and width sections of `[11, 11, 10]`. [Plane positions](../src/media/multimodal_prompt.cpp#L41)<!-- prefix: "void append_" --> · [Rotary axis selection](../src/text_attention_gqa.cu#L35)<!-- prefix: "__device__ i" -->
 
 Prefill scores the first output. When the next forward pass consumes the output token at zero-based index `k`, its KV index is `expanded_prompt_length + k`. All three rotary axes then use `next_position + k`, where `next_position` is one above the largest prompt coordinate. The CPU planner returns `next_position`. [Continuation](../src/decoder.cpp#L706)<!-- prefix: "const Forwar" -->
 
@@ -56,7 +56,7 @@ The batch decoder accepts ordinary sampling and stop options. [Prefix reuse](pre
 
 ## Verification
 
-Use the managed Pixi default environment. Run from the repository root. Build [`sglang_decoder`](../xmake.lua#L251)<!-- prefix: "target(\"sgla" --> before linking the fixture program. Call `prepare_multimodal_prompt` in the CPU planner check. Supply the same template IDs, grid, and timestamp IDs as the reference.
+Use the managed Pixi default environment. Run from the repository root. Build [`sglang_decoder`](../xmake.lua#L255)<!-- prefix: "target(\"sgla" --> before linking the fixture program. Call `prepare_multimodal_prompt` in the CPU planner check. Supply the same template IDs, grid, and timestamp IDs as the reference.
 
 ```bash
 export CUDA_VISIBLE_DEVICES=''

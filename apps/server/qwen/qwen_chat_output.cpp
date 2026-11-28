@@ -25,11 +25,6 @@ bool starts_with(std::string_view text, std::string_view prefix) {
     return text.substr(0, prefix.size()) == prefix;
 }
 
-const json::Value* field(const json::Value& value, std::string_view key) {
-    const auto* object = value.ordered_object();
-    return object ? json::get(*object, key) : nullptr;
-}
-
 Type argument_type(const json::Value& value) {
     const auto text = value.string();
     constexpr std::array names{"string"sv, "integer"sv, "number"sv, "boolean"sv, "object"sv,
@@ -42,10 +37,11 @@ Type argument_type(const json::Value& value) {
 }
 
 void read_types(const json::Value& schema, Args& types, int depth = 0) {
-    if (!schema.ordered_object() || field(schema, "$ref") || depth > 32) {
+    if (schema.ordered_object() == nullptr || get_ordered(schema, "$ref") != nullptr ||
+        depth > 32) {
         throw std::invalid_argument("Expected a supported tool parameter schema");
     }
-    if (const auto* type = field(schema, "type")) {
+    if (const auto* type = get_ordered(schema, "type")) {
         if (const auto* array = type->array(); array && !array->empty()) {
             for (const auto& item : *array) {
                 types.push_back(argument_type(item));
@@ -55,9 +51,9 @@ void read_types(const json::Value& schema, Args& types, int depth = 0) {
         }
         return;
     }
-    const auto* choices = field(schema, "anyOf");
+    const auto* choices = get_ordered(schema, "anyOf");
     if (!choices) {
-        choices = field(schema, "oneOf");
+        choices = get_ordered(schema, "oneOf");
     }
     if (!choices) {
         types.push_back(Type::string);
@@ -115,12 +111,13 @@ ChatToolSchema read_schema(const json::Value* value, bool strict) {
     if (!value || value->is_null()) {
         return schema;
     }
-    const auto* type = field(*value, "type");
+    const auto* type = get_ordered(*value, "type");
     if (!value->ordered_object() || (type && type->string() != "object") ||
-        field(*value, "$ref") || field(*value, "anyOf") || field(*value, "oneOf")) {
+        get_ordered(*value, "$ref") != nullptr || get_ordered(*value, "anyOf") != nullptr ||
+        get_ordered(*value, "oneOf") != nullptr) {
         throw std::invalid_argument("Expected an object as the tool parameters schema");
     }
-    if (const auto* props = field(*value, "properties")) {
+    if (const auto* props = get_ordered(*value, "properties")) {
         const auto* object = props->ordered_object();
         if (!object) {
             throw std::invalid_argument("Expected an object for tool parameter properties");
@@ -131,12 +128,12 @@ ChatToolSchema read_schema(const json::Value* value, bool strict) {
             }
             auto& output = schema.properties[name];
             read_types(property, output.types);
-            if (strict && !field(property, "type")) {
-                read_enum_values(output, field(property, "enum"));
+            if (strict && get_ordered(property, "type") == nullptr) {
+                read_enum_values(output, get_ordered(property, "enum"));
             }
         }
     }
-    if (const auto* required = field(*value, "required")) {
+    if (const auto* required = get_ordered(*value, "required")) {
         const auto* array = required->array();
         if (!array) {
             throw std::invalid_argument("Expected an array for required tool parameters");
@@ -145,7 +142,7 @@ ChatToolSchema read_schema(const json::Value* value, bool strict) {
             schema.required.emplace(schema_name(&item));
         }
     }
-    if (const auto* additional = field(*value, "additionalProperties")) {
+    if (const auto* additional = get_ordered(*value, "additionalProperties")) {
         if (const auto flag = additional->boolean()) {
             schema.additional_properties = *flag;
         } else {
@@ -227,14 +224,14 @@ bool ChatOutputOptions::accepts_tool_calls(std::size_t calls) const {
 
 void read_chat_tools(ChatOutputOptions& options, const json::Array& tools) {
     for (const auto& tool : tools) {
-        const auto* type = field(tool, "type");
-        const auto* function = field(tool, "function");
+        const auto* type = get_ordered(tool, "type");
+        const auto* function = get_ordered(tool, "function");
         if (!type || type->string() != "function" || !function) {
             throw std::invalid_argument("Only function tools are supported");
         }
-        const auto name = schema_name(field(*function, "name"));
-        const auto* strict = field(*function, "strict");
-        auto schema = read_schema(field(*function, "parameters"),
+        const auto name = schema_name(get_ordered(*function, "name"));
+        const auto* strict = get_ordered(*function, "strict");
+        auto schema = read_schema(get_ordered(*function, "parameters"),
                                   strict && strict->boolean().value_or(false));
         if (!options.tools.emplace(name, std::move(schema)).second) {
             throw std::invalid_argument("Duplicate tool name");

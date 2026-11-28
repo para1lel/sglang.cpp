@@ -398,6 +398,11 @@ const Value* get(const OrderedObject& object, std::string_view key) {
     return nullptr;
 }
 
+const Value* get_ordered(const Value& value, std::string_view key) {
+    const auto* object = value.ordered_object();
+    return object != nullptr ? get(*object, key) : nullptr;
+}
+
 std::optional<std::string_view> get_string(const Object& object, std::string_view key) {
     const auto* value = get(object, key);
     return value ? value->string() : std::nullopt;

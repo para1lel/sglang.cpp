@@ -58,9 +58,14 @@ else
     libraries=("$build/lib/libsglang_tokenizer.a" "$build/lib/libsglang_json.a")
 fi
 
-cuda_headers=()
-if [[ -n ${CONDA_PREFIX:-} ]]; then
-    cuda_headers=(-isystem "$CONDA_PREFIX/targets/x86_64-linux/include")
+prefix=${CONDA_PREFIX:?Run in the managed Pixi environment}
+icu=(-L"$prefix/lib" -Wl,-rpath,"$prefix/lib" -licuuc -licudata)
+cuda_runtime=()
+arena="$source/src/runtime/backend/device_arena.cpp"
+if [[ -f "$arena" ]]; then
+    sources+=("$arena" "$source/src/runtime/backend/cuda_error.cpp")
+    cuda_lib="$prefix/targets/x86_64-linux/lib"
+    cuda_runtime=(-L"$cuda_lib" -Wl,-rpath,"$cuda_lib" -lcudart)
 fi
 
 media_api=()
@@ -84,8 +89,9 @@ fi
 
 "${CXX:-c++}" -std=c++17 -O2 -pthread \
     -Wall -Wextra -Wpedantic -Werror -ffunction-sections -fdata-sections \
-    -I"$source/include" "${cuda_headers[@]}" "${media_api[@]}" "${lmcache_api[@]}" "${sources[@]}" \
-    "$tests/chat_cpu_decoder.cpp" "${libraries[@]}" \
+    -I"$source/include" -isystem "$prefix/targets/x86_64-linux/include" -isystem "$prefix/include" \
+    "${media_api[@]}" "${lmcache_api[@]}" "${sources[@]}" "$tests/chat_cpu_decoder.cpp" \
+    "${libraries[@]}" "${icu[@]}" "${cuda_runtime[@]}" \
     -Wl,--wrap=_ZNSt6chrono3_V212steady_clock3nowEv \
     -Wl,--gc-sections,--print-gc-sections,--no-undefined,-Map,"$output.map" \
     -o "$output"

@@ -100,7 +100,7 @@ The [grouped head checks](../tests/decoder/README.md#grouped-decode-lm-head) req
 
 Use [scheduler admission](../tests/batch/README.md#scheduler-admission) for caps, queueing, reuse, row accounting, and the [admission failure contract](#resident-memory-admission). Verify peer IDs, subsequent completion and readiness after recoverable OOM. On terminal fault, require 500 for new completions, 503 from readiness, and unchanged health limits. Pre-submission rejection and capture failure use eager. Post-submission failure propagates and retains resources until safe. Check reuse under Compute Sanitizer.
 
-Use an FP64 oracle with packed KV for both edges and adjacent lengths of page-parallel and legacy narrow dispatch. Check graph/eager parity, remaps, rebound positions, ordered fallback, masks, scratch guards, and unaffected heads through score overflow and cancellation. [GQA verifier](development.md#gqa-verification) · [Test target](../xmake.lua#L427)<!-- prefix: "target(\"batc" -->
+Use an FP64 oracle with packed KV for both edges and adjacent lengths of page-parallel and legacy narrow dispatch. Check graph/eager parity, remaps, rebound positions, ordered fallback, masks, scratch guards, and unaffected heads through score overflow and cancellation. [GQA verifier](development.md#gqa-verification) · [Test target](../xmake.lua#L431)<!-- prefix: "target(\"batc" -->
 
 ### Capture and replay diagnostics
 

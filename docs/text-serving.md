@@ -112,7 +112,12 @@ Text stops match generated output [before commit](native-generate.md#text-stops)
 
 ## Run with bundled libraries
 
-The Linux x86-64 Release test bundles `libcudart.so.13`, `libstdc++.so.6`, and `libgcc_s.so.1` with server and generator. Supply host glibc, a compatible NVIDIA driver, and the checkpoint. Use the host loader to bypass build `DT_RPATH`; both programs must resolve and show help without LLVM or Pixi paths. [Loader procedure](https://github.com/para1lel/sglang.cpp/blob/acbf95b0de14108b37c37bdc3dc40daaf2db2099/docs/text-serving.md#run-with-bundled-libraries).
+The Linux x86-64 Release test bundles `libcudart.so.13`, `libstdc++.so.6`, `libgcc_s.so.1`,
+`libicuuc.so.78`, and `libicudata.so.78` with server and generator. Copy both ICU libraries
+from the pinned Pixi environment into the same bundle directory. Supply host glibc, a
+compatible NVIDIA driver, and the checkpoint. Use the host loader to bypass build `DT_RPATH`.
+Both programs must resolve and show help without LLVM or Pixi paths.
+[Loader procedure](https://github.com/para1lel/sglang.cpp/blob/acbf95b0de14108b37c37bdc3dc40daaf2db2099/docs/text-serving.md#run-with-bundled-libraries).
 
 ## Tokenizer assets
 
@@ -122,10 +127,10 @@ The native tokenizer uses the Qwen checkpoint's literal added tokens, vocabulary
 | --- | --- |
 | `tokenizer.json` | Qwen `Qwen/Qwen3.8-27B-FP8` revision `c3a462cc3d38cf351f3b26cbd763469eeb74ef81`, 12,809,320 bytes, SHA-256 `0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3`. [Checkpoint authentication](research/checkpoint.md#checkpoint-evidence) |
 | Tokenizer license | Apache-2.0 from the pinned checkpoint. [License and asset links](../tools/unicode/README.md) |
-| NFC tables | Unicode Character Database 9.0.0, canonical decomposition, combining classes, and composition exclusions. |
-| Pretokenizer tables | Unicode Character Database 16.0.0, general categories, `White_Space`, and simple case folds. |
+| NFC data | ICU 78.3, filtered to the Unicode 9.0 repertoire. |
+| Pretokenizer properties | Unicode 16.0 general categories, `White_Space`, and contraction folds. |
 
-The [Unicode regeneration procedure](../tools/unicode/README.md) pins both archives and identifies the applicable Unicode notice. The build compiles the checked-in tables.
+The [Unicode dependency](../tools/unicode/README.md) records the ICU version and license.
 
 ## Verification
 

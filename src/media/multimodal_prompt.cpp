@@ -1,20 +1,23 @@
 #include "sglang/multimodal_prompt.h"
 
+#include "sglang/runtime/model/qwen_text_model.h"
+#include "sglang/runtime/model/qwen_tokenizer.h"
+
 #include <algorithm>
 #include <stdexcept>
 
 namespace sglang {
 namespace {
 
-constexpr int vision_start = 248053;
-constexpr int vision_end = 248054;
-constexpr int image_pad = 248056;
-constexpr int video_pad = 248057;
-constexpr int vocab_size = 248320;
-constexpr int context_tokens = 262144;
+using model::image_pad;
+using model::video_pad;
+using model::vision_end;
+using model::vision_start;
+
+constexpr int context_tokens = decoder::QwenTextModel::max_position_embeddings;
 
 bool valid_token(int id) {
-    return id >= 0 && id < vocab_size;
+    return id >= 0 && id < decoder::qwen_text_model.vocab_size;
 }
 
 bool timestamp_token(int id) {

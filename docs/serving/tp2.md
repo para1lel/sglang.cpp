@@ -23,7 +23,7 @@ sglang-server --checkpoint MODEL --device 0 --port PORT --tp 2 --eager \
 
 ## Two-rank allreduce transport
 
-The decoder builds MNNVL from the project CUDA source. NCCL handles devices or calls that decline multicast VMM or kernel eligibility. [MNNVL build](../../xmake.lua#L600)<!-- prefix: "target(\"sgla" --> · [Dispatch](../../src/runtime/backend/tensor_parallel.cpp#L460)<!-- prefix: "const bool t" -->
+The decoder builds MNNVL from the project CUDA source. NCCL handles devices or calls that decline multicast VMM or kernel eligibility. [MNNVL build](../../xmake.lua#L604)<!-- prefix: "target(\"sgla" --> · [Dispatch](../../src/runtime/backend/tensor_parallel.cpp#L460)<!-- prefix: "const bool t" -->
 
 Ordinary MNNVL needs 16-byte alignment and whole 5,120-element BF16 rows. One shot supports up to 51 rows (1,048,576-byte cap) in eager execution or joined capture. Eager two shot needs 80 rows, two 819,200-byte stages per Lamport slot, and 400 concurrently resident blocks per GPU. [Workspace](../../src/runtime/backend/mnnvl_ar.cu#L694)<!-- prefix: "state.twosho" --> · [Occupancy](../../src/runtime/backend/mnnvl_ar.cu#L223)<!-- prefix: "bool twoshot" -->
 

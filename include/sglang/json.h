@@ -74,6 +74,7 @@ Value parse(std::string_view input);
 Value parse(std::string_view input, Syntax syntax);
 const Value* get(const Object& object, std::string_view key);
 const Value* get(const OrderedObject& object, std::string_view key);
+const Value* get_ordered(const Value& value, std::string_view key);
 std::optional<std::string_view> get_string(const Object& object, std::string_view key);
 std::optional<bool> get_boolean(const Object& object, std::string_view key);
 void append_quoted(std::string& output, std::string_view value);

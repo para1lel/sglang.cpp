@@ -44,6 +44,21 @@ int long_serial_visible(const PrefillGrant* grants, int count, bool grouped) {
     return visible;
 }
 
+int resident_gqa_staging_visible(const PrefillGrant* grants, int count) {
+    if (count != 1) {
+        return 0;
+    }
+    const auto& grant = grants[0];
+    if (grant.request == nullptr || grant.media != nullptr ||
+        grant.request->cached_gqa_tokens < staged_serial_min_position ||
+        grant.tile_rows != batch_prefill_tile_rows || grant.rows < 2 * batch_prefill_tile_rows ||
+        grant.position < staged_serial_min_position ||
+        grant.position > text_attention_max_tokens - grant.rows) {
+        return 0;
+    }
+    return grant.position + grant.rows;
+}
+
 void validate_prefill_tile(const PrefillGrant& grant, const PrefillWorkspace& workspace,
                                   int capacity) {
     const auto rows = grant.rows;
@@ -110,9 +125,9 @@ void peer_causal_segments(const PrefillGrant* peer_grants, int source, int offse
 
 bool execute_partial_projection_groups(const PrefillGrant* grants, int count, cudaStream_t stream,
                                        DecoderBatchStepStats& stats,
-                                       const PartialProjectionSchedule& schedule,
-                                       int min_rows,
-                                       int staged_visible) {
+                                       const PartialProjectionSchedule& schedule, int min_rows,
+                                       GqaGeometry staged_geometry, int staged_visible,
+                                       bool resident_staging) {
     int serial_capacity = 1;
     int grouped_capacity = 0;
     for (int index = 0; index < count;) {
@@ -130,7 +145,8 @@ bool execute_partial_projection_groups(const PrefillGrant* grants, int count, cu
     }
     if (!grouped_capacity) return false;
 
-    PrefillWorkspace workspace(stream, std::max(serial_capacity, grouped_capacity), staged_visible);
+    PrefillWorkspace workspace(stream, std::max(serial_capacity, grouped_capacity), staged_geometry,
+                               staged_visible, resident_staging);
     if (!workspace.data()) return false;
     stats.prefill_workspace_bytes = std::max(stats.prefill_workspace_bytes, workspace.bytes());
     for (int index = 0; index < count;) {
@@ -167,5 +183,4 @@ bool execute_partial_projection_groups(const PrefillGrant* grants, int count, cu
     workspace.close();
     return true;
 }
-
 }

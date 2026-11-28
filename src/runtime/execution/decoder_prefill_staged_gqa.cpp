@@ -127,8 +127,15 @@ bool prefill_causal_group_gqa(const Chunk& chunk, const GqaLayer& layer, int ban
     constexpr int group_rows = grouped_prefill_max_rows;
     constexpr int long_context = staged_prefill_batch_long_max_position + tile_rows;
     const auto& first = grants[0];
-    if (count != group_rows / tile_rows || first.position < 0 ||
-        first.position > long_context - group_rows || first.position % tile_rows != 0) {
+    const bool resident =
+        chunk.long_staging.resident && first.position >= staged_serial_min_position;
+    const int rows = count * tile_rows;
+    if (resident) {
+        if (rows != group_rows && rows != group_rows - tile_rows) {
+            return false;
+        }
+    } else if (rows != group_rows || first.position < 0 ||
+               first.position > long_context - group_rows || first.position % tile_rows != 0) {
         return false;
     }
     for (int index = 0; index < count; ++index) {
@@ -139,13 +146,17 @@ bool prefill_causal_group_gqa(const Chunk& chunk, const GqaLayer& layer, int ban
     const auto cache = first.request->caches[bank];
     const auto pages = first.request->pages;
     auto combined = first;
-    combined.rows = group_rows;
+    combined.rows = rows;
     const auto segment = prefill_attention_segment(chunk, combined, 0);
     segment.gqa_append(layer, cache, pages);
-    const PagedPrefillSequence sequence{cache, pages, first.position, group_rows,
-                                     chunk.work.rope_queries, chunk.work.attention};
-    const auto submitted = launch_causal_group_staged_tmem_prefill(
-        sequence, chunk.stream, chunk.work.gqa_scratch());
+    const PagedPrefillSequence sequence{
+        cache, pages, first.position, rows, chunk.work.rope_queries, chunk.work.attention,
+    };
+    const auto submitted =
+        resident
+            ? try_resident_staged_paged_prefill(sequence, chunk.stream, chunk.long_staging.scratch)
+            : launch_causal_group_staged_tmem_prefill(sequence, chunk.stream,
+                                                      chunk.work.gqa_scratch());
     if (submitted) {
         check(*submitted, "Read staged single-request causal prefill group");
     } else {

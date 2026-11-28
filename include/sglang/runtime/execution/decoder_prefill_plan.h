@@ -28,6 +28,7 @@ inline constexpr PrefillGroup causal_three_tile_group{3, 3 * batch_prefill_tile_
 PrefillGroup causal_projection_group(int rows);
 
 int long_serial_visible(const PrefillGrant* grants, int count, bool grouped);
+int resident_gqa_staging_visible(const PrefillGrant* grants, int count);
 
 void validate_prefill_tile(const PrefillGrant& grant, const PrefillWorkspace& workspace,
                            int capacity);
@@ -57,6 +58,6 @@ bool execute_partial_projection_groups(const PrefillGrant* grants, int count, cu
                                        DecoderBatchStepStats& stats,
                                        const PartialProjectionSchedule& schedule,
                                        int min_rows = min_partial_prefill_rows,
-                                       int staged_visible = 0);
-
+                                       GqaGeometry staged_geometry = gqa_rank_geometry,
+                                       int staged_visible = 0, bool resident_staging = false);
 }

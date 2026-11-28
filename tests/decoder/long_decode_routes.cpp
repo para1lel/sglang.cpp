@@ -54,10 +54,31 @@ struct MtpRoutes {
     unsigned kv_heads = mxfp8_kv_heads;
 };
 MtpRoutes* mtp_routes = nullptr;
-int* serial_reads = nullptr;
+
+struct SerialRoutes {
+    int scores = 0;
+    int replays = 0;
+    int tiled = 0;
+    bool ordered = true;
+};
+
+SerialRoutes*& serial_routes() {
+    static SerialRoutes* active = nullptr;
+    return active;
+}
 
 void check(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
+}
+
+void check_serial_launches(const SerialRoutes& launches, int rows, const char* label) {
+    constexpr int chunks_per_row = 3;
+    const int expected = rows * gqa_layers * chunks_per_row;
+    std::cout << label << " scores=" << launches.scores << " replays=" << launches.replays
+              << " tiled=" << launches.tiled << '\n';
+    check(launches.scores == expected && launches.replays == expected && launches.tiled == 0 &&
+              launches.ordered,
+          "Restored serial prefill did not use ordered score/replay chunk pairs");
 }
 
 struct LogitCapture {
@@ -614,7 +635,7 @@ void serial_prefill(const char* checkpoint, const char* fixture) {
     stores->wait();
     prefix_fixture::read_checkpoint(cache, cached, salt, seed_rows);
     batch.release_retired_allocations();
-    const auto tail = [&](int rows, bool without_arena, int* reads) {
+    const auto tail = [&](int rows, bool without_arena, SerialRoutes* launches) {
         const std::vector<int> prompt(tokens.begin(), tokens.begin() + prefix + rows);
         auto restore = options;
         restore.prefix_cache_read = prefix_fixture::read_checkpoint(cache, prompt, salt, prefix);
@@ -623,7 +644,6 @@ void serial_prefill(const char* checkpoint, const char* fixture) {
               "Restore should complete asynchronously");
         const auto restored = prefix_fixture::wait(batch, 0).restored;
         check(restored == prefix, "Missing restored interior prefix");
-        serial_reads = reads;
         const auto arena = decoder::DeviceArena::current(0);
         decoder::Allocations held(0);
         if (without_arena) {
@@ -645,9 +665,10 @@ void serial_prefill(const char* checkpoint, const char* fixture) {
                   "Unable to exhaust the committed prefill arena");
         }
         DecoderBatchStepStats stats;
+        serial_routes() = launches;
         const auto step = batch.advance_chunked(selected, &stats)[0];
+        serial_routes() = nullptr;
         held.close();
-        serial_reads = nullptr;
         check(step.token && step.generated_logprobs && stats.prefill_rows[0] == rows,
               "Missing token, scores, or restored prefill rows");
         check((stats.prefill_workspace_bytes == 0) == (without_arena || rows == 1),
@@ -658,19 +679,18 @@ void serial_prefill(const char* checkpoint, const char* fixture) {
         check(batch.request_device_allocation_bytes() == 0, "Request allocations remained live");
         return step.generated_logprobs->selected;
     };
-    int singleton_reads = 0, fallback_reads = 0;
-    tail(1, false, &singleton_reads);
+    SerialRoutes singleton_routes;
+    SerialRoutes fallback_routes;
+    tail(1, false, &singleton_routes);
     const auto control = tail(3, false, nullptr);
-    const auto fallback = tail(3, true, &fallback_reads);
+    const auto fallback = tail(3, true, &fallback_routes);
     const auto recovered = tail(3, false, nullptr);
     const auto repeated = tail(3, true, nullptr);
     check(control.token_id == recovered.token_id && control.value == recovered.value &&
               fallback.token_id == repeated.token_id && fallback.value == repeated.value,
           "Allocation fallback or recovery changed its token or score");
-    if (singleton_reads != gqa_layers) std::cerr << "Wrong reader for restored singleton\n";
-    if (fallback_reads != 3 * gqa_layers) std::cerr << "Wrong reader for no-arena tail\n";
-    check(singleton_reads == gqa_layers && fallback_reads == 3 * gqa_layers,
-          "Restored serial prefill did not use the scratch-free tiled reader");
+    check_serial_launches(singleton_routes, 1, "Restored singleton");
+    check_serial_launches(fallback_routes, 3, "Restored arena-exhausted tail");
     std::cout << "Restored singleton and allocation-limited prefill passed\n";
 }
 
@@ -721,8 +741,19 @@ extern "C" cudaError_t __real_cudaLaunchKernel(const void*, dim3, dim3, void**, 
                                                cudaStream_t);
 
 static void record_launch(std::string_view symbol, dim3 grid, dim3 block) {
-    if (serial_reads) {
-        *serial_reads += symbol.find("tiled_prefill_attention") != symbol.npos;
+    if (auto* serial = serial_routes(); serial != nullptr) {
+        auto& launches = *serial;
+        if (symbol.find("exact_scores_kernel") != std::string_view::npos) {
+            launches.ordered &= launches.scores == launches.replays;
+            ++launches.scores;
+        }
+        if (symbol.find("draft_range_replay_kernel") != std::string_view::npos) {
+            launches.ordered &= launches.scores == launches.replays + 1;
+            ++launches.replays;
+        }
+        if (symbol.find("tiled_prefill_attention") != std::string_view::npos) {
+            ++launches.tiled;
+        }
         return;
     }
     if (mtp_routes) {
@@ -767,7 +798,7 @@ extern "C" cudaError_t __cudaLaunchKernel(cudaKernel_t kernel, dim3 grid, dim3 b
     static const auto launch = reinterpret_cast<decltype(&__cudaLaunchKernel)>(
         dlsym(RTLD_NEXT, "__cudaLaunchKernel"));
     check(launch != nullptr, "Cannot resolve CUDA kernel launch");
-    if (watch || mtp_routes || serial_reads) {
+    if (watch || mtp_routes != nullptr || serial_routes() != nullptr) {
         static void* const driver = dlopen("libcuda.so.1", RTLD_NOW | RTLD_LOCAL);
         check(driver != nullptr, "Cannot load the CUDA driver");
         static const auto get_name = reinterpret_cast<decltype(&cuKernelGetName)>(
@@ -783,11 +814,11 @@ extern "C" cudaError_t __cudaLaunchKernel(cudaKernel_t kernel, dim3 grid, dim3 b
 extern "C" cudaError_t __wrap_cudaLaunchKernel(const void* function, dim3 grid, dim3 block,
                                                void** args, std::size_t shared,
                                                cudaStream_t stream) {
-    if (watch || mtp_routes || serial_reads) {
+    if (watch || mtp_routes != nullptr || serial_routes() != nullptr) {
         const char* name = nullptr;
         check(cudaFuncGetName(&name, function) == cudaSuccess, "Cannot identify decode kernel");
         record_launch(name, grid, block);
-        if (mtp_routes || serial_reads) {
+        if (mtp_routes != nullptr || serial_routes() != nullptr) {
             return __real_cudaLaunchKernel(function, grid, block, args, shared, stream);
         }
         const std::string_view symbol(name);

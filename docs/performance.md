@@ -190,6 +190,14 @@ Each TP1 W6 arm served 2,129,920 measured input tokens and emitted 20,480 output
 
 The campaign root is `artifacts/pool-w6/campaign/official-0788856a586a-6874dc330b99/`. Retained `comparison.json` and arm receipts give exact timings, streams, cache counters, and launch controls.
 
+### Warm GQA diagnostics
+
+A separate TP1 replay of turn 20 matched all 1,024 output IDs from the timed native run. Its two prefill grants spanned 3.168 s. The trace attributed 1.074 s to 16 tiled singleton calls and 1.724 s to 144 raw paired calls. Together those readers accounted for 2.798 s of prefill. The replay receipt is `artifacts/pool-w6/verification/w6-prefill-nsys.H85aZmFJ/turn20-coverage.txt`.
+
+A focused TP1 replay with the chunked singleton reader preserved the cache hits and first eight output IDs on turns 6 and 20. Turn 20 time to first token fell from 3,271.929 to 2,394.973 ms. Its first 2,049-row grant fell from 1,560.879 to 689.398 ms. The second stayed near 1,604 ms. The short replay receipts are under `artifacts/pool-w6/hotpool/control.FmgaURB3/` and `artifacts/pool-w6/hotpool/singleton-generation.2prfpSKU/`.
+
+The resident staged reader passed 24 eager TP1 and TP2 rank-local cases against an independent FP64 reference. Across 198,180,864 outputs, maximum absolute error was 0.00866110 and maximum normalized RMSE was 0.00230620. For 1,024 query rows with 195,583 visible tokens, the three-trial median fell from 12.324 to 5.656 ms at TP1. At TP2, the rank-local median fell from 6.191 to 2.750 ms. These isolated readings compare raw paired attention with the staged reader. The `exact-final-resident-parity-tp{1,2}.log` files are under `artifacts/pool-w6/tmem/w6-profile.kecUkXXS/`.
+
 ### Historical PR #3 campaign
 
 The historical PR #3 campaign covered W1–W5. Native release `739413015202541bdb4bdabcc1580aceb381e86b` passed the 1.10× gate independently on all five rows at both widths. Each native arm used one LMCache daemon with a 64 GiB CPU L1 at TP1 and 128 GiB at TP2. [PR #3 campaign evidence](https://github.com/para1lel/sglang.cpp/pull/3)

@@ -133,6 +133,12 @@ cudaError_t read_gqa(Workspace& work, Mxfp8PageTable pages, Mxfp8KvCache cache,
             return exact_decode_gqa_attention(cache, pages, position, work.rope_queries,
                 work.attention, singleton_scores, stream, 0, mode == TextGdnMode::prefill);
         }
+        if (mode == TextGdnMode::prefill && vector) {
+            const auto status = try_chunked_ordered_gqa(cache, pages, position, work.rope_queries,
+                                                        work.attention, scores, stream);
+            if (status)
+                return *status;
+        }
         if (mode == TextGdnMode::prefill || position >= scores.capacity) {
             return mxfp8_gqa_attention(cache, pages, position + 1, position, 1,
                                        work.rope_queries, work.attention, stream, geometry);

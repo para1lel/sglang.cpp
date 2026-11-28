@@ -77,7 +77,9 @@ struct PrefillProjections {
 
 class PrefillWorkspace {
 public:
-  PrefillWorkspace(cudaStream_t stream, int capacity, int staged_visible = 0);
+  PrefillWorkspace(cudaStream_t stream, int capacity,
+                   GqaGeometry staged_geometry = gqa_rank_geometry, int staged_visible = 0,
+                   bool resident_staging = false);
   ~PrefillWorkspace();
   PrefillWorkspace(const PrefillWorkspace&) = delete;
   PrefillWorkspace& operator=(const PrefillWorkspace&) = delete;
@@ -90,6 +92,7 @@ public:
   int capacity() const;
   void* data() const;
   PairedPrefillScratch long_gqa_staging() const;
+  bool resident_gqa_staging() const;
 
 private:
     friend class PrefillPeerNorm;
@@ -104,6 +107,7 @@ private:
     PairedPrefillScratch staging_{};
     cudaError_t release_status_ = cudaSuccess;
     std::shared_ptr<DeviceArena> arena_;
+    bool resident_staging_ = false;
 };
 
 class PrefillPeerNorm {

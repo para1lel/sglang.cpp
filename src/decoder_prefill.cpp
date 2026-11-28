@@ -90,9 +90,11 @@ void each_attention_group(const PrefillGrant* grants, int count, Run run) {
 
 template <typename Group, typename Native>
 bool schedule_partial_projection_groups(const PrefillGrant* grants, int count, cudaStream_t stream,
-                                       DecoderBatchStepStats& stats, Group group, Native native,
-                                       int min_rows = min_partial_prefill_rows,
-                                       int staged_visible = 0) {
+                                        DecoderBatchStepStats& stats, Group group, Native native,
+                                        int min_rows = min_partial_prefill_rows,
+                                        int staged_visible = 0,
+                                        GqaGeometry staged_geometry = gqa_rank_geometry,
+                                        bool resident_staging = false) {
     using Callbacks = std::pair<Group, Native>;
     const Callbacks callbacks{std::move(group), std::move(native)};
     const PartialProjectionSchedule schedule{
@@ -110,7 +112,7 @@ bool schedule_partial_projection_groups(const PrefillGrant* grants, int count, c
         },
     };
     return execute_partial_projection_groups(grants, count, stream, stats, schedule, min_rows,
-                                             staged_visible);
+                                             staged_geometry, staged_visible, resident_staging);
 }
 struct PrefillGroupPlan {
     bool grouped = false;
@@ -396,12 +398,6 @@ void finish_prefill_group_tp(const DecoderModel& model, const Chunk& chunk,
     }
 }
 
-PairedPrefillScratch paired_long_staging(const PrefillWorkspace& local,
-                                        const PrefillWorkspace& peer) {
-    const auto scratch = local.long_gqa_staging();
-    return scratch.keys && peer.long_gqa_staging().keys ? scratch : PairedPrefillScratch{};
-}
-
 void prefill_layerwise_tp(const DecoderModel& model, const DecoderModel& peer,
                           const PrefillGrant* grants, const PrefillGrant* peer_grants,
                           PrefillGroup group, const PrefillGroupPlan& plan, int serial_capacity,
@@ -412,10 +408,15 @@ void prefill_layerwise_tp(const DecoderModel& model, const DecoderModel& peer,
     const auto peer_dims = PrefillDims::from_layers(peer.layers);
     ScratchLayout peer_layout{static_cast<std::byte*>(peer_workspace.data())};
     const TileBuffers peer_buffers(peer_layout, peer_workspace.capacity(), peer_dims);
-    const Chunk peer_chunk{{peer_buffers.activation, group.rows, peer_stream,
-                            chunk.tensor_core_fp8, plan.grouped || plan.serial_attention},
-                           peer_buffers, 0, nullptr, 0,
-                           paired_long_staging(peer_workspace, workspace)};
+    const PrefillProjections projections{
+        peer_buffers.activation,
+        group.rows,
+        peer_stream,
+        chunk.tensor_core_fp8,
+        plan.grouped || plan.serial_attention,
+    };
+    const Chunk peer_chunk(projections, peer_buffers, 0, nullptr, 0,
+                           select_gqa_staging(peer_workspace, &workspace));
     PrefillPeerNorm peer_norm;
     if (plan.full_causal && chunk.tensor_core_fp8 && comm.rank_count() == 2 &&
         comm.device(0) == model.device && comm.device(1) == peer.device) {
@@ -464,10 +465,11 @@ void prefill_layerwise(const DecoderModel& model, const PrefillGrant* grants, Pr
     const bool tensor_core = peer
         ? model.backend.tensor_core_prefill && peer->backend.tensor_core_prefill
         : true;
-    const Chunk chunk{{buffers.activation, group.rows, stream, tensor_core,
-                       plan.grouped || plan.serial_attention}, buffers, 0, nullptr, 0,
-                      peer ? paired_long_staging(workspace, *peer_workspace)
-                           : PairedPrefillScratch{}};
+    const PrefillProjections projections{
+        buffers.activation, group.rows, stream, tensor_core, plan.grouped || plan.serial_attention,
+    };
+    const Chunk chunk(projections, buffers, 0, nullptr, 0,
+                      select_gqa_staging(workspace, peer_workspace));
     const bool scaled_output = group.rows == grouped_prefill_max_rows;
     const bool reuse_all_gqa = std::all_of(grants, grants + group.grants,
         [](const PrefillGrant& grant) {
@@ -562,15 +564,17 @@ bool decoder::try_prefill_projection_groups(
         }
     }
     if (!model.backend.tensor_core_prefill) return false;
-    return schedule_partial_projection_groups(grants, count, stream, stats,
-        [&](int, int, const PrefillGrant* group, PrefillGroup rows,
-            PrefillWorkspace& workspace, PrefillAttentionMode attention, int capacity) {
+    const int resident_visible = resident_gqa_staging_visible(grants, count);
+    return schedule_partial_projection_groups(
+        grants, count, stream, stats,
+        [&](int, int, const PrefillGrant* group, PrefillGroup rows, PrefillWorkspace& workspace,
+            PrefillAttentionMode attention, int capacity) {
             prefill_layerwise(model, group, rows, workspace, attention, capacity);
         },
-        [&](int, const PrefillGrant* grant, PrefillWorkspace& workspace, int capacity,
-            int offset) {
+        [&](int, const PrefillGrant* grant, PrefillWorkspace& workspace, int capacity, int offset) {
             enqueue_native_prefill_grants(model, grant, 1, workspace, capacity, offset);
-        });
+        },
+        min_partial_prefill_rows, resident_visible, gqa_full_geometry, resident_visible != 0);
 }
 
 void Decoder::Model::prefill_chunk(Request& request, const int* tokens, int rows, int position,
@@ -630,8 +634,9 @@ void Decoder::Model::prefill_chunk(Request& request, const int* tokens, int rows
     const auto dims = PrefillDims::from_layers(layers);
     const TileBuffers buffers(layout, capacity, dims);
     const bool tensor_core = backend.tensor_core_prefill;
-    const Chunk chunk{{buffers.activation, rows, stream, tensor_core}, buffers, position,
-        media ? media->positions + position : nullptr, request.cached_gqa_tokens};
+    const Chunk chunk({buffers.activation, rows, stream, tensor_core}, buffers, position,
+                      media != nullptr ? media->positions + position : nullptr,
+                      request.cached_gqa_tokens, select_gqa_staging(workspace));
     const auto& work = chunk.work;
     gather_embeddings(embedding, tokens, rows, work.residual, stream);
     if (media) {
@@ -688,12 +693,12 @@ void prefill_chunk_tp(const DecoderModel& model, const DecoderModel& peer,
     const TileBuffers peer_buffers(peer_layout, peer_workspace.capacity(), peer_dims);
     const bool tensor_core = model.backend.tensor_core_prefill &&
         peer.backend.tensor_core_prefill;
-    const Chunk chunk{{buffers.activation, rows, stream, tensor_core}, buffers, grant.position,
+    const Chunk chunk({buffers.activation, rows, stream, tensor_core}, buffers, grant.position,
                       nullptr, request.cached_gqa_tokens,
-                      paired_long_staging(workspace, peer_workspace)};
-    const Chunk peer_chunk{{peer_buffers.activation, rows, peer_stream, tensor_core},
-                           peer_buffers, grant.position, nullptr, peer_request.cached_gqa_tokens,
-                           paired_long_staging(peer_workspace, workspace)};
+                      select_gqa_staging(workspace, &peer_workspace));
+    const Chunk peer_chunk({peer_buffers.activation, rows, peer_stream, tensor_core}, peer_buffers,
+                           grant.position, nullptr, peer_request.cached_gqa_tokens,
+                           select_gqa_staging(peer_workspace, &workspace));
     const auto& work = chunk.work;
     const auto& peer_work = peer_chunk.work;
     gather_embeddings(model.embedding, grant.tokens, rows, work.residual, stream);
@@ -872,12 +877,15 @@ bool try_prefill_projection_groups_tp(const DecoderModel& model, const DecoderMo
     if (!model.backend.tensor_core_prefill || !peer.backend.tensor_core_prefill) return false;
     if (try_prefill_paired_tiles_tp(model, peer, grants, peer_grants, count, stream, peer_stream,
                                     group, stats)) return true;
-    const int staged_visible = long_serial_visible(grants, count, true);
+    const int resident_visible = resident_gqa_staging_visible(grants, count);
+    const int staged_visible =
+        resident_visible != 0 ? resident_visible : long_serial_visible(grants, count, true);
     std::optional<PrefillWorkspace> peer_workspace;
     const auto ensure_peer = [&](int capacity) {
         if (peer_workspace) return;
         const DeviceScope scope(peer.device);
-        peer_workspace.emplace(peer_stream, capacity, staged_visible);
+        peer_workspace.emplace(peer_stream, capacity, gqa_rank_geometry, staged_visible,
+                               resident_visible != 0);
         if (!peer_workspace->data()) {
             throw std::runtime_error("Prefill workspace unavailable under tensor parallelism");
         }
@@ -906,7 +914,7 @@ bool try_prefill_projection_groups_tp(const DecoderModel& model, const DecoderMo
                                              1, workspace, *peer_workspace, capacity, offset,
                                              stream, peer_stream, group);
         },
-        prefill_chunk_rows, staged_visible);
+        prefill_chunk_rows, staged_visible, gqa_rank_geometry, resident_visible != 0);
     if (peer_workspace) {
         const DeviceScope scope(peer.device);
         peer_workspace->close();
@@ -924,7 +932,10 @@ void Decoder::Model::prefill_grants(const PrefillGrant* grants, int count, cudaS
     for (int index = 0; index < count; ++index) {
         capacity = std::max(capacity, grants[index].tile_rows);
     }
-    std::optional<PrefillWorkspace> workspace(std::in_place, stream, capacity);
+    const int staged_visible =
+        backend.tensor_core_prefill ? resident_gqa_staging_visible(grants, count) : 0;
+    std::optional<PrefillWorkspace> workspace(std::in_place, stream, capacity, gqa_full_geometry,
+                                              staged_visible, staged_visible != 0);
     if (!workspace->data() && capacity > prefill_chunk_rows) {
         workspace.emplace(stream, prefill_chunk_rows);
     }
@@ -949,17 +960,22 @@ void Decoder::Model::prefill_grants_tp(const Model& peer, const PrefillGrant* gr
     for (int index = 0; index < count; ++index) {
         capacity = std::max(capacity, grants[index].tile_rows);
     }
-    const int staged_visible = backend.tensor_core_prefill && peer.backend.tensor_core_prefill
-        ? long_serial_visible(grants, count, false) : 0;
-    std::optional<PrefillWorkspace> workspace(std::in_place, stream, capacity, staged_visible);
+    const bool tensor_core = backend.tensor_core_prefill && peer.backend.tensor_core_prefill;
+    const int resident_visible = tensor_core ? resident_gqa_staging_visible(grants, count) : 0;
+    const int legacy_visible = tensor_core ? long_serial_visible(grants, count, false) : 0;
+    const int staged_visible = resident_visible != 0 ? resident_visible : legacy_visible;
+    std::optional<PrefillWorkspace> workspace(std::in_place, stream, capacity, gqa_rank_geometry,
+                                              staged_visible, resident_visible != 0);
     if (!workspace->data() && capacity > prefill_chunk_rows) {
-        workspace.emplace(stream, prefill_chunk_rows, staged_visible);
+        workspace.emplace(stream, prefill_chunk_rows, gqa_rank_geometry, staged_visible,
+                          resident_visible != 0);
     }
     stats.prefill_workspace_bytes = std::max(stats.prefill_workspace_bytes, workspace->bytes());
     std::optional<PrefillWorkspace> peer_workspace;
     {
         const DeviceScope scope(peer.device);
-        peer_workspace.emplace(peer_stream, workspace->capacity(), staged_visible);
+        peer_workspace.emplace(peer_stream, workspace->capacity(), gqa_rank_geometry,
+                               staged_visible, resident_visible != 0);
     }
     if (workspace->data() && !peer_workspace->data()) {
         throw std::runtime_error("Prefill workspace unavailable under tensor parallelism");

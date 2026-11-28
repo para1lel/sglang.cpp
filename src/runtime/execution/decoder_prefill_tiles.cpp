@@ -321,12 +321,34 @@ void Chunk::gqa_gate() const {
           "Gate prefill grouped-query attention");
 }
 
+PrefillGqaStaging select_gqa_staging(const PrefillWorkspace& target,
+                                     const PrefillWorkspace* counterpart) {
+    if (counterpart != nullptr && counterpart->long_gqa_staging().keys == nullptr) {
+        return {};
+    }
+    return {
+        target.long_gqa_staging(),
+        target.resident_gqa_staging() &&
+            (counterpart == nullptr || counterpart->resident_gqa_staging()),
+    };
+}
+
+Chunk::Chunk(PrefillProjections projections, const TileBuffers& buffers, int position,
+             const MropePosition* mrope, int cached_gqa_tokens, PrefillGqaStaging staging)
+    : PrefillProjections(projections), work(buffers), position(position), mrope(mrope),
+      cached_gqa_tokens(cached_gqa_tokens), long_staging(staging) {
+}
+
 void Chunk::gqa_read(Mxfp8KvCache cache, Mxfp8PageTable pages, PairedPrefillScratch scratch) const {
-    auto staged = long_staging.keys && tensor_core_fp8
-        ? try_long_serial_staged_paged_prefill(
-              {cache, pages, position, rows, work.rope_queries, work.attention}, stream,
-              long_staging)
-        : std::nullopt;
+    std::optional<cudaError_t> staged;
+    if (long_staging.scratch.keys != nullptr && tensor_core_fp8) {
+        const PagedPrefillSequence sequence{
+            cache, pages, position, rows, work.rope_queries, work.attention,
+        };
+        staged = long_staging.resident
+                     ? try_resident_staged_paged_prefill(sequence, stream, long_staging.scratch)
+                     : try_long_serial_staged_paged_prefill(sequence, stream, long_staging.scratch);
+    }
     if (!staged) {
         staged = tensor_core_fp8 ? tensor_core_multirow_prefill_gqa(cache, pages, position, rows,
                                                                     work.rope_queries,
@@ -538,9 +560,14 @@ PrefillGroup prefill_group(const PrefillGrant* grants, int count) {
 }
 
 Chunk prefill_attention_segment(const Chunk& chunk, const PrefillGrant& grant, int offset) {
-    return Chunk{{{}, grant.rows, chunk.stream, true}, chunk.work.attention_segment(offset),
-        grant.position, grant.media ? grant.media->positions + grant.position : nullptr,
-        grant.request->cached_gqa_tokens, chunk.long_staging};
+    return Chunk{
+        {{}, grant.rows, chunk.stream, true},
+        chunk.work.attention_segment(offset),
+        grant.position,
+        grant.media != nullptr ? grant.media->positions + grant.position : nullptr,
+        grant.request->cached_gqa_tokens,
+        chunk.long_staging,
+    };
 }
 
 }

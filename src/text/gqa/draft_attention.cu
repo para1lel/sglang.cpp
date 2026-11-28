@@ -163,9 +163,11 @@ cudaError_t launch_long_draft_batch(
     return cudaSuccess;
 }
 
-cudaError_t launch_long_draft_attention(
-    Mxfp8KvCache cache, const std::int32_t* pages, int visible, const __nv_bfloat16* queries,
-    __nv_bfloat16* output, decoder::ExactGqaWorkspace workspace, cudaStream_t stream) {
+cudaError_t launch_chunked_ordered_attention(Mxfp8KvCache cache, const std::int32_t* pages,
+                                             int visible, const __nv_bfloat16* queries,
+                                             __nv_bfloat16* output,
+                                             decoder::ExactGqaWorkspace workspace,
+                                             cudaStream_t stream) {
     auto* carry = workspace.scores + gqa_query_heads(cache.kv_heads) * draft_score_chunk;
     workspace.capacity = draft_score_chunk;
     for (int first = 0; first < visible; first += draft_score_chunk) {
@@ -243,6 +245,23 @@ std::optional<cudaError_t> try_grouped_draft_attention(const DraftAttentionRow* 
 
 }
 
+std::optional<cudaError_t>
+decoder::try_chunked_ordered_gqa(Mxfp8KvCache cache, Mxfp8PageTable pages, int position,
+                                 const __nv_bfloat16* queries, __nv_bfloat16* output,
+                                 ExactGqaWorkspace workspace, cudaStream_t stream) {
+    const auto visible = static_cast<std::int64_t>(position) + 1;
+    if (visible <= workspace.capacity || visible > text_attention_max_tokens ||
+        workspace.scores == nullptr ||
+        workspace.capacity < draft_score_chunk + draft_carry_per_head) {
+        return std::nullopt;
+    }
+    if (queries == nullptr || output == nullptr || !cache_covers(cache, pages, visible)) {
+        return cudaErrorInvalidValue;
+    }
+    return launch_chunked_ordered_attention(cache, pages.device_pages, static_cast<int>(visible),
+                                            queries, output, workspace, stream);
+}
+
 cudaError_t decoder::mtp_gqa_attention(Mxfp8KvCache cache, Mxfp8PageTable pages, int position,
                                       const __nv_bfloat16* queries, __nv_bfloat16* output,
                                       ExactGqaWorkspace workspace, cudaStream_t stream,
@@ -259,11 +278,9 @@ cudaError_t decoder::mtp_gqa_attention(Mxfp8KvCache cache, Mxfp8PageTable pages,
         return launch_draft_vector_attention(
             cache, pages.device_pages, position, queries, output, workspace, stream);
     }
-    if (visible > workspace.capacity && visible <= text_attention_max_tokens && workspace.scores &&
-        workspace.capacity >= draft_score_chunk + draft_carry_per_head) {
-        return launch_long_draft_attention(
-            cache, pages.device_pages, static_cast<int>(visible), queries, output, workspace,
-            stream);
+    if (const auto status =
+            try_chunked_ordered_gqa(cache, pages, position, queries, output, workspace, stream)) {
+        return *status;
     }
     if (visible < min_tiled_tokens || visible > max_tiled_tokens) {
         return mxfp8_gqa_attention(cache, pages, static_cast<int>(visible), position, 1,

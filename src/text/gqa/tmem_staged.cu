@@ -1,5 +1,6 @@
 #include "sglang/text/gqa/tmem_ops.cuh"
 #include "sglang/runtime/backend/cuda_resources.h"
+#include "sglang/text_attention.h"
 #include <algorithm>
 #include <climits>
 #include <cudaTypedefs.h>
@@ -454,7 +455,10 @@ std::optional<cudaError_t> launch_staged_requests(const decoder::PagedPrefillSeq
     const int position = sequences[0].position;
     const int kv_heads = sequences[0].cache.kv_heads;
     constexpr int min_partial_rows = LongPage ? decoder::staged_serial_min_rows : 256;
-    constexpr int max_partial_visible = LongPage ? decoder::staged_serial_max_tokens : 32768;
+    constexpr int max_serial_visible = LongPage ? decoder::staged_serial_max_tokens : 32768;
+    constexpr int max_partial_visible =
+        CausalGroup ? text_attention_max_tokens : max_serial_visible;
+    constexpr int max_partial_rows = CausalGroup ? staged_causal_group_rows : flash_chunk;
     if (!StagedRange(scratch.keys, scratch.key_bytes, 1).valid() ||
         !StagedRange(scratch.values, scratch.value_bytes, 1).valid()) return std::nullopt;
     if constexpr (!Partial && !CausalGroup) {
@@ -471,8 +475,9 @@ std::optional<cudaError_t> launch_staged_requests(const decoder::PagedPrefillSeq
             return std::nullopt;
         const int rows = sequence.rows;
         if constexpr (Partial) {
-            if (rows < min_partial_rows || rows > flash_chunk || sequence.position < 0 ||
-                sequence.position > max_partial_visible - rows) return std::nullopt;
+            if (rows < min_partial_rows || rows > max_partial_rows || sequence.position < 0 ||
+                sequence.position > max_partial_visible - rows)
+                return std::nullopt;
         } else if constexpr (CausalGroup) {
             constexpr int context = LongPage
                 ? decoder::staged_prefill_batch_long_max_position + flash_chunk
@@ -603,6 +608,15 @@ std::optional<cudaError_t> decoder::try_long_serial_staged_paged_prefill(
     if (sequence.cache.kv_heads != gqa_rank_geometry.kv_heads ||
         !wants_long_serial_staging(sequence.position, sequence.rows)) return std::nullopt;
     return launch_staged_requests<1, true, false, true>(&sequence, stream, scratch);
+}
+
+std::optional<cudaError_t>
+decoder::try_resident_staged_paged_prefill(const PagedPrefillSequence& sequence,
+                                           cudaStream_t stream, PairedPrefillScratch scratch) {
+    if (sequence.position < staged_serial_min_position) {
+        return std::nullopt;
+    }
+    return launch_staged_requests<1, true, true, true>(&sequence, stream, scratch);
 }
 
 std::optional<cudaError_t> launch_partial_staged_tmem_prefill(

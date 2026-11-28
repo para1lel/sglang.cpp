@@ -238,6 +238,12 @@ struct ExactGqaWorkspace {
     int capacity;
 };
 
+std::optional<cudaError_t> try_chunked_ordered_gqa(Mxfp8KvCache cache, Mxfp8PageTable pages,
+                                                   int position, const __nv_bfloat16* queries,
+                                                   __nv_bfloat16* output,
+                                                   ExactGqaWorkspace workspace,
+                                                   cudaStream_t stream);
+
 struct DraftAttentionRow {
     Mxfp8KvCache cache;
     Mxfp8PageTable pages;

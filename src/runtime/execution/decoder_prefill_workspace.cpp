@@ -85,9 +85,13 @@ PrefillGrant decoder::prefill_tile(PrefillGrant grant, int offset) {
     return grant;
 }
 
-PrefillWorkspace::PrefillWorkspace(cudaStream_t stream, int capacity, int staged_visible)
+PrefillWorkspace::PrefillWorkspace(cudaStream_t stream, int capacity, GqaGeometry staged_geometry,
+                                   int staged_visible, bool resident_staging)
     : stream_(stream), capacity_(capacity) {
-    if (!stream || capacity < 1 || capacity > grouped_prefill_max_rows) {
+    const int staged_kv_heads = staged_geometry.kv_heads;
+    if (stream == nullptr || capacity < 1 || capacity > grouped_prefill_max_rows ||
+        (staged_kv_heads != gqa_rank_geometry.kv_heads &&
+         staged_kv_heads != gqa_full_geometry.kv_heads)) {
         throw std::invalid_argument("Invalid decoder prefill workspace");
     }
     if (capacity == 1) {
@@ -100,10 +104,13 @@ PrefillWorkspace::PrefillWorkspace(cudaStream_t stream, int capacity, int staged
     const auto base = prefill_workspace_bytes(capacity);
     constexpr std::size_t alignment = 128;
     const auto offset = (base + alignment - 1) / alignment * alignment;
-    const auto visible = std::clamp(staged_visible, 0, staged_serial_max_tokens);
+    const auto visible = std::clamp(staged_visible, 0, text_attention_max_tokens);
     const auto pages = (visible + mxfp8_page_size - 1) / mxfp8_page_size;
-    const auto page_heads = std::size_t(pages) * gqa_rank_geometry.kv_heads;
-    const auto plane = page_heads * mxfp8_page_size * mxfp8_head_dim * sizeof(__nv_bfloat16);
+    const auto page_heads = static_cast<std::size_t>(pages) * staged_kv_heads;
+    constexpr std::size_t bytes_per_page_head =
+        static_cast<std::size_t>(mxfp8_page_size) * mxfp8_head_dim * sizeof(__nv_bfloat16);
+    static_assert(bytes_per_page_head % alignment == 0);
+    const auto plane = page_heads * bytes_per_page_head;
     const auto values = plane + page_heads * sizeof(int);
     auto bytes = plane ? offset + plane + values : base;
     void* data = nullptr;
@@ -129,6 +136,7 @@ PrefillWorkspace::PrefillWorkspace(cudaStream_t stream, int capacity, int staged
     if (bytes != base) {
         auto* keys = static_cast<std::byte*>(data) + offset;
         staging_ = {keys, plane, keys + plane, values};
+        resident_staging_ = resident_staging;
     }
 }
 
@@ -138,6 +146,9 @@ cudaStream_t PrefillWorkspace::stream() const { return stream_; }
 int PrefillWorkspace::capacity() const { return capacity_; }
 void* PrefillWorkspace::data() const { return data_; }
 PairedPrefillScratch PrefillWorkspace::long_gqa_staging() const { return staging_; }
+bool PrefillWorkspace::resident_gqa_staging() const {
+    return resident_staging_ && staging_.keys != nullptr;
+}
 
 bool PrefillWorkspace::allow_peer_access(int peer_device) {
     return arena_ && arena_->allows_peer_access(peer_device);

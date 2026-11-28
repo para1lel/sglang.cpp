@@ -93,12 +93,23 @@ struct TileBuffers {
     TextFp8Activation activation;
 };
 
+struct PrefillGqaStaging {
+    PairedPrefillScratch scratch;
+    bool resident = false;
+};
+
+PrefillGqaStaging select_gqa_staging(const PrefillWorkspace& target,
+                                     const PrefillWorkspace* counterpart = nullptr);
+
 struct Chunk : PrefillProjections {
+    Chunk(PrefillProjections projections, const TileBuffers& buffers, int position,
+          const MropePosition* mrope, int cached_gqa_tokens, PrefillGqaStaging staging);
+
     TileBuffers work;
     int position;
     const MropePosition* mrope;
     int cached_gqa_tokens = 0;
-    PairedPrefillScratch long_staging{};
+    PrefillGqaStaging long_staging{};
 
     bool project_packed(TextFp8ActivationView input,
                         std::initializer_list<PrefillFp8Projection> projections) const;

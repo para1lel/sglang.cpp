@@ -145,7 +145,7 @@ def main():
     w4 = commands.add_parser("w4", help="verify original W5/00..15.request.json as TP2 W4")
     w4.add_argument("fixtures", type=Path)
     check = commands.add_parser("verify", help="verify both observed workers")
-    check.add_argument("row", choices=suite.ROWS)
+    check.add_argument("row", choices=suite.rows(suite.TP2_POOL_PROTOCOL))
     for name in ("run", "reservation", "checkpoint", "vllm_root"):
         check.add_argument(name, type=Path)
     check.add_argument("devices", nargs=2, metavar="GPU-UUID")

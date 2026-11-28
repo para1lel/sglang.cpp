@@ -1,5 +1,6 @@
 #include "sglang/server/chat_media.h"
 
+#include "sglang/runtime/model/qwen_tokenizer.h"
 #include "sglang/server/media_codec.h"
 #include "sglang/tokenizer/tokenizer.h"
 
@@ -15,6 +16,11 @@ using json::get;
 using json::OrderedObject;
 using json::Value;
 
+using model::image_pad;
+using model::video_pad;
+using model::vision_end;
+using model::vision_start;
+
 constexpr std::string_view rgb_url = "data:application/x-sglang-rgb8;base64,";
 constexpr std::size_t max_media = 4;
 constexpr int max_source_frames = 1'000'000'000;
@@ -22,10 +28,6 @@ constexpr int max_grid_patches = 16384;
 constexpr int max_frame_patches = 4096;
 constexpr int resize_alignment = 32;
 constexpr int patch_edge = 16;
-constexpr int vision_start = 248053;
-constexpr int vision_end = 248054;
-constexpr int image_pad = 248056;
-constexpr int video_pad = 248057;
 
 const OrderedObject* object(const OrderedObject& parent, std::string_view key) {
     const auto* value = get(parent, key);

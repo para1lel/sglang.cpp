@@ -20,7 +20,7 @@ A composed patch left stale and blank code anchors after source and layout chang
 
 ## L004 · Finite-input NaNs in page-parallel GQA
 
-**Correction verified on the isolated W2 candidate.** At 1,536 visible tokens, finite inputs overflowed FP32 QK scores or page-local value sums. Both cases returned NaNs in eager and graph modes while ordered replay and the FP64 oracle returned finite outputs.
+**Correction verified.** At 1,536 visible tokens, finite inputs overflowed FP32 QK scores or page-local value sums. Both cases returned NaNs in eager and graph modes while ordered replay and the FP64 oracle returned finite outputs.
 
 The [merge guard](batch-graphs.md#page-parallel-gqa-decode) sends an affected head and channel tile through ordered replay. The correction matched the ordered and FP64 outputs on both cases. Keep both cases in the GQA regression and run them with eager execution and graph replay.
 
@@ -30,7 +30,7 @@ A stalled HTTP body previously blocked health and completions on the accept thre
 
 ## L006 · FP16 operand loss in split GQA
 
-FP16 narrowing lost small Q channels before multiplying large K values and lost the weighted V operand in a second case. Keep BF16 Q and decoded KV, FP32 accumulation, and per-head FP64 replay on unsafe range. Use the reserved B200 regression from the repository root. [Query load](../src/text/gqa_decode_split.cu#L175)<!-- prefix: "__device__ v" --> · [Regression cases](../tests/decoder/gqa_split_fp64_check.cpp#L181)<!-- prefix: "int main() t" --> · [Frozen range probes and results](https://github.com/para1lel/sglang.cpp/blob/6debe50edccdeda34ff307235ed38e74b6b8f2ee/docs/lessons.md#l006--fp16-operand-loss-in-split-gqa)
+FP16 narrowing lost small Q channels before multiplying large K values and lost the weighted V operand in a second case. Keep BF16 Q and decoded KV, FP32 accumulation, and per-head FP64 replay on unsafe range. Use the reserved B200 regression from the repository root. [Query load](../src/text/gqa_decode_split.cu#L176)<!-- prefix: "__device__ v" --> · [Regression cases](../tests/decoder/gqa_split_fp64_check.cpp#L181)<!-- prefix: "int main() t" --> · [Frozen range probes and results](https://github.com/para1lel/sglang.cpp/blob/6debe50edccdeda34ff307235ed38e74b6b8f2ee/docs/lessons.md#l006--fp16-operand-loss-in-split-gqa)
 
 ```bash
 out="$PWD/build/long-decode"
@@ -44,7 +44,7 @@ Compare well-conditioned, query-range, and weighted-value cases with FP64. The f
 
 ## L007 · Singleton route parity
 
-Singleton graph attention diverged from eager when capture used a different operator. Keep the same singleton route before and after eligible launch rejection. The correction recovered all 352 fixed-history decode rows bitwise. [Bound attention](../src/runtime/execution/decoder_forward_attention.cpp#L251)<!-- prefix: "void attend_" --> · [Frozen candidate and control results](https://github.com/para1lel/sglang.cpp/blob/6debe50edccdeda34ff307235ed38e74b6b8f2ee/docs/lessons.md#l007--singleton-route-parity)
+Singleton graph attention diverged from eager when capture used a different operator. Keep the same singleton route before and after eligible launch rejection. The correction recovered all 352 fixed-history decode rows bitwise. [Bound attention](../src/runtime/execution/decoder_forward_attention.cpp#L267)<!-- prefix: "void attend_" --> · [Frozen candidate and control results](https://github.com/para1lel/sglang.cpp/blob/6debe50edccdeda34ff307235ed38e74b6b8f2ee/docs/lessons.md#l007--singleton-route-parity)
 
 Build using the [batch graph runbook](../tests/batch/README.md). Set `out` to the Release build directory, `checkpoint` to the local checkpoint, and `GPU_UUID` to a reserved B200. Use a fresh `$out/singleton` directory.
 
@@ -82,7 +82,7 @@ The `packed-setup` procedure in [L009](#l009--terminal-error-during-first-packed
 
 ## L011 · Saved benchmark counts concealed mismatched controls
 
-Saved cohort counts and medians hid the wrong device, fixture, or depth, and an altered receipt could claim a different route. Resolve the physical UUID first. Bind row, arm, executable, request and campaign to observed argv, policy, and depth-four activity in both engines. Check bounded and long routes. Require a known pre-long source or receipt before treating an absent long-route field as disabled. Keep passing archive and wrong-row, wrong-profile, zero-depth, missing fourth-position, and long-route substitution controls. Run `python3 -B -m unittest discover -s tests -p test_paired_identity.py`. [Paired protocol](../benchmarks/paired/README.md#matched-k4-timing-protocol) · [Frozen negative controls](https://github.com/para1lel/sglang.cpp/blob/a5974ba4eb99bd8e8f890c2e7262a27dbc3aace1/docs/lessons.md#l011--saved-benchmark-counts-concealed-mismatched-controls)
+Saved counts and medians hid differences in device, inputs, and draft policy. An altered receipt could also claim a different route. Bind results to the physical GPU UUIDs, executable and dependency hashes, observed arguments, resolved policy, actual dispatch, and scored request cohort. Use route checks before interpreting missing activity. [Execution identity](../.agents/skills/coding-mode/references/execution-identity.md) · [AgentX evidence](agentx-256k.md#scoring-and-evidence)
 
 ## L012 · Manual CUDA launch arguments drifted from the kernel signature
 
@@ -99,11 +99,31 @@ Keep launch arguments typed. At `8e4f210b`, omitting the sixth argument failed N
 The LMCache migration updated constraints, batch admission, and sampled MTP in `f38f03a`.
 The next fix updated the media runner in `7e349bb`. The batch lifecycle runner still passed
 the former resident entry count `4` to `server_policy`. Its Boolean identity check rejected
-even a healthy daemon before the first W1 turn. Later assertions still expected resident
+even a healthy daemon before the first request. Later assertions still expected resident
 store events on individual scheduler steps. [First migration](https://github.com/para1lel/sglang.cpp/commit/f38f03af03450904c1fd4a8499687ee69d214cb4) · [Lifecycle call at the reviewed revision](https://github.com/para1lel/sglang.cpp/blob/7e349bb224fbb5715a2c5ff937d513d860fe6d01/tests/batch/checkpoint_lifecycle.py#L246)<!-- prefix: "http.server_" --> · [Review finding](https://github.com/para1lel/sglang.cpp/pull/1#discussion_r4694496532)
 
 When the shared fixture changes, trace its imports and calls across test directories. Exercise
 each affected public entry point in its documented cache mode. For this change, the media
 runner checks both daemon-enabled and explicit cache-off workers. The batch runner requires a
-dedicated daemon and proves that the saved W1 endpoint restores the exact rows and produces
+dedicated daemon and proves that restoring the stored endpoint recovers the exact rows and produces
 the same continuation IDs as a cold request. [Media controls](../tests/media/http-contract.md) · [Lifecycle reproducer](../tests/batch/README.md#checkpoint-lifecycle)
+
+## L014 · Score scratch limits hid graph fallback
+
+TP1 MTP verification reused a 248,320-element BF16 logits buffer for FP32 GQA scores. With 24 query heads and 128-token pages, only 40 whole pages fit. The verifier quietly ran eager when its exclusive row end exceeded 5,120. The score-slab check asserted the inline limit and exercised separate long scratch for ordinary batch decode. It did not exercise the MTP verifier at that boundary. [Inline score capacity](https://github.com/para1lel/sglang.cpp/blob/6cf81a27829354551397d463113be002ea025343/src/runtime/model/qwen_request.cpp#L256)<!-- prefix: "ExactGqaWork" --> · [Verifier gate](https://github.com/para1lel/sglang.cpp/blob/6cf81a27829354551397d463113be002ea025343/src/decoder_verify.cpp#L401)<!-- prefix: "eager_worksp" --> · [Score-slab check](https://github.com/para1lel/sglang.cpp/blob/6cf81a27829354551397d463113be002ea025343/tests/batch/check_score_slab.cpp#L141)<!-- prefix: "require(requ" -->
+
+The default server enabled a separate TP2 verifier option when eager mode was off. Both C++ graph flags defaulted to `false`. TP2 verification graph dispatch read `tp_verification_graphs` independently of `cuda_graphs`. The TP2 graph required two lanes and ten rows and had a separate score limit of 256 positions. Long-history TP2 replay needed a direct graph check. [Server option wiring](https://github.com/para1lel/sglang.cpp/blob/6cf81a27829354551397d463113be002ea025343/apps/sglang-server.cpp#L405)<!-- prefix: "arguments.ma" --> · [C++ options](https://github.com/para1lel/sglang.cpp/blob/6cf81a27829354551397d463113be002ea025343/include/sglang/decoder_batch.h#L70)<!-- prefix: "bool tp_veri" --> · [TP2 position gate](https://github.com/para1lel/sglang.cpp/blob/6cf81a27829354551397d463113be002ea025343/src/runtime/execution/tp_verify_graph.cpp#L128)<!-- prefix: "row.position" -->
+
+Check capture and warm replay through default HTTP and both explicit C++ graph options. Exercise row ends immediately below, at, and above each scratch limit. Include replay near the 262,144-token context limit and vary the active group and sampling policy. Observe which graph launched and record the reason for each supported decline. Compare IDs and committed state with eager execution at the same positions. Keep allocation and replay checks on the same verifier path. [Optimized route verification rules](../.agents/skills/coding-mode/SKILL.md#prepare-the-candidate)
+
+**Correction verified in scoped checks.** TP1 and TP2 K4 singleton fixtures replayed near 262,144 tokens and matched eager continuation IDs. The TP1 fixture also checked committed state transitions. Direct C++ TP2 K0 checks exercised replay at widths 8, 16, and 32. A separate two-lane HTTP check observed default K0 replay and no replay with `--eager`. Greedy and seeded sampled responses matched. Keep HTTP option coverage and direct graph route coverage separate. [Graph checks](batch-graphs.md#verification) · [MTP checks](mtp.md#verification-graph-checks)
+
+## L015 · Target parallelism hid rank 0 drafting
+
+The TP2 constructor loaded sharded target layers on both devices and assigned MTP weights only to the root model. Batch admission created a single draft request, with its draft KV owned by rank 0. Rank 1 built a target verification round without a draft request. Eligible peer repair prepared work from the root draft weights. That work assisted repair while proposal and persistent draft state remained on rank 0. [Draft weight ownership](https://github.com/para1lel/sglang.cpp/blob/6cf81a27829354551397d463113be002ea025343/src/decoder.cpp#L520)<!-- prefix: "model_-\u003emtp_" --> · [Draft request](https://github.com/para1lel/sglang.cpp/blob/6cf81a27829354551397d463113be002ea025343/src/decoder_batch.cpp#L108)<!-- prefix: "lane.draft =" --> · [Peer round](https://github.com/para1lel/sglang.cpp/blob/6cf81a27829354551397d463113be002ea025343/src/decoder_tp.cpp#L167)<!-- prefix: "return {null" --> · [Peer repair](https://github.com/para1lel/sglang.cpp/blob/6cf81a27829354551397d463113be002ea025343/src/decoder_tp.cpp#L181)<!-- prefix: "peer_repair " -->
+
+Validation checked the target communicator and rank identity. Output agreement and target collectives could therefore pass with draft state and proposal work confined to one rank.
+
+For a sharded draft policy, prove which weights each rank loads and which useful draft work each rank executes. Check proposal, acceptance and rejection repair, and committed KV on both ranks. Check cold seeding and restoration of the same endpoint from LMCache. Use controls that expose missing peer draft work and stale peer state. Report draft topology separately from target topology and measure its memory and latency costs. [Optimized route verification rules](../.agents/skills/coding-mode/SKILL.md#prepare-the-candidate)
+
+**Correction verified in scoped checks.** The TP2 draft runs shard-local proposals and repairs on both ranks. Mixed greedy and sampled fixtures recorded useful proposal and repair rows on rank 1, including rank-1 vocabulary winners. A restart control restored both ranks’ draft state. Missing-rank controls exercised draft-only and target-GQA-only reuse, with matching seeded continuation. [Ranked draft contract](serving/tp2.md#two-rank-wide-verification) · [Restart checks](prefix-cache.md#verification)

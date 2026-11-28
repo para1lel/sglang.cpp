@@ -171,7 +171,7 @@ DecoderBatch::DecoderBatch(const Decoder&, DecoderBatchOptions options)
 }
 DecoderBatch::~DecoderBatch() = default;
 
-int DecoderBatch::admit(int slot, std::vector<int> prompt, const DecoderOptions& options) {
+int DecoderBatch::admit(int slot, const std::vector<int>& prompt, const DecoderOptions& options) {
     require(slot == 3 && prompt == std::vector<int>{7} && options.mtp_steps == 4 &&
                 (options.max_new_tokens == 1 || options.max_new_tokens == 6),
             "Unexpected admission");
@@ -182,9 +182,21 @@ int DecoderBatch::admit(int slot, std::vector<int> prompt, const DecoderOptions&
     return 0;
 }
 
-int DecoderBatch::admit_multimodal(int slot, std::vector<int> prompt,
-                                  const DecoderOptions& options,
-                                  const std::vector<DecoderMedia>& media) {
+int DecoderBatch::admit(int slot, std::vector<int>&& prompt, const DecoderOptions& options) {
+    const auto owned = std::move(prompt);
+    return admit(slot, owned, options);
+}
+
+int DecoderBatch::admit_multimodal(int slot, const std::vector<int>& prompt,
+                                   const DecoderOptions& options,
+                                   const std::vector<DecoderMedia>& media) {
+    require(media.size() == 1, "Unexpected media count");
+    return admit(slot, prompt, options);
+}
+
+int DecoderBatch::admit_multimodal(int slot, std::vector<int>&& prompt,
+                                   const DecoderOptions& options,
+                                   const std::vector<DecoderMedia>& media) {
     require(media.size() == 1, "Unexpected media count");
     return admit(slot, std::move(prompt), options);
 }

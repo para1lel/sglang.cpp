@@ -45,6 +45,10 @@ bool wants_long_serial_staging(int position, int rows);
 std::optional<cudaError_t> try_long_serial_staged_paged_prefill(
     const PagedPrefillSequence& sequence, cudaStream_t stream, PairedPrefillScratch scratch);
 
+std::optional<cudaError_t> try_resident_staged_paged_prefill(const PagedPrefillSequence& sequence,
+                                                             cudaStream_t stream,
+                                                             PairedPrefillScratch scratch);
+
 std::optional<cudaError_t> try_batched_staged_paged_prefill(
     const PagedPrefillSequence* sequences, int count, cudaStream_t stream,
     PairedPrefillScratch scratch);
@@ -57,11 +61,6 @@ cudaError_t tensor_core_multirow_prefill_gqa(
     Mxfp8KvCache cache, Mxfp8PageTable pages, int position, int rows,
     const __nv_bfloat16* queries, __nv_bfloat16* output, cudaStream_t stream,
     PairedPrefillScratch scratch);
-
-cudaError_t tensor_core_model_prefill_gqa(
-    Mxfp8KvCache cache, Mxfp8PageTable pages, int position, int rows,
-    const __nv_bfloat16* queries, __nv_bfloat16* output, cudaStream_t stream,
-    PairedPrefillScratch scratch = PairedPrefillScratch{});
 
 }
 

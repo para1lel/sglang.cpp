@@ -68,16 +68,11 @@ const Array& list(const Value* value, std::string_view name, std::size_t min, st
     invalid(std::string(name) + " has an invalid number of items or is not an array");
 }
 
-bool whitespace(char32_t point) {
-    return (point >= 9 && point <= 13) || (point >= 0x1c && point <= 0x20) ||
-        point == 0x85 || point == 0xa0 || point == 0x1680 ||
-        (point >= 0x2000 && point <= 0x200a) || point == 0x2028 || point == 0x2029 ||
-        point == 0x202f || point == 0x205f || point == 0x3000;
-}
-
 std::u32string_view stripped(std::u32string_view value) {
-    while (!value.empty() && whitespace(value.front())) value.remove_prefix(1);
-    while (!value.empty() && whitespace(value.back())) value.remove_suffix(1);
+    while (!value.empty() && python_whitespace(value.front()))
+        value.remove_prefix(1);
+    while (!value.empty() && python_whitespace(value.back()))
+        value.remove_suffix(1);
     return value;
 }
 
@@ -548,24 +543,6 @@ Value answer(const Request& request, const Question& question, const BatchPrompt
     return output;
 }
 
-std::string response(const Request& request, const std::vector<BatchPrompt>& prompts,
-                     const std::vector<DecoderResult>& results) {
-    if (results.size() != prompts.size()) throw std::logic_error("Incomplete decision batch");
-    OrderedObject answers;
-    std::uint64_t tokens = 0;
-    for (std::size_t index = 0; index < prompts.size(); ++index) {
-        const auto& question = request.questions[index];
-        answers.emplace_back(question.id,
-                             answer(request, question, prompts[index], results[index]));
-        tokens += prompts[index].prompt_tokens();
-    }
-    OrderedObject usage{{"prompt_tokens", tokens}, {"total_tokens", tokens},
-                        {"completion_tokens", 0}, {"reasoning_tokens", 0}};
-    return chat_template_json(OrderedObject{{"object", "decisions"}, {"model", request.model},
-        {"prompt_format_version", version}, {"answers", std::move(answers)},
-        {"usage", std::move(usage)}}, true);
-}
-
 Value systemone_answer(const Question& question, const DecoderResult& result) {
     if (!result.label_logprobs || result.label_logprobs->size() != question.labels.size()) {
         throw std::logic_error("Missing System One result");
@@ -614,19 +591,45 @@ Value systemone_answer(const Question& question, const DecoderResult& result) {
     return output;
 }
 
-std::string systemone_response(const Request& request, const std::vector<BatchPrompt>& prompts,
-                               const std::vector<DecoderResult>& results) {
-    if (results.size() != prompts.size()) throw std::logic_error("Incomplete System One batch");
+std::string response(const Request& request, const std::vector<BatchPrompt>& prompts,
+                     const std::vector<DecoderResult>& results, bool systemone) {
+    if (results.size() != prompts.size()) {
+        throw std::logic_error(systemone ? "Incomplete System One batch"
+                                         : "Incomplete decision batch");
+    }
     OrderedObject answers;
     std::uint64_t tokens = 0;
     for (std::size_t index = 0; index < prompts.size(); ++index) {
         const auto& question = request.questions[index];
-        answers.emplace_back(question.id, systemone_answer(question, results[index]));
+        answers.emplace_back(question.id,
+                             systemone ? systemone_answer(question, results[index])
+                                       : answer(request, question, prompts[index], results[index]));
         tokens += prompts[index].prompt_tokens();
     }
-    return chat_template_json(OrderedObject{
-        {"model", request.model}, {"answers", std::move(answers)},
-        {"usage", OrderedObject{{"input_tokens", tokens}, {"output_tokens", 0}}}}, true);
+    if (systemone) {
+        return chat_template_json(
+            OrderedObject{
+                {"model", request.model},
+                {"answers", std::move(answers)},
+                {"usage", OrderedObject{{"input_tokens", tokens}, {"output_tokens", 0}}},
+            },
+            true);
+    }
+    OrderedObject usage{
+        {"prompt_tokens", tokens},
+        {"total_tokens", tokens},
+        {"completion_tokens", 0},
+        {"reasoning_tokens", 0},
+    };
+    return chat_template_json(
+        OrderedObject{
+            {"object", "decisions"},
+            {"model", request.model},
+            {"prompt_format_version", version},
+            {"answers", std::move(answers)},
+            {"usage", std::move(usage)},
+        },
+        true);
 }
 
 void schema_error(const Socket& connection, bool systemone, std::string_view message) {
@@ -651,8 +654,8 @@ void serve(const Socket& connection, BatchService& service, int slot,
         if (prompts.empty()) return;
         const auto results = service.generate_batch(slot, prompts, callbacks);
         if (results) {
-            write_json(connection, "200 OK", model ? systemone_response(request, prompts, *results)
-                                                   : response(request, prompts, *results));
+            write_json(connection, "200 OK",
+                       response(request, prompts, *results, model.has_value()));
         }
     } catch (const ScoreValidationError& error) {
         schema_error(connection, model.has_value(), error.what());

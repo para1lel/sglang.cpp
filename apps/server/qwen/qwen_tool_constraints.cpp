@@ -13,11 +13,6 @@ constexpr std::string_view tool_trigger = "<tool_call>";
 constexpr std::string_view think_close = "</think>";
 constexpr std::size_t max_cached_tool_constraints = 8;
 
-const json::Value* field(const json::Value& value, std::string_view key) {
-    const auto* object = value.ordered_object();
-    return object ? json::get(*object, key) : nullptr;
-}
-
 std::string loose_parameters() {
     std::string pattern = "(?:\n|(?:<parameter=[^<>\\x00-\\x1f]+>\n";
     pattern += tokenizer::xml_string_pattern;
@@ -26,16 +21,19 @@ std::string loose_parameters() {
 }
 
 std::string function_pattern(const json::Value& tool) {
-    const auto& function = *field(tool, "function");
-    const auto name = *field(function, "name")->string();
-    const auto* strict = field(function, "strict");
+    const auto& function = *get_ordered(tool, "function");
+    const auto name = get_ordered(function, "name")->string();
+    if (!name) {
+        throw std::invalid_argument("Expected unique function tools with valid names");
+    }
+    const auto* strict = get_ordered(function, "strict");
     const bool constrained = strict && strict->boolean().value_or(false);
-    auto pattern = tokenizer::regex_literal("\n<function=" + std::string(name) + ">\n");
+    auto pattern = tokenizer::regex_literal("\n<function=" + std::string(*name) + ">\n");
     try {
-        pattern += constrained ? tokenizer::xml_parameters_pattern(field(function, "parameters"))
-                               : loose_parameters();
+        const auto* parameters = get_ordered(function, "parameters");
+        pattern += constrained ? tokenizer::xml_parameters_pattern(parameters) : loose_parameters();
     } catch (const std::invalid_argument& error) {
-        throw std::invalid_argument("Strict tool " + std::string(name) + ": " + error.what());
+        throw std::invalid_argument("Strict tool " + std::string(*name) + ": " + error.what());
     }
     pattern += tokenizer::regex_literal("</function>\n</tool_call>");
     return pattern;

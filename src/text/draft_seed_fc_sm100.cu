@@ -14,7 +14,6 @@ namespace sglang::decoder {
 namespace {
 
 constexpr int input_width = 10240;
-constexpr int output_width = 5120;
 constexpr int columns = 128;
 constexpr int rows = 32;
 constexpr int depth_bytes = 128;
@@ -125,7 +124,7 @@ __device__ void store_tile(unsigned tmem, int warp, int lane,
 
 __global__ void seed_tc_kernel(const __grid_constant__ CUtensorMap weights,
                                const __grid_constant__ CUtensorMap input, int height,
-                               __nv_bfloat16* output) {
+                               int output_width, __nv_bfloat16* output) {
     alignas(1024) extern __shared__ unsigned char tiles[];
     __shared__ Pipeline pipe;
     alignas(16) __shared__ __nv_bfloat16 result[rows][columns + 2];
@@ -194,8 +193,11 @@ static cudaError_t submit_status(cudaError_t status) {
 }
 
 std::optional<cudaError_t> try_seed_fc_sm100(const __nv_bfloat16* weight,
-                                            const __nv_bfloat16* input, int height,
-                                            __nv_bfloat16* output, cudaStream_t stream) {
+                                             const __nv_bfloat16* input, int height,
+                                             int output_width, __nv_bfloat16* output,
+                                             cudaStream_t stream) {
+    if (output_width % columns != 0)
+        return std::nullopt;
     const auto pending = cudaGetLastError();
     if (pending != cudaSuccess) return pending;
     decode_proj::LaunchTarget target{};
@@ -235,9 +237,10 @@ std::optional<cudaError_t> try_seed_fc_sm100(const __nv_bfloat16* weight,
                                   shared);
     if (status != cudaSuccess) return submit_status(status);
     const auto blocks = (output_width / columns) * ((height + rows - 1) / rows);
-    void* arguments[] = {&weights, &activation, &height, &output};
+    void* arguments[] = {
+        &weights, &activation, &height, &output_width, static_cast<void*>(&output),
+    };
     return submit_status(cudaLaunchKernel(seed_tc_kernel, blocks, threads, arguments, shared,
                                           stream));
 }
-
 }

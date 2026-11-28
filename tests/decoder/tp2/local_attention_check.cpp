@@ -1,4 +1,5 @@
 #include "sglang/text/gdn_local.h"
+#include "sglang/text/gdn/replay_ssm.h"
 
 #include <cuda_runtime.h>
 
@@ -128,23 +129,117 @@ struct GdnResult {
     std::vector<float> recurrent, prefix_recurrent;
 };
 
-void verify_batch(bool local, int features, int heads, dec::GdnVerificationLane base,
-                  TextGdnWeights weights) {
-    dec::GdnVerificationBatch batch;
-    const int width = heads * 128;
-    for (int lane = 0; lane < batch.lanes; ++lane) {
-        const int row = lane * batch.rows;
-        const int hist = lane * features * 3;
-        const int recur = lane * heads * 128 * 128;
-        batch.entries[lane] = {
-            {base.inputs.qkv + row * features, base.inputs.convolved + row * features,
-             base.inputs.b + row * heads, base.inputs.a + row * heads}, base.z + row * width,
-            {base.initial.history + hist, base.initial.recurrent + recur},
-            {base.tail.history + hist, base.tail.recurrent + recur},
-            base.observable + row * width, base.output + row * width};
+constexpr int verify_lanes = 4;
+constexpr int gdn_verify_rows = text_gdn_max_verify_rows;
+namespace replay = gdn_replay_ssm;
+
+void check_committed(int accepted, const replay::Cursor* cursors, int lanes) {
+    for (int lane = 0; lane < lanes; ++lane) {
+        if (cursors[lane].committed != accepted || cursors[lane].pending != 0) {
+            throw std::runtime_error("GDN verification left incorrect cursor");
+        }
     }
-    const auto verify = local ? dec::decode_verify_gdn_batch_local : dec::decode_verify_gdn_batch;
-    check(verify(batch, weights, nullptr), "GDN batched verification");
+}
+
+GdnResult run_gdn_replay(bool local, int lanes, int poison, TextGdnWeights weights,
+                         replay::Lane job, Array<Bf16>& history, Array<float>& state) {
+    const std::size_t features = local ? GdnLocal::qkv_width : GdnFull::qkv_width;
+    const std::size_t heads = local ? GdnLocal::value_heads : GdnFull::value_heads;
+    const std::size_t keys_per_row = local ? GdnLocal::qk_width : GdnFull::qk_width;
+    const auto width = heads * text_gdn_head_dim;
+    const auto history_size = features * text_gdn_history_taps;
+    const auto state_size = width * text_gdn_head_dim;
+    const auto initial_h = history.snapshot();
+    const auto initial_s = state.snapshot();
+    const auto ring_rows = std::size_t{replay::capacity} * lanes;
+    Array<float> keys(ring_rows * keys_per_row, poison);
+    Array<float> updates(ring_rows * width, poison);
+    Array<float> decay_log(ring_rows * heads, poison);
+    Array<Bf16> raw(ring_rows * features, poison);
+    Array<replay::Cursor> cursors(lanes, 0);
+    Array<Bf16> tail_history(lanes * history_size, poison);
+    Array<float> tail_state(lanes * state_size, poison);
+    replay::Lanes batch{};
+    const int lane_rows = job.rows / lanes;
+    for (int lane = 0; lane < lanes; ++lane) {
+        const auto row = static_cast<std::size_t>(lane) * lane_rows;
+        const auto ring = static_cast<std::size_t>(lane) * replay::capacity;
+        const auto qkv_offset = row * features;
+        const auto gate_offset = row * heads;
+        const auto output_offset = row * width;
+        const TextGdnState checkpoint{
+            history.data() + (lane * history_size),
+            state.data() + (lane * state_size),
+        };
+        const TextGdnReplayRows inputs{
+            job.inputs.qkv + qkv_offset,
+            job.inputs.convolved + qkv_offset,
+            job.inputs.b + gate_offset,
+            job.inputs.a + gate_offset,
+        };
+        const replay::State ring_state{
+            checkpoint,
+            keys.data() + (ring * keys_per_row),
+            updates.data() + (ring * width),
+            decay_log.data() + (ring * heads),
+            raw.data() + (ring * features),
+            cursors.data() + lane,
+        };
+        batch.lanes[lane] = {
+            ring_state,
+            inputs,
+            job.z + output_offset,
+            job.observable + output_offset,
+            job.output + output_offset,
+            lane_rows,
+            job.commit_all,
+        };
+    }
+    const auto launch = [&] {
+        return lanes == 1 ? replay::launch(local, batch.lanes[0], weights, nullptr)
+                          : replay::launch(local, batch, lanes, lane_rows, weights, nullptr);
+    };
+    check(launch(), "GDN ReplaySSM launch");
+    GdnResult result;
+    if (job.rows == gdn_verify_rows) {
+        Array<Bf16> prefix_h(history_size, poison);
+        Array<float> prefix_s(state_size, poison);
+        check(replay::commit(cursors.data(), lanes, 2, nullptr), "GDN accept prefix");
+        check(replay::materialize(local, batch.lanes[0].state, {prefix_h.data(), prefix_s.data()},
+                                  nullptr),
+              "GDN materialize prefix");
+        check(cudaDeviceSynchronize(), "GDN prefix completion");
+        check_committed(2, cursors.data(), 1);
+        result.prefix_history = prefix_h.snapshot();
+        result.prefix_recurrent = prefix_s.snapshot();
+        cursors.data()[0] = {};
+        check(launch(), "GDN ReplaySSM full verification");
+    }
+    if (!job.commit_all) {
+        check(replay::commit(cursors.data(), lanes, lane_rows, nullptr), "GDN accept full");
+    }
+    for (int lane = 0; lane < lanes; ++lane) {
+        const TextGdnState tail{
+            tail_history.data() + (lane * history_size),
+            tail_state.data() + (lane * state_size),
+        };
+        check(replay::materialize(local, batch.lanes[lane].state, tail, nullptr),
+              "GDN materialize committed state");
+    }
+    check(cudaDeviceSynchronize(), "GDN materialization completion");
+    check_committed(lane_rows, cursors.data(), lanes);
+    result.history = tail_history.snapshot();
+    result.recurrent = tail_state.snapshot();
+    if (std::memcmp(history.data(), initial_h.data(), initial_h.size() * sizeof(Bf16)) != 0 ||
+        std::memcmp(state.data(), initial_s.data(), initial_s.size() * sizeof(float)) != 0) {
+        throw std::runtime_error("GDN verification mutated checkpoint");
+    }
+    keys.check_guards();
+    updates.check_guards();
+    decay_log.check_guards();
+    raw.check_guards();
+    cursors.check_guards();
+    return result;
 }
 
 GdnResult gdn(int rows, int rank) {
@@ -153,11 +248,11 @@ GdnResult gdn(int rows, int rank) {
     const int features = local ? 5120 : 10240;
     const int heads = local ? 24 : 48;
     const int width = heads * 128;
-    const int lanes = rows == 20 ? dec::GdnVerificationBatch::lanes : 1;
+    const int lanes = rows == verify_lanes * gdn_verify_rows ? verify_lanes : 1;
     Array<Bf16> qkv(rows * features), z(rows * width), b(rows * heads), a(rows * heads);
     Array<Bf16> conv(features * 4), decay(heads), bias(heads), norm(128);
-    Array<Bf16> history(lanes * features * 3), tail_history(lanes * features * 3, poison);
-    Array<float> state(lanes * heads * 128 * 128), tail_state(lanes * heads * 128 * 128, poison);
+    Array<Bf16> history(static_cast<std::size_t>(lanes) * features * 3);
+    Array<float> state(static_cast<std::size_t>(lanes) * heads * 128 * 128);
     Array<Bf16> workspace(rows * (features + width), poison), output(rows * width, poison);
     fill(qkv, rows, features, 1, rank, 1, true);
     fill(z, rows, width, 1, rank, 2);
@@ -170,61 +265,32 @@ GdnResult gdn(int rows, int rank) {
     fill(history, lanes, features, 3, rank, 9, true);
     fill(state, lanes, heads, 128 * 128, rank, 10);
     TextGdnWeights weights{conv.data(), decay.data(), bias.data(), norm.data()};
-    Array<TextGdnState> bindings(2);
-    bindings.data()[0] = {history.data(), state.data()};
-    bindings.data()[1] = {tail_history.data(), tail_state.data()};
     GdnResult result;
-    if (rows == 1) {
-        const auto decode = local ? dec::decode_gdn_local : dec::decode_gdn;
-        check(decode(qkv.data(), z.data(), b.data(), a.data(), weights, bindings.data(),
-                     workspace.data(), output.data(), nullptr), "GDN decode");
-    } else if (rows == 5) {
-        const auto initial_h = history.snapshot();
-        const auto initial_s = state.snapshot();
-        TextGdnReplayRows replay{qkv.data(), workspace.data(), b.data(), a.data()};
-        const auto verify = local ? dec::decode_verify_gdn_local : dec::decode_verify_gdn;
-        check(verify(rows, replay, z.data(), weights, bindings.data(), bindings.data() + 1,
-                     workspace.data() + rows * features, output.data(), nullptr), "GDN verify");
-        check(cudaDeviceSynchronize(), "GDN verify completion");
-        result.history = tail_history.snapshot();
-        result.recurrent = tail_state.snapshot();
-        Array<Bf16> prefix_h(features * 3, poison);
-        Array<float> prefix_s(heads * 128 * 128, poison);
-        const auto prefix = local ? text_gdn_replay_prefix_local : text_gdn_replay_prefix;
-        check(prefix(2, replay, weights, bindings.data()[0], {prefix_h.data(), prefix_s.data()},
-                     nullptr), "GDN prefix replay");
-        check(cudaDeviceSynchronize(), "GDN replay completion");
-        result.prefix_history = prefix_h.snapshot();
-        result.prefix_recurrent = prefix_s.snapshot();
-        if (std::memcmp(history.data(), initial_h.data(), initial_h.size() * sizeof(Bf16)) ||
-            std::memcmp(state.data(), initial_s.data(), initial_s.size() * sizeof(float))) {
-            throw std::runtime_error("GDN verification/replay mutated committed state");
-        }
-    } else if (lanes > 1) {
-        const auto initial_h = history.snapshot();
-        const auto initial_s = state.snapshot();
-        verify_batch(local, features, heads,
-                     {{qkv.data(), workspace.data(), b.data(), a.data()}, z.data(),
-                      bindings.data()[0], bindings.data()[1], workspace.data() + rows * features,
-                      output.data()}, weights);
-        check(cudaDeviceSynchronize(), "GDN batched verification completion");
-        result.history = tail_history.snapshot();
-        result.recurrent = tail_state.snapshot();
-        if (std::memcmp(history.data(), initial_h.data(), initial_h.size() * sizeof(Bf16)) ||
-            std::memcmp(state.data(), initial_s.data(), initial_s.size() * sizeof(float))) {
-            throw std::runtime_error("GDN batched verification mutated committed state");
-        }
+    if (rows <= verify_lanes * gdn_verify_rows) {
+        const auto convolved_size = static_cast<std::size_t>(rows) * features;
+        const replay::Lane job{
+            {},
+            {qkv.data(), workspace.data(), b.data(), a.data()},
+            z.data(),
+            workspace.data() + convolved_size,
+            output.data(),
+            rows,
+            rows == 1,
+        };
+        result = run_gdn_replay(local, lanes, poison, weights, job, history, state);
     } else {
         Array<float2> gates(rows * heads, poison);
         const auto scratch_bytes = ((rows + 31) / 32) * heads * (2 * 32 * 32 * 2 + 3 * 32 * 4);
         Array<std::uint8_t> scratch(scratch_bytes, poison);
-        using Prefill = cudaError_t (*)(int, const Bf16*, const Bf16*, const Bf16*, const Bf16*,
-            TextGdnWeights, TextGdnState, Bf16*, float2*, Bf16*, cudaStream_t, void*, std::size_t);
-        Prefill prefill = local ? static_cast<Prefill>(dec::tensor_core_prefill_gdn_local) :
-                                  static_cast<Prefill>(dec::tensor_core_prefill_gdn);
-        check(prefill(rows, qkv.data(), z.data(), b.data(), a.data(), weights, bindings.data()[0],
-                      workspace.data(), gates.data(), output.data(), nullptr, scratch.data(),
-                      scratch_bytes), "GDN prefill");
+        using Prefill = cudaError_t (*)(
+            int, const Bf16*, const Bf16*, const Bf16*, const Bf16*, TextGdnWeights, TextGdnState,
+            Bf16*, float2*, Bf16*, cudaStream_t, void*, std::size_t, TextGdnPrefillCheckpoints);
+        const Prefill prefill = local ? static_cast<Prefill>(dec::tensor_core_prefill_gdn_local)
+                                      : static_cast<Prefill>(dec::tensor_core_prefill_gdn);
+        check(prefill(rows, qkv.data(), z.data(), b.data(), a.data(), weights,
+                      {history.data(), state.data()}, workspace.data(), gates.data(), output.data(),
+                      nullptr, scratch.data(), scratch_bytes, {}),
+              "GDN prefill");
         check(cudaDeviceSynchronize(), "GDN prefill completion");
         if (std::all_of(scratch.data(), scratch.data() + scratch_bytes,
                         [poison](auto byte) { return byte == poison; })) {
@@ -247,7 +313,7 @@ GdnResult gdn(int rows, int rank) {
 
 void gdn_check() {
     for (const int rows : {1, 5, 20, 128}) {
-        const int lanes = rows == 20 ? dec::GdnVerificationBatch::lanes : 1;
+        const int lanes = rows == verify_lanes * gdn_verify_rows ? verify_lanes : 1;
         const auto full = gdn(rows, -1);
         for (int rank = 0; rank < 2; ++rank) {
             const auto local = gdn(rows, rank);

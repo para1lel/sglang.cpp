@@ -292,7 +292,7 @@ void check_speculative_media(const Decoder& engine, const std::vector<DecoderMed
         require(batch.admit_multimodal(0, tokens, options, media) == 0,
                 "Unexpected cache hit in the media K4 page test");
         std::vector<int> committed;
-        int replayed = 0;
+        int discarded = 0;
         bool verified_across_page = false;
         for (;;) {
             const auto step = batch.advance_chunked({true})[0];
@@ -302,7 +302,10 @@ void check_speculative_media(const Decoder& engine, const std::vector<DecoderMed
                 const int end = start + step.mtp_verified_rows - 1;
                 verified_across_page |= start / mxfp8_page_size != end / mxfp8_page_size;
             }
-            replayed += step.mtp_replayed_rows;
+            require(step.mtp_replayed_rows == 0, "Media MTP replayed committed GDN rows");
+            discarded +=
+                std::max(0, step.mtp_verified_rows - static_cast<int>(step.token.has_value()) -
+                                step.extra_token_count);
             if (step.token) committed.push_back(*step.token);
             committed.insert(committed.end(), step.extra_tokens.begin(),
                 step.extra_tokens.begin() + step.extra_token_count);
@@ -311,9 +314,9 @@ void check_speculative_media(const Decoder& engine, const std::vector<DecoderMed
                 break;
             }
         }
-        require(committed == expected.output_token_ids && verified_across_page && replayed > 0,
-                "Media K4 did not preserve the result through cross-page verification and replay");
-        std::cout << "media K4 cross-page verified, replayed=" << replayed << '\n';
+        require(committed == expected.output_token_ids && verified_across_page && discarded > 0,
+                "Media K4 changed after cross-page verification and discarded proposals");
+        std::cout << "media K4 cross-page verified, discarded=" << discarded << '\n';
     }
 }
 

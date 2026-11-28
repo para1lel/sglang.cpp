@@ -7,6 +7,7 @@
 namespace sglang {
 
 inline constexpr int text_target_fp8_max_rows = 24;
+inline constexpr int text_target_fp8_single_tile_rows = 8;
 inline constexpr int text_target_fp8_m10_rows = 10;
 inline constexpr int text_target_fp8_m40_rows = 40;
 inline constexpr int text_target_fp8_m80_rows = 80;

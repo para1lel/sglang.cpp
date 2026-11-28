@@ -13,7 +13,7 @@ python -B tests/prefill/run_native.py \
     --evidence artifacts/prefill-check
 ```
 
-Pass either executable to run its checks on seven fixed W2 prefixes from 1 to 511 rows.
+Pass either executable to run its checks on seven fixed prompt prefixes from 1 to 511 rows.
 The CLI uses `--mtp-steps 0` and compares five greedy IDs and the ordered top 64 scores
 across two invocations. Each score digest covers the little-endian 32-bit token ID and
 IEEE 754 binary32 logit in step and rank order.

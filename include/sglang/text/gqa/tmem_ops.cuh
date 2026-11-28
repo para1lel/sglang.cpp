@@ -78,7 +78,6 @@ inline constexpr int tmem_threads = flash_queries + tmem_producers;
 inline constexpr int pair_threads = tmem_threads + 32;
 
 static_assert(tmem_scores + 2 * flash_keys <= tmem_cols);
-inline constexpr int tmem_parts = 3;
 
 struct alignas(1024) TmemFlashTile {
     std::uint16_t query[channels / tmem_swizzle][flash_queries][tmem_swizzle];

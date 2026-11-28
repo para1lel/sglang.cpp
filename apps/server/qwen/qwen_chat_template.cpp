@@ -443,11 +443,6 @@ QwenChatTemplate::QwenChatTemplate(const std::filesystem::path& checkpoint) {
 
 namespace {
 
-const Value* field(const Value& value, std::string_view key) {
-    const auto* object = value.ordered_object();
-    return object ? get(*object, key) : nullptr;
-}
-
 void collect_tools(json::Array& output, const Value* value) {
     if (!value || value->is_null()) return;
     const auto* tools = value->array();
@@ -459,9 +454,9 @@ void collect_message_tools(json::Array& output, const OrderedObject& chat) {
     const auto* list = get(chat, "messages");
     if (!list || !list->array()) return;
     for (const auto& message : *list->array()) {
-        const auto* tools = field(message, "tools");
+        const auto* tools = get_ordered(message, "tools");
         if (!tools || tools->is_null()) continue;
-        const auto* role = field(message, "role");
+        const auto* role = get_ordered(message, "role");
         if (role && (role->string() == "system" || role->string() == "developer" ||
                      role->string() == "root")) {
             collect_tools(output, tools);
@@ -477,9 +472,9 @@ ChatToolChoice read_tool_choice(const Value* selector, std::string_view& selecte
     }
     if (selector->string() == "none") return ChatToolChoice::none;
     if (selector->string() == "required") return ChatToolChoice::required;
-    const auto* type = field(*selector, "type");
-    const auto* function = field(*selector, "function");
-    const auto* name = function ? field(*function, "name") : nullptr;
+    const auto* type = get_ordered(*selector, "type");
+    const auto* function = get_ordered(*selector, "function");
+    const auto* name = function != nullptr ? get_ordered(*function, "name") : nullptr;
     if (!type || type->string() != "function" || !name || !name->string() ||
         name->string()->empty()) {
         throw std::invalid_argument("Unsupported tool_choice. Expected auto, none, required, "
@@ -531,16 +526,16 @@ ChatTools select_qwen_chat_tools(const OrderedObject& chat) {
     if (output.choice == ChatToolChoice::none) return output;
     std::set<std::string> names;
     for (auto& tool : effective) {
-        const auto* type = field(tool, "type");
-        const auto* function = field(tool, "function");
-        const auto* value = function ? field(*function, "name") : nullptr;
+        const auto* type = get_ordered(tool, "type");
+        const auto* function = get_ordered(tool, "function");
+        const auto* value = function != nullptr ? get_ordered(*function, "name") : nullptr;
         const auto name = value ? value->string().value_or("") : ""sv;
         if (!type || type->string() != "function" || name.empty() || name.size() > 64 ||
             name.find_first_of("<>\r\n") != name.npos || !names.emplace(name).second) {
             throw std::invalid_argument("Expected unique function tools with valid names");
         }
         if (output.choice == ChatToolChoice::named && name != selected) continue;
-        const auto* strict = field(*function, "strict");
+        const auto* strict = get_ordered(*function, "strict");
         if (strict && !strict->is_null()) {
             if (!strict->boolean()) throw std::invalid_argument("Expected boolean function.strict");
             output.strict |= *strict->boolean();

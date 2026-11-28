@@ -3,8 +3,9 @@
 namespace sglang::decoder {
 
 PrefixCacheLayout tp2_prefix_cache_layout(int rank) {
-    return {2, rank, mxfp8_kv_heads / 2, text_gdn_qk_heads / 2,
-            text_gdn_value_heads / 2, rank == 0};
+    return {
+        2, rank, mxfp8_kv_heads / 2, text_gdn_qk_heads / 2, text_gdn_value_heads / 2, true,
+    };
 }
 
 std::size_t prefix_kv_payload_bytes_per_page(const PrefixCacheLayout& layout) {

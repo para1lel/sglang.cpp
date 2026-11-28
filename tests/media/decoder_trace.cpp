@@ -1,4 +1,7 @@
 #include "sglang/decoder_cuda.cuh"
+#include "sglang/decoder_prefill.h"
+#include "sglang/runtime/backend/cuda_resources.h"
+#include "sglang/runtime/backend/device_arena.h"
 #include "sglang/text/prefill_attn_sm100.h"
 #include "sglang/testing/media/decoder_fixture.h"
 #include "sglang/testing/media/decoder_trace.h"
@@ -6,6 +9,8 @@
 #include <iostream>
 
 using namespace sglang;
+using sglang::decoder::CudaError;
+using sglang::decoder::DeviceArena;
 using sglang::decoder::ExactGqaWorkspace;
 using sglang::decoder::PairedPrefillScratch;
 
@@ -82,17 +87,19 @@ void media_test::finish_mtp_trace() {
     mtp_prompt_rows = 0;
 }
 
-extern "C" cudaError_t __real_cudaMallocFromPoolAsync(
-    void**, std::size_t, cudaMemPool_t, cudaStream_t);
+extern "C" void*
+real_arena_lease(DeviceArena* arena,
+                 std::size_t bytes) asm("__real__ZN6sglang7decoder11DeviceArena8allocateEm");
+extern "C" void*
+wrap_arena_lease(DeviceArena* arena,
+                 std::size_t bytes) asm("__wrap__ZN6sglang7decoder11DeviceArena8allocateEm");
 
-extern "C" cudaError_t __wrap_cudaMallocFromPoolAsync(
-    void** output, std::size_t bytes, cudaMemPool_t pool, cudaStream_t stream) {
-    if (tracing && force_fallback) {
+void* wrap_arena_lease(DeviceArena* arena, std::size_t bytes) {
+    if (tracing && force_fallback && bytes == decoder::prefill_workspace_bytes(tile_rows)) {
         ++fallback_calls;
-        *output = nullptr;
-        return cudaErrorMemoryAllocation;
+        throw CudaError(cudaErrorMemoryAllocation, "Test media prefill arena exhaustion");
     }
-    return __real_cudaMallocFromPoolAsync(output, bytes, pool, stream);
+    return real_arena_lease(arena, bytes);
 }
 
 extern "C" cudaError_t __real_cudaStreamBeginCapture(cudaStream_t, cudaStreamCaptureMode);

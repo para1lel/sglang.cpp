@@ -2,7 +2,7 @@
 
 ## Responsibilities and sources of truth
 
-HTTP handles [model discovery](#model-discovery) and [server information](#server-information) outside the completion queue. The [startup writer](../apps/sglang-server.cpp#L219)<!-- prefix: "std::string " --> supplies metadata, and the [scheduler snapshot](../apps/server/batch_service.cpp#L788)<!-- prefix: "BatchRuntime" --> supplies live state under its mutex. [Implementation map](https://github.com/para1lel/sglang.cpp/blob/49a48f98e44223bd619e7b6f43569b45175504c0/docs/native-model-info.md#responsibilities-and-sources-of-truth)
+HTTP handles [model discovery](#model-discovery) and [server information](#server-information) outside the completion queue. The [startup writer](../apps/sglang-server.cpp#L248)<!-- prefix: "std::string " --> supplies metadata, and the [scheduler snapshot](../apps/server/batch_service.cpp#L771)<!-- prefix: "BatchRuntime" --> supplies live state under its mutex. [Implementation map](https://github.com/para1lel/sglang.cpp/blob/49a48f98e44223bd619e7b6f43569b45175504c0/docs/native-model-info.md#responsibilities-and-sources-of-truth)
 
 ## Runtime path
 
@@ -23,37 +23,39 @@ Both model-info aliases bypass the queue and return HTTP 200 with identical star
 
 ### Model discovery
 
-`GET /v1/models` returns 200 with `object: "list"` and one card in `data`. `GET /v1/models/Qwen3.8-27B-FP8` returns the card. Its `id` and `root` are that model ID. Other fields are `object: "model"`, `owned_by: "sglang"`, `parent: null`, integer Unix seconds in `created`, and `max_model_len: 262144`. See [resident admission](batch-graphs.md#resident-memory-admission) and the [benchmark alias](../benchmarks/streaming/README.md#wire-contract). [Pinned SGLang discovery comparison](https://github.com/para1lel/sglang.cpp/blob/6debe50edccdeda34ff307235ed38e74b6b8f2ee/docs/native-model-info.md#model-discovery)
+`GET /v1/models` returns 200 with `object: "list"` and one card in `data`. `GET /v1/models/Qwen3.8-27B-FP8` returns the card. Its `id` and `root` are that model ID. Other fields are `object: "model"`, `owned_by: "sglang"`, `parent: null`, integer Unix seconds in `created`, and `max_model_len: 262144`. See [resident admission](batch-graphs.md#resident-memory-admission) and the [token-ID alias](text-serving.md#token-id-streaming-alias).
 
 ### Server information
 
-Both `GET /server_info` and deprecated `GET /get_server_info` return startup settings and a live scheduler snapshot. Like [model discovery](#model-discovery), they bypass the completion queue regardless of prefix reuse. [Reader dispatch](../apps/server/prefix_controls.cpp#L692)<!-- prefix: "write_json(c" -->
+Both `GET /server_info` and deprecated `GET /get_server_info` return startup settings and a live scheduler snapshot. Like [model discovery](#model-discovery), they bypass the completion queue regardless of prefix reuse. [Reader dispatch](../apps/server/prefix_controls.cpp#L644)<!-- prefix: "write_json(c" -->
 
 | Top-level field | JSON type and meaning |
 | --- | --- |
 | `frontend`, `version`, `supports_inline_system` | `"cpp"`, `null`, and `false`. A system turn must be first. |
 | `host`, `port`, `device` | `"127.0.0.1"`, TCP port, and process-visible CUDA ordinal. |
-| `dp_size`, `tp_size`, `pp_size` | Integers reported by the batch executor. The single-device executor sets each to `1`. [Topology](../src/runtime/server/single_device_batch_executor.cpp#L74)<!-- prefix: "BatchTopolog" --> |
+| `dp_size`, `tp_size`, `pp_size` | Integers reported by the batch executor. The single-device executor sets each to `1`. [Topology](../src/runtime/server/single_device_batch_executor.cpp#L77)<!-- prefix: "BatchTopolog" --> |
 | `model_path`, `tokenizer_path`, `served_model_name` | Strings. Both paths expose the effective checkpoint directory. The served ID is `"Qwen3.8-27B-FP8"`. |
 | `launch_command` | String starting with `sglang-server`. It records explicit options in input order, including repeats. |
 | `max_running_requests`, `max_num_batched_tokens` | Lane limit and aggregate target tokens per step. Defaults are 8 and 32,768. |
 | `mtp_steps`, `prefix_cache_entries` | Integer [server draft depth](mtp.md#runtime-path), default 4, and the former slot-count field, always 0. |
 | `lmcache_enabled`, `lmcache_available` | Booleans for [configured reuse and daemon availability](prefix-cache.md#lmcache-daemon). |
-| `enable_multimodal` | Boolean. `true` for [image and video inputs](chat-serving.md#image-and-video-inputs); the vision encoder loads on first use. [Capability field](../apps/sglang-server.cpp#L258)<!-- prefix: "body += R\u0022(," --> |
-| `mtp_online_gqa` | Boolean. True on B200 with positive server draft depth and capacity for at least two lanes. Each scored draft wave checks its lanes. [Metadata check](../apps/sglang-server.cpp#L280)<!-- prefix: "body += back" --> |
+| `gpu_memory_utilization`, `prefix_gqa_pages`, `prefix_gdn_slots` | Number and two integers. Defaults are `0.88`, `0`, and `0`. Zero selects automatic cache sizing. [Pool configuration](../apps/sglang-server.cpp#L298)<!-- prefix: "body += R\u0022(," --> |
+| `resident_prefix_cache`, `device_memory_pools` | Reuse toggle and one object per rank. Each object contains process-visible `device`, total arena `budget_bytes`, general `capacity_bytes` and `available_bytes`, and `cache_bytes` and `cache_available_bytes`. [Rank fields](../apps/sglang-server.cpp#L309)<!-- prefix: "for (int ran" --> · [Memory pools](serving/request-memory.md) |
+| `enable_multimodal` | Boolean. `true` for [image and video inputs](chat-serving.md#image-and-video-inputs); the vision encoder loads on first use. [Capability field](../apps/sglang-server.cpp#L287)<!-- prefix: "body += R\"(," --> |
+| `mtp_online_gqa` | Boolean. True on B200 with positive server draft depth and capacity for at least two lanes. Each scored draft wave checks its lanes. [Metadata check](../apps/sglang-server.cpp#L329)<!-- prefix: "body += back" --> |
 | `mtp_int8_head` | Boolean indicating availability of the [INT8 draft head](#int8-draft-head). |
 | `certified_int8_verify_head` | Boolean indicating availability of the [certified Tensor Core head](#certified-tensor-core-target-head). |
-| `fp8_prefill` | String `"tensor-core"` on B200 or `"exact"` otherwise. This reports backend policy; individual grants still apply shape and resource guards. [Backend selection](../apps/sglang-server.cpp#L290)<!-- prefix: "const bool t" --> |
-| `target_gqa` | String `"grouped-split"` on B200, or `"exact"` otherwise. Per-row shape and numerical guards still apply. [Backend selection](../apps/sglang-server.cpp#L293)<!-- prefix: "sglang::json" --> |
-| `paired_prefill` | Boolean. True on B200 with at least two lanes and a step budget of at least 2,048. The [whole-tile selector](native-prefill-workspace.md#projection-pairs-for-mtp) determines eligibility and workspace fallback per step. [Metadata check](../apps/sglang-server.cpp#L295)<!-- prefix: "const bool p" --> |
-| `mtp_seed_fc` | Null at K0, otherwise the configured [draft seed FC policy](mtp.md#runtime-path). This field is exclusive to the server information routes. [Metadata builder](../apps/sglang-server.cpp#L461)<!-- prefix: "std::string " --> |
+| `fp8_prefill` | String `"tensor-core"` on B200 or `"exact"` otherwise. This reports backend policy; individual grants still apply shape and resource guards. [Backend selection](../apps/sglang-server.cpp#L339)<!-- prefix: "const bool t" --> |
+| `target_gqa` | String `"grouped-split"` on B200, or `"exact"` otherwise. Per-row shape and numerical guards still apply. [Backend selection](../apps/sglang-server.cpp#L342)<!-- prefix: "sglang::json" --> |
+| `paired_prefill` | Boolean configuration gate for eligible Tensor Core [projection groups](native-prefill-workspace.md#projection-pairs-for-mtp). Individual grants and rank workspace availability determine dispatch. [Metadata check](../apps/sglang-server.cpp#L344)<!-- prefix: "const bool p" --> |
+| `mtp_seed_fc` | Null at K0, otherwise the configured [draft seed FC policy](mtp.md#runtime-path). This field is exclusive to the server information routes. [Metadata builder](../apps/sglang-server.cpp#L519)<!-- prefix: "std::string " --> |
 | `sampling_defaults` | String `"model"` or `"openai"`, according to the serving configuration. |
 | `reasoning_parser`, `tool_call_parser` | JSON `null` when disabled. Enabled values are `"qwen3"` and `"qwen3_coder"`, respectively. |
-| `eager`, `trace_batches`, `batch_cuda_graphs` | Booleans for eager execution, tracing, and [TP1 batch graphs](batch-graphs.md). `batch_cuda_graphs` defaults to `true` on TP1 and is `false` with `--eager` or TP2. |
+| `eager`, `trace_batches`, `batch_cuda_graphs` | Booleans for eager execution, tracing, and [ordinary decode graph policy](batch-graphs.md). `batch_cuda_graphs` defaults to `true` on TP1 and TP2 and is `false` with `--eager`. It reports configuration. Actual replay depends on each step’s eligibility. [Policy field](../apps/sglang-server.cpp#L357)<!-- prefix: "body += R\"(," --> |
 | `startup_time` | Object with one numeric field, `server_e2e`: elapsed monotonic seconds from before argument parsing through listener creation, fixed for the process lifetime. |
 | `internal_states` | Array with one object for the native scheduler rank. |
 
-On B200 with Tensor Core prefill and positive depth, this policy object reports `preferred: "tma_tcgen05_bf16_fp32"`, `fallback: "wmma_bf16_fp32"`, `outside_shape_limits: "simt_bf16_fp32"`, and limits of `min_prompt_tokens: 4096`, `min_rows: 64`, and `max_rows: 128`. Other positive-depth configurations report `preferred: "simt_bf16_fp32"`. See [launch eligibility](mtp.md#runtime-path). [Policy attachment](../apps/sglang-server.cpp#L317)<!-- prefix: "return body " -->
+On B200 with Tensor Core prefill and positive depth, this policy object reports `preferred: "tma_tcgen05_bf16_fp32"`, `fallback: "wmma_bf16_fp32"`, `outside_shape_limits: "simt_bf16_fp32"`, and limits of `min_prompt_tokens: 4096`, `min_rows: 64`, and `max_rows: 128`. Other positive-depth configurations report `preferred: "simt_bf16_fp32"`. See [launch eligibility](mtp.md#runtime-path). [Policy attachment](../apps/sglang-server.cpp#L366)<!-- prefix: "return body " -->
 
 | Field in `internal_states[0]` | JSON type and meaning |
 | --- | --- |
@@ -63,7 +65,7 @@ On B200 with Tensor Core prefill and positive depth, this policy object reports 
 | `num_running_reqs` | Integer count of admitted user generation items still in scheduler slots. It excludes waiting HTTP work and internal health jobs. |
 | `generation_tokens_total` | Cumulative integer count of published user output IDs, including additional MTP IDs. It advances at scheduler publication, independently of socket delivery and prefix reuse. Health generation contributes zero. |
 
-The command records switches and validated numeric or enumerated operands. Every `--checkpoint` value, including superseded values, becomes `'<redacted>'`. Public path fields identify the selected checkpoint. Environment, executable paths, and HTTP inputs supply no command text. [Argument recording](../apps/sglang-server.cpp#L122)<!-- prefix: "Arguments pa" --> · [Startup interval](../apps/sglang-server.cpp#L395)<!-- prefix: "const auto s" --> · [Listener timestamp](../apps/sglang-server.cpp#L416)<!-- prefix: "const std::c" -->
+The command records switches and validated numeric or enumerated operands. Every `--checkpoint` value, including superseded values, becomes `'<redacted>'`. Public path fields identify the selected checkpoint. Environment, executable paths, and HTTP inputs supply no command text. [Argument recording](../apps/sglang-server.cpp#L143)<!-- prefix: "Arguments pa" --> · [Startup interval](../apps/sglang-server.cpp#L452)<!-- prefix: "const auto s" --> · [Listener timestamp](../apps/sglang-server.cpp#L474)<!-- prefix: "const std::c" -->
 
 Native omits upstream Python settings, `kv_events`, `last_gen_throughput`, and `memory_usage`. [Pinned Python routes](https://github.com/sgl-project/sglang/blob/f04d886bf79aa3d6237cbb12a3311838eb9f9bd8/python/sglang/srt/entrypoints/http_server.py#L888)<!-- prefix: "@app.get(\"/g" --> · [Resolved fields](https://github.com/sgl-project/sglang/blob/f04d886bf79aa3d6237cbb12a3311838eb9f9bd8/python/sglang/srt/entrypoints/server_utils.py#L206)<!-- prefix: "def build_se" --> · [Scheduler measurements](https://github.com/sgl-project/sglang/blob/f04d886bf79aa3d6237cbb12a3311838eb9f9bd8/python/sglang/srt/managers/scheduler_components/internal_state.py#L75)<!-- prefix: "state[\"last_" -->
 
@@ -101,15 +103,15 @@ Reproduce archived timings with the measured revision, command, and environment.
 
 ### Model-info targets
 
-Both routes accept empty GETs, ignore the query, and follow [shared redirects](http-server.md#request-targets-and-redirects). A GET with a body or an unknown path returns 404. Unsupported methods return 405 with `Allow: GET` and `{"detail":"Method Not Allowed"}`; HEAD omits the body. The reader rejects malformed HTTP first. Use [readiness](http-server.md#health-and-readiness) for the decoder and [tokenization](native-tokenization.md) for tokenizer access. [Method response](../apps/server/http.cpp#L633)<!-- prefix: "void write_g" --> · [Request line](../apps/server/http.cpp#L128)<!-- prefix: "HttpRequest " -->
+Both routes accept empty GETs, ignore the query, and follow [shared redirects](http-server.md#request-targets-and-redirects). A GET with a body or an unknown path returns 404. Unsupported methods return 405 with `Allow: GET` and `{"detail":"Method Not Allowed"}`; HEAD omits the body. The reader rejects malformed HTTP first. Use [readiness](http-server.md#health-and-readiness) for the decoder and [tokenization](native-tokenization.md) for tokenizer access. [Method response](../apps/server/http.cpp#L656)<!-- prefix: "void write_g" --> · [Request line](../apps/server/http.cpp#L128)<!-- prefix: "HttpRequest " -->
 
 ### Discovery targets and errors
 
-The list ignores the query and returns 404 on a non-GET or nonempty body. Retrieval ignores query and framed body. The case-sensitive ID is the decoded suffix, including any trailing slash. An interior line feed prevents matching. Empty or unknown IDs return 404 with `error.message: "The model '<id>' does not exist"`, `type: "invalid_request_error"`, `param: "model"`, and `code: "model_not_found"`. Unsupported retrieval methods follow the [model-info 405 rule](#model-info-targets). [ID decoding](../apps/server/http.cpp#L353)<!-- prefix: "std::string " --> · [Lookup and errors](../apps/server/prefix_controls.cpp#L467)<!-- prefix: "void retriev" --> · [Method response](../apps/server/http.cpp#L562)<!-- prefix: "void write_m" -->
+The list ignores the query and returns 404 on a non-GET or nonempty body. Retrieval ignores query and framed body. The case-sensitive ID is the decoded suffix, including any trailing slash. An interior line feed prevents matching. Empty or unknown IDs return 404 with `error.message: "The model '<id>' does not exist"`, `type: "invalid_request_error"`, `param: "model"`, and `code: "model_not_found"`. Unsupported retrieval methods follow the [model-info 405 rule](#model-info-targets). [ID decoding](../apps/server/http.cpp#L353)<!-- prefix: "std::string " --> · [Lookup and errors](../apps/server/prefix_controls.cpp#L415)<!-- prefix: "void retriev" --> · [Method response](../apps/server/http.cpp#L585)<!-- prefix: "void write_m" -->
 
 ### Server-info targets
 
-Both aliases ignore queries and framed GET bodies, return 200 even with `ready: false`, and redirect trailing slashes to the corresponding alias. Unknown paths return 404. Apply the [same 405/HEAD rule](#model-info-targets). Invalid framing fails before the handler. [Query split](../apps/server/http.cpp#L143)<!-- prefix: "const auto s" --> · [Method reply](../apps/server/http.cpp#L562)<!-- prefix: "void write_m" --> · [Worker flag](../apps/server/batch_service.cpp#L719)<!-- prefix: "bool BatchSe" -->
+Both aliases ignore queries and framed GET bodies, return 200 even with `ready: false`, and redirect trailing slashes to the corresponding alias. Unknown paths return 404. Apply the [same 405/HEAD rule](#model-info-targets). Invalid framing fails before the handler. [Query split](../apps/server/http.cpp#L143)<!-- prefix: "const auto s" --> · [Method reply](../apps/server/http.cpp#L585)<!-- prefix: "void write_m" --> · [Worker flag](../apps/server/batch_service.cpp#L690)<!-- prefix: "bool BatchSe" -->
 
 ## Verification
 

@@ -30,12 +30,10 @@ private:
     template <typename Weight>
     static std::vector<Tap<Weight>> make_weights(int input, int output, ResizeFilter filter);
     static int make_fixed_weights(int input, int output, std::vector<Tap<int>>& axis);
-    static void apply_axis(const std::uint8_t* input, Size source, std::uint8_t* output,
-                           Size target, const std::vector<Tap<int>>& axis, int precision,
-                           bool horizontal);
-    template <typename Input, typename Output>
-    static void apply_bilinear(const Input* input, Size source, Output* output, Size target,
-                               const std::vector<Tap<float>>& axis, bool horizontal);
+    template <typename Input, typename Output, typename Weight, typename Accumulate>
+    static void apply_axis(const Input* input, Size source, Output* output, Size target,
+                           const std::vector<Tap<Weight>>& axis, bool horizontal,
+                           Accumulate accumulate);
 
     Size input_;
     Size middle_;

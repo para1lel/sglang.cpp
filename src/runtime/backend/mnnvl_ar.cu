@@ -1,4 +1,6 @@
 #include "sglang/runtime/backend/mnnvl_ar.h"
+#include "sglang/runtime/backend/device_arena.h"
+#include "sglang/runtime/backend/cuda_resources.h"
 #include "sglang/runtime/backend/mnnvl_rms_quantize.h"
 #include "sglang/text/quantization/rms_quantize.cuh"
 #include "sglang/runtime/execution/tp_verify_graph.h"
@@ -45,6 +47,9 @@ struct alignas(16) LamportState {
     uint2 dirty_bytes;
     std::uint32_t arrivals;
 };
+
+static_assert(kSignalPad >= kBufferAlignment + sizeof(LamportState));
+static_assert(kBufferAlignment % alignof(LamportState) == 0);
 
 template <int Stages>
 struct LamportBuffer {
@@ -270,8 +275,11 @@ private:
     int saved_ = 0;
 };
 
-__global__ void fill_sentinel_kernel(std::uint32_t* target, std::size_t count) {
-    std::size_t index = blockIdx.x * blockDim.x + threadIdx.x;
+__global__ void init_lamport_kernel(std::uint32_t* target, std::size_t count, LamportState* flags,
+                                    std::uint32_t buffer_size) {
+    const std::size_t index = (blockIdx.x * blockDim.x) + threadIdx.x;
+    if (index == 0)
+        *flags = LamportState{{0, 2, buffer_size, 0}, {0, 0}, 0};
     std::size_t stride = gridDim.x * blockDim.x;
     for (std::size_t i = index; i < count; i += stride) target[i] = kLamportSentinel;
 }
@@ -320,8 +328,10 @@ __device__ bool poll_wide_rank0(const uint4* address, PackedBf16& remote, std::u
                                 std::uint64_t epoch) {
     unsigned misses = 0;
     while (!poll_pack(address, remote)) {
-        if ((++misses & 255) == 0 &&
-            PairAtomic(*rejected).load(cuda::memory_order_acquire) == epoch) return false;
+        if (rejected != nullptr && (++misses & 255) == 0 &&
+            PairAtomic(*rejected).load(cuda::memory_order_acquire) == epoch) {
+            return false;
+        }
     }
     return true;
 }
@@ -424,6 +434,7 @@ struct MnnvlAllReduce::State {
     std::uint64_t* wide_device_word = nullptr;
     std::uint64_t wide_epoch = 0;
 
+    std::array<std::shared_ptr<DeviceArena>, kRanks> charged_arenas{};
     CUmemGenericAllocationHandle physical[kRanks]{};
     CUmemGenericAllocationHandle multicast{};
     CUdeviceptr uc_base = 0;           
@@ -501,49 +512,55 @@ bool MnnvlAllReduce::State::map_wide_submission() {
 void MnnvlAllReduce::State::release() {
     CallerDevice device_scope;
     for (int r = 0; r < kRanks; ++r) {
-        if (flags[r] != nullptr) {
-            cudaSetDevice(devices[r]);
-            cudaFree(flags[r]);
-            flags[r] = nullptr;
+        if (flags[r] == nullptr)
+            continue;
+        cudaError_t status = cudaSetDevice(devices[r]);
+        if (status == cudaSuccess)
+            status = cudaDeviceSynchronize();
+        if (status != cudaSuccess) {
+            (void)std::fputs("MNNVL teardown could not fence a rank; retaining its workspace\n",
+                             stderr);
+            return;
         }
     }
-    if (wide_rejected != nullptr) {
-        (void)cudaFreeHost(wide_rejected);
-        wide_rejected = nullptr;
-    }
-    if (mapped_mc) {
-        (void)cuMemUnmap(mc_va, allocation_size);
+    if (mapped_mc && cuMemUnmap(mc_va, allocation_size) == CUDA_SUCCESS) {
         mapped_mc = false;
     }
-    if (reserved_mc) {
+    if (reserved_mc && !mapped_mc) {
         (void)cuMemAddressFree(mc_va, allocation_size);
         reserved_mc = false;
     }
     for (int r = kRanks - 1; r >= 0; --r) {
-        if (mapped_uc[r]) {
-            (void)cuMemUnmap(uc_ptrs[r], allocation_size);
+        if (mapped_uc[r] && cuMemUnmap(uc_ptrs[r], allocation_size) == CUDA_SUCCESS) {
             mapped_uc[r] = false;
         }
     }
-    if (reserved_uc) {
+    if (reserved_uc && !mapped_uc[0] && !mapped_uc[1]) {
         (void)cuMemAddressFree(uc_base, allocation_size * kRanks);
         reserved_uc = false;
     }
     for (int r = kRanks - 1; r >= 0; --r) {
-        if (bound_multicast[r]) {
-            (void)cuMulticastUnbind(multicast, devices[r], 0, allocation_size);
+        if (bound_multicast[r] &&
+            cuMulticastUnbind(multicast, devices[r], 0, allocation_size) == CUDA_SUCCESS) {
             bound_multicast[r] = false;
         }
     }
     for (int r = kRanks - 1; r >= 0; --r) {
-        if (created_physical[r]) {
-            (void)cuMemRelease(physical[r]);
+        if (created_physical[r] && !mapped_uc[r] && !bound_multicast[r] &&
+            cuMemRelease(physical[r]) == CUDA_SUCCESS) {
             created_physical[r] = false;
         }
+        if (charged_arenas[r] && !created_physical[r]) {
+            charged_arenas[r]->refund_startup_bytes(allocation_size);
+        }
     }
-    if (created_multicast) {
+    if (created_multicast && !mapped_mc && !bound_multicast[0] && !bound_multicast[1]) {
         (void)cuMemRelease(multicast);
         created_multicast = false;
+    }
+    if (wide_rejected != nullptr) {
+        (void)cudaFreeHost(wide_rejected);
+        wide_rejected = nullptr;
     }
 }
 
@@ -610,6 +627,14 @@ void MnnvlAllReduce::create_physical(State& state) {
     mc_prop.flags = 0;
 
     for (int r = 0; r < kRanks; ++r) {
+        if (!DeviceArena::active(state.devices[r]))
+            continue;
+        auto arena = DeviceArena::current(state.devices[r]);
+        arena->charge_startup_bytes(state.allocation_size);
+        state.charged_arenas[r] = std::move(arena);
+    }
+
+    for (int r = 0; r < kRanks; ++r) {
         device_scope.select(state.devices[r], "Select a rank device");
         alloc_prop.location.id = state.devices[r];
         require_cu(cuMemCreate(&state.physical[r], state.allocation_size, &alloc_prop, 0),
@@ -671,26 +696,18 @@ void MnnvlAllReduce::init_lamport(State& state) {
     state.buffer_size_bytes = static_cast<std::uint32_t>(per_buffer);
     state.twoshot_supported = per_buffer >= kTwoshotBufferBytes;
 
+    const std::uint64_t flags_offset = round_up(usable, kBufferAlignment);
     CallerDevice device_scope;
     for (int r = 0; r < kRanks; ++r) {
         device_scope.select(state.devices[r], "Select a rank device");
-        cudaError_t status = cudaMalloc(&state.flags[r], sizeof(LamportState));
+        const CUdeviceptr local = state.uc_ptrs[r];
+        state.flags[r] = reinterpret_cast<LamportState*>(local + flags_offset);
+        init_lamport_kernel<<<256, 256, 0, nullptr>>>(reinterpret_cast<std::uint32_t*>(local),
+                                                      usable / sizeof(std::uint32_t),
+                                                      state.flags[r], state.buffer_size_bytes);
+        cudaError_t status = cudaGetLastError();
         if (status != cudaSuccess) {
-            throw std::runtime_error(std::string("Allocate the Lamport flags: ") +
-                                     cudaGetErrorString(status));
-        }
-        const LamportState flag_host{{0, 2, state.buffer_size_bytes, 0}, {0, 0}, 0};
-        status = cudaMemcpy(state.flags[r], &flag_host, sizeof(flag_host), cudaMemcpyHostToDevice);
-        if (status != cudaSuccess) {
-            throw std::runtime_error(std::string("Initialize the Lamport flags: ") +
-                                     cudaGetErrorString(status));
-        }
-        fill_sentinel_kernel<<<256, 256, 0, 0>>>(
-            reinterpret_cast<std::uint32_t*>(state.uc_ptrs[r]),
-            (state.allocation_size - kSignalPad) / sizeof(std::uint32_t));
-        status = cudaGetLastError();
-        if (status != cudaSuccess) {
-            throw std::runtime_error(std::string("Pre-dirty the Lamport buffers: ") +
+            throw std::runtime_error(std::string("Initialize the Lamport workspace: ") +
                                      cudaGetErrorString(status));
         }
     }
@@ -768,6 +785,7 @@ std::unique_ptr<MnnvlAllReduce> MnnvlAllReduce::create(std::vector<int> devices)
 cudaStreamCaptureStatus MnnvlAllReduce::preflight(State& state, __nv_bfloat16* const buffers[],
                                                   const cudaStream_t streams[], bool two_shot) {
     cudaStreamCaptureStatus capture_status[kRanks];
+    unsigned long long capture_id[kRanks]{};
     for (int r = 0; r < kRanks; ++r) {
         int stream_device = -1;
         if (cudaStreamGetDevice(streams[r], &stream_device) != cudaSuccess ||
@@ -776,7 +794,8 @@ cudaStreamCaptureStatus MnnvlAllReduce::preflight(State& state, __nv_bfloat16* c
                 "MnnvlAllReduce::allreduce_bf16 requires each stream to belong to its "
                 "rank's device.");
         }
-        const cudaError_t capture_error = cudaStreamIsCapturing(streams[r], &capture_status[r]);
+        const auto capture_error =
+            cudaStreamGetCaptureInfo(streams[r], &capture_status[r], &capture_id[r]);
         if (capture_error != cudaSuccess) {
             state.failed = true;
             throw MnnvlArError(
@@ -803,14 +822,13 @@ cudaStreamCaptureStatus MnnvlAllReduce::preflight(State& state, __nv_bfloat16* c
                 "MnnvlAllReduce::allreduce_bf16 requires 16-byte aligned buffers.");
         }
     }
-    if (capture_status[0] != capture_status[1]) {
-        throw std::invalid_argument(
-            "MnnvlAllReduce::allreduce_bf16 requires both ranks to share one capture "
-            "state; a graph-recorded kernel cannot Lamport-synchronize with an "
-            "eager peer.");
+    const bool captured = capture_status[0] == cudaStreamCaptureStatusActive;
+    if (capture_status[0] != capture_status[1] ||
+        (captured && (capture_id[0] == 0 || capture_id[0] != capture_id[1]))) {
+        throw std::invalid_argument("MNNVL allreduce requires one capture across both ranks.");
     }
-    if (two_shot && capture_status[0] != cudaStreamCaptureStatusNone) {
-        throw std::invalid_argument("The two-shot MNNVL allreduce requires eager streams.");
+    if (captured && two_shot && !tp_verify_graph::owns_collective(streams, kTwoshotRows)) {
+        throw std::invalid_argument("Captured two-shot MNNVL requires an owned rank pair.");
     }
     return capture_status[0];
 }
@@ -840,7 +858,8 @@ void MnnvlAllReduce::allreduce_bf16(__nv_bfloat16* const buffers[], const cudaSt
         throw std::invalid_argument("Unsupported two-shot MNNVL allreduce count or device.");
     }
     ensure_healthy();
-    preflight(*state_, buffers, streams, two_shot);
+    const bool captured =
+        preflight(*state_, buffers, streams, two_shot) != cudaStreamCaptureStatusNone;
 
     const int tokens = static_cast<int>(count / kTokenDim);
     CallerDevice device_scope;
@@ -854,6 +873,8 @@ void MnnvlAllReduce::allreduce_bf16(__nv_bfloat16* const buffers[], const cudaSt
             ? launch_twoshot(args, r, streams[r])
             : launch_oneshot(args, r, tokens, state_->multiprocessors[r], streams[r]);
         if (status != cudaSuccess) {
+            if (captured)
+                throw CudaError(status, "Record the MNNVL BF16 allreduce");
             state_->failed = true;
             throw MnnvlArError(std::string("Enqueue the MNNVL BF16 allreduce: ") +
                                    cudaGetErrorString(status),
@@ -915,16 +936,17 @@ bool MnnvlAllReduce::try_reduce_norm(Bf16* const buffers[], const cudaStream_t s
         }
     }
     ensure_healthy();
-    if (preflight(*state_, buffers, streams, false) != cudaStreamCaptureStatusNone) {
-        if constexpr (!narrow) return false;
-        if (width != tp_verify_graph::rows || !tp_verify_graph::binding(streams[0]) ||
-            !tp_verify_graph::binding(streams[1])) return false;
-    }
+    const bool captured =
+        preflight(*state_, buffers, streams, false) != cudaStreamCaptureStatusNone;
+    if (captured && !tp_verify_graph::owns_collective(streams, width))
+        return false;
     std::uint64_t epoch = 0;
     if constexpr (!narrow) {
-        if (state_->wide_epoch == UINT64_MAX)
-            return false;
-        epoch = ++state_->wide_epoch;
+        if (!captured) {
+            if (state_->wide_epoch == UINT64_MAX)
+                return false;
+            epoch = ++state_->wide_epoch;
+        }
     }
 
     ReduceNorm<Rows> launch[kRanks];
@@ -934,7 +956,7 @@ bool MnnvlAllReduce::try_reduce_norm(Bf16* const buffers[], const cudaStream_t s
                              reinterpret_cast<void*>(state_->mc_va), state_->flags[rank],
                              rows[rank]};
         if constexpr (!narrow) {
-            launch[rank].rejected = state_->wide_device_word;
+            launch[rank].rejected = captured ? nullptr : state_->wide_device_word;
             launch[rank].epoch = epoch;
         }
     }
@@ -948,6 +970,8 @@ bool MnnvlAllReduce::try_reduce_norm(Bf16* const buffers[], const cudaStream_t s
                                       streams[rank]);
         }
         if (status != cudaSuccess) {
+            if (captured)
+                throw CudaError(status, "Record MNNVL reduction and RMS quantization");
             state_->failed = true;
             if constexpr (!narrow) {
                 if (rank > 0) {
@@ -964,10 +988,6 @@ bool MnnvlAllReduce::try_reduce_norm(Bf16* const buffers[], const cudaStream_t s
     }
     return true;
 }
-
-}   
-
-namespace sglang::decoder {
 
 bool MnnvlRmsQuantizeRows::supports(int count) {
     return count == size || (count >= 3 && count <= 5);

@@ -27,7 +27,8 @@ export CUDA_CACHE_PATH="$output/cache" TMPDIR="$output"
     "$build/lib/libsglang_mnnvl_ar.a" -Wl,--end-group \
     -L"$toolkit/lib" -L"$toolkit/lib/stubs" -Wl,-rpath,"$toolkit/lib" \
     -lcuda -lcudart "$nccl/lib/libnccl.so.2" -Wl,-rpath,"$nccl/lib" \
-    -Wl,-rpath,"$CONDA_PREFIX/lib" -lpthread -ldl -o "$output/logit-bias-check"
+    -L"$CONDA_PREFIX/lib" -Wl,-rpath,"$CONDA_PREFIX/lib" -licuuc -licudata \
+    -lpthread -ldl -o "$output/logit-bias-check"
 
 exec 8<"/tmp/gpu-coord/$gpu.lock"
 exec 9<"$shared/environments/vllm-81a8cb063e62/$gpu.lock"

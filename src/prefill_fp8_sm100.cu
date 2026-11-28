@@ -1,5 +1,7 @@
 #include "sglang/prefill_fp8.h"
 #include "sglang/runtime/backend/cuda_resources.h"
+#include "sglang/text/decode_proj.h"
+#include "sglang/text/decode_proj_sm100.cuh"
 
 #include <cstddef>
 #include <limits>
@@ -10,6 +12,19 @@
 
 namespace sglang {
 namespace {
+
+using decode_proj::allocate_tmem;
+using decode_proj::commit_mma;
+using decode_proj::copy_tile;
+using decode_proj::expect_bytes;
+using decode_proj::fence_after_sync;
+using decode_proj::free_tmem;
+using decode_proj::init_barrier;
+using decode_proj::load_tmem16;
+using decode_proj::matrix_desc;
+using decode_proj::release_slot;
+using decode_proj::shared_address;
+using decode_proj::wait_barrier;
 
 constexpr int group_size = text_fp8_group_size;
 constexpr int warp_size = 32;
@@ -52,39 +67,6 @@ struct Pipeline {
     unsigned tmem;
 };
 
-__device__ unsigned shared_address(const void* pointer) {
-    return static_cast<unsigned>(__cvta_generic_to_shared(pointer));
-}
-
-__device__ void init_barrier(unsigned long long* barrier, int arrivals) {
-    asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;"
-                 :: "r"(shared_address(barrier)), "r"(arrivals) : "memory");
-}
-
-__device__ void wait_barrier(const unsigned long long* barrier, unsigned phase) {
-    asm volatile("{ .reg .pred ready;\n"
-                 "WAIT: mbarrier.try_wait.parity.acquire.cta.shared::cta.b64 ready, [%0], %1;\n"
-                 "@!ready bra.uni WAIT; }"
-                 :: "r"(shared_address(barrier)), "r"(phase) : "memory");
-}
-
-__device__ void arrive_barrier(unsigned long long* barrier) {
-    asm volatile("mbarrier.arrive.release.cta.shared::cta.b64 _, [%0];"
-                 :: "r"(shared_address(barrier)) : "memory");
-}
-
-__device__ void commit_mma(unsigned long long* barrier) {
-    asm volatile("tcgen05.commit.cta_group::1.mbarrier::arrive::one.b64 [%0];"
-                 :: "r"(shared_address(barrier)) : "memory");
-}
-
-__device__ void copy_tile(const CUtensorMap* map, unsigned shared, unsigned barrier,
-                          int col, int row) {
-    asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes "
-                 "[%0], [%1, {%2, %3}], [%4];"
-                 :: "r"(shared), "l"(map), "r"(col), "r"(row), "r"(barrier) : "memory");
-}
-
 template <class Config>
 __device__ void produce_tiles(Pipeline<Config>& pipe, unsigned shared, const CUtensorMap* input,
                               const CUtensorMap* weight, int row_base, int col_base, int groups) {
@@ -95,9 +77,8 @@ __device__ void produce_tiles(Pipeline<Config>& pipe, unsigned shared, const CUt
         }
         const int remaining = groups - group;
         const int count = remaining < Config::copy_batch ? remaining : Config::copy_batch;
-        const unsigned barrier = shared_address(&pipe.copy_ready[slot]);
-        asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;"
-                     :: "r"(barrier), "r"(count * Config::stage_bytes) : "memory");
+        auto* barrier = &pipe.copy_ready[slot];
+        expect_bytes(barrier, count * Config::stage_bytes);
         for (int offset = 0; offset < count; ++offset) {
             const unsigned start =
                 shared + (slot * Config::copy_batch + offset) * Config::stage_bytes;
@@ -106,15 +87,6 @@ __device__ void produce_tiles(Pipeline<Config>& pipe, unsigned shared, const CUt
             copy_tile(weight, start + Config::rows * group_size, barrier, position, col_base);
         }
     }
-}
-
-__device__ std::uint64_t matrix_desc(unsigned start) {
-    constexpr std::uint64_t stride = 8 * group_size / 16;
-    constexpr std::uint64_t swizzle_128b = std::uint64_t{2} << 61;
-    constexpr std::uint64_t descriptor_version = std::uint64_t{1} << 46;
-    constexpr std::uint64_t leading_offset = std::uint64_t{1} << 16;
-    return swizzle_128b | descriptor_version | (stride << 32) | leading_offset |
-           ((start & 0x3ffffu) >> 4);
 }
 
 template <class Config>
@@ -132,7 +104,7 @@ __device__ void multiply_tiles(Pipeline<Config>& pipe, unsigned shared, int grou
         }
         if (group % Config::copy_batch == 0) {
             wait_barrier(&pipe.copy_ready[copy_slot], (group / Config::copies) % 2);
-            asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+            fence_after_sync();
         }
         const unsigned start = shared + stage * Config::stage_bytes;
         const unsigned destination = pipe.tmem + accum * Config::accum_cols;
@@ -167,13 +139,7 @@ __device__ void multiply_tiles(Pipeline<Config>& pipe, unsigned shared, int grou
 template <int Count>
 __device__ void load_partial(unsigned source, unsigned (&out)[Count]) {
     if constexpr (Count == 16) {
-        asm volatile("tcgen05.ld.sync.aligned.32x32b.x16.b32 {%0,%1,%2,%3,%4,%5,%6,%7,"
-                     "%8,%9,%10,%11,%12,%13,%14,%15}, [%16];\ntcgen05.wait::ld.sync.aligned;"
-                     : "=r"(out[0]), "=r"(out[1]), "=r"(out[2]), "=r"(out[3]),
-                       "=r"(out[4]), "=r"(out[5]), "=r"(out[6]), "=r"(out[7]),
-                       "=r"(out[8]), "=r"(out[9]), "=r"(out[10]), "=r"(out[11]),
-                       "=r"(out[12]), "=r"(out[13]), "=r"(out[14]), "=r"(out[15])
-                     : "r"(source) : "memory");
+        load_tmem16(source, out);
     } else if constexpr (Count == 32) {
         asm volatile("tcgen05.ld.sync.aligned.32x32b.x32.b32 {%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,"
                      "%10,%11,%12,%13,%14,%15,%16,%17,%18,%19,%20,%21,%22,%23,%24,%25,"
@@ -233,7 +199,7 @@ __device__ void accumulate(Pipeline<Config>& pipe, const float* activation,
         const float scale = __fmul_rn(activation_scale, __bfloat162float(weight[group]));
         if (group % Config::batch == 0) {
             wait_barrier(&pipe.accum_ready[batch % accum_stages], (batch / accum_stages) % 2);
-            asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+            fence_after_sync();
         }
         #pragma unroll
         for (int base = 0; base < Config::warp_cols; base += Config::partial_cols) {
@@ -246,11 +212,7 @@ __device__ void accumulate(Pipeline<Config>& pipe, const float* activation,
             }
         }
         if (group % Config::batch == Config::batch - 1 || group == groups - 1) {
-            asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
-            __syncwarp();
-            if (threadIdx.x % warp_size == 0) {
-                arrive_barrier(&pipe.accum_empty[batch % accum_stages]);
-            }
+            release_slot(&pipe.accum_empty[batch % accum_stages]);
         }
     }
 }
@@ -315,9 +277,7 @@ void fp8_tma(const __grid_constant__ CUtensorMap activation_map,
         asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
     }
     if (warp == Config::consumers) {
-        asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;"
-                     :: "r"(shared_address(&pipe.tmem)), "r"(Config::tmem_cols) : "memory");
-        asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;" ::: "memory");
+        allocate_tmem(&pipe.tmem, Config::tmem_cols);
     }
     __syncthreads();
 
@@ -350,8 +310,7 @@ void fp8_tma(const __grid_constant__ CUtensorMap activation_map,
         }
     }
     if (warp == Config::consumers) {
-        asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;"
-                     :: "r"(pipe.tmem), "r"(Config::tmem_cols) : "memory");
+        free_tmem(&pipe.tmem, Config::tmem_cols);
     }
     __syncthreads();
     int column = col_base;
@@ -381,14 +340,9 @@ void fp8_tma(const __grid_constant__ CUtensorMap activation_map,
 
 CUresult encode_map(PFN_cuTensorMapEncodeTiled_v12000 encode, CUtensorMap& map,
                     const std::uint8_t* data, int rows, int width, int tile) {
-    const cuuint64_t dimensions[] = {static_cast<cuuint64_t>(width), static_cast<cuuint64_t>(rows)};
-    const cuuint64_t stride[] = {static_cast<cuuint64_t>(width)};
-    const cuuint32_t box[] = {group_size, static_cast<cuuint32_t>(tile)};
-    const cuuint32_t element_stride[] = {1, 1};
-    return encode(&map, CU_TENSOR_MAP_DATA_TYPE_UINT8, 2, const_cast<std::uint8_t*>(data),
-                  dimensions, stride, box, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE,
-                  CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE,
-                  CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+    return decode_proj::encode_tiled_map(encode, map, data,
+                                         {CU_TENSOR_MAP_DATA_TYPE_UINT8, 1, rows, width, tile},
+                                         CU_TENSOR_MAP_L2_PROMOTION_NONE);
 }
 
 struct ByteSpan {

@@ -7,6 +7,8 @@
 #include "sglang/decoder_sampling.h"
 #include "sglang/runtime/backend/cuda_resources.h"
 #include "sglang/runtime/model/qwen_layers.h"
+#include "sglang/runtime/cache/prefix_residency.h"
+#include "sglang/text/gdn/replay_ssm.h"
 
 #include <array>
 #include <cstdint>
@@ -58,6 +60,7 @@ struct Workspace {
 };
 
 using GdnBank = std::array<TextGdnState, gdn_layers>;
+using GdnReplayBank = std::array<gdn_replay_ssm::State, gdn_layers>;
 void allocate_gdn(Allocations& memory, GdnBank& states,
                   std::size_t history_elements = gdn_history_elements,
                   std::size_t state_elements = gdn_state_elements);
@@ -92,21 +95,33 @@ void select_constrained(Workspace& work, const ConstraintWorkspace& scratch,
                         const ConstraintCursor& cursor, const SamplingParameters* sampling,
                         int position, void* sampling_workspace, cudaStream_t stream);
 
+struct RequestKvStorage {
+    int limit = 0;
+    int heads = mxfp8_kv_heads;
+    const PrefixSlab* slab = nullptr;
+    int rank = 0;
+    PrefixPages pages;
+    const ResidentPrefixRead* reuse = nullptr;
+};
+
 struct Request {
     explicit Request(int device, bool reusable = false, RequestBlockCache* cache = nullptr);
     Request(int device, int capacity, std::shared_ptr<const void> owners, bool reusable = false,
             int kv_limit = 0);
 
-    void initialize(int capacity, cudaStream_t stream, int kv_limit = 0,
-                    int kv_heads = mxfp8_kv_heads);
+    void initialize(int capacity, cudaStream_t stream, int kv_limit = 0);
+    void initialize(int capacity, cudaStream_t stream, RequestKvStorage storage);
     void grow_kv(int positions, int written, cudaStream_t stream);
+    void initialize_kv(int capacity, cudaStream_t stream, RequestKvStorage storage);
     void reset(cudaStream_t stream);
     void reset();
+    void reset_gdn_replay(cudaStream_t stream);
+    void materialize_gdn(cudaStream_t stream);
     void prepare_minimum_stops(const DecoderOptions& options, cudaStream_t stream);
     void prepare_logit_adjustments(const DecoderOptions& options, cudaStream_t stream);
-    ExactGqaWorkspace batch_graph_scores();
 
     std::vector<std::uint32_t> minimum_stop_upload;
+    PrefixPages shared_prefix_pages;
     Allocations memory;
     Workspace work;
     int* decode_position;
@@ -119,7 +134,7 @@ struct Request {
     int cached_gqa_tokens = 0;
     bool prefix_checkpoint_outputs = false;
     GdnBank states;
-    std::optional<ExactGqaWorkspace> long_graph_scores;
+    GdnReplayBank gdn_replay{};
     std::byte* sampling_workspace = nullptr;
     ConstraintWorkspace constraint_workspace;
     const DecoderLogitBias* logit_bias = nullptr;

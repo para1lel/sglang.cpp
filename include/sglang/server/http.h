@@ -3,6 +3,7 @@
 #include <chrono>
 #include <functional>
 #include <optional>
+#include <random>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -60,6 +61,8 @@ bool stopping();
 Socket listen_loopback(int port);
 bool disconnected(const Socket& connection);
 std::string decode_url(std::string_view text, bool form = false);
+std::string random_request_id(std::string_view prefix, std::random_device& random);
+std::string random_request_id(std::string_view prefix);
 GenerateRoute generate_route(const HttpRequest& request);
 TokenizationRoute tokenization_route(const HttpRequest& request);
 using AnthropicCountOverride = std::function<bool(const HttpRequest&)>;

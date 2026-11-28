@@ -10,15 +10,16 @@ and explicit barriers for final responses and reset acknowledgement. It needs no
 out="$PWD/build/prefix-readers"
 mkdir -p "$out"
 "${CXX:-c++}" -std=c++17 -O2 -Wall -Wextra -Werror -pthread -ffunction-sections -fdata-sections \
-    -Iinclude tests/prefix/reader_queue.cpp \
+    -isystem "$CONDA_PREFIX/include" -Iinclude tests/prefix/reader_queue.cpp \
     apps/server/{prefix_controls,flush_cache,http,loads,completions,ollama_discovery}.cpp \
     apps/server/{parse_function_call,native_sessions,responses,native_generate,ollama_generate}.cpp \
-    apps/server/{text_request,text_completion,tokenization_validation,tool_literal,tool_union}.cpp \
+    apps/server/{text_request,text_completion,tokenization,tokenization_validation}.cpp \
+    apps/server/{anthropic_count,tool_literal,tool_union}.cpp \
     apps/server/detail/{batch_state,text_stop}.cpp \
     apps/server/qwen/{qwen_chat_output,qwen_tool_output,qwen_tool_syntax,qwen_chat_template}.cpp \
     src/runtime/server/batch_executor.cpp src/runtime/execution/decoder_options.cpp \
     src/tokenizer/*.cpp src/{json,utf8}.cpp \
-    -Wl,--gc-sections \
+    -L"$CONDA_PREFIX/lib" -Wl,-rpath,"$CONDA_PREFIX/lib" -licuuc -licudata -Wl,--gc-sections \
     -Wl,--wrap=accept4 -o "$out/reader-queue"
 for mode in --cache-off --cache-on --reader-failure --worker-failure --flush; do
     timeout 20s "$out/reader-queue" "$mode"
@@ -42,9 +43,17 @@ busy replies, reader responsiveness, and separate reset acknowledgements after t
 
 ## LMCache route checks
 
-Use the [real-daemon route procedure](../../docs/prefix-cache.md#verification) with a Release server and pinned checkpoint. It checks selective GQA and GDN coverage, shifted draft continuation, reuse across worker restarts, cancellation, and peer progress during held requests.
+Use a Release server and a private LMCache 0.5.8 daemon with at least 4 GiB on the same GPUs. The runner reads its fixed prompts from the test tree. Set `TP` to `1` or `2` and pass a fresh evidence directory. Add `--alternate-checkpoint` with a compatible checkpoint containing different weights to check weight isolation.
 
-At exactly 8,192 prompt tokens, the length and text-stop routes each publish one terminal state. The graph fixture gives cancellation the terminal claim at the same endpoint and checks that both exit paths leave the daemon empty for that request.
+```bash
+PYTHONPATH="$PWD" python3 -B tests/prefix/lmcache_routes.py \
+    "$SGLANG_SERVER" "$CHECKPOINT" "$LMCACHE_SOCKET" "$EVIDENCE" \
+    --tp "$TP"
+```
+
+Require an empty `failures` object in `summary.json`. The fixture checks resident repeats, suffix forks, cache salt isolation, selective misses across cache families, failed GET recovery, and CPU-backed reuse after the writer exits. TP1 also checks image identity. TP2 checks that the chosen recurrent checkpoint is present on both ranks when their deeper endpoints differ. Keep `relay.json` and the metric scrapes as evidence of the CPU backups and reloads induced by ordinary pool pressure.
+
+The [pool verification procedure](../../docs/prefix-cache.md#verification) covers backup overlap with an active peer, cancellation, reset, and anchor retention. The [archived direct-STORE procedure](https://github.com/para1lel/sglang.cpp/blob/bdaec36dbb985edd57e54b3565315ba321290a23/docs/prefix-cache.md#verification) contains the held IPC, eager publication, aligned terminal STORE order, and wide eager checkpoint cases for that release.
 
 ## Device state and graph controls
 
@@ -55,13 +64,29 @@ GPU_UUID="$GPU_UUID" LMCACHE_SOCKET="$LMCACHE_SOCKET" \
     bash tests/prefix/run_lmcache_state.sh "${release_build:?set the Release build directory}" "$checkpoint" "$evidence"
 ```
 
-Require exit zero and `PASS` in both `state.log` and `graph.log`. The runner bounds each binary, including its STORE worker and receipt waits. `LMCACHE_TEST_TIMEOUT` defaults to `5m`. At the deadline GNU `timeout` sends SIGTERM, then SIGKILL if the process survives another five seconds. A timeout fails the run. [Device runner](run_lmcache_state.sh#L39)<!-- prefix: "CUDA_VISIBLE" -->
+Require exit zero and `PASS` in `state.log`, `graph.log`, and `release.log`. The runner bounds each binary, including its STORE worker and receipt waits. `LMCACHE_TEST_TIMEOUT` defaults to `5m`. At the deadline GNU `timeout` sends SIGTERM, then SIGKILL if the process survives another five seconds. A timeout fails the run. [Device runner](run_lmcache_state.sh#L57)<!-- prefix: "CUDA_VISIBLE" -->
 
-The state check compares payloads and scores, counts KV writes with imported GQA, and covers unequal GQA and GDN coverage, a hole in GQA, and K4 continuation. It checks periodic views across allocation growth and a failed store. Terminal views retain their source blocks after retirement without copying them. The fixture queues a periodic copy before cancelling and replacing its source request, and injects allocation, copy, and event failures. [Periodic view](lmcache_state.cpp#L583)<!-- prefix: "void check_d" --> · [Terminal view](lmcache_state.cpp#L606)<!-- prefix: "void check_t" --> · [Delayed copy](lmcache_state.cpp#L718)<!-- prefix: "void check_d" --> · [Copy failure](lmcache_state.cpp#L771)<!-- prefix: "void check_c" -->
+The state check compares payloads and scores, counts KV writes with imported GQA, and covers unequal GQA and GDN coverage, a hole in GQA, and K4 continuation. It checks nonterminal views across allocation growth and a failed store. Terminal views retain their source blocks after retirement without copying them. The fixture queues a nonterminal copy before cancelling and replacing its source request, and injects allocation, copy, and event failures. [Nonterminal view](lmcache_state.cpp#L546)<!-- prefix: "void check_d" --> · [Terminal view](lmcache_state.cpp#L571)<!-- prefix: "void check_t" --> · [Delayed copy](lmcache_state.cpp#L621)<!-- prefix: "static void " --> · [Copy failure](lmcache_state.cpp#L674)<!-- prefix: "void check_c" -->
 
-For a private GDN allocation, the test observes the STORE worker enqueue one free and synchronize the same stream. A second case injects a recoverable synchronization error after the real release and requires one diagnostic. For detached blocks, the test requires the attempted `cudaFreeAsync` pointer to match the injected pointer. `cudaErrorNotSupported` permits a synchronous free and clears the charge. `cudaErrorInvalidValue` retains the charge and skips the synchronous free. [STORE worker](lmcache_state.cpp#L806)<!-- prefix: "void check_w" --> · [Detached release](lmcache_state.cpp#L687)<!-- prefix: "void check_f" --> · [Accounting](lmcache_state.cpp#L650)<!-- prefix: "void check_d" -->
+The state test checks that the STORE worker returns its GDN slice before acknowledging completion. A second case retains an alias until after acknowledgement and checks that the slice becomes available after the alias releases it.
 
 The graph check advances a K0 or K1 peer while a checkpoint transfer is held, then compares native state and continuation scores with the control. For direct K1 generation, it checks a restored hit and a cold restart after an exceptional GET. Both must match cache-off output IDs and produce a deferred terminal STORE receipt. A failed STORE must surface through its receipt and leave the successful-store count at zero.
+
+The release check holds a detached arena lease across an idle drain and a competing allocation. It injects event record and query errors and verifies that a block becomes available only after completion is confirmed.
+
+The release probe also holds the pressure worker at IPC export, before transport counts the STORE. It checks that the residency manager reports pending during the hold and clears it after the injected export failure and reset.
+
+### TP2 release isolation
+
+Reserve two B200 GPUs and set `GPU_UUIDS` to their comma-separated UUIDs in rank order. Set `release_evidence` to a fresh directory path. This mode runs the release checks without an LMCache daemon. [Runner mode](run_lmcache_state.sh#L24)<!-- prefix: "if [[ $mode " -->
+
+```bash
+GPU_UUID="$GPU_UUIDS" bash tests/prefix/run_lmcache_state.sh \
+    "${release_build:?set the Release build directory}" "$checkpoint" "$release_evidence" \
+    --serving-release-only
+```
+
+Require exit zero and `PASS` in `release.log`. The fixture holds simultaneous detached leases on both ranks and verifies that releasing rank 1 leaves rank 0 charged. Each rank also exercises the event failure checks.
 
 ## Historical resident-cache checks
 

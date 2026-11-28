@@ -3,6 +3,7 @@
 #include "sglang/runtime/backend/cuda_backend_policy.h"
 #endif
 #include "sglang/runtime/backend/tp_ar_counters.h"
+#include "sglang/server/http.h"
 #include "sglang/server/vision_completion.h"
 #include "sglang/tokenizer/tokenizer.h"
 
@@ -275,7 +276,8 @@ struct Decoder::Model {};
 #if __has_include(SGLANG_TEST_TP_HEADER)
 struct Decoder::TpRuntime {};
 
-Decoder::Decoder(const std::filesystem::path& checkpoint, int device, bool mtp, int ranks)
+Decoder::Decoder(const std::filesystem::path& checkpoint, int device, bool mtp, int ranks,
+                 [[maybe_unused]] DecoderMemoryOptions options)
     : Decoder(checkpoint, device, mtp) {
     if (ranks != 1) throw std::invalid_argument("CPU decoder fixture supports one rank");
 }
@@ -360,7 +362,7 @@ DecoderBatch::DecoderBatch(const Decoder&, DecoderBatchOptions options)
 
 DecoderBatch::~DecoderBatch() = default;
 
-int DecoderBatch::admit(int slot, std::vector<int> prompt, const DecoderOptions& options) {
+int DecoderBatch::admit(int slot, const std::vector<int>& prompt, const DecoderOptions& options) {
     validate_token_ids(prompt, options);
     auto& lane = state_->lanes.at(slot);
     if (lane) {
@@ -369,7 +371,10 @@ int DecoderBatch::admit(int slot, std::vector<int> prompt, const DecoderOptions&
     const auto* rejected_seed = std::getenv("SGLANG_TEST_BATCH_ADMISSION_FAILURE");
     if (rejected_seed && options.seed && std::to_string(*options.seed) == rejected_seed) {
         std::cerr << ("cpu reject seed=" + std::to_string(*options.seed) + '\n');
-        throw DecoderCapacityError("Injected batch admission failure", true);
+        if (std::getenv("SGLANG_TEST_BATCH_ADMISSION_RETRYABLE") != nullptr) {
+            throw DecoderCapacityError("Injected batch admission failure", true);
+        }
+        throw server::HttpError("503 Service Unavailable", "Injected batch admission failure");
     }
     const bool health = std::getenv("SGLANG_TEST_HEALTH_CONTROL") &&
                         prompt.size() == 1 && prompt.front() == 0;
@@ -391,10 +396,20 @@ int DecoderBatch::admit(int slot, std::vector<int> prompt, const DecoderOptions&
     return 0;
 }
 
+int DecoderBatch::admit(int slot, std::vector<int>&& prompt, const DecoderOptions& options) {
+    const auto cached = admit(slot, prompt, options);
+    prompt.clear();
+    return cached;
+}
+
 #ifdef SGLANG_TEST_BATCH_MEDIA
-int DecoderBatch::admit_multimodal(int, std::vector<int>, const DecoderOptions&,
-                                  const std::vector<DecoderMedia>&) {
-    throw std::logic_error("The CPU decoder does not accept media");
+int DecoderBatch::admit_multimodal(int slot, std::vector<int>&& prompt,
+                                   const DecoderOptions& options,
+                                   const std::vector<DecoderMedia>& media) {
+    if (!media.empty()) {
+        throw std::logic_error("The CPU decoder does not accept media");
+    }
+    return admit(slot, std::move(prompt), options);
 }
 #endif
 
@@ -442,7 +457,9 @@ DecoderBatch::advance_chunked(const std::array<bool, decoder_batch_max_lanes>& s
             continue;
         }
         const auto* gate = std::getenv("SGLANG_TEST_BATCH_STEP_GATE");
-        if (gate && lane->options.seed == -41 &&
+        const auto* gate_unseeded = std::getenv("SGLANG_TEST_BATCH_STEP_GATE_UNSEEDED");
+        if (gate != nullptr &&
+            (lane->options.seed == -41 || (gate_unseeded != nullptr && !lane->options.seed)) &&
             !std::filesystem::exists(std::string(gate) + "." + std::to_string(lane->tokens))) {
             continue;
         }
@@ -480,6 +497,11 @@ bool DecoderBatch::available() const {
 
 DecoderPrefixCacheStats DecoderBatch::prefix_cache_stats() const {
     return {};
+}
+
+bool DecoderBatch::prefix_backup_pending() const {
+    const auto stats = prefix_cache_stats();
+    return stats.backups_started > stats.backups_completed + stats.backups_failed;
 }
 
 void DecoderBatch::reset_prefix_cache() {}

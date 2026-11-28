@@ -73,8 +73,10 @@ __device__ __inline_hint__ void quantize_warp(const __nv_bfloat16* input,
         const auto* up_pairs = reinterpret_cast<const __nv_bfloat162*>(up + offset);
         const auto up_first = up_pairs[0];
         const auto up_second = up_pairs[1];
-        first = {swiglu(first.x, up_first.x), swiglu(first.y, up_first.y)};
-        second = {swiglu(second.x, up_second.x), swiglu(second.y, up_second.y)};
+        first = __halves2bfloat162(swiglu(__low2bfloat16(first), __low2bfloat16(up_first)),
+                                   swiglu(__high2bfloat16(first), __high2bfloat16(up_first)));
+        second = __halves2bfloat162(swiglu(__low2bfloat16(second), __low2bfloat16(up_second)),
+                                    swiglu(__high2bfloat16(second), __high2bfloat16(up_second)));
     }
     quantize_warp_pairs(first, second, group, offset, lane, output);
 }

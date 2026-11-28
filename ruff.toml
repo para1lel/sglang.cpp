@@ -36,6 +36,9 @@ strict = true
 ".agents/skills/main-mode/scripts/session_review.py" = ["T201"]
 ".agents/checks/tool_process.py" = ["S603"]
 "tests/test_gate_contract.py" = ["S603", "S607"]
+"tests/decoder/make_k4_route_prompts.py" = ["S311"]
+"tests/decoder/tp2/serving_cache.py" = ["S603"]
+"tests/prefix/lmcache_rank_roundtrip.py" = ["S603"]
 "tests/test_anthropic_count_cpu.py" = ["RUF001"]
 
 [format]

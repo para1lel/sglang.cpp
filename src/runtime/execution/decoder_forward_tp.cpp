@@ -177,22 +177,6 @@ void tp_scatter(LayerBatch<Lane>& batch, int count, cudaStream_t lane_stream,
 
 }
 
-void Decoder::Model::forward_tp(
-    const Model& peer, const decoder::ForwardLane* primary_lanes,
-    const decoder::ForwardLane* peer_lanes, int count, cudaStream_t stream,
-    cudaStream_t peer_stream, decoder::TensorParallel& group,
-    const decoder::TpPartials& primary_partials, const decoder::TpPartials& peer_partials) const {
-    if (!primary_lanes || !peer_lanes || count < 1 || count > decoder_batch_max_lanes) {
-        throw std::invalid_argument("Invalid decoder batch width");
-    }
-    embed_forward_lanes(embedding, primary_lanes, count, stream, "Look up token embedding");
-    decoder::DeviceScope peer_scope(peer.device);
-    embed_forward_lanes(peer.embedding, peer_lanes, count, peer_stream,
-                        "Look up peer token embedding");
-    peer_scope.restore();
-    forward_layers_tp(peer, primary_lanes, peer_lanes, count, stream, peer_stream, group,
-                      primary_partials, peer_partials);
-}
 
 template <typename Lane>
 bool Decoder::Model::forward_layers_tp(
@@ -293,6 +277,10 @@ template bool Decoder::Model::forward_layers_tp<decoder::ForwardLane>(
     const Model&, const decoder::ForwardLane*, const decoder::ForwardLane*, int, cudaStream_t,
     cudaStream_t, decoder::TensorParallel&, const decoder::TpPartials&,
     const decoder::TpPartials&, std::uint8_t*, std::uint8_t*, bool) const;
+template bool Decoder::Model::forward_layers_tp<decoder::BatchGraphLane>(
+    const Model&, const decoder::BatchGraphLane*, const decoder::BatchGraphLane*, int, cudaStream_t,
+    cudaStream_t, decoder::TensorParallel&, const decoder::TpPartials&, const decoder::TpPartials&,
+    std::uint8_t*, std::uint8_t*, bool) const;
 template bool Decoder::Model::forward_layers_tp<decoder::VerificationRow>(
     const Model&, const decoder::VerificationRow*, const decoder::VerificationRow*, int,
     cudaStream_t, cudaStream_t, decoder::TensorParallel&, const decoder::TpPartials&,

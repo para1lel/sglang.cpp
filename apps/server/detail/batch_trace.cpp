@@ -46,6 +46,10 @@ void trace_batch_details(const BatchTrace::Steps& steps, const DecoderBatchStepS
     if (stats.graph_slots) {
         std::cerr << ("batch graph_slots=" + std::to_string(stats.graph_slots) + '\n');
     }
+    if (stats.verification_graph_slots != 0) {
+        std::cerr << ("batch verification_graph_slots=" +
+                      std::to_string(stats.verification_graph_slots) + '\n');
+    }
     if (stats.sampling_workspace_bytes) {
         std::cerr << ("batch sampling_workspace_bytes=" +
                       std::to_string(stats.sampling_workspace_bytes) + '\n');
@@ -118,7 +122,7 @@ BatchProfileStep batch_profile_step(std::uint64_t elapsed, int width,
     const int decode = std::count_if(steps.begin(), steps.end(),
                                      [](const auto& step) { return step.decode; });
     const int rows = std::accumulate(stats.prefill_rows.begin(), stats.prefill_rows.end(), 0);
-    return {elapsed, width, rows, decode, stats.graph_slots};
+    return {elapsed, width, rows, decode, stats.graph_slots, stats.verification_graph_slots};
 }
 
 }

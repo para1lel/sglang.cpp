@@ -24,7 +24,6 @@ struct PendingBatchPrefix {
 struct DeferredPrefixStore {
     const Workspace* row = nullptr;
     std::shared_ptr<void> reservation = nullptr;
-    bool terminal = false;
 };
 
 }

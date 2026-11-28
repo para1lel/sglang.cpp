@@ -82,6 +82,7 @@ struct LayerBatch {
     bool tensor_core_lane(int index) const;
 
     bool single_decode() const;
+    bool batch_decode() const;
 
     bool fuse_verify_activation() const;
 

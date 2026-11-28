@@ -9,6 +9,8 @@
 #include "sglang/text/mtp/draft_stream.h"
 #include "sglang/text/mtp/tc_vocab.h"
 #include "sglang/runtime/cache/kv_residency_policy.h"
+#include "sglang/mxfp8_gqa.h"
+#include "sglang/runtime/backend/tensor_parallel.h"
 
 #include <algorithm>
 #include <cmath>
@@ -20,29 +22,33 @@
 
 namespace sglang::decoder {
 
-DraftWorkspace::DraftWorkspace(Allocations& memory)
+DraftWorkspace::DraftWorkspace(Allocations& memory, WeightSharding shard, int vocab_rows)
     : embedding(memory.allocate<Bf16>(hidden_size)),
       concatenated(memory.allocate<Bf16>(2 * hidden_size)),
-      residual(memory.allocate<Bf16>(hidden_size)),
-      normalized(memory.allocate<Bf16>(hidden_size)),
+      residual(memory.allocate<Bf16>(hidden_size)), normalized(memory.allocate<Bf16>(hidden_size)),
       branch(memory.allocate<Bf16>(hidden_size)),
-      q_gate(memory.allocate<Bf16>(text_gqa_q_gate_width)),
-      keys(memory.allocate<Bf16>(text_gqa_kv_width)),
-      values(memory.allocate<Bf16>(text_gqa_kv_width)),
-      rope_queries(memory.allocate<Bf16>(text_gqa_q_width)),
-      rope_keys(memory.allocate<Bf16>(text_gqa_kv_width)),
-      attention(memory.allocate<Bf16>(text_gqa_q_width)),
-      gate(memory.allocate<Bf16>(intermediate_size)),
-      up(memory.allocate<Bf16>(intermediate_size)),
+      q_gate(memory.allocate<Bf16>(shard.local_q_gate_width())),
+      keys(memory.allocate<Bf16>(shard.local_gqa_kv_width())),
+      values(memory.allocate<Bf16>(shard.local_gqa_kv_width())),
+      rope_queries(memory.allocate<Bf16>(shard.local_q_width())),
+      rope_keys(memory.allocate<Bf16>(shard.local_gqa_kv_width())),
+      attention(memory.allocate<Bf16>(shard.local_q_width())),
+      gate(memory.allocate<Bf16>(shard.local_intermediate_size())),
+      up(memory.allocate<Bf16>(shard.local_intermediate_size())),
       score_storage(memory.allocate<float>(score_storage_count)),
       logits(reinterpret_cast<Bf16*>(score_storage)),
-      activation{memory.allocate<std::uint8_t>(intermediate_size),
-                 memory.allocate<float>(text_fp8_group_count(intermediate_size))},
-      argmax_scratch(memory.allocate<TextLogitCandidate>(text_argmax_scratch_count(vocab_size))),
-      argmax(memory.allocate<TextLogitCandidate>(1)) {}
+      activation{
+          memory.allocate<std::uint8_t>(shard.local_intermediate_size()),
+          memory.allocate<float>(text_fp8_group_count(shard.local_intermediate_size())),
+      },
+      argmax_scratch(memory.allocate<TextLogitCandidate>(
+          text_argmax_scratch_count(shard.primary_rank() ? vocab_size : vocab_rows))),
+      argmax(memory.allocate<TextLogitCandidate>(1)) {
+}
 
-ExactGqaWorkspace DraftWorkspace::attention_scores() const {
-    return {score_storage, score_storage_count / mxfp8_query_heads};
+ExactGqaWorkspace DraftWorkspace::attention_scores(GqaGeometry geometry) const {
+    const int float_count = score_storage_count * geometry.query_heads / mxfp8_query_heads;
+    return {score_storage, float_count / geometry.query_heads};
 }
 
 namespace {
@@ -73,58 +79,98 @@ bool prepare_streaming_projection(int device) {
 }
 
 MtpDraftWeights::State::State(const std::filesystem::path& directory, int device,
-                             std::shared_ptr<const Allocations> target_weights,
-                             const Bf16* embedding, Bf16Weight lm_head,
-                             DraftOperatorCapabilities capabilities)
-    : device(device), capabilities(capabilities), target_weights(std::move(target_weights)),
-      memory(device), embedding(embedding), lm_head(lm_head) {
-    if (!this->target_weights || !embedding || !lm_head.values ||
-        lm_head.rows != vocab_size || lm_head.columns != hidden_size) {
-        throw std::invalid_argument("Invalid MTP target embedding or LM head");
+                              std::shared_ptr<const Allocations> target_weights,
+                              const Bf16* embedding, Bf16Weight lm_head,
+                              DraftOperatorCapabilities capabilities, WeightSharding shard)
+    : device(device), shard(shard), geometry{shard.local_query_heads(), shard.local_kv_heads()},
+      vocab_begin(vocab_size * shard.rank / std::max(1, shard.world_size)),
+      capabilities(capabilities), target_weights(std::move(target_weights)), memory(device),
+      embedding(embedding) {
+    shard.validate();
+    if (!this->target_weights || embedding == nullptr) {
+        throw std::invalid_argument("Invalid MTP target embedding");
     }
+    const int vocab_rows = (vocab_size * (shard.rank + 1) / shard.world_size) - vocab_begin;
     DeviceScope selected_device(device);
-    streaming_projection = prepare_streaming_projection(device);
+    streaming_projection = shard.single_rank() && prepare_streaming_projection(device);
     auto& checkpoint = memory.transfers().checkpoint;
     checkpoint = std::make_unique<Checkpoint>(directory);
     memory.open_stream();
     QwenWeightUpload upload(*checkpoint, memory, memory.stream());
+    const bool shared_target_head = shard.primary_rank();
+    if (shared_target_head) {
+        if (lm_head.values == nullptr || lm_head.rows != vocab_size ||
+            lm_head.columns != hidden_size) {
+            throw std::invalid_argument("Invalid shared MTP target LM head");
+        }
+        this->lm_head = {lm_head.values, vocab_rows, hidden_size};
+    } else {
+        this->lm_head = upload.bf16_matrix_rows("lm_head.weight", vocab_size, hidden_size,
+                                                vocab_begin, vocab_rows);
+    }
     embedding_norm = upload.bf16("mtp.pre_fc_norm_embedding.weight", {hidden_size});
     hidden_norm = upload.bf16("mtp.pre_fc_norm_hidden.weight", {hidden_size});
-    fc = upload.bf16_matrix("mtp.fc.weight", hidden_size, 2 * hidden_size);
+    const int full_rows = hidden_size;
+    const int row_count = full_rows / shard.world_size;
+    fc = upload.bf16_matrix_rows("mtp.fc.weight", full_rows, 2 * hidden_size,
+                                 shard.rank * row_count, row_count);
     input_norm = upload.bf16("mtp.layers.0.input_layernorm.weight", {hidden_size});
     attention_norm = upload.bf16("mtp.layers.0.post_attention_layernorm.weight", {hidden_size});
     const std::string attention = "mtp.layers.0.self_attn.";
+    const int q_gate_width = shard.local_q_gate_width();
+    const int kv_width = shard.local_gqa_kv_width();
+    const auto qkv = upload.packed_fp8(
+        {
+            {attention + "q_proj", text_gqa_q_gate_width, shard.rank * q_gate_width, q_gate_width},
+            {attention + "k_proj", text_gqa_kv_width, shard.rank * kv_width, kv_width},
+            {attention + "v_proj", text_gqa_kv_width, shard.rank * kv_width, kv_width},
+        },
+        hidden_size);
+    const int q_width = shard.local_q_width();
     gqa = {
-        upload.fp8_matrix(attention + "q_proj", text_gqa_q_gate_width, hidden_size),
-        upload.fp8_matrix(attention + "k_proj", text_gqa_kv_width, hidden_size),
-        upload.fp8_matrix(attention + "v_proj", text_gqa_kv_width, hidden_size),
+        qkv[0],
+        qkv[1],
+        qkv[2],
         upload.bf16(attention + "q_norm.weight", {mxfp8_head_dim}),
         upload.bf16(attention + "k_norm.weight", {mxfp8_head_dim}),
-        upload.fp8_matrix(attention + "o_proj", hidden_size, text_gqa_q_width),
+        upload.fp8_matrix_columns(attention + "o_proj", hidden_size, text_gqa_q_width,
+                                  shard.rank * q_width, q_width),
     };
     const std::string mlp = "mtp.layers.0.mlp.";
-    mlp_gate = upload.fp8_matrix(mlp + "gate_proj", intermediate_size, hidden_size);
-    mlp_up = upload.fp8_matrix(mlp + "up_proj", intermediate_size, hidden_size);
-    mlp_down = upload.fp8_matrix(mlp + "down_proj", hidden_size, intermediate_size);
+    const int ffn = shard.local_intermediate_size();
+    const auto gate_up = upload.packed_fp8(
+        {
+            {mlp + "gate_proj", intermediate_size, shard.rank * ffn, ffn},
+            {mlp + "up_proj", intermediate_size, shard.rank * ffn, ffn},
+        },
+        hidden_size);
+    mlp_gate = gate_up[0];
+    mlp_up = gate_up[1];
+    mlp_down = upload.fp8_matrix_columns(mlp + "down_proj", hidden_size, intermediate_size,
+                                         shard.rank * ffn, ffn);
     final_norm = upload.bf16("mtp.norm.weight", {hidden_size});
+    const int int8_rows = shared_target_head ? vocab_size : vocab_rows;
     if (capabilities.int8_head) {
-        auto* values = memory.allocate<std::uint8_t>(std::size_t(vocab_size) * hidden_size);
-        auto* maxima = memory.allocate<float>(vocab_size);
-        check(quantize_draft_head_int8(lm_head.values, vocab_size, values, maxima,
-                                      memory.stream()), "Quantize MTP vocabulary head");
+        const auto* head = this->lm_head.values;
+        auto* values =
+            memory.allocate<std::uint8_t>(static_cast<std::size_t>(int8_rows) * hidden_size);
+        auto* maxima = memory.allocate<float>(int8_rows);
+        check(quantize_draft_head_int8(head, int8_rows, values, maxima, memory.stream()),
+              "Quantize MTP vocabulary head");
         quantized_head = values;
         quantized_head_maxima = maxima;
-        shared_vocab = prepare_tc_vocab(lm_head.values, values, maxima, memory);
+        if (shared_target_head)
+            shared_vocab = prepare_tc_vocab(head, values, maxima, memory);
     }
     memory.close_stream();
     if (capabilities.int8_head) {
-        std::vector<float> maxima(vocab_size);
+        std::vector<float> maxima(int8_rows);
         check(cudaMemcpy(maxima.data(), quantized_head_maxima, maxima.size() * sizeof(float),
                          cudaMemcpyDeviceToHost), "Read INT8 MTP vocabulary row maxima");
-        for (int token = 0; token < vocab_size; ++token) {
+        for (int token = 0; token < int8_rows; ++token) {
             if (!std::isfinite(maxima[token])) {
                 throw std::runtime_error("Nonfinite INT8 MTP vocabulary weight at token " +
-                                         std::to_string(token));
+                                         std::to_string(vocab_begin + token));
             }
         }
     }
@@ -132,22 +178,43 @@ MtpDraftWeights::State::State(const std::filesystem::path& directory, int device
 }
 
 MtpDraftRequest::State::State(std::shared_ptr<const MtpDraftWeights> weights, int capacity,
-                              RequestBlockCache* block_cache)
-    : weights(std::move(weights)), memory(this->weights->state_->device, block_cache), work(memory),
+                              RequestBlockCache* block_cache, PrefixStorage storage)
+    : weights(std::move(weights)), resident_pages(std::move(storage.pages)),
+      memory(this->weights->state_->device, block_cache),
+      work(memory, this->weights->state_->shard, this->weights->state_->lm_head.rows),
       capacity(capacity) {
     const int page_count = (capacity + mxfp8_page_size - 1) / mxfp8_page_size;
-    const auto payload = page_count * mxfp8_payload_bytes_per_page;
-    const auto scales = page_count * mxfp8_scale_bytes_per_page;
-    cache = {
-        memory.allocate<std::uint8_t>(payload), memory.allocate<std::uint8_t>(payload),
-        memory.allocate<std::uint8_t>(scales), memory.allocate<std::uint8_t>(scales), page_count,
-    };
     auto* table = memory.allocate<std::int32_t>(page_count);
     pages = {table, page_count};
     auto& host_pages = memory.transfers().logical_pages;
     host_pages.resize(page_count);
-    std::iota(host_pages.begin(), host_pages.end(), 0);
     memory.open_stream();
+    if (storage.slab != nullptr) {
+        cache = storage.slab->cache({storage.slab_rank});
+        for (int index = 0; index < page_count; ++index) {
+            host_pages[index] = *resident_pages.at(index);
+        }
+        const int reusable = storage.reuse->draft_private_from;
+        if (reusable % mxfp8_page_size != 0) {
+            const int tail = reusable / mxfp8_page_size;
+            storage.slab->copy_tail(storage.slab_rank,
+                                    {
+                                        host_pages[tail],
+                                        *storage.reuse->draft.at(tail),
+                                        reusable % mxfp8_page_size,
+                                    },
+                                    memory.stream());
+        }
+    } else {
+        const int heads = this->weights->state_->geometry.kv_heads;
+        const auto elements = static_cast<std::size_t>(page_count) * mxfp8_page_size * heads;
+        const auto payload = elements * mxfp8_head_dim;
+        const auto scales = elements * mxfp8_groups;
+        auto* base = memory.allocate_cache<std::uint8_t>(2 * (payload + scales));
+        auto* key_scales = base + (2 * payload);
+        cache = {base, base + payload, key_scales, key_scales + scales, page_count, heads};
+        std::iota(host_pages.begin(), host_pages.end(), 0);
+    }
     copy_cuda_async(table, host_pages.data(), host_pages.size() * sizeof(std::int32_t),
                     cudaMemcpyHostToDevice, memory.stream(), "Upload MTP KV page table");
     memory.close_stream();
@@ -183,35 +250,11 @@ void MtpDraftRequest::State::prepare_attention(cudaStream_t stream) {
     quantize(work.normalized, hidden_size, work, stream);
 }
 
-void MtpDraftRequest::State::append(int position, bool score, const MropePosition* mrope,
-                                   int rotary_position, cudaStream_t stream) {
-    const auto& gqa = weights->state_->gqa;
-    const int rotary = rotary_position < 0 ? position : rotary_position;
-    if (score) {
-        const auto status = mrope
-            ? mrope_gqa_preprocess(mrope, 1, work.q_gate, work.keys, gqa.query_norm, gqa.key_norm,
-                                   work.rope_queries, work.rope_keys, stream)
-            : text_gqa_preprocess(rotary, 1, work.q_gate, work.keys, gqa.query_norm, gqa.key_norm,
-                                  work.rope_queries, work.rope_keys, stream);
-        check(status, "Rotate MTP Q/K");
-    } else {
-        const auto status = mrope
-            ? mrope_gqa_preprocess_keys(mrope, 1, work.keys, gqa.key_norm, work.rope_keys, stream)
-            : text_gqa_preprocess_keys(rotary, 1, work.keys, gqa.key_norm, work.rope_keys, stream);
-        check(status, "Rotate MTP key");
-    }
-    check(mxfp8_kv_append(cache, pages, position, 1, work.rope_keys, work.values, stream),
-          "Append MTP MXFP8 KV");
-}
-
-DraftAttentionRow MtpDraftRequest::State::attention_row(int position) {
-    return {cache, pages, position, work.rope_queries, work.attention, work.attention_scores()};
-}
-
 void MtpDraftRequest::State::gate_attention(cudaStream_t stream) {
-    check(text_gqa_postgate(1, work.q_gate, work.attention, work.attention, stream),
+    const auto geometry = weights->state_->geometry;
+    check(text_gqa_postgate(1, work.q_gate, work.attention, work.attention, stream, geometry),
           "Gate MTP attention");
-    quantize(work.attention, text_gqa_q_width, work, stream);
+    quantize(work.attention, geometry.query_heads * mxfp8_head_dim, work, stream);
 }
 
 void MtpDraftRequest::State::prepare_mlp(cudaStream_t stream) {
@@ -223,9 +266,9 @@ void MtpDraftRequest::State::prepare_mlp(cudaStream_t stream) {
 }
 
 void MtpDraftRequest::State::activate_mlp(cudaStream_t stream) {
-    check(text_swiglu(work.gate, work.up, intermediate_size, work.gate, stream),
-          "Apply MTP SwiGLU");
-    quantize(work.gate, intermediate_size, work, stream);
+    const int width = weights->state_->shard.local_intermediate_size();
+    check(text_swiglu(work.gate, work.up, width, work.gate, stream), "Apply MTP SwiGLU");
+    quantize(work.gate, width, work, stream);
 }
 
 void MtpDraftRequest::State::normalize_output(cudaStream_t stream) {
@@ -292,9 +335,10 @@ int MtpDraftRequest::State::score_token() {
     return mapped_score ? host->token_id : transfer.winner;
 }
 
-void MtpDraftRequest::State::score_wave(State* const* batch, int count, cudaStream_t stream) {
+void MtpDraftRequest::State::project_scores(State* const* batch, int count, bool int8,
+                                            cudaStream_t stream, int output_offset) {
     const auto& model = *batch[0]->weights->state_;
-    if (model.quantized_head) {
+    if (int8) {
         std::array<DraftInt8Projection, draft_wave_rows> projections;
         for (int index = 0; index < count; ++index) {
             const auto& work = batch[index]->work;
@@ -302,18 +346,22 @@ void MtpDraftRequest::State::score_wave(State* const* batch, int count, cudaStre
                                   work.activation.scales, work.logits};
         }
         check(decode_draft_head_int8_batch(model.quantized_head, model.quantized_head_maxima,
-                                           projections.data(), count, stream),
+                                           projections.data(), count, stream, model.lm_head.rows),
               "Run batched INT8 MTP vocabulary head");
     } else {
         std::array<TextBf16Projection, draft_wave_rows> projections;
         for (int index = 0; index < count; ++index) {
             const auto& work = batch[index]->work;
-            projections[index] = {work.normalized, work.logits};
+            projections[index] = {work.normalized, work.logits + output_offset};
         }
         const auto& head = model.lm_head;
         check(text_bf16_gemm(head.values, head.rows, head.columns, projections.data(),
                              count, stream), "Run batched BF16 MTP vocabulary head");
     }
+}
+
+void MtpDraftRequest::State::score_wave(State* const* batch, int count, cudaStream_t stream) {
+    project_scores(batch, count, batch[0]->weights->state_->quantized_head != nullptr, stream);
     select_wave(batch, count, stream);
 }
 
@@ -340,28 +388,92 @@ void MtpDraftRequest::State::select_wave(State* const* batch, int count, cudaStr
     }
 }
 
+void MtpDraftRequest::State::select_tp_wave(State* const* batch, int count, bool int8,
+                                            cudaStream_t stream) {
+    const auto& model = *batch[0]->weights->state_;
+    DraftArgmaxRows winners{};
+    for (int index = 0; index < count; ++index) {
+        auto& row = *batch[index];
+        row.mapped_score = row.prepare_mapped_score(stream);
+        row.scored = true;
+        row.int8_score = int8;
+        row.constrained_score = false;
+        winners.rows[index] = {
+            row.work.logits,
+            row.work.argmax_scratch,
+            row.mapped_score ? row.device_score : row.work.argmax,
+        };
+    }
+    const int width = model.lm_head.rows;
+    if (count > 1) {
+        check(draft_argmax_wave(winners, count, width, int8, stream),
+              "Select rank-local MTP winners");
+    } else {
+        const auto& row = winners.rows[0];
+        const auto status =
+            int8 ? text_argmax_finite(row.logits, width, row.scratch, row.winner, stream)
+                 : text_argmax(row.logits, width, row.scratch, row.winner, stream);
+        check(status, "Select rank-local MTP winner");
+    }
+    for (int index = 0; index < count; ++index) {
+        auto& row = *batch[index];
+        if (!row.mapped_score) {
+            copy_cuda_async(&row.retry_winner, row.work.argmax, sizeof(TextLogitCandidate),
+                            cudaMemcpyDeviceToHost, stream, "Copy rank-local MTP winner");
+        }
+    }
+}
+
+TextLogitCandidate MtpDraftRequest::State::tp_winner() {
+    auto winner =
+        mapped_score
+            ? *static_cast<const TextLogitCandidate*>(memory.transfers().verification_results.get())
+            : retry_winner;
+    const auto& model = *weights->state_;
+    if (winner.token_id >= 0 && winner.token_id < model.lm_head.rows)
+        winner.token_id += model.vocab_begin;
+    else
+        winner.token_id = -1;
+    return winner;
+}
+
 MtpDraftWeights::MtpDraftWeights(const std::filesystem::path& checkpoint, int device,
                                  std::shared_ptr<const Allocations> target_weights,
                                  const Bf16* embedding, Bf16Weight lm_head,
-                                 DraftOperatorCapabilities capabilities)
+                                 DraftOperatorCapabilities capabilities, WeightSharding shard)
     : state_(std::make_unique<State>(checkpoint, device, std::move(target_weights), embedding,
-                                     lm_head, capabilities)) {}
+                                     lm_head, capabilities, shard)) {
+}
 
 MtpDraftWeights::~MtpDraftWeights() = default;
 
 std::size_t MtpDraftWeights::device_allocation_bytes() const { return state_->memory.bytes(); }
+int MtpDraftWeights::vocab_begin() const {
+    return state_->vocab_begin;
+}
+int MtpDraftWeights::vocab_rows() const {
+    return state_->lm_head.rows;
+}
+int MtpDraftWeights::kv_heads() const {
+    return state_->geometry.kv_heads;
+}
 
 std::shared_ptr<const TcVocabWeights> MtpDraftWeights::shared_vocab() const {
     return state_->shared_vocab;
 }
 
 MtpDraftRequest::MtpDraftRequest(std::shared_ptr<const MtpDraftWeights> weights, int capacity,
-                                 RequestBlockCache* cache) {
+                                 RequestBlockCache* cache)
+    : MtpDraftRequest(std::move(weights), capacity, cache, {}) {
+}
+
+MtpDraftRequest::MtpDraftRequest(std::shared_ptr<const MtpDraftWeights> weights, int capacity,
+                                 RequestBlockCache* cache, PrefixStorage storage) {
     if (!weights || capacity < 1 || capacity > text_attention_max_tokens) {
         throw std::invalid_argument("Invalid MTP draft weights or capacity");
     }
     DeviceScope selected_device(weights->state_->device);
-    state_ = std::make_unique<State>(std::move(weights), capacity, cache);
+    state_ = std::make_unique<State>(std::move(weights), capacity, cache, std::move(storage));
     selected_device.restore();
 }
 
@@ -489,28 +601,14 @@ void MtpDraftRequest::enqueue_wave_impl(MtpDraftInput* rows, int count, bool sco
             count == 2 && !packed && model.streaming_projection, stream);
         DraftProjectionBatch<State, DraftWorkspace> batch(states.data(), count, packed, stream,
                                                            exact, streaming);
-        batch.prepare_fc(rows, model.embedding, model.embedding_norm, model.hidden_norm, model.fc);
+        batch.prepare_fc(rows,
+                         {model.embedding, model.embedding_norm, model.hidden_norm, model.fc});
         if (packed) {
             batch.rms_activation(&DraftWorkspace::residual, model.input_norm, false);
         } else {
             apply(&State::prepare_attention);
         }
-        if (score) {
-            batch.project({{model.gqa.q_gate, &DraftWorkspace::q_gate},
-                           {model.gqa.key, &DraftWorkspace::keys},
-                           {model.gqa.value, &DraftWorkspace::values}});
-        } else {
-            batch.project({{model.gqa.key, &DraftWorkspace::keys},
-                           {model.gqa.value, &DraftWorkspace::values}});
-        }
-        if (grouped_rope) {
-            batch.append(rows, model.gqa.query_norm, model.gqa.key_norm, score);
-        } else {
-            for (int lane = 0; lane < count; ++lane) {
-                const auto& row = rows[lane];
-                states[lane]->append(row.position, score, row.mrope, row.rotary_position, stream);
-            }
-        }
+        batch.prepare_attention(rows, count, model.gqa, score, gqa_full_geometry, grouped_rope);
         if (score) {
             batch.read_attention(rows, model.capabilities.online_attention);
             if (packed) batch.gate_attention();
@@ -689,34 +787,50 @@ void MtpDraftRequest::repair_wave(const DraftRepairs* repairs, int count, Bf16* 
     }
 }
 
+void MtpDraftRequest::State::append_prefill(int first, int count, const MtpPrefillBuffers& buffers,
+                                            cudaStream_t stream, const MediaPrefill* media) {
+    const auto& model = *weights->state_;
+    const auto status =
+        media != nullptr ? mrope_gqa_preprocess_keys(media->positions + first, count, buffers.keys,
+                                                     model.gqa.key_norm, buffers.rope_keys, stream,
+                                                     model.geometry)
+                         : text_gqa_preprocess_keys(first, count, buffers.keys, model.gqa.key_norm,
+                                                    buffers.rope_keys, stream, model.geometry);
+    check(status, "Rotate MTP prefill keys");
+    check(mxfp8_kv_append(cache, pages, first, count, buffers.rope_keys, buffers.values, stream,
+                          model.geometry),
+          "Append MTP prefill MXFP8 KV");
+    prefix += count;
+    scored = false;
+}
+
 void MtpDraftRequest::seed_prefill(int position, const int* shifted_tokens, const Bf16* hidden,
                                    const Bf16* residual, const Bf16* final_norm,
-                                   const PrefillProjections& projections,
-                                   MtpPrefillBuffers buffers, const MediaPrefill* media) {
+                                   const PrefillProjections& full, MtpPrefillBuffers buffers,
+                                   const MediaPrefill* media) {
     auto& request = *state_;
     if (request.failed) {
         throw std::logic_error("MTP draft request failed");
     }
-    const int rows = projections.rows;
-    if (position != request.prefix || rows <= 0 || rows > request.capacity - position ||
-        !shifted_tokens || !hidden || !residual || !final_norm) {
+    if (position < 0 || full.rows <= 0 || full.rows > request.capacity - position ||
+        position > request.prefix || shifted_tokens == nullptr || hidden == nullptr ||
+        residual == nullptr || final_norm == nullptr) {
         throw std::invalid_argument("Invalid MTP draft prefill input");
     }
+    const int reused = request.prefix - position;
+    if (reused >= full.rows)
+        return;
+    auto projections = full;
+    projections.rows -= reused;
+    position += reused;
+    shifted_tokens += reused;
+    const auto reused_elements = static_cast<std::size_t>(reused) * hidden_size;
+    hidden += reused_elements;
+    residual += reused_elements;
+    const int rows = projections.rows;
     const auto& model = *request.weights->state_;
     const auto stream = projections.stream;
     const bool paired = model.capabilities.paired_seed_kv && rows > 1;
-    const auto append = [&](int first, int count) {
-        const auto status = media
-            ? mrope_gqa_preprocess_keys(media->positions + first, count, buffers.keys,
-                                        model.gqa.key_norm, buffers.rope_keys, stream)
-            : text_gqa_preprocess_keys(first, count, buffers.keys, model.gqa.key_norm,
-                                       buffers.rope_keys, stream);
-        check(status, "Rotate MTP prefill keys");
-        check(mxfp8_kv_append(request.cache, request.pages, first, count, buffers.rope_keys,
-                              buffers.values, stream), "Append MTP prefill MXFP8 KV");
-        request.prefix += count;
-        request.scored = false;
-    };
     const auto append_prepared = [&](int count) {
         if (!paired || count == 0) {
             return;
@@ -727,7 +841,7 @@ void MtpDraftRequest::seed_prefill(int position, const int* shifted_tokens, cons
             check(mtp_seed_project_kv(model.gqa.key, model.gqa.value, input, count,
                                        buffers.keys, buffers.values, stream),
                   "Run exact prefill FP8 projection");
-            append(position, count);
+            request.append_prefill(position, count, buffers, stream, media);
         } catch (...) {
             request.failed = true;
             throw;
@@ -767,7 +881,7 @@ void MtpDraftRequest::seed_prefill(int position, const int* shifted_tokens, cons
             if (!paired) {
                 tile.project(model.gqa.key, input, buffers.keys);
                 tile.project(model.gqa.value, input, buffers.values);
-                append(position + offset, tile.rows);
+                request.append_prefill(position + offset, tile.rows, buffers, stream, media);
             }
         } catch (...) {
             append_prepared(offset);
@@ -824,6 +938,18 @@ bool MtpDraftRequest::retry_invalid_int8(cudaStream_t stream) {
 }
 
 int MtpDraftRequest::valid_prefix() const { return state_->prefix; }
+
+int MtpDraftRequest::kv_elements_per_row() const {
+    return state_->cache.kv_heads * mxfp8_head_dim;
+}
+
+const PrefixPages& MtpDraftRequest::resident_prefix_pages() const {
+    return state_->resident_pages;
+}
+
+const std::vector<std::int32_t>& MtpDraftRequest::prefix_physical_pages() const {
+    return state_->memory.transfers().logical_pages;
+}
 
 Mxfp8KvCache MtpDraftRequest::prefix_cache_view(int rows, bool storing) const {
     if (state_->failed || rows < 0 || rows >= state_->capacity ||

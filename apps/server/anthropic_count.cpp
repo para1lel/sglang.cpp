@@ -14,19 +14,12 @@ using json::Array;
 using json::OrderedObject;
 using json::Value;
 using namespace std::string_view_literals;
-
-const Value* supplied(const OrderedObject& object, std::string_view key) {
-    const auto* value = json::get(object, key);
-    return value && !value->is_null() ? value : nullptr;
-}
+using request_validation::invalid;
+using request_validation::optional_bool;
 
 std::string_view text(const OrderedObject& object, std::string_view key) {
     const auto* value = supplied(object, key);
     return value ? value->string().value_or("") : "";
-}
-
-[[noreturn]] void invalid(std::string_view field, std::string_view message) {
-    throw std::invalid_argument(std::string(field) + ": " + std::string(message));
 }
 
 template <class Type>
@@ -60,15 +53,8 @@ void optional_text(const OrderedObject& object, std::string_view key) {
     }
 }
 
-bool optional_bool(const Value* value, std::string_view field, bool fallback = false) {
-    if (!value) return fallback;
-    if (const auto flag = chat_boolean(*value)) return *flag;
-    invalid(field, "Input should be a valid boolean");
-}
-
 double integer(const Value& value, std::string_view field) {
-    const auto number = value.boolean() ? std::optional<double>(*value.boolean())
-                                        : chat_number(value);
+    const auto number = chat_number(value);
     if (!number || !std::isfinite(*number) || std::trunc(*number) != *number) {
         invalid(field, "Input should be a valid integer");
     }
@@ -442,7 +428,7 @@ void convert_turn(Array& messages, std::string_view role, const Value& content,
     messages.emplace_back(std::move(turn));
 }
 
-Array convert_messages(const OrderedObject& request) {
+Array convert_messages(const OrderedObject& request, bool reasoning_parser, bool generation) {
     Array messages;
     std::string system_text;
     if (const auto* system = supplied(request, "system")) {
@@ -462,6 +448,13 @@ Array convert_messages(const OrderedObject& request) {
         if (role == "system") append_system(system_text, *content, true);
     }
     if (!system_text.empty()) emit(messages, "system", std::move(system_text));
+    for (const auto& value : turns) {
+        const auto& turn = *value.ordered_object();
+        const auto role = text(turn, "role");
+        if (role != "system") {
+            convert_turn(messages, role, *json::get(turn, "content"), reasoning_parser, generation);
+        }
+    }
     return messages;
 }
 
@@ -684,16 +677,7 @@ AnthropicCountChat convert_chat(const Value& value, bool reasoning_parser, bool 
     const auto& request = *object;
     const auto model = required_text(request, "model", "model");
     if (model.empty()) invalid("model", "Value error, Model is required");
-    auto messages = convert_messages(request);
-    const auto& turns = *json::get(request, "messages")->array();
-    for (const auto& value : turns) {
-        const auto& turn = *value.ordered_object();
-        const auto role = text(turn, "role");
-        if (role != "system") {
-            convert_turn(messages, role, *json::get(turn, "content"), reasoning_parser,
-                         generation);
-        }
-    }
+    auto messages = convert_messages(request, reasoning_parser, generation);
     if (const auto* betas = supplied(request, "betas")) {
         for (const auto& beta : structure<Array>(betas, "betas")) {
             if (!beta.string()) invalid("betas", "Input should be a valid string");
@@ -718,8 +702,7 @@ void add_generation_options(OrderedObject& chat, const OrderedObject& request) {
     chat.emplace_back("stream", stream);
     for (const auto key : {"temperature"sv, "top_p"sv}) {
         if (const auto* value = supplied(request, key)) {
-            const auto number = value->boolean() ? std::optional<double>(*value->boolean())
-                                                 : chat_number(*value);
+            const auto number = chat_number(*value);
             if (!number) invalid(key, "Input should be a valid number");
             chat.emplace_back(key, *number);
         }

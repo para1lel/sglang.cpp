@@ -23,6 +23,11 @@ struct BatchMetrics {
     LmCacheMetrics lmcache;
     decoder::TpArCounters tp_ar;
     bool tp_ar_present = false;
+    std::uint64_t resident_admission_retries = 0;
+    std::uint64_t mailbox_grace_timeouts = 0;
+    int admission_waiting_for_capacity = 0;
+    int admission_waiting_for_lookup = 0;
+    int admission_waiting_for_restore = 0;
 };
 
 
@@ -38,6 +43,7 @@ struct BatchProfileStep {
     int prefill_rows = 0;
     int decode_lanes = 0;
     std::uint32_t graph_slots = 0;
+    std::uint32_t verification_graph_slots = 0;
 };
 
 struct BatchProfile {

@@ -10,11 +10,8 @@
 #include "sglang/server/native_generate.h"
 #include "sglang/server/ollama_discovery.h"
 #include "sglang/server/parse_function_call.h"
-#include "sglang/server/serving/qwen_parser.h"
-#include "sglang/utf8.h"
 
 #include <algorithm>
-#include <array>
 #include <chrono>
 #include <condition_variable>
 #include <ctime>
@@ -31,123 +28,18 @@ namespace {
 using Clock = std::chrono::steady_clock;
 constexpr auto generation_health_timeout = std::chrono::seconds(20);
 constexpr auto flush_probe_retry = std::chrono::milliseconds(10);
+constexpr auto flush_disconnect_poll = std::chrono::milliseconds(250);
 constexpr std::string_view model_prefix = "/v1/models/";
-
-std::string lowercase_ascii(std::string_view text) {
-    std::string result(text);
-    for (auto& character : result) {
-        if (character >= 'A' && character <= 'Z') {
-            character += 'a' - 'A';
-        }
-    }
-    return result;
-}
-
-bool return_reasoning_blocks(const json::Value* value) {
-    if (!value) {
-        return false;
-    }
-    if (const auto flag = value->boolean()) {
-        return *flag;
-    }
-    if (const auto number = value->number(); number == 0 || number == 1) {
-        return number == 1;
-    }
-    if (const auto text = value->string()) {
-        const auto flag = lowercase_ascii(*text);
-        if (flag == "1" || flag == "true" || flag == "t" ||
-            flag == "yes" || flag == "y" || flag == "on") {
-            return true;
-        }
-        if (flag == "0" || flag == "false" || flag == "f" ||
-            flag == "no" || flag == "n" || flag == "off") {
-            return false;
-        }
-    }
-    throw std::invalid_argument("return_blocks: Input should be a valid boolean");
-}
-
-void write_separated_reasoning(const Socket& connection, const SeparatedReasoning& parsed,
-                               bool return_blocks) {
-    std::string response = R"({"reasoning_text":)";
-    json::append_quoted(response, parsed.reasoning, true);
-    response += R"(,"text":)";
-    json::append_quoted(response, parsed.text, true);
-    if (return_blocks) {
-        response += R"(,"reasoning_blocks":[)";
-        if (!parsed.reasoning.empty()) {
-            json::append_quoted(response, parsed.reasoning, true);
-        }
-        response += R"(],"text_blocks":[)";
-        json::append_quoted(response, parsed.text, true);
-        response += R"(],"blocks":[)";
-        if (!parsed.reasoning.empty()) {
-            response += R"({"type":"reasoning","text":)";
-            json::append_quoted(response, parsed.reasoning, true);
-            response += "},";
-        }
-        response += R"({"type":"text","text":)";
-        json::append_quoted(response, parsed.text, true);
-        response += "}]";
-    }
-    write_json(connection, "200 OK", response + '}');
-}
-
-void separate_reasoning(const Socket& connection, std::string_view body) {
-    try {
-        if (!valid_utf8(body)) {
-            throw std::invalid_argument("JSON decode error: Invalid UTF-8");
-        }
-        const auto input = body.empty() ? json::Value() :
-            json::parse(body, json::Syntax::last_key_wins);
-        if (input.is_null()) {
-            throw std::invalid_argument("body: Field required");
-        }
-        const auto* object = input.object();
-        if (!object) {
-            throw std::invalid_argument("Input should be a valid dictionary");
-        }
-        for (const auto key : {"rid", "http_worker_ipc", "text", "reasoning_parser"}) {
-            const auto* value = json::get(*object, key);
-            const bool required = std::string_view(key) == "text" ||
-                std::string_view(key) == "reasoning_parser";
-            if (!value && required) {
-                throw std::invalid_argument(std::string(key) + ": Field required");
-            }
-            if (value && !value->string() && (required || !value->is_null())) {
-                throw std::invalid_argument(std::string(key) + ": Input should be a valid string");
-            }
-        }
-        const bool return_blocks = return_reasoning_blocks(json::get(*object, "return_blocks"));
-        const auto parser = *json::get_string(*object, "reasoning_parser");
-        constexpr std::array<std::string_view, 4> adapter_parsers{
-            "deepseek-v4", "deepseekv4", "deepseek-v41", "deepseekv41"};
-        if (std::find(adapter_parsers.begin(), adapter_parsers.end(), parser) !=
-            adapter_parsers.end()) {
-            write_tokenization_error(connection, "400 Bad Request", "400",
-                "'" + std::string(parser) + "' output is parsed with its model's tokenizer; "
-                "this server does not serve that model");
-            return;
-        }
-        const auto text = *json::get_string(*object, "text");
-        const auto result = model::separate_qwen_reasoning(text, parser);
-        if (!result) {
-            write_internal_server_error(connection);
-            return;
-        }
-        write_separated_reasoning(connection, *result, return_blocks);
-    } catch (const json::ParseError& error) {
-        write_tokenization_error(connection, "400 Bad Request", "Bad Request",
-                                 "JSON decode error: " + std::string(error.what()));
-    } catch (const std::invalid_argument& error) {
-        write_tokenization_error(connection, "400 Bad Request", "Bad Request", error.what());
-    }
-}
 
 struct Completion {
     Socket connection;
     std::optional<HttpRequest> request;
     QueuedGenerate generate = QueuedGenerate{};
+};
+
+struct AuxiliaryRequest {
+    Socket connection;
+    HttpRequest request;
 };
 
 struct HealthCheck {
@@ -244,7 +136,9 @@ void stop_profile(const Socket& connection, BatchService& service, const HttpReq
         report += R"(,"width":)" + std::to_string(step.width);
         report += R"(,"prefill_rows":)" + std::to_string(step.prefill_rows);
         report += R"(,"decode_lanes":)" + std::to_string(step.decode_lanes);
-        report += R"(,"graph_slots":)" + std::to_string(step.graph_slots) + '}';
+        report += R"(,"graph_slots":)" + std::to_string(step.graph_slots);
+        report +=
+            R"(,"verification_graph_slots":)" + std::to_string(step.verification_graph_slots) + '}';
     }
     write_json(connection, "200 OK", report + "]}");
 }
@@ -268,6 +162,7 @@ public:
 
     void read(const Socket& listener);
     void run(int slot);
+    void run_auxiliary();
     void run_aborted();
     void run_health();
     void run_flushes();
@@ -278,6 +173,18 @@ private:
         ConnectionQueue& queue;
         bool active = false;
         ~Lease();
+    };
+
+    struct Preparation {
+        explicit Preparation(ConnectionQueue& owner) : queue(&owner) {
+        }
+        Preparation(const Preparation&) = delete;
+        Preparation& operator=(const Preparation&) = delete;
+        Preparation(Preparation&&) = delete;
+        Preparation& operator=(Preparation&&) = delete;
+        ConnectionQueue* queue;
+        bool active = false;
+        ~Preparation();
     };
 
     struct CacheReset {
@@ -297,15 +204,21 @@ private:
     };
 
     NativeRoute native_route(std::string_view path, std::string_view method) const;
-    void enqueue(Socket& connection, HttpRequest request, bool generate, bool auxiliary,
+    void enqueue(Socket& connection, HttpRequest request, bool generate, bool tokenization_errors,
                  QueuedGenerate prepared);
+    void enqueue_auxiliary(Socket& connection, HttpRequest request);
+    template <typename Work, typename... Args>
+    bool enqueue_control(std::list<Work>& pending, std::condition_variable& ready,
+                         Socket& connection, Args&&... args);
+    template <typename Work>
+    std::optional<Work> take_control(std::list<Work>& pending, std::condition_variable& ready);
     void serve_control(Socket& connection, const HttpRequest& request);
     void queue_health(Socket& connection, const HttpRequest& request);
     void queue_reset(Socket& connection, const HttpRequest& request);
     bool idle_for_cache_reset();
     void reset_cache(const Socket& connection);
     void queue_flush(Socket& connection, double timeout);
-    FlushCacheResult flush_cache(double timeout);
+    FlushCacheResult flush_cache(const FlushCache& work);
     void discard_disconnected();
 
     BatchService& service_;
@@ -328,14 +241,17 @@ private:
     const bool prefix_controls_;
     std::mutex mutex_;
     std::condition_variable changed_;
+    std::condition_variable auxiliary_ready_;
     std::condition_variable abort_ready_;
     std::condition_variable health_ready_;
     std::condition_variable cache_ready_;
     std::list<Completion> pending_;
+    std::list<AuxiliaryRequest> auxiliary_;
     std::list<HealthCheck> health_checks_;
     std::list<FlushCache> flushes_;
     std::optional<Socket> reset_;
     int running_ = 0;
+    bool preparing_ = false;
     bool resetting_ = false;
     bool closing_ = false;
 };
@@ -349,6 +265,16 @@ ConnectionQueue::Lease::~Lease() {
     }
 }
 
+ConnectionQueue::Preparation::~Preparation() {
+    if (active) {
+        {
+            const std::scoped_lock lock(queue->mutex_);
+            queue->preparing_ = false;
+        }
+        queue->cache_ready_.notify_one();
+    }
+}
+
 void ConnectionQueue::discard_disconnected() {
     const bool had_pending = !pending_.empty();
     pending_.remove_if([](const auto& job) { return disconnected(job.connection); });
@@ -359,7 +285,7 @@ void ConnectionQueue::discard_disconnected() {
 
 bool ConnectionQueue::idle_for_cache_reset() {
     discard_disconnected();
-    return pending_.empty() && running_ == 0 && !resetting_;
+    return pending_.empty() && running_ == 0 && !preparing_ && !resetting_;
 }
 
 ConnectionQueue::CacheReset::~CacheReset() {
@@ -396,19 +322,46 @@ void ConnectionQueue::reset_cache(const Socket& connection) {
     });
 }
 
-void ConnectionQueue::queue_flush(Socket& connection, double timeout) {
-    {
-        const std::lock_guard lock(mutex_);
-        flushes_.push_back({std::move(connection), timeout});
+template <typename Work, typename... Args>
+bool ConnectionQueue::enqueue_control(std::list<Work>& pending, std::condition_variable& ready,
+                                      Socket& connection, Args&&... args) {
+    const std::scoped_lock lock(mutex_);
+    if (closing_ || disconnected(connection)) {
+        return false;
     }
-    cache_ready_.notify_one();
+    pending.remove_if([](const auto& work) { return disconnected(work.connection); });
+    if (pending.size() >= static_cast<std::size_t>(capacity_)) {
+        return false;
+    }
+    pending.push_back({std::move(connection), std::forward<Args>(args)...});
+    ready.notify_one();
+    return true;
 }
 
-FlushCacheResult ConnectionQueue::flush_cache(double timeout) {
+template <typename Work>
+std::optional<Work> ConnectionQueue::take_control(std::list<Work>& pending,
+                                                  std::condition_variable& ready) {
+    std::unique_lock lock(mutex_);
+    ready.wait(lock, [&] { return closing_ || !pending.empty(); });
+    if (pending.empty()) {
+        return std::nullopt;
+    }
+    std::optional<Work> work(std::in_place, std::move(pending.front()));
+    pending.pop_front();
+    return work;
+}
+
+void ConnectionQueue::queue_flush(Socket& connection, double timeout) {
+    if (!enqueue_control(flushes_, cache_ready_, connection, timeout)) {
+        throw HttpError("503 Service Unavailable", "Native cache flush queue is full");
+    }
+}
+
+FlushCacheResult ConnectionQueue::flush_cache(const FlushCache& work) {
     using Seconds = std::chrono::duration<double>;
     const auto started = Clock::now();
     std::unique_lock lock(mutex_);
-    while (!closing_ && !stopping()) {
+    while (!closing_ && !disconnected(work.connection)) {
         const bool idle = idle_for_cache_reset();
         if (idle) {
             resetting_ = true;
@@ -421,31 +374,26 @@ FlushCacheResult ConnectionQueue::flush_cache(double timeout) {
             }
             lock.lock();
         }
-        if (timeout == 0.0) {
+        if (work.timeout == 0.0) {
             return FlushCacheResult::busy;
         }
-        const auto remaining = Seconds(timeout) - Seconds(Clock::now() - started);
+        const auto remaining = Seconds(work.timeout) - Seconds(Clock::now() - started);
         if (remaining <= Seconds::zero()) {
             return FlushCacheResult::timed_out;
         }
-        const auto wait_limit = idle ? Seconds(flush_probe_retry) : Seconds(60);
-        cache_ready_.wait_for(lock, std::min(remaining, wait_limit));
+        const auto wait_limit = idle ? flush_probe_retry : flush_disconnect_poll;
+        cache_ready_.wait_for(lock, std::min(remaining, Seconds(wait_limit)));
     }
     return FlushCacheResult::busy;
 }
 
 void ConnectionQueue::run_flushes() {
-    for (;;) {
-        std::unique_lock lock(mutex_);
-        cache_ready_.wait(lock, [&] { return closing_ || !flushes_.empty(); });
-        if (closing_) {
-            return;
-        }
-        auto work = std::move(flushes_.front());
-        flushes_.pop_front();
-        lock.unlock();
-        handle_errors(work.connection, [&] {
-            write_flush_cache(work.connection, flush_cache(work.timeout));
+    while (auto work = take_control(flushes_, cache_ready_)) {
+        handle_errors(work->connection, [&] {
+            const auto result = flush_cache(*work);
+            if (!disconnected(work->connection)) {
+                write_flush_cache(work->connection, result);
+            }
         });
     }
 }
@@ -533,13 +481,15 @@ void ConnectionQueue::serve_control(Socket& connection, const HttpRequest& reque
             return;
         }
         if (prefix_controls_ && path == "/metrics") {
-            std::string body;
+            int running = 0;
+            std::size_t pending = 0;
             {
                 const std::lock_guard lock(mutex_);
                 discard_disconnected();
-                body = format_metrics(service_.metrics(), running_, pending_.size());
+                running = running_;
+                pending = pending_.size();
             }
-            write_metrics(connection, body);
+            write_metrics(connection, format_metrics(service_.metrics(), running, pending));
             return;
         }
     }
@@ -657,10 +607,12 @@ void ConnectionQueue::route(Socket& connection, HttpRequest request) {
         write_loads(connection, request, snapshot);
         return;
     }
-    if (const auto parser = path == separate_reasoning_route ? separate_reasoning
-                          : path == parse_function_call_route ? parse_function_call : nullptr) {
-        if (request.method == "POST") parser(connection, request.body);
-        else write_method_not_allowed(connection, "POST", request.method == "HEAD");
+    if (path == separate_reasoning_route || path == parse_function_call_route) {
+        if (request.method == "POST") {
+            enqueue_auxiliary(connection, std::move(request));
+        } else {
+            write_method_not_allowed(connection, "POST", request.method == "HEAD");
+        }
         return;
     }
     const bool score = score_ && path == score_route;
@@ -701,51 +653,79 @@ void ConnectionQueue::route(Socket& connection, HttpRequest request) {
         return;
     }
     const bool generate = generate_ && native_route == GenerateRoute::allowed;
-    const bool tokenize = tokenize_ && tokenization_route(request) != TokenizationRoute::none;
-    if (!generate && !tokenize && !score && !messages && !responses &&
-        !decisions && !completion_route(request)) {
+    if (tokenize_ && tokenization_route(request) != TokenizationRoute::none) {
+        enqueue_auxiliary(connection, std::move(request));
+        return;
+    }
+    if (!generate && !score && !messages && !responses && !decisions &&
+        !completion_route(request)) {
         serve_control(connection, request);
         return;
     }
-    enqueue(connection, std::move(request), generate, tokenize || score || messages || decisions,
-            {});
+    enqueue(connection, std::move(request), generate, score || messages || decisions, {});
+}
+
+void write_queue_overload(const Socket& connection, bool anthropic) {
+    if (anthropic) {
+        write_anthropic_error(connection, "503 Service Unavailable", "api_error",
+                              "Internal server error");
+    } else {
+        write_tokenization_error(connection, "503 Service Unavailable", "ServiceUnavailableError",
+                                 "Native request queue is full");
+    }
 }
 
 void ConnectionQueue::enqueue(Socket& connection, HttpRequest request, bool generate,
-                              bool auxiliary, QueuedGenerate prepared) {
-    if (!auxiliary) {
+                              bool tokenization_errors, QueuedGenerate prepared) {
+    if (!tokenization_errors) {
         service_.rethrow_failure();
     }
-    {
-        std::unique_lock lock(mutex_);
-        if (closing_) {
-            return;
-        }
-        discard_disconnected();
-        if (pending_.size() >= static_cast<std::size_t>(capacity_)) {
-            if (auxiliary) {
-                lock.unlock();
-                if (request.route_path() == anthropic_count_route ||
-                    request.route_path() == anthropic_messages_route) {
-                    write_anthropic_error(connection, "503 Service Unavailable", "api_error",
-                                          "Internal server error");
-                } else {
-                    write_tokenization_error(connection, "503 Service Unavailable",
-                        "ServiceUnavailableError", "Native request queue is full");
-                }
-                return;
-            }
+    if (prepared.complete) {
+        request.body = std::string{};
+    }
+    Preparation preparation{*this};
+    std::unique_lock lock(mutex_);
+    if (closing_ || disconnected(connection)) {
+        return;
+    }
+    discard_disconnected();
+    const int idle_workers = resetting_ ? 0 : capacity_ - running_;
+    const auto available =
+        static_cast<std::size_t>(idle_workers) + static_cast<std::size_t>(capacity_);
+    if (pending_.size() >= available) {
+        lock.unlock();
+        if (!tokenization_errors) {
             throw HttpError("503 Service Unavailable", "Native completion queue is full");
         }
-        if (generate) {
-            prepared = generate_(request.body);
-        }
+        write_queue_overload(connection, request.route_path() == anthropic_messages_route);
+        return;
+    }
+    if (generate) {
+        preparation.active = preparing_ = true;
+        lock.unlock();
+        prepared = generate_(request.body);
         if (prepared.complete) {
             request.body = std::string{};
         }
-        pending_.push_back({std::move(connection), std::move(request), std::move(prepared)});
+        lock.lock();
+        if (closing_ || disconnected(connection)) {
+            return;
+        }
     }
+    pending_.push_back({std::move(connection), std::move(request), std::move(prepared)});
+    if (preparation.active) {
+        preparing_ = false;
+        preparation.active = false;
+    }
+    lock.unlock();
     changed_.notify_one();
+}
+
+void ConnectionQueue::enqueue_auxiliary(Socket& connection, HttpRequest request) {
+    const bool anthropic = request.route_path() == anthropic_count_route;
+    if (!enqueue_control(auxiliary_, auxiliary_ready_, connection, std::move(request))) {
+        write_queue_overload(connection, anthropic);
+    }
 }
 
 void ConnectionQueue::read(const Socket& listener) {
@@ -793,27 +773,41 @@ void ConnectionQueue::run(int slot) {
         } else if (!disconnected(work->connection)) {
             const auto& request = *work->request;
             handle_errors(work->connection, [&] {
-                const auto tokenize = tokenization_route(request);
+                const auto path = request.route_path();
                 if (work->generate.complete) {
                     const auto generate = std::move(work->generate);
                     generate.complete(work->connection, slot);
-                } else if (tokenize != TokenizationRoute::none) {
-                    tokenize_(work->connection, tokenize, request.body);
-                } else if (score_ && request.route_path() == score_route) {
+                } else if (score_ && path == score_route) {
                     score_(work->connection, slot, request.body);
-                } else if (messages_ && request.route_path() == anthropic_messages_route) {
+                } else if (messages_ && path == anthropic_messages_route) {
                     messages_(work->connection, slot, request.body);
-                } else if (responses_ && request.route_path() == responses_route) {
+                } else if (responses_ && path == responses_route) {
                     responses_(work->connection, slot, request.body);
-                } else if (decisions_ && (request.route_path() == decisions_route ||
-                                          request.route_path() == systemone_route)) {
-                    decisions_(work->connection, slot, request.body,
-                               request.route_path() == systemone_route);
+                } else if (decisions_ && (path == decisions_route || path == systemone_route)) {
+                    decisions_(work->connection, slot, request.body, path == systemone_route);
                 } else {
                     complete_(work->connection, slot, request.body, chat_route(request));
                 }
             });
         }
+    }
+}
+
+void ConnectionQueue::run_auxiliary() {
+    while (auto work = take_control(auxiliary_, auxiliary_ready_)) {
+        if (disconnected(work->connection)) {
+            continue;
+        }
+        handle_errors(work->connection, [&] {
+            const auto path = work->request.route_path();
+            if (path == separate_reasoning_route) {
+                separate_reasoning(work->connection, work->request.body);
+            } else if (path == parse_function_call_route) {
+                parse_function_call(work->connection, work->request.body);
+            } else {
+                tokenize_(work->connection, tokenization_route(work->request), work->request.body);
+            }
+        });
     }
 }
 
@@ -856,36 +850,17 @@ void ConnectionQueue::queue_health(Socket& connection, const HttpRequest& reques
         throw HttpError("404 Not Found", "Expected an empty generation health request");
     }
     const auto started = Clock::now();
-    {
-        const std::lock_guard lock(mutex_);
-        health_checks_.remove_if([](const auto& check) {
-            return disconnected(check.connection);
-        });
-        if (!stopping() && service_.ready() &&
-            health_checks_.size() < static_cast<std::size_t>(capacity_)) {
-            health_checks_.push_back({std::move(connection), started});
-            health_ready_.notify_one();
-            return;
-        }
+    if (!service_.ready() || !enqueue_control(health_checks_, health_ready_, connection, started)) {
+        write_generation_health(connection, false);
     }
-    write_generation_health(connection, false);
 }
 
 void ConnectionQueue::run_health() {
-    for (;;) {
-        std::unique_lock lock(mutex_);
-        health_ready_.wait(lock, [&] { return closing_ || !health_checks_.empty(); });
-        if (health_checks_.empty()) {
-            return;
-        }
-        auto work = std::move(health_checks_.front());
-        health_checks_.pop_front();
-        lock.unlock();
-
-        const auto cancelled = [&] { return disconnected(work.connection); };
+    while (auto work = take_control(health_checks_, health_ready_)) {
+        const auto cancelled = [&] { return disconnected(work->connection); };
         const bool healthy = service_.wait_for_generation(
-            work.started, work.started + generation_health_timeout, cancelled);
-        write_generation_health(work.connection, healthy && service_.ready());
+            work->started, work->started + generation_health_timeout, cancelled);
+        write_generation_health(work->connection, healthy && service_.ready());
     }
 }
 
@@ -894,10 +869,12 @@ void ConnectionQueue::stop() {
         const std::lock_guard lock(mutex_);
         closing_ = true;
         pending_.clear();
+        auxiliary_.clear();
         flushes_.clear();
         reset_.reset();
     }
     changed_.notify_all();
+    auxiliary_ready_.notify_one();
     abort_ready_.notify_one();
     health_ready_.notify_one();
     cache_ready_.notify_one();
@@ -921,7 +898,7 @@ void serve_connections(const Socket& listener, BatchService& service, int max_ac
                           tokenize, model_info, abort, server_info, score, discovery, messages,
                           responses, response_store, decisions, accelerator, session_control);
     std::vector<std::thread> workers;
-    workers.reserve(max_active + (abort ? 3 : 2));
+    workers.reserve(max_active + (abort ? 4 : 3));
     std::mutex failure_mutex;
     std::exception_ptr failure;
     const auto stop_on_error = [&] {
@@ -943,6 +920,7 @@ void serve_connections(const Socket& listener, BatchService& service, int max_ac
     try {
         start_worker(&ConnectionQueue::run_health);
         start_worker(&ConnectionQueue::run_flushes);
+        start_worker(&ConnectionQueue::run_auxiliary);
         if (abort) {
             start_worker(&ConnectionQueue::run_aborted);
         }

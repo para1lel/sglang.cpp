@@ -94,6 +94,18 @@ Disposable compiler-generated output is exempt from maintained-source limits.
 Document size and language rules belong to [doc's writing reference](../../doc-mode/references/writing.md).
 Mechanically testable requirements belong in [incremental gates](../../test-mode/references/evidence.md#examine-the-selected-index).
 
+For a project-wide code cap, count maintained framework code regardless of its language, path, file name, or packaging.
+Include production source, headers, tests, benchmarks, tools, standalone examples, hooks, and build files.
+Count configuration files that define executable steps or source transformations as code.
+Count physical lines in code files, including blanks, comments, and a final line without a line ending.
+Count embedded maintained programs in documentation or fixtures when they serve as source.
+Exclude prose, illustrative fragments, and configuration or fixtures consumed only as data.
+Count vendored source kept in the tree and maintained generated source built or shipped by the framework.
+Disclose external dependencies and account for framework code transferred to them or packaged in archives, binaries, or data.
+
+Meet the cap by sharing general mechanisms across supported cases and removing obsolete code.
+Preserve normal formatting, supported features, numerical semantics, failure behavior, and the project's formal performance requirements.
+
 ## Edit instruction files
 
 When assigned a skill edit, keep its purpose and essential workflow in `SKILL.md`.

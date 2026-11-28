@@ -1,6 +1,5 @@
 #pragma once
 
-
 #include "sglang/decoder_prefill.h"
 #include "sglang/decoder_batch.h"
 #include "sglang/decoder_media_internal.h"
@@ -54,17 +53,6 @@ struct PrefillDims {
     std::size_t gdn_workspace_bytes(int rows) const;
 };
 
-struct SeedScratch {
-    Bf16* concatenated = nullptr;
-    Bf16* keys = nullptr;
-    Bf16* values = nullptr;
-    Bf16* rope_keys = nullptr;
-};
-
-std::size_t seed_scratch_bytes(int concat_rows, int kv_rows);
-
-SeedScratch make_seed_scratch(Bf16* memory, int concat_rows, int kv_rows);
-
 struct TileBuffers {
     TileBuffers(ScratchLayout& layout, int rows, const PrefillDims& tile_dims = PrefillDims{});
 
@@ -93,26 +81,37 @@ struct TileBuffers {
     TextFp8Activation activation;
 };
 
+struct PrefillGqaStaging {
+    PairedPrefillScratch scratch;
+    bool resident = false;
+};
+
+PrefillGqaStaging select_gqa_staging(const PrefillWorkspace& target,
+                                     const PrefillWorkspace* counterpart = nullptr);
+
 struct Chunk : PrefillProjections {
+    Chunk(PrefillProjections projections, const TileBuffers& buffers, int position,
+          const MropePosition* mrope, int cached_gqa_tokens, PrefillGqaStaging staging);
+
     TileBuffers work;
     int position;
     const MropePosition* mrope;
     int cached_gqa_tokens = 0;
-    PairedPrefillScratch long_staging{};
+    PrefillGqaStaging long_staging{};
 
     bool project_packed(TextFp8ActivationView input,
                         std::initializer_list<PrefillFp8Projection> projections) const;
 
     void seed_draft(MtpDraftRequest& draft, const int* shifted_tokens, int seed_rows,
-                    const Bf16* final_norm, bool wmma, const MediaPrefill* media,
-                    const SeedScratch* seed = nullptr) const;
+                    const Bf16* final_norm, bool wmma, const MediaPrefill* media) const;
 
     void gdn_input(const GdnLayer& layer) const;
 
-    void gdn_recur(const GdnLayer& layer, TextGdnState state, int bank,
-                   TextFp8Activation quantized) const;
+    void gdn_recur(const GdnLayer& layer, TextGdnState state, int bank, TextFp8Activation quantized,
+                   TextGdnPrefillCheckpoints checkpoints = TextGdnPrefillCheckpoints()) const;
 
-    void gdn_attention(const GdnLayer& layer, TextGdnState state, int bank) const;
+    void gdn_attention(const GdnLayer& layer, TextGdnState state, int bank,
+                       TextGdnPrefillCheckpoints checkpoints = TextGdnPrefillCheckpoints()) const;
 
     void gqa_input(const GqaLayer& layer, bool reuse_all = false) const;
 
@@ -142,15 +141,31 @@ void gather_embeddings(const Bf16* embedding, const int* tokens, int rows, Bf16*
 
 void stage_prefill_row(Request& request, const TileBuffers& work, int row, cudaStream_t stream);
 
+void seed_ranked_prefill_draft(const std::array<const DecoderModel*, 2>& models,
+                               const std::array<const PrefillGrant*, 2>& grants,
+                               const std::array<const Chunk*, 2>& chunks, int offset,
+                               TensorParallel& group);
+void seed_scalar_prefill_draft_tp(const DecoderModel& model, const DecoderModel& peer,
+                                  const PrefillGrant& grant, const PrefillGrant& peer_grant,
+                                  cudaStream_t stream, cudaStream_t peer_stream,
+                                  TensorParallel& group);
+
+struct GdnPrefillCheckpoints {
+    GdnPrefillCheckpoints();
+    GdnPrefillCheckpoints(const PrefillGrant& grant, int bank);
+    TextGdnPrefillCheckpoints view() const;
+    std::array<TextGdnPrefillCheckpoint, text_gdn_max_prefill_checkpoints> items{};
+    int count = 0;
+};
+
+PrefillCheckpoints prefill_checkpoints(const PrefillGrant& grant);
+void capture_prefill_checkpoints(const PrefillGrant& grant, const TileBuffers* work, int offset,
+                                 cudaStream_t stream);
+void publish_prefill_checkpoints(const PrefillGrant& grant);
+
 void capture_prefill_scores(const DecoderModel& model, const PrefillGrant& grant,
                             const TileBuffers* buffers, int offset, cudaStream_t stream);
 
-constexpr int layerwise_row_alignment = 128;
-constexpr int max_layerwise_rows = 1023;
-static_assert(max_layerwise_rows / 256 <= max_gdn_prefill_segments);
-static_assert(text_gqa_kv_width * sizeof(Bf16) >= text_gdn_value_heads * sizeof(float2));
-
-PrefillGroup prefill_group(const PrefillGrant* grants, int count);
 
 Chunk prefill_attention_segment(const Chunk& chunk, const PrefillGrant& grant, int offset);
 

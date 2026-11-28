@@ -1,19 +1,26 @@
 """Exercise four /v1/completions prompt forms through the CPU host server."""
 
-from contextlib import closing
-import http.client
 import json
-from pathlib import Path
 import select
-import socket
-import struct
-from tempfile import TemporaryDirectory
 import time
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
-from test_native_text import HEADERS, MODEL, event, events, exchange, legacy, raw, usage
-from test_sampling_routes_cpu import receipts, run_cpu_suite, server
+from test_native_generate_cpu import abort, raw_post, raw_response
+from test_native_text import (
+    HEADERS,
+    MODEL,
+    event,
+    events,
+    exchange,
+    legacy,
+    raw,
+    stream_options,
+    usage,
+)
+from test_sampling_routes_cpu import control_response, receipts, run_cpu_suite, server, sse_frames
 
 
 class CompletionPrompts(unittest.TestCase):
@@ -24,7 +31,12 @@ class CompletionPrompts(unittest.TestCase):
                                                "--max-active", "2", sampling=False))
 
     def plain(self, prompt, budget, *, port=None, **options):
-        mime, data = exchange(port or self.port, raw(prompt, budget, **options))
+        return self.post_json(raw(prompt, budget, **options), port=port)
+
+    def post_json(
+        self, payload: dict[str, object], status: int = 200, *, port: int | None = None
+    ) -> dict[str, object]:
+        mime, data = exchange(port or self.port, payload, status)
         self.assertEqual(mime, "application/json")
         return json.loads(data)
 
@@ -76,9 +88,8 @@ class CompletionPrompts(unittest.TestCase):
             with self.subTest(prompt=prompt):
                 packet = self.plain(prompt, 3, cache_salt="openai-forms")
                 self.check_json(packet, ids, outputs, ["length"] * len(ids))
-                self.check_stream(events(self.port, raw(prompt, 3, stream=True,
-                                                       stream_options={"include_usage": True})),
-                                  packet, include_usage=True)
+                frames = events(self.port, raw(prompt, 3, **stream_options()))
+                self.check_stream(frames, packet, include_usage=True)
                 packets.append(packet)
         if len(packets) == len(inputs):
             self.assertEqual(packets[0], packets[1])
@@ -105,8 +116,7 @@ class CompletionPrompts(unittest.TestCase):
         choices = [{"index": index, "text": "", "finish_reason": "stop"} for index in range(2)]
         self.assertEqual(self.plain(prompts, 131072, **options),
                          {"choices": choices, "usage": counts})
-        frames = events(self.port, raw(prompts, 131072, stream=True, **options,
-                                       stream_options={"include_usage": True}))
+        frames = events(self.port, raw(prompts, 131072, **options, **stream_options()))
         self.assertCountEqual(frames[:-1], [{"choices": [choice]} for choice in choices])
         self.assertEqual(frames[-1], {"choices": [], "usage": counts})
 
@@ -147,9 +157,7 @@ class CompletionPrompts(unittest.TestCase):
         for label, fields in cases:
             with self.subTest(label=label):
                 payload = raw([[32], [33]], 1, stream=True) | fields
-                mime, data = exchange(self.port, payload, 400)
-                self.assertEqual(mime, "application/json")
-                message = json.loads(data)["error"]["message"]
+                message = self.post_json(payload, 400)["error"]["message"]
                 self.assertTrue(message)
                 if "context" in label:
                     self.assertIn("context", message)
@@ -163,8 +171,7 @@ class CompletionPrompts(unittest.TestCase):
                 packet = self.plain(prompts, 2, **options)
                 self.check_json(packet, prompts, [[253, 239], [32]], ["length", "stop"])
                 self.assertEqual(packet["choices"][1]["text"], "")
-                frames = events(self.port, raw(prompts, 2, stream=True, **options,
-                                               stream_options={"include_usage": True}))
+                frames = events(self.port, raw(prompts, 2, **options, **stream_options()))
                 self.check_stream(frames, packet, include_usage=True)
 
     def gated_server(self, width=2):
@@ -177,18 +184,10 @@ class CompletionPrompts(unittest.TestCase):
         return port, gate, log
 
     def connect(self, port, payload):
-        wire = json.dumps(payload).encode()
-        client = self.enterContext(socket.create_connection(("127.0.0.1", port), timeout=5))
-        client.sendall(
-            b"POST /v1/completions HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n"
-            b"Content-Type: application/json\r\nContent-Length: " + str(len(wire)).encode()
-            + b"\r\n\r\n" + wire
-        )
-        return client
+        return self.enterContext(raw_post(port, "/v1/completions", payload))
 
     def begin_stream(self, client):
-        reply = self.enterContext(http.client.HTTPResponse(client))
-        reply.begin()
+        reply = self.enterContext(raw_response(client))
         self.assertEqual(reply.status, 200)
         self.assertEqual(reply.headers.get_content_type(), "text/event-stream")
         self.assertEqual(reply.getheader("Transfer-Encoding"), "chunked")
@@ -197,8 +196,9 @@ class CompletionPrompts(unittest.TestCase):
     def test_incremental_stream_with_out_of_order_finish(self):
         port, gate, _ = self.gated_server()
         prompts = [[32] * 4, [33] * 7]
-        payload = raw(prompts, 2, stream=True, seed=-41, ignore_eos=False, stop_token_ids=[32],
-                      stream_options={"include_usage": True})
+        payload = raw(
+            prompts, 2, seed=-41, ignore_eos=False, stop_token_ids=[32], **stream_options()
+        )
         client = self.connect(port, payload)
         reply = self.begin_stream(client)
         gate.with_name(gate.name + ".0").touch()
@@ -211,7 +211,7 @@ class CompletionPrompts(unittest.TestCase):
                          [[253]])
         self.assertFalse(select.select([client], [], [], 0.1)[0])
         gate.with_name(gate.name + ".1").touch()
-        rest = list(iter(lambda: event(reply), "[DONE]"))
+        rest = list(sse_frames(reply))
         self.assertEqual(reply.read(1), b"")
         expected = self.plain(prompts, 2, ignore_eos=False, stop_token_ids=[32])
         self.check_stream(first + rest, expected, include_usage=True)
@@ -223,19 +223,13 @@ class CompletionPrompts(unittest.TestCase):
         expected = {f'vllm:num_requests_running{{engine="0"}} {running}',
                     f'vllm:num_requests_waiting{{engine="0"}} {waiting}'}
         while time.monotonic() < deadline:
-            with closing(http.client.HTTPConnection("127.0.0.1", port, timeout=5)) as connection:
-                connection.request("GET", "/metrics", headers=HEADERS)
-                with connection.getresponse() as reply:
-                    self.assertEqual(reply.status, 200)
-                    metrics = reply.read().decode().splitlines()
+            with control_response(port, "GET", "/metrics", headers=HEADERS) as reply:
+                self.assertEqual(reply.status, 200)
+                metrics = reply.read().decode().splitlines()
             if expected <= set(metrics):
                 return
             time.sleep(0.01)
         self.fail(f"Missing metrics {expected!r} in {metrics!r}")
-
-    def disconnect(self, client):
-        client.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
-        client.close()
 
     def test_active_disconnect_retires_items_and_skips_unsubmitted_tail(self):
         port, gate, log = self.gated_server()
@@ -246,7 +240,7 @@ class CompletionPrompts(unittest.TestCase):
         self.assertEqual({event(reply)["choices"][0]["index"] for _ in range(2)}, {0, 1})
         self.wait_queue(port, 1, 0)
         reply.close()
-        self.disconnect(active)
+        abort(active)
         self.wait_queue(port, 0, 0)
         lines = log.read_text().splitlines()
         admitted = {line for line in lines if line.startswith("cpu admit ")}
@@ -265,7 +259,7 @@ class CompletionPrompts(unittest.TestCase):
         reply = self.begin_stream(active)
         queued = self.connect(port, raw([[35] * 5, [36] * 6], 6))
         self.wait_queue(port, 1, 1)
-        self.disconnect(queued)
+        abort(queued)
         self.wait_queue(port, 1, 0)
         gate.with_name(gate.name + ".0").touch()
         self.assertEqual(event(reply)["choices"][0]["token_ids"], [32])
@@ -280,9 +274,7 @@ class CompletionPrompts(unittest.TestCase):
     def test_inherited_sampling_and_singleton_routes(self):
         log = self.output / "inherited-sampling.log"
         with server(self.binary, self.checkpoint, log, "--max-active", "2") as port:
-            mime, data = exchange(port, {"model": MODEL, "prompt": "Hi"})
-            self.assertEqual(mime, "application/json")
-            packet = json.loads(data)
+            packet = self.post_json({"model": MODEL, "prompt": "Hi"}, port=port)
             self.assertNotIn("prompt_token_ids", packet["choices"][0])
             self.assertNotIn("token_ids", packet["choices"][0])
             self.assertEqual(packet["choices"][0]["finish_reason"], "stop")

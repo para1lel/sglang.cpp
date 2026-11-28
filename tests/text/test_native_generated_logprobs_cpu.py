@@ -1,12 +1,108 @@
 """Check native score metadata through the HTTP worker with scripted decoder scores."""
 
-from pathlib import Path
+from __future__ import annotations
+
 import unittest
+from contextlib import contextmanager
+from dataclasses import dataclass
+from http import HTTPStatus
+from pathlib import Path
+from typing import TYPE_CHECKING
 from unittest.mock import patch
 
 from test_native_chat import tokenizer_pieces
-from test_native_generate_cpu import ABORTED, ABORT_REQUEST, GENERATE, batch_frame, batch_frames
-from test_sampling_routes_cpu import checked_body, post_response, receipts, run_cpu_suite, server
+from test_native_generate_cpu import ABORT_REQUEST, ABORTED, GENERATE, batch_frame, batch_frames
+from test_sampling_routes_cpu import (
+    checked_body,
+    post_response,
+    receipts,
+    run_cpu_suite,
+    server,
+    sse_frames,
+)
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Generator, Mapping, Sequence
+    from typing import Protocol
+
+    class ServerPaths(Protocol):
+        binary: Path
+        checkpoint: Path
+        output: Path
+
+
+@contextmanager
+def scripted_server(
+    test: type[ServerPaths],
+    name: str,
+    scripts: Mapping[int, Sequence[int]],
+    log: Path,
+    *flags: str,
+    sampling: bool = True,
+    **environment: str,
+) -> Generator[int, None, None]:
+    script = test.output / name
+    script.write_text(
+        "".join(f"{seed} {' '.join(map(str, ids))}\n" for seed, ids in scripts.items()),
+        encoding="ascii",
+    )
+    with (
+        patch.dict("os.environ", SGLANG_TEST_CHAT_OUTPUT_IDS=str(script), **environment),
+        server(test.binary, test.checkpoint, log, *flags, sampling=sampling) as port,
+    ):
+        yield port
+
+
+@dataclass(frozen=True)
+class ReplyChecks:
+    status: int = HTTPStatus.OK
+    native_eof: str = "Stream ended before DONE"
+    read_error: bool = False
+
+
+def checked_exchange(
+    test: unittest.TestCase,
+    route: str,
+    payload: dict[str, object],
+    port: int,
+    checks: ReplyChecks,
+) -> dict[str, object] | list[dict[str, object]]:
+    with post_response(port, route, payload) as response:
+        detail: bytes | tuple[str, dict[str, object]] = (route, payload)
+        if checks.read_error and response.status != checks.status:
+            detail = response.read()
+        test.assertEqual(response.status, checks.status, detail)
+        frames = None
+        if checks.status == HTTPStatus.OK and payload.get("stream"):
+            frames = (
+                batch_frames(response, checks.native_eof)
+                if route == GENERATE
+                else sse_frames(response)
+            )
+        return checked_body(test, response, frames)
+
+
+def assert_output_logprobs(
+    test: unittest.TestCase,
+    frame: dict[str, object],
+    token_text: Callable[[int], str | None],
+    top: int,
+    *,
+    alternative_text: str | None = None,
+) -> None:
+    meta = frame["meta_info"]
+    ids = frame["output_ids"]
+    selected = [[-0.25 * ordinal, token, token_text(token)] for ordinal, token in enumerate(ids, 1)]
+    test.assertEqual(meta["output_token_logprobs_length"], len(ids))
+    test.assertEqual(meta["output_token_logprobs"], selected)
+    if top == 0:
+        test.assertNotIn("output_top_logprobs", meta)
+        return
+    expected = [
+        [row] + [[row[0] - rank, rank, alternative_text] for rank in range(1, top)]
+        for row in selected
+    ]
+    test.assertEqual(meta["output_top_logprobs"], expected)
 
 
 def prompts(budget, **parameters):
@@ -24,25 +120,26 @@ class NativeGeneratedLogprobs(unittest.TestCase):
         cls.hello = ids[b"hello"]
         cls.snow = [ids[bytes([byte])] for byte in "⛄".encode()]
         cls.stop_id = ids[b"Z"]
-        script = cls.output / "generated-logprobs.ids"
-        normal = [cls.hello, *cls.snow, cls.stop_id]
-        script.write_text("217 " + " ".join(map(str, normal)) + "\n-41 32 33 34\n")
+        scripts = {217: [cls.hello, *cls.snow, cls.stop_id], -41: [32, 33, 34]}
         cls.gate = cls.output / "generated-logprobs-gate"
         Path(f"{cls.gate}.0").touch()
-        cls.enterClassContext(patch.dict("os.environ", SGLANG_TEST_CHAT_OUTPUT_IDS=str(script),
-                                         SGLANG_TEST_BATCH_STEP_GATE=str(cls.gate),
-                                         SGLANG_TEST_SCRIPTED_MTP="1"))
         cls.log = cls.output / "generated-logprobs.log"
-        cls.port = cls.enterClassContext(server(cls.binary, cls.checkpoint, cls.log,
-                                               "--max-active", "2", "--mtp-steps", "0"))
+        flags = ("--max-active", "2", "--mtp-steps", "0")
+        with_script = scripted_server(
+            cls,
+            "generated-logprobs.ids",
+            scripts,
+            cls.log,
+            *flags,
+            SGLANG_TEST_BATCH_STEP_GATE=str(cls.gate),
+            SGLANG_TEST_SCRIPTED_MTP="1",
+        )
+        cls.port = cls.enterClassContext(with_script)
 
     def exchange(self, payload, expected=200, *, port=None):
-        with post_response(port or self.port, GENERATE, payload) as response:
-            self.assertEqual(response.status, expected,
-                             response.read() if response.status != expected else None)
-            streamed = expected == 200 and payload.get("stream")
-            frames = batch_frames(response, "Stream ended before DONE") if streamed else None
-            return checked_body(self, response, frames)
+        checks = ReplyChecks(status=expected, read_error=True)
+        port = self.port if port is None else port
+        return checked_exchange(self, GENERATE, payload, port, checks)
 
     def scores(self, frame, top, text=False, prompt=(), start=0):
         meta = frame["meta_info"]
@@ -51,27 +148,26 @@ class NativeGeneratedLogprobs(unittest.TestCase):
         if top is None:
             self.assertFalse(any("logprob" in key for key in meta))
             return
-        prompt_scores = [[None if index == start else -1.5 * index, token,
-                          self.pieces[token].decode(errors="replace") if text else None]
-                         for index, token in enumerate(prompt) if index >= start]
+
+        def token_text(token: int) -> str | None:
+            return self.pieces[token].decode(errors="replace") if text else None
+
+        prompt_scores = [
+            [None if index == start else -1.5 * index, token, token_text(token)]
+            for index, token in enumerate(prompt)
+            if index >= start
+        ]
         self.assertEqual(meta["input_token_logprobs"], prompt_scores)
-        self.assertEqual(meta["output_token_logprobs_length"], len(ids))
-        selected = [[-0.25 * ordinal, token, self.pieces[token].decode(errors="replace")
-                     if text else None] for ordinal, token in enumerate(ids, 1)]
-        self.assertEqual(meta["output_token_logprobs"], selected)
+        assert_output_logprobs(self, frame, token_text, top)
         if top == 0:
             self.assertNotIn("input_top_logprobs", meta)
-            self.assertNotIn("output_top_logprobs", meta)
             return
-        prompt_top = [[-0.125 * rank, 31 + rank,
-                       self.pieces[31 + rank].decode(errors="replace") if text else None]
-                      for rank in range(1, top + 1)]
+        prompt_top = [
+            [-0.125 * rank, 31 + rank, token_text(31 + rank)] for rank in range(1, top + 1)
+        ]
         self.assertEqual(meta["input_top_logprobs"],
                          [None] + [prompt_top] * (len(prompt_scores) - 1)
                          if prompt_scores else [])
-        expected = [[selected_row] + [[selected_row[0] - rank, rank, None]
-                                      for rank in range(1, top)] for selected_row in selected]
-        self.assertEqual(meta["output_top_logprobs"], expected)
 
     def test_partial_and_id_stops(self):
         partial = prompts(7, stop="llo") | {

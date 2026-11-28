@@ -4,6 +4,7 @@
 #include "sglang/text/prefill_attn_sm100.h"
 
 #include <array>
+#include <functional>
 #include <memory>
 
 namespace sglang::decoder {
@@ -11,7 +12,7 @@ namespace sglang::decoder {
 inline constexpr int batch_prefill_tile_rows = 1024;
 inline constexpr int min_partial_prefill_rows = 256;
 
-struct PrefillPool;
+class DeviceArena;
 
 void reclaim_prefill_workspaces(int device);
 
@@ -32,6 +33,20 @@ struct PromptLogprobCapture {
 void finish_prompt_logprobs(const DecoderOptions& options, DecoderPromptLogprobs& scores,
                             DecoderBatchStep& result);
 
+class PrefixPrefillSnapshot;
+
+struct PrefillCheckpoint {
+    int end = 0;
+    std::shared_ptr<PrefixPrefillSnapshot> snapshot;
+};
+
+using PrefillCheckpointList = std::array<PrefillCheckpoint, text_gdn_max_prefill_checkpoints>;
+
+struct PrefillCheckpoints {
+    const PrefillCheckpoint* data = nullptr;
+    int size = 0;
+};
+
 struct PrefillGrant {
     Request* request;
     const int* tokens;
@@ -42,6 +57,8 @@ struct PrefillGrant {
     MtpDraftRequest* draft;
     const MediaPrefill* media;
     const PromptLogprobCapture* scores = nullptr;
+    const std::function<void(int)>* checkpoint = nullptr;
+    PrefillCheckpoints checkpoints{};
 };
 
 struct PrefillProjections {
@@ -60,38 +77,35 @@ struct PrefillProjections {
 
 class PrefillWorkspace {
 public:
-    enum class Retention { existing, transient };
+  PrefillWorkspace(cudaStream_t stream, int capacity,
+                   GqaGeometry staged_geometry = gqa_rank_geometry, int staged_visible = 0,
+                   bool resident_staging = false);
+  ~PrefillWorkspace();
+  PrefillWorkspace(const PrefillWorkspace&) = delete;
+  PrefillWorkspace& operator=(const PrefillWorkspace&) = delete;
 
-    PrefillWorkspace(cudaStream_t stream, int capacity);
-    PrefillWorkspace(cudaStream_t stream, int capacity, int staged_visible);
-    PrefillWorkspace(cudaStream_t stream, int capacity, Retention retention);
-    ~PrefillWorkspace();
-    PrefillWorkspace(const PrefillWorkspace&) = delete;
-    PrefillWorkspace& operator=(const PrefillWorkspace&) = delete;
+  std::size_t bytes() const;
+  void close();
 
-    std::size_t bytes() const;
-    std::size_t layout_bytes() const;
-    void close();
-
-    cudaStream_t stream() const;
-    int capacity() const;
-    void* data() const;
-    PairedPrefillScratch long_gqa_staging() const;
+  cudaStream_t stream() const;
+  int capacity() const;
+  void* data() const;
+  PairedPrefillScratch long_gqa_staging() const;
+  bool resident_gqa_staging() const;
 
 private:
     friend class PrefillPeerNorm;
     bool allow_peer_access(int peer_device);
-    PrefillWorkspace(cudaStream_t stream, int capacity, Retention retention, int staged_visible);
     cudaError_t release() noexcept;
 
     cudaStream_t stream_;
     int capacity_;
     void* data_ = nullptr;
     std::size_t bytes_ = 0;
-    std::size_t layout_bytes_ = 0;
     PairedPrefillScratch staging_{};
     cudaError_t release_status_ = cudaSuccess;
-    std::unique_ptr<PrefillPool> pool_;
+    std::shared_ptr<DeviceArena> arena_;
+    bool resident_staging_ = false;
 };
 
 class PrefillPeerNorm {
@@ -117,8 +131,12 @@ private:
 
 std::size_t prefill_workspace_bytes(int rows);
 
-bool full_tile_prefill_grants(const PrefillGrant* grants, int count);
-PrefillGrant prefill_tile(PrefillGrant grant, int offset);
+struct PrefillTileSpan {
+    int offset = 0;
+    int rows = batch_prefill_tile_rows;
+};
+
+PrefillGrant prefill_tile(PrefillGrant grant, PrefillTileSpan span);
 
 bool try_prefill_projection_groups(const DecoderModel& model, const PrefillGrant* grants,
                                    int count, cudaStream_t stream, DecoderBatchStepStats& stats);

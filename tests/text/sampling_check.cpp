@@ -196,7 +196,7 @@ struct Lane {
     std::vector<int> tokens{};
     int accepted = 0;
     int drafted = 0;
-    int replayed = 0;
+    int discarded = 0;
     int boundaries = 0;
 };
 
@@ -227,7 +227,10 @@ std::pair<std::uint32_t, int> drain(DecoderBatch& batch, std::vector<Lane>& lane
                                step.extra_tokens.begin() + step.extra_token_count);
             lane.accepted += step.mtp_accepted_tokens;
             lane.drafted += step.mtp_drafted_tokens;
-            lane.replayed += step.mtp_replayed_rows;
+            require(step.mtp_replayed_rows == 0, "Sampled MTP replayed committed GDN rows");
+            lane.discarded +=
+                std::max(0, step.mtp_verified_rows - static_cast<int>(step.token.has_value()) -
+                                step.extra_token_count);
             lane.boundaries += step.mtp_boundary;
             if (step.finish_reason) {
                 require(*step.finish_reason == DecoderFinishReason::length,
@@ -275,17 +278,17 @@ void check_sampled_mtp(const Decoder& decoder, DecoderOptions sampled) {
     DecoderBatch batch(decoder, {true, 4});
     const auto mixed = drain(batch, lanes);
     require(mixed.second > 0, "heterogeneous sampled MTP batch did not verify");
-    int replayed = 0;
+    int discarded = 0;
     for (std::size_t index = 0; index < lanes.size(); ++index) {
         const auto& lane = lanes[index];
         require(lane.tokens == expected[index] && lane.drafted > 0,
                 "heterogeneous sampled MTP changed a K0 trace");
-        replayed += lane.replayed;
+        discarded += lane.discarded;
         std::cout << "sampled K" << lane.options.mtp_steps << " drafted=" << lane.drafted
-                  << " accepted=" << lane.accepted << " replayed=" << lane.replayed
+                  << " accepted=" << lane.accepted << " discarded=" << lane.discarded
                   << " boundary=" << lane.boundaries << '\n';
     }
-    require(replayed > 0, "heterogeneous fixture did not exercise target rollback");
+    require(discarded > 0, "heterogeneous fixture did not exercise target rollback");
 
     auto stopped = lanes.back().options;
     stopped.stop_token_id = expected.back()[2];

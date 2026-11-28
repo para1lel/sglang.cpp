@@ -4,11 +4,14 @@
 #include "sglang/decoder_internal.h"
 #include "sglang/decoder_mtp.h"
 #include "sglang/text/decode_proj.h"
+#include "sglang/text/fp8_projection.cuh"
 #include "sglang/text/mtp/draft_stream.h"
+#include "sglang/text/quantization/quantize_warp.cuh"
 #include "sglang/text/text_cuda_primitives.cuh"
 
 #include <algorithm>
 #include <cstddef>
+#include <limits>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
@@ -16,6 +19,7 @@ namespace sglang {
 namespace {
 
 using namespace text_kernel;
+using namespace fp8_projection;
 
 __device__ float decode_fp8(std::uint8_t bits) {
     __nv_fp8_e4m3 value;
@@ -74,29 +78,42 @@ __global__ void fp8_gemv_kernel(const std::uint8_t* weight, const __nv_bfloat16*
     }
 }
 
-__device__ float fp8x4_dot(unsigned int lhs_bits, unsigned int rhs_bits, float sum) {
+__device__ float fp8_pair_dot(std::uint16_t bits, __half2_raw rhs, float sum) {
+    const auto lhs = __nv_cvt_fp8x2_to_halfraw2(bits, __NV_E4M3);
+    asm("fma.rn.f32.f16 %0, %1, %2, %0;" : "+f"(sum) : "h"(lhs.x), "h"(rhs.x));
+    asm("fma.rn.f32.f16 %0, %1, %2, %0;" : "+f"(sum) : "h"(lhs.y), "h"(rhs.y));
+    return sum;
+}
+
+__device__ float fp8x4_dot(unsigned lhs, unsigned rhs, float sum) {
 #pragma unroll
     for (int pair = 0; pair < 2; ++pair) {
-        const auto left = __nv_cvt_fp8x2_to_halfraw2(
-            static_cast<std::uint16_t>(lhs_bits >> (16 * pair)), __NV_E4M3);
-        const auto right = __nv_cvt_fp8x2_to_halfraw2(
-            static_cast<std::uint16_t>(rhs_bits >> (16 * pair)), __NV_E4M3);
-        asm("fma.rn.f32.f16 %0, %1, %2, %0;" : "+f"(sum) : "h"(left.x), "h"(right.x));
-        asm("fma.rn.f32.f16 %0, %1, %2, %0;" : "+f"(sum) : "h"(left.y), "h"(right.y));
+        const auto shift = static_cast<unsigned>(pair * 16);
+        const auto right =
+            __nv_cvt_fp8x2_to_halfraw2(static_cast<std::uint16_t>(rhs >> shift), __NV_E4M3);
+        sum = fp8_pair_dot(static_cast<std::uint16_t>(lhs >> shift), right, sum);
     }
     return sum;
 }
 
-constexpr int fp8_pack_bytes = 16;
-constexpr int fp8_packed_warps = 4;
-constexpr int fp8_groups_per_warp = warp_width * fp8_pack_bytes / text_fp8_group_size;
+}
+
+namespace fp8_projection {
+
+using namespace text_kernel;
+
+__device__ __inline_hint__ float fp8_pack_dot(uint4 lhs, uint4 rhs) {
+    const float low = fp8x4_dot(lhs.y, rhs.y, fp8x4_dot(lhs.x, rhs.x, 0.0F));
+    const float high = fp8x4_dot(lhs.w, rhs.w, fp8x4_dot(lhs.z, rhs.z, 0.0F));
+    return low + high;
+}
 
 bool supports_wide_fp8(const std::uint8_t* weight, TextFp8ActivationView input, int in_width) {
     return in_width % (fp8_groups_per_warp * text_fp8_group_size) == 0 &&
            aligned(weight, fp8_pack_bytes) && aligned(input.values, fp8_pack_bytes);
 }
 
-__device__ uint4 load_fp8_weight(const void* address) {
+__device__ __inline_hint__ uint4 load_fp8_weight(const void* address) {
     uint4 bits;
     const auto global = __cvta_generic_to_global(address);
     asm("ld.global.cs.v4.b32 {%0, %1, %2, %3}, [%4];"
@@ -105,36 +122,212 @@ __device__ uint4 load_fp8_weight(const void* address) {
     return bits;
 }
 
-__global__ void fp8_gemv_packed_kernel(const std::uint8_t* weight,
-                                       const __nv_bfloat16* weight_scales,
-                                       TextFp8ActivationView input, int out_width, int in_width,
-                                       int groups, __nv_bfloat16* output) {
-    const int lane = threadIdx.x % warp_width;
-    const int row = blockIdx.x * fp8_packed_warps + threadIdx.x / warp_width;
-    if (row >= out_width) {
+}
+
+namespace {
+
+using fp8_projection::fp8_pack_dot;
+
+struct ActivationPack {
+    __half2_raw pairs[8];
+};
+
+__device__ ActivationPack unpack_activation(uint4 bytes) {
+    const unsigned words[]{bytes.x, bytes.y, bytes.z, bytes.w};
+    ActivationPack pack{};
+#pragma unroll
+    for (std::size_t word = 0; word < 4; ++word) {
+        pack.pairs[2 * word] =
+            __nv_cvt_fp8x2_to_halfraw2(static_cast<std::uint16_t>(words[word]), __NV_E4M3);
+        pack.pairs[(2 * word) + 1] =
+            __nv_cvt_fp8x2_to_halfraw2(static_cast<std::uint16_t>(words[word] >> 16U), __NV_E4M3);
+    }
+    return pack;
+}
+
+__device__ float fp8_pack_dot(uint4 bytes, const ActivationPack& input) {
+    const unsigned words[]{bytes.x, bytes.y, bytes.z, bytes.w};
+    float low = 0.0F;
+    float high = 0.0F;
+#pragma unroll
+    for (std::size_t word = 0; word < 2; ++word) {
+        low = fp8_pair_dot(static_cast<std::uint16_t>(words[word]), input.pairs[2 * word], low);
+        low = fp8_pair_dot(static_cast<std::uint16_t>(words[word] >> 16U),
+                           input.pairs[(2 * word) + 1], low);
+        high = fp8_pair_dot(static_cast<std::uint16_t>(words[word + 2]),
+                            input.pairs[(2 * word) + 4], high);
+        high = fp8_pair_dot(static_cast<std::uint16_t>(words[word + 2] >> 16U),
+                            input.pairs[(2 * word) + 5], high);
+    }
+    return low + high;
+}
+
+using decoder::DecodeFp8Projection;
+
+template <int Count> struct SingletonProjections {
+    DecodeFp8Projection entries[Count];
+};
+
+template <int Width, int Count>
+__global__ void fp8_decode_projection_kernel(TextFp8ActivationView input,
+                                             SingletonProjections<Count> projections,
+                                             int in_width) {
+    const int width = Width == 0 ? in_width : Width;
+    const int groups = width / text_fp8_group_size;
+    const int lane = static_cast<int>(threadIdx.x % warp_width);
+    int row = static_cast<int>((blockIdx.x * fp8_packed_warps) + (threadIdx.x / warp_width));
+    auto matrix = projections.entries[0];
+    if constexpr (Count == 3) {
+        if (row >= matrix.rows) {
+            row -= matrix.rows;
+            matrix = projections.entries[1];
+            if (row >= matrix.rows) {
+                row -= matrix.rows;
+                matrix = projections.entries[2];
+            }
+        }
+    }
+    if (row >= matrix.rows) {
         return;
     }
-    const auto* row_weight = weight + static_cast<std::size_t>(row) * in_width;
-    const auto* row_scales =
-        weight_scales + static_cast<std::size_t>(row / text_fp8_group_size) * groups;
     constexpr int lanes_per_group = warp_width / fp8_groups_per_warp;
     const int lane_group = lane / lanes_per_group;
-    const int lane_col = lane * fp8_pack_bytes;
-    float sum = 0.0f;
+    const int lane_column = lane * fp8_pack_bytes;
+    const auto offset = static_cast<std::size_t>(row) * width;
+    const auto scale_offset = static_cast<std::size_t>(row / text_fp8_group_size) * groups;
+    const auto* values = matrix.values + offset + lane_column;
+    const auto* scales = matrix.scales + scale_offset + lane_group;
+    float sum = 0.0F;
+    constexpr int unroll_factor = Width == 0 ? 1 : 2;
+#pragma unroll unroll_factor
     for (int group = 0; group < groups; group += fp8_groups_per_warp) {
-        const auto col = static_cast<std::size_t>(group) * text_fp8_group_size + lane_col;
-        const uint4 rhs = load_128(input.values + col);
-        const uint4 lhs = load_fp8_weight(row_weight + col);
-        const float low = fp8x4_dot(lhs.y, rhs.y, fp8x4_dot(lhs.x, rhs.x, 0.0f));
-        const float high = fp8x4_dot(lhs.w, rhs.w, fp8x4_dot(lhs.z, rhs.z, 0.0f));
-        const int scale_index = group + lane_group;
-        const float scaled = (low + high) * input.scales[scale_index];
-        sum = fmaf(scaled, __bfloat162float(row_scales[scale_index]), sum);
+        const int column = group * text_fp8_group_size;
+        const auto rhs = load_128(input.values + column + lane_column);
+        const auto lhs = load_fp8_weight(values + column);
+        const float dot =
+            Count == 3 ? fp8_pack_dot(lhs, unpack_activation(rhs)) : fp8_pack_dot(lhs, rhs);
+        sum = fmaf(dot * input.scales[group + lane_group], __bfloat162float(scales[group]), sum);
     }
     sum = warp_sum(sum);
     if (lane == 0) {
-        output[row] = __float2bfloat16_rn(sum);
+        matrix.output[row] = __float2bfloat16_rn(sum);
     }
+}
+
+template <int Width, int Count>
+cudaError_t launch_decode_projection(int width, TextFp8ActivationView input,
+                                     SingletonProjections<Count> projections, int rows,
+                                     cudaStream_t stream) {
+    static_assert(Width % (text_fp8_group_size * fp8_groups_per_warp) == 0);
+    void* args[] = {&input, &projections, &width};
+    return cudaLaunchKernel(fp8_decode_projection_kernel<Width, Count>,
+                            divide_up(rows, fp8_packed_warps), fp8_packed_warps * warp_width, args,
+                            0, stream);
+}
+
+__global__ void fp8_decode_gate_up_kernel(TextFp8ActivationView input, DecodeFp8Projection gate,
+                                          DecodeFp8Projection up) {
+    const int lane = static_cast<int>(threadIdx.x % warp_width);
+    const int row = static_cast<int>((blockIdx.x * fp8_packed_warps) + (threadIdx.x / warp_width));
+    if (row >= gate.rows) {
+        return;
+    }
+    constexpr int width = decoder::hidden_size;
+    constexpr int groups = width / text_fp8_group_size;
+    constexpr int lanes_per_group = warp_width / fp8_groups_per_warp;
+    static_assert(groups % fp8_groups_per_warp == 0);
+    const int lane_group = lane / lanes_per_group;
+    const int lane_column = lane * fp8_pack_bytes;
+    const auto row_column = (static_cast<std::size_t>(row) * width) + lane_column;
+    const int scale_offset = ((row / text_fp8_group_size) * groups) + lane_group;
+    float gate_sum = 0.0F;
+    float up_sum = 0.0F;
+#pragma unroll 1
+    for (int group = 0; group < groups; group += fp8_groups_per_warp) {
+        const int column = group * text_fp8_group_size;
+        const auto rhs = unpack_activation(load_128(input.values + column + lane_column));
+        const float scale = input.scales[group + lane_group];
+        const auto gate_pack = load_fp8_weight(gate.values + row_column + column);
+        gate_sum = fmaf(fp8_pack_dot(gate_pack, rhs) * scale,
+                        __bfloat162float(gate.scales[scale_offset + group]), gate_sum);
+        const auto up_pack = load_fp8_weight(up.values + row_column + column);
+        up_sum = fmaf(fp8_pack_dot(up_pack, rhs) * scale,
+                      __bfloat162float(up.scales[scale_offset + group]), up_sum);
+    }
+    gate_sum = warp_sum(gate_sum);
+    up_sum = warp_sum(up_sum);
+    if (lane == 0) {
+        gate.output[row] = swiglu(__float2bfloat16_rn(gate_sum), __float2bfloat16_rn(up_sum));
+    }
+}
+
+struct ByteSpan {
+    std::uintptr_t begin;
+    std::uintptr_t end;
+
+    bool valid() const {
+        return begin < end;
+    }
+    bool overlaps(ByteSpan other) const {
+        return begin < other.end && other.begin < end;
+    }
+};
+
+template <typename Element> ByteSpan byte_span(const Element* pointer, std::size_t count) {
+    const auto begin = reinterpret_cast<std::uintptr_t>(pointer);
+    return {begin, begin + (count * sizeof(Element))};
+}
+
+template <std::size_t Count>
+bool valid_singleton_buffers(TextFp8ActivationView input, int width,
+                             const DecodeFp8Projection (&projections)[Count], bool alias = false) {
+    static_assert(std::numeric_limits<std::uintptr_t>::digits >=
+                  (2 * std::numeric_limits<int>::digits) + 1);
+    if (width <= 0 || !input.values || !input.scales || !aligned(input.scales, alignof(float))) {
+        return false;
+    }
+    const auto groups = static_cast<std::size_t>(text_fp8_group_count(width));
+    const ByteSpan inputs[]{byte_span(input.values, width), byte_span(input.scales, groups)};
+    if (!inputs[0].valid() || !inputs[1].valid()) {
+        return false;
+    }
+    ByteSpan weights[Count][2];
+    ByteSpan outputs[Count];
+    for (std::size_t i = 0; i < Count; ++i) {
+        const auto& [values, scales, output, rows] = projections[i];
+        if (rows <= 0 || !values || !scales || !output ||
+            !aligned(scales, alignof(__nv_bfloat16)) || !aligned(output, alignof(__nv_bfloat16))) {
+            return false;
+        }
+        weights[i][0] = byte_span(values, std::size_t(rows) * width);
+        weights[i][1] = byte_span(scales, text_fp8_group_count(rows) * groups);
+        outputs[i] = byte_span(output, rows);
+        if (!weights[i][0].valid() || !weights[i][1].valid() || !outputs[i].valid() ||
+            inputs[0].overlaps(outputs[i]) || inputs[1].overlaps(outputs[i])) {
+            return false;
+        }
+    }
+    for (std::size_t i = 0; i < Count; ++i) {
+        for (const auto& weight : weights) {
+            if (weight[0].overlaps(outputs[i]) || weight[1].overlaps(outputs[i])) {
+                return false;
+            }
+        }
+        for (std::size_t j = 0; j < i; ++j) {
+            const bool equal =
+                outputs[j].begin == outputs[i].begin && outputs[j].end == outputs[i].end;
+            if (outputs[j].overlaps(outputs[i]) && !(alias && equal)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+cudaError_t singleton_unfused(TextFp8ActivationView input, DecodeFp8Projection projection,
+                              int width, cudaStream_t stream) {
+    return text_fp8_gemv(projection.values, projection.scales, input, projection.rows, width,
+                         projection.output, stream);
 }
 
 template <int Count>
@@ -177,10 +370,7 @@ __global__ void fp8_batch_packed_kernel(const std::uint8_t* weight,
             const float input_scale = input.scales[scale_index];
 #pragma unroll
             for (int channel = 0; channel < Channels; ++channel) {
-                const auto left = lhs[channel];
-                const float low = fp8x4_dot(left.y, rhs.y, fp8x4_dot(left.x, rhs.x, 0.0f));
-                const float high = fp8x4_dot(left.w, rhs.w, fp8x4_dot(left.z, rhs.z, 0.0f));
-                const float scaled = (low + high) * input_scale;
+                const float scaled = fp8_pack_dot(lhs[channel], rhs) * input_scale;
                 sums[index][channel] = fmaf(scaled, scale, sums[index][channel]);
             }
         }
@@ -209,256 +399,6 @@ cudaError_t launch_fp8_batch(const std::uint8_t* weight, const __nv_bfloat16* we
     void* args[] = {&weight, &weight_scales, &out_width, &in_width, &groups, &batch};
     return cudaLaunchKernel(fp8_batch_packed_kernel<Count, Channels>,
                             divide_up(out_width, fp8_packed_warps * Channels),
-                            fp8_packed_warps * warp_width, args, 0, stream);
-}
-
-__device__ float fp8_pack_dot(uint4 lhs, uint4 rhs) {
-    const float low = fp8x4_dot(lhs.y, rhs.y, fp8x4_dot(lhs.x, rhs.x, 0.0f));
-    const float high = fp8x4_dot(lhs.w, rhs.w, fp8x4_dot(lhs.z, rhs.z, 0.0f));
-    return low + high;
-}
-
-template <int Rows, int Channels = 1>
-__global__ void fp8_prefill_tile_kernel(const std::uint8_t* weight,
-                                       const __nv_bfloat16* weight_scales,
-                                       TextFp8ActivationView input, int out_width, int in_width,
-                                       int groups, int rows, int tiles, __nv_bfloat16* output) {
-    static_assert(text_fp8_group_size % Channels == 0);
-    constexpr int lanes_per_group = warp_width / fp8_groups_per_warp;
-    const int lane = threadIdx.x % warp_width;
-    const int block = Channels == 1 ? blockIdx.x / tiles : blockIdx.y;
-    const int row = (block * fp8_packed_warps + threadIdx.x / warp_width) * Channels;
-    if (row >= out_width) {
-        return;
-    }
-    const int first = (Channels == 1 ? blockIdx.x % tiles : blockIdx.x) * Rows;
-    const auto* row_weight = weight + static_cast<std::size_t>(row) * in_width;
-    const auto* row_scales =
-        weight_scales + static_cast<std::size_t>(row / text_fp8_group_size) * groups;
-    const auto* values = input.values + static_cast<std::size_t>(first) * in_width;
-    const auto* scales = input.scales + static_cast<std::size_t>(first) * groups;
-    float sums[Rows][Channels]{};
-    for (int group = 0; group < groups; group += fp8_groups_per_warp) {
-        const auto col = static_cast<std::size_t>(group) * text_fp8_group_size +
-                         lane * fp8_pack_bytes;
-        uint4 lhs[Channels];
-#pragma unroll
-        for (int channel = 0; channel < Channels; ++channel) {
-            lhs[channel] = load_fp8_weight(row_weight + col +
-                                           static_cast<std::size_t>(channel) * in_width);
-        }
-        const int scale_index = group + lane / lanes_per_group;
-        const float weight_scale = __bfloat162float(row_scales[scale_index]);
-#pragma unroll
-        for (int item = 0; item < Rows; ++item) {
-            if (first + item < rows) {
-                const auto rhs = load_128(values + static_cast<std::size_t>(item) * in_width + col);
-                const float input_scale = scales[static_cast<std::size_t>(item) * groups +
-                                                 scale_index];
-#pragma unroll
-                for (int channel = 0; channel < Channels; ++channel) {
-                    const float scaled = fp8_pack_dot(lhs[channel], rhs) * input_scale;
-                    sums[item][channel] = fmaf(scaled, weight_scale, sums[item][channel]);
-                }
-            }
-        }
-    }
-#pragma unroll
-    for (int item = 0; item < Rows; ++item) {
-        if (first + item < rows) {
-            auto* result = output + static_cast<std::size_t>(first + item) * out_width + row;
-#pragma unroll
-            for (int channel = 0; channel < Channels; ++channel) {
-                const float sum = warp_sum(sums[item][channel]);
-                if (lane == 0) {
-                    result[channel] = __float2bfloat16_rn(sum);
-                }
-            }
-        }
-    }
-}
-
-__device__ __forceinline__ float accumulate_prefill_pair(__half2_raw lhs, __half2_raw rhs,
-                                                        float sum) {
-    asm("fma.rn.f32.f16 %0, %1, %2, %0;" : "+f"(sum) : "h"(lhs.x), "h"(rhs.x));
-    asm("fma.rn.f32.f16 %0, %1, %2, %0;" : "+f"(sum) : "h"(lhs.y), "h"(rhs.y));
-    return sum;
-}
-
-template <int Rows, int Channels>
-__device__ __forceinline__ void accumulate_prefill_pairs(
-    const unsigned int (&weights)[Channels], const unsigned int (&inputs)[Rows],
-    float (&dots)[Rows][Channels]) {
-#pragma unroll
-    for (int pair = 0; pair < 2; ++pair) {
-        __half2_raw decoded_weights[Channels];
-        __half2_raw decoded_inputs[Rows];
-#pragma unroll
-        for (int channel = 0; channel < Channels; ++channel) {
-            decoded_weights[channel] = __nv_cvt_fp8x2_to_halfraw2(
-                static_cast<std::uint16_t>(weights[channel] >> (16 * pair)), __NV_E4M3);
-        }
-#pragma unroll
-        for (int item = 0; item < Rows; ++item) {
-            decoded_inputs[item] = __nv_cvt_fp8x2_to_halfraw2(
-                static_cast<std::uint16_t>(inputs[item] >> (16 * pair)), __NV_E4M3);
-        }
-#pragma unroll
-        for (int item = 0; item < Rows; ++item) {
-#pragma unroll
-            for (int channel = 0; channel < Channels; ++channel) {
-                dots[item][channel] = accumulate_prefill_pair(
-                    decoded_weights[channel], decoded_inputs[item], dots[item][channel]);
-            }
-        }
-    }
-}
-
-template <unsigned int uint4::*Word, int Rows, int Channels>
-__device__ __forceinline__ void accumulate_prefill_word(
-    const uint4 (&weights)[Channels], const uint4 (&inputs)[Rows],
-    float (&dots)[Rows][Channels]) {
-    unsigned int weight_words[Channels];
-    unsigned int input_words[Rows];
-#pragma unroll
-    for (int channel = 0; channel < Channels; ++channel) {
-        weight_words[channel] = weights[channel].*Word;
-    }
-#pragma unroll
-    for (int item = 0; item < Rows; ++item) {
-        input_words[item] = inputs[item].*Word;
-    }
-    accumulate_prefill_pairs(weight_words, input_words, dots);
-}
-
-template <int Rows, int Channels>
-__device__ __forceinline__ void fp8_prefill_reuse_tile(
-    const std::uint8_t* weight, const __nv_bfloat16* weight_scales,
-    TextFp8ActivationView input, int out_width, int in_width, int groups, int rows,
-    __nv_bfloat16* output) {
-    static_assert(text_fp8_group_size % Channels == 0);
-    constexpr int lanes_per_group = warp_width / fp8_groups_per_warp;
-    const int lane = threadIdx.x % warp_width;
-    const int row = (blockIdx.y * fp8_packed_warps + threadIdx.x / warp_width) * Channels;
-    if (row >= out_width) {
-        return;
-    }
-    const int first = blockIdx.x * Rows;
-    const auto* row_weight = weight + static_cast<std::size_t>(row) * in_width;
-    const auto* row_scales =
-        weight_scales + static_cast<std::size_t>(row / text_fp8_group_size) * groups;
-    float sums[Rows][Channels]{};
-    int input_rows[Rows];
-#pragma unroll
-    for (int item = 0; item < Rows; ++item) {
-        input_rows[item] = min(first + item, rows - 1);
-    }
-    for (int group = 0; group < groups; group += fp8_groups_per_warp) {
-        const auto col = static_cast<std::size_t>(group) * text_fp8_group_size +
-                         lane * fp8_pack_bytes;
-        uint4 lhs[Channels];
-        uint4 rhs[Rows];
-#pragma unroll
-        for (int channel = 0; channel < Channels; ++channel) {
-            lhs[channel] = load_fp8_weight(row_weight + col +
-                                           static_cast<std::size_t>(channel) * in_width);
-        }
-#pragma unroll
-        for (int item = 0; item < Rows; ++item) {
-            rhs[item] = load_128(input.values +
-                                 static_cast<std::size_t>(input_rows[item]) * in_width + col);
-        }
-        float low[Rows][Channels]{};
-        float high[Rows][Channels]{};
-        accumulate_prefill_word<&uint4::x>(lhs, rhs, low);
-        accumulate_prefill_word<&uint4::y>(lhs, rhs, low);
-        accumulate_prefill_word<&uint4::z>(lhs, rhs, high);
-        accumulate_prefill_word<&uint4::w>(lhs, rhs, high);
-        const int scale_index = group + lane / lanes_per_group;
-        const float weight_scale = __bfloat162float(row_scales[scale_index]);
-#pragma unroll
-        for (int item = 0; item < Rows; ++item) {
-            const float input_scale =
-                input.scales[static_cast<std::size_t>(input_rows[item]) * groups + scale_index];
-#pragma unroll
-            for (int channel = 0; channel < Channels; ++channel) {
-                const float scaled = (low[item][channel] + high[item][channel]) * input_scale;
-                sums[item][channel] = fmaf(scaled, weight_scale, sums[item][channel]);
-            }
-        }
-    }
-#pragma unroll
-    for (int item = 0; item < Rows; ++item) {
-        if (first + item < rows) {
-            auto* result = output + static_cast<std::size_t>(first + item) * out_width + row;
-#pragma unroll
-            for (int channel = 0; channel < Channels; ++channel) {
-                const float sum = warp_sum(sums[item][channel]);
-                if (lane == 0) {
-                    result[channel] = __float2bfloat16_rn(sum);
-                }
-            }
-        }
-    }
-}
-
-template <int Rows, int Channels>
-__global__ void fp8_prefill_reuse_kernel(const std::uint8_t* weight,
-                                        const __nv_bfloat16* weight_scales,
-                                        TextFp8ActivationView input, int out_width, int in_width,
-                                        int groups, int rows, int, __nv_bfloat16* output) {
-    fp8_prefill_reuse_tile<Rows, Channels>(weight, weight_scales, input, out_width, in_width,
-                                          groups, rows, output);
-}
-
-struct Fp8PrefillMatrix {
-    const std::uint8_t* weight;
-    const __nv_bfloat16* scales;
-    __nv_bfloat16* output;
-};
-
-template <int Rows, int Channels>
-__global__ void fp8_prefill_reuse_pair_kernel(Fp8PrefillMatrix first, Fp8PrefillMatrix second,
-                                             TextFp8ActivationView input, int out_width,
-                                             int in_width, int groups, int rows) {
-    const auto matrix = blockIdx.z == 0 ? first : second;
-    fp8_prefill_reuse_tile<Rows, Channels>(matrix.weight, matrix.scales, input, out_width,
-                                          in_width, groups, rows, matrix.output);
-}
-
-template <int Count>
-cudaError_t launch_fp8_rows(const std::uint8_t* weight, const __nv_bfloat16* weight_scales,
-                            TextFp8ActivationView input, int out_width, int in_width, int rows,
-                            __nv_bfloat16* output, cudaStream_t stream) {
-    int groups = text_fp8_group_count(in_width);
-    int tiles = divide_up(rows, Count);
-    void* args[] = {&weight, &weight_scales, &input, &out_width, &in_width,
-                     &groups, &rows, &tiles, &output};
-    if constexpr (Count == 8) {
-        constexpr int tile_rows = 4;
-        constexpr int channels = 4;
-        if ((in_width == decoder::hidden_size || in_width == decoder::intermediate_size ||
-             in_width == text_gqa_q_width || in_width == text_gqa_q_width / 2 ||
-             in_width == decoder::intermediate_size / 2) &&
-            out_width % channels == 0 && out_width <= 65535) {
-            constexpr int reuse_channels = 8;
-            if (rows >= 64 && rows <= 128 && out_width % reuse_channels == 0) {
-                const dim3 grid(divide_up(rows, tile_rows),
-                                divide_up(out_width, fp8_packed_warps * reuse_channels));
-                return cudaLaunchKernel(fp8_prefill_reuse_kernel<tile_rows, reuse_channels>, grid,
-                                        fp8_packed_warps * warp_width, args, 0, stream);
-            }
-            const dim3 grid(divide_up(rows, tile_rows),
-                            divide_up(out_width, fp8_packed_warps * channels));
-            return cudaLaunchKernel(fp8_prefill_tile_kernel<tile_rows, channels>, grid,
-                                    fp8_packed_warps * warp_width, args, 0, stream);
-        }
-    }
-    const auto blocks = static_cast<std::uint64_t>(divide_up(out_width, fp8_packed_warps)) * tiles;
-    if (blocks > 2147483647u) {
-        return cudaErrorInvalidConfiguration;
-    }
-    return cudaLaunchKernel(fp8_prefill_tile_kernel<Count>, static_cast<unsigned int>(blocks),
                             fp8_packed_warps * warp_width, args, 0, stream);
 }
 
@@ -613,15 +553,94 @@ cudaError_t text_fp8_gemv(const std::uint8_t* weight, const __nv_bfloat16* weigh
         return cudaErrorInvalidValue;
     }
     int groups = text_fp8_group_count(in_width);
-    const bool wide = supports_wide_fp8(weight, input, in_width);
+    if (supports_wide_fp8(weight, input, in_width)) {
+        return launch_decode_projection<0>(
+            in_width, input, SingletonProjections<1>{{{weight, weight_scales, output, out_width}}},
+            out_width, stream);
+    }
     const bool packed = in_width % 4 == 0 && aligned(weight, 4) && aligned(input.values, 4);
     void* args[] = {&weight, &weight_scales, &input, &out_width, &in_width, &groups, &output};
-    const auto kernel = wide ? fp8_gemv_packed_kernel
-                             : (packed ? fp8_gemv_kernel<true> : fp8_gemv_kernel<false>);
-    const int rows_per_block = wide ? fp8_packed_warps : block_warps;
-    return cudaLaunchKernel(kernel, divide_up(out_width, rows_per_block),
-                            rows_per_block * warp_width, args, 0, stream);
+    return cudaLaunchKernel(packed ? fp8_gemv_kernel<true> : fp8_gemv_kernel<false>,
+                            divide_up(out_width, block_warps), block_threads, args, 0, stream);
 }
+
+cudaError_t decoder::decode_fp8_project(TextFp8ActivationView input, DecodeFp8Projection projection,
+                                        int width, cudaStream_t stream) {
+    if (!valid_singleton_buffers(input, width, {projection})) {
+        return cudaErrorInvalidValue;
+    }
+    if (supports_wide_fp8(projection.values, input, width)) {
+        const SingletonProjections<1> matrix{{projection}};
+        switch (width) {
+        case hidden_size:
+            return launch_decode_projection<hidden_size>(width, input, matrix, projection.rows,
+                                                         stream);
+        case text_gqa_q_width:
+            return launch_decode_projection<text_gqa_q_width>(width, input, matrix, projection.rows,
+                                                              stream);
+        case intermediate_size:
+            return launch_decode_projection<intermediate_size>(width, input, matrix,
+                                                               projection.rows, stream);
+        case text_gqa_q_width / 2:
+            return launch_decode_projection<text_gqa_q_width / 2>(width, input, matrix,
+                                                                  projection.rows, stream);
+        case intermediate_size / 2:
+            return launch_decode_projection<intermediate_size / 2>(width, input, matrix,
+                                                                   projection.rows, stream);
+        default:
+            break;
+        }
+    }
+    return singleton_unfused(input, projection, width, stream);
+}
+
+cudaError_t decoder::decode_fp8_qkv(TextFp8ActivationView input, DecodeFp8Projection query,
+                                    DecodeFp8Projection key, DecodeFp8Projection value, int width,
+                                    cudaStream_t stream) {
+    const SingletonProjections<3> matrices{{query, key, value}};
+    if (!valid_singleton_buffers(input, width, matrices.entries)) {
+        return cudaErrorInvalidValue;
+    }
+    const bool tp1 = query.rows == text_gqa_q_gate_width && key.rows == text_gqa_kv_width;
+    const bool tp2 = query.rows == text_gqa_q_width && key.rows == text_gqa_kv_width / 2;
+    if ((tp1 || tp2) && value.rows == key.rows && width == hidden_size &&
+        aligned(input.values, fp8_pack_bytes) && aligned(query.values, fp8_pack_bytes) &&
+        aligned(key.values, fp8_pack_bytes) && aligned(value.values, fp8_pack_bytes)) {
+        return launch_decode_projection<hidden_size>(width, input, matrices,
+                                                     query.rows + key.rows + value.rows, stream);
+    }
+    for (const auto& projection : matrices.entries) {
+        if (const auto status = singleton_unfused(input, projection, width, stream);
+            status != cudaSuccess) {
+            return status;
+        }
+    }
+    return cudaSuccess;
+}
+
+cudaError_t decoder::decode_fp8_gate_up(TextFp8ActivationView input, DecodeFp8Projection gate,
+                                        DecodeFp8Projection up, int width, cudaStream_t stream) {
+    const bool fused = width == hidden_size &&
+                       (gate.rows == intermediate_size || gate.rows == intermediate_size / 2) &&
+                       aligned(input.values, fp8_pack_bytes) &&
+                       aligned(gate.values, fp8_pack_bytes) && aligned(up.values, fp8_pack_bytes);
+    if (gate.rows != up.rows || !valid_singleton_buffers(input, width, {gate, up}, fused)) {
+        return cudaErrorInvalidValue;
+    }
+    if (fused) {
+        void* args[] = {&input, &gate, &up};
+        return cudaLaunchKernel(fp8_decode_gate_up_kernel, divide_up(gate.rows, fp8_packed_warps),
+                                fp8_packed_warps * warp_width, args, 0, stream);
+    }
+    for (const auto& projection : {gate, up}) {
+        if (const auto status = singleton_unfused(input, projection, width, stream);
+            status != cudaSuccess) {
+            return status;
+        }
+    }
+    return text_swiglu(gate.output, up.output, gate.rows, gate.output, stream);
+}
+
 cudaError_t text_fp8_gemm(const std::uint8_t* weight, const __nv_bfloat16* weight_scales,
                           int out_width, int in_width, const TextFp8Projection* projections,
                           int count, cudaStream_t stream) {
@@ -668,67 +687,6 @@ cudaError_t text_fp8_gemm(const std::uint8_t* weight, const __nv_bfloat16* weigh
         }
     }
     return cudaSuccess;
-}
-cudaError_t text_fp8_gemv_rows(const std::uint8_t* weight, const __nv_bfloat16* weight_scales,
-                               TextFp8ActivationView input, int out_width, int in_width, int rows,
-                               __nv_bfloat16* output, cudaStream_t stream) {
-    if (!weight || !weight_scales || !input.values || !input.scales || !output ||
-        out_width <= 0 || in_width <= 0 || rows <= 0 || rows > 65535) {
-        return cudaErrorInvalidValue;
-    }
-    if (rows > 1 && supports_wide_fp8(weight, input, in_width)) {
-        if (rows <= 8 || (rows <= 16 && (out_width <= 1024 || in_width >= 16384))) {
-            return launch_fp8_rows<2>(weight, weight_scales, input, out_width, in_width, rows,
-                                      output, stream);
-        }
-        if (rows < 64 || out_width <= 1024) {
-            return launch_fp8_rows<4>(weight, weight_scales, input, out_width, in_width, rows,
-                                      output, stream);
-        }
-        return launch_fp8_rows<8>(weight, weight_scales, input, out_width, in_width, rows,
-                                  output, stream);
-    }
-    const int groups = text_fp8_group_count(in_width);
-    for (int row = 0; row < rows; ++row) {
-        const TextFp8ActivationView source{
-            input.values + static_cast<std::size_t>(row) * in_width,
-            input.scales + static_cast<std::size_t>(row) * groups};
-        const auto status = text_fp8_gemv(weight, weight_scales, source, out_width, in_width,
-                                          output + static_cast<std::size_t>(row) * out_width,
-                                          stream);
-        if (status != cudaSuccess) {
-            return status;
-        }
-    }
-    return cudaSuccess;
-}
-
-cudaError_t decoder::mtp_seed_project_kv(const Fp8Weight& key, const Fp8Weight& value,
-                                        TextFp8ActivationView input, int rows,
-                                        __nv_bfloat16* keys, __nv_bfloat16* values,
-                                        cudaStream_t stream) {
-    constexpr int tile_rows = 4;
-    constexpr int channels = 8;
-    constexpr int threads = fp8_packed_warps * warp_width;
-    static_assert(text_gqa_kv_width % (fp8_packed_warps * channels) == 0);
-    static_assert(hidden_size % text_fp8_group_size == 0);
-    if (rows < 2 || rows > text_attention_max_tokens || !input.values || !input.scales ||
-        !key.values || !value.values || !key.scales || !value.scales || !keys || !values ||
-        key.rows != text_gqa_kv_width || value.rows != text_gqa_kv_width ||
-        key.columns != hidden_size || value.columns != hidden_size ||
-        !supports_wide_fp8(key.values, input, hidden_size) ||
-        !supports_wide_fp8(value.values, input, hidden_size)) {
-        return cudaErrorInvalidValue;
-    }
-    int out_width = text_gqa_kv_width;
-    int in_width = hidden_size;
-    int groups = text_fp8_group_count(in_width);
-    Fp8PrefillMatrix key_matrix{key.values, key.scales, keys};
-    Fp8PrefillMatrix value_matrix{value.values, value.scales, values};
-    void* args[] = {&key_matrix, &value_matrix, &input, &out_width, &in_width, &groups, &rows};
-    const dim3 grid(divide_up(rows, tile_rows), out_width / (fp8_packed_warps * channels), 2);
-    return cudaLaunchKernel(fp8_prefill_reuse_pair_kernel<tile_rows, channels>, grid, threads,
-                            args, 0, stream);
 }
 
 cudaError_t text_fp8_decode_rows(const std::uint8_t* weight, const __nv_bfloat16* weight_scales,

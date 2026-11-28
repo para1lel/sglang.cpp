@@ -11,9 +11,12 @@ decoder_lib=(
     -Wl,--start-group "$build/lib/"*.a -Wl,--end-group
     -L"$toolkit/lib" -L"$toolkit/lib/stubs" -Wl,-rpath,"$toolkit/lib" -Wl,-rpath,"$nccl/lib"
     "$nccl/lib/libnccl.so.2" -lcuda -lcudart -pthread -ldl -lrt
+    -L"$CONDA_PREFIX/lib" -Wl,-rpath,"$CONDA_PREFIX/lib" -licuuc -licudata
 )
 g++ "${host_flags[@]}" "$tests/token_probe.cpp" \
-    "$build/lib/libsglang_tokenizer.a" "$build/lib/libsglang_json.a" -o "$build/bin/token-probe"
+    "$build/lib/libsglang_tokenizer.a" "$build/lib/libsglang_json.a" \
+    -L"$CONDA_PREFIX/lib" -Wl,-rpath,"$CONDA_PREFIX/lib" -licuuc -licudata \
+    -o "$build/bin/token-probe"
 g++ "${host_flags[@]}" -I"$toolkit/include" "$tests/mtp_guard.cpp" \
     "${decoder_lib[@]}" -o "$build/bin/mtp-guard"
 "$build/bin/mtp-guard" "$checkpoint/tokenizer.json"
@@ -30,7 +33,7 @@ The HTTP suite saves JSON and SSE. Select an idle GPU and set `LMCACHE_SOCKET` t
 
 ```bash
 server="$build/bin/sglang-server"
-python "$tests/http_contract.py" "$server" "$checkpoint" "$evidence/w1"
+python "$tests/http_contract.py" "$server" "$checkpoint" "$evidence/width-one"
 python "$tests/http_contract.py" "$server" "$checkpoint" "$evidence/eager" --eager
 python "$tests/http_contract.py" "$server" "$checkpoint" "$evidence/graph" \
     --width 4 --graph --mtp 1

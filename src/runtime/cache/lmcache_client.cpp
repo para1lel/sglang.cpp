@@ -14,8 +14,8 @@
 #include <stdexcept>
 #include <string_view>
 #include <sys/socket.h>
-#include <sys/un.h>
 #include <sys/syscall.h>
+#include <sys/un.h>
 #include <unistd.h>
 #include <utility>
 
@@ -24,9 +24,11 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 constexpr std::string_view magic = "SLC3";
-constexpr std::string_view daemon_version = "0.5.8+native-v3";
+constexpr std::string_view daemon_version = "0.5.8+native-v5";
 constexpr int max_native_tokens = QwenTextModel::max_position_embeddings;
 constexpr std::size_t max_record = std::size_t{1} << 30;
+constexpr std::uint64_t max_allocation = std::uint64_t{1} << 40;
+constexpr std::uint32_t mapped_pages_flag = std::uint32_t{1} << 31;
 constexpr std::size_t max_metadata = std::size_t{64} << 20;
 constexpr std::size_t max_keys = std::size_t{1} << 20;
 constexpr std::size_t max_error = 1024;
@@ -42,8 +44,15 @@ constexpr long pidfd_open_syscall = 434;
 #else
 #error "Linux pidfd_open syscall definition is required"
 #endif
-enum class Operation { ready = 1, lookup, retrieve, store, reset, erase, lookup_prefix, lease,
-                       lookup_prefix_detail, retrieve_v4, store_v4 };
+enum class Operation {
+    ready = 1,
+    lookup = 2,
+    reset = 5,
+    lease = 8,
+    lookup_prefix = 9,
+    retrieve = 10,
+    store = 11,
+};
 
 [[noreturn]] void transport_error(std::string detail) {
     throw std::runtime_error("LMCache: " + std::move(detail));
@@ -264,31 +273,47 @@ void append_address(std::string& output, const PrefixDeviceAddress& address) {
     append_number(output, 8, address.offset);
 }
 
-void append_mxfp8(std::string& output, const PrefixCacheKeys& keys,
-                  const PrefixDeviceMxfp8& view, int layers, bool draft, bool v4) {
+void append_mxfp8(std::string& output, const PrefixCacheKeys& keys, const PrefixDeviceMxfp8& view,
+                  int layers, bool draft) {
     constexpr int chunk = prefix_gqa_chunk_tokens;
+    const auto& page_map = view.physical_pages;
+    const int last_page = view.end > 0 ? 1 + ((view.end - 1) / mxfp8_page_size) : 0;
+    const int mapped_count = last_page - (view.begin / mxfp8_page_size);
     const bool valid_shape = view.end == 0 ||
         (view.begin < view.end && view.layers == layers && view.page_count > 0 &&
-         view.page_count <= max_native_tokens / mxfp8_page_size &&
-         view.end <= view.page_count * mxfp8_page_size &&
          view.kv_heads > 0 && view.kv_heads <= 128);
+    const bool valid_map =
+        page_map.empty()
+            ? view.end == 0 || (view.page_count >= last_page &&
+                                view.page_count <= max_native_tokens / mxfp8_page_size)
+            : mapped_count > 0 && page_map.size() == static_cast<std::size_t>(mapped_count);
     if (view.begin < 0 || view.begin > view.end || view.end > max_native_tokens ||
-        view.begin % chunk || !valid_shape) {
+        view.begin % chunk != 0 || !valid_shape || !valid_map ||
+        (view.end != 0 && view.end > keys.cacheable_tokens() - static_cast<int>(draft))) {
         throw std::invalid_argument("Invalid native MXFP8 transfer extent");
     }
     append_number(output, 4, view.begin);
     append_number(output, 4, view.end);
-    if (!view.end) return;
-    if (v4) append_number(output, 4, view.kv_heads);
-    append_number(output, 4, view.page_count);
+    if (view.end == 0)
+        return;
+    append_number(output, 4, view.kv_heads);
+    append_number(output, 4,
+                  static_cast<std::uint32_t>(view.page_count) |
+                      (page_map.empty() ? 0 : mapped_pages_flag));
     for (const auto& plane : view.planes) append_address(output, plane);
+    for (const auto page : page_map) {
+        if (page < 0 || page >= view.page_count) {
+            throw std::invalid_argument("Invalid native MXFP8 physical page");
+        }
+        append_number(output, 4, static_cast<std::uint32_t>(page));
+    }
     for (int begin = view.begin; begin < view.end; begin += chunk) {
-        output += keys.key(std::min(begin + chunk, view.end) + draft);
+        output += keys.key(std::min(begin + chunk, view.end) + static_cast<int>(draft));
     }
 }
 
 void append_gdn(std::string& output, const PrefixCacheKeys& keys, const PrefixDeviceGdn& view) {
-    if (view.end < 0 || view.end > max_native_tokens) {
+    if (view.end < 0 || view.end > max_native_tokens || view.end > keys.cacheable_tokens()) {
         throw std::invalid_argument("Invalid native GDN endpoint");
     }
     append_number(output, 4, view.end);
@@ -303,19 +328,16 @@ void append_gdn(std::string& output, const PrefixCacheKeys& keys, const PrefixDe
     }
 }
 
-
 std::string prefix_lookup_metadata(const LmCacheConfig& config, std::string_view digests,
-                                   int max_restore, bool draft) {
+                                   bool draft) {
     constexpr std::size_t digest_bytes = 64;
     const auto count = digests.size() / digest_bytes;
     auto metadata = request_prefix(config);
-    if (digests.size() % digest_bytes || count > max_keys ||
-        digests.size() > max_metadata - metadata.size() - 9 || max_restore < 0 ||
-        static_cast<std::size_t>(max_restore) > count) {
+    if (digests.size() % digest_bytes != 0 || count > max_native_tokens ||
+        digests.size() > max_metadata - metadata.size() - 5) {
         throw std::invalid_argument("Invalid LMCache prefix lookup metadata");
     }
     append_number(metadata, 4, count);
-    append_number(metadata, 4, max_restore);
     append_number(metadata, 1, draft);
     metadata += digests;
     return metadata;
@@ -332,15 +354,47 @@ std::string encode_transfer(const LmCacheConfig& config, const PrefixCacheKeys& 
     append_bytes(output, transfer.ready_event);
     append_number(output, 4, transfer.allocations.size());
     for (const auto& allocation : transfer.allocations) {
-        if (allocation.bytes == 0) throw std::invalid_argument("Empty GPU allocation");
+        if (allocation.bytes == 0 || allocation.bytes > max_allocation) {
+            throw std::invalid_argument("Invalid GPU allocation size");
+        }
         append_bytes(output, allocation.handle);
         append_number(output, 8, allocation.bytes);
     }
-    append_mxfp8(output, keys, view.layout.gqa, qwen_text_model.full_attention_layers(), false,
-                 config.native_v4);
-    append_mxfp8(output, keys, view.layout.draft, 1, true, config.native_v4);
+    append_mxfp8(output, keys, view.layout.gqa, qwen_text_model.full_attention_layers(), false);
+    append_mxfp8(output, keys, view.layout.draft, 1, true);
     append_gdn(output, keys, view.layout.gdn);
     return output;
+}
+
+void append_retention(std::string& output, const PrefixCacheKeys& keys,
+                      const PrefixDeviceTransfer& transfer) {
+    const int count = transfer.retention_endpoint_count;
+    const bool draft = transfer.retention_requires_draft;
+    if (count < 0 || count > prefix_prefill_retention_limit || (count == 0 && draft)) {
+        throw std::invalid_argument("Invalid native LMCache retention count");
+    }
+    append_number(output, 1, count);
+    append_number(output, 1, static_cast<std::uint64_t>(draft));
+    int last = 0;
+    for (int index = 0; index < count; ++index) {
+        const int end = transfer.retention_endpoints[index];
+        if (end <= last || end >= transfer.layout.gdn.end || end > keys.cacheable_tokens()) {
+            throw std::invalid_argument("Invalid native LMCache retention endpoint");
+        }
+        append_number(output, 4, end);
+        output += keys.key(end);
+        last = end;
+    }
+    constexpr int chunk = prefix_gqa_chunk_tokens;
+    const auto append_missing = [&](const PrefixDeviceMxfp8& view, int shift) {
+        for (int rows = chunk; rows + shift < last; rows += chunk) {
+            if (rows <= view.begin || rows > view.end)
+                output += keys.key(rows + shift);
+        }
+    };
+    append_missing(transfer.layout.gqa, 0);
+    if (draft)
+        append_missing(transfer.layout.draft, 1);
 }
 
 class GpuLease {
@@ -480,66 +534,39 @@ std::vector<bool> LmCacheClient::lookup(const std::vector<LmCacheKey>& keys) con
     return found;
 }
 
-LmCachePrefix LmCacheClient::lookup_prefix(std::string_view digests, int max_restore,
-                                           bool draft) const {
-    const auto metadata = prefix_lookup_metadata(config_, digests, max_restore, draft);
+LmCachePrefixDetail LmCacheClient::lookup_prefix(std::string_view digests, bool draft) const {
+    const auto metadata = prefix_lookup_metadata(config_, digests, draft);
     const Connection connection(config_);
     connection.request(Operation::lookup_prefix, metadata);
-    connection.response(16);
-    std::array<char, 16> raw{};
-    connection.read_all(raw.data(), raw.size());
-    const std::string_view frame(raw.data(), raw.size());
-    const auto gqa = decode_number(frame.substr(0, 4));
-    const auto gdn = decode_number(frame.substr(4, 4));
-    const auto draft_rows = decode_number(frame.substr(8, 4));
-    const auto matched_gdn = decode_number(frame.substr(12));
-    if (gqa > digests.size() / 64 || matched_gdn > digests.size() / 64 || gdn > matched_gdn ||
-        gdn > std::min(gqa, static_cast<std::uint64_t>(max_restore)) ||
-        draft_rows != (draft && gdn ? gdn - 1 : 0)) {
-        transport_error("invalid prefix coverage result");
-    }
-    return {static_cast<int>(gqa), static_cast<int>(gdn), static_cast<int>(draft_rows),
-            static_cast<int>(matched_gdn)};
-}
-
-LmCachePrefixDetail LmCacheClient::lookup_prefix_detail(std::string_view digests,
-                                                        int max_restore, bool draft) const {
-    const auto metadata = prefix_lookup_metadata(config_, digests, max_restore, draft);
-    const Connection connection(config_);
-    connection.request(Operation::lookup_prefix_detail, metadata);
     const auto [status, size] = connection.response_header();
-    constexpr std::size_t lead = 16;
-    if (status != 0 || size < lead || (size - lead) % 5 != 0) {
-        transport_error("ranked LMCache daemon required for prefix coverage inventory");
+    constexpr std::size_t lead = 12;
+    constexpr std::size_t entry = 5;
+    const auto count = digests.size() / 64;
+    if (status != 0 || size < lead || (size - lead) % entry != 0 || (size - lead) / entry > count) {
+        transport_error("invalid LMCache prefix coverage inventory frame");
     }
     std::string raw(size, '\0');
     connection.read_all(raw.data(), raw.size());
     const std::string_view frame(raw.data(), raw.size());
-    const auto count = digests.size() / 64;
     const auto gqa = decode_number(frame.substr(0, 4));
-    const auto matched_gdn = decode_number(frame.substr(4, 4));
-    const auto total = decode_number(frame.substr(8, 4));
-    const auto listed = decode_number(frame.substr(12, 4));
-    if (gqa > count || matched_gdn > count || listed != (frame.size() - lead) / 5 ||
-        total < listed) {
+    const auto draft_rows = decode_number(frame.substr(4, 4));
+    const auto listed = decode_number(frame.substr(8, 4));
+    if (gqa > count || (draft_rows != 0 && (!draft || draft_rows >= count)) ||
+        listed != (frame.size() - lead) / entry) {
         transport_error("invalid prefix coverage inventory");
     }
-    if (total > listed) {
-        transport_error("LMCache prefix coverage inventory is truncated");
-    }
-    LmCachePrefixDetail detail{static_cast<int>(gqa), static_cast<int>(matched_gdn), {}};
+    LmCachePrefixDetail detail{static_cast<int>(gqa), {}, static_cast<int>(draft_rows)};
     detail.endpoints.reserve(listed);
-    const auto bound = std::min(gqa, static_cast<std::uint64_t>(max_restore));
-    std::uint64_t previous = static_cast<std::uint64_t>(max_native_tokens) + 1;
+    auto previous = count + 1;
     for (std::size_t index = 0; index < listed; ++index) {
-        const auto offset = lead + index * 5;
+        const auto offset = lead + (index * entry);
         const auto end = decode_number(frame.substr(offset, 4));
         const auto draft_ok = decode_number(frame.substr(offset + 4, 1));
-        if (end == 0 || end > matched_gdn || end > bound || end >= previous ||
-            draft_ok > 1 || (!draft && draft_ok)) {
+        if (end == 0 || end >= previous || draft_ok > 1 || (!draft && draft_ok != 0) ||
+            (draft && end == 1 && draft_ok == 0)) {
             transport_error("invalid prefix coverage inventory");
         }
-        previous = static_cast<int>(end);
+        previous = end;
         detail.endpoints.push_back({static_cast<int>(end), draft_ok != 0});
     }
     return detail;
@@ -547,7 +574,9 @@ LmCachePrefixDetail LmCacheClient::lookup_prefix_detail(std::string_view digests
 
 std::string LmCacheClient::prepare_store(const PrefixCacheKeys& keys,
                                          const PrefixDeviceTransfer& transfer) const {
-    return encode_transfer(config_, keys, transfer);
+    auto metadata = encode_transfer(config_, keys, transfer);
+    append_retention(metadata, keys, transfer);
+    return metadata;
 }
 
 LmCacheStatus LmCacheClient::store(const PrefixCacheKeys& keys,
@@ -556,18 +585,16 @@ LmCacheStatus LmCacheClient::store(const PrefixCacheKeys& keys,
     return store_prepared(prepare_store(keys, transfer), receipt);
 }
 
-LmCacheStatus LmCacheClient::store_prepared(std::string_view metadata,
-                                           LmCacheReceipt* receipt) const {
-    return transfer_records(config_, config_.native_v4 ? Operation::store_v4 : Operation::store,
-                            metadata, receipt);
+LmCacheStatus LmCacheClient::store_prepared(std::string_view metadata, LmCacheReceipt* receipt,
+                                            int stop_fd) const {
+    return transfer_records(config_, Operation::store, metadata, receipt, stop_fd);
 }
 
 LmCacheStatus LmCacheClient::retrieve(const PrefixCacheKeys& keys,
                                        const PrefixDeviceTransfer& transfer,
                                        LmCacheReceipt* receipt, int stop_fd) const {
-    return transfer_records(config_, config_.native_v4 ? Operation::retrieve_v4
-                                                       : Operation::retrieve,
-                            encode_transfer(config_, keys, transfer), receipt, stop_fd);
+    return transfer_records(config_, Operation::retrieve, encode_transfer(config_, keys, transfer),
+                            receipt, stop_fd);
 }
 
 void LmCacheClient::reset() const {

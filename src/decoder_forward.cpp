@@ -4,6 +4,7 @@
 #include "sglang/decoder_cuda.cuh"
 #include "sglang/decoder_verify.h"
 #include "sglang/runtime/execution/decoder_forward_layers.h"
+#include "sglang/runtime/execution/verification_row_copy.h"
 
 namespace sglang {
 namespace {
@@ -48,15 +49,16 @@ void Decoder::Model::decode_graph(Request& request) const {
 
 void Decoder::Model::capture_batch_decode(const BatchGraphLane* lanes, int count,
                                           cudaStream_t stream) const {
+    VerificationCopyRows embeddings{};
     for (int index = 0; index < count; ++index) {
-        const auto& lane = lanes[index];
-        auto& work = *lane.work;
-        check(decode_embedding(embedding, vocab_size, hidden_size, &lane.binding->input,
-                               work.residual, stream), "Look up bound token embedding");
+        embeddings.destination[index] = lanes[index].work->residual;
     }
+    check(gather_verification_embeddings(embedding, lanes[0].batch->tokens, embeddings, count,
+                                         stream),
+          "Look up bound decode embeddings");
     forward_layers(lanes, count, stream);
     DecodeHeadRows rows;
-    if (count == static_cast<int>(rows.size())) {
+    if (!backend.ordered_attention && count == static_cast<int>(rows.size())) {
         DecodeStateRows states;
         for (int index = 0; index < count; ++index) {
             rows[index] = lanes[index].work;

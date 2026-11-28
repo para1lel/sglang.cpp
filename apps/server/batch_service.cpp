@@ -16,7 +16,9 @@ BatchService::State::State(std::unique_ptr<BatchExecutor> owner, bool trace, int
     : trace(trace), cuda_graphs(owner->options().cuda_graphs), mtp_steps(mtp_steps),
       max_active(owner->options().max_active),
       prefix_cache_entries(owner->options().prefix_cache_entries),
-      max_num_batched_tokens(owner->options().max_num_batched_tokens), executor(std::move(owner)) {
+      max_num_batched_tokens(owner->options().max_num_batched_tokens),
+      resident_prefix_cache(owner->options().resident_prefix_cache), cache_identity(identity),
+      executor(std::move(owner)) {
     if (max_active < 1 || max_active > decoder_batch_max_lanes) {
         throw std::invalid_argument("Invalid decoder batch service capacity");
     }
@@ -27,16 +29,8 @@ BatchService::State::State(std::unique_ptr<BatchExecutor> owner, bool trace, int
 
 BatchService::State::State(std::unique_ptr<BatchExecutor> owner, bool trace, int mtp_steps,
                            const decoder::LmCacheConfig& cache,
-                           std::vector<std::array<std::uint8_t, 16>> devices,
-                           std::string identity)
-    : trace(trace), cuda_graphs(owner->options().cuda_graphs), mtp_steps(mtp_steps),
-      max_active(owner->options().max_active),
-      prefix_cache_entries(owner->options().prefix_cache_entries),
-      max_num_batched_tokens(owner->options().max_num_batched_tokens), executor(std::move(owner)) {
-    if (max_active < 1 || max_active > decoder_batch_max_lanes) {
-        throw std::invalid_argument("Invalid decoder batch service capacity");
-    }
-    counters.cache_capacity = prefix_cache_entries;
+                           std::vector<std::array<std::uint8_t, 16>> devices, std::string identity)
+    : State(std::move(owner), trace, mtp_steps, {}, identity) {
     if (devices.size() < 2) {
         throw std::invalid_argument("Ranked LMCache requires at least two rank devices");
     }
@@ -46,13 +40,29 @@ BatchService::State::State(std::unique_ptr<BatchExecutor> owner, bool trace, int
 
 void BatchService::State::start() {
     executor->start(
-        [this](BatchSession& batch) { counters.cache = batch.prefix_cache_stats(); },
+        [this](BatchSession& batch) {
+            const std::scoped_lock lock(mutex);
+            counters.cache = batch.prefix_cache_stats();
+            session = &batch;
+        },
         [this](BatchSession& batch) {
             try {
                 process(batch);
             } catch (...) {
                 fail_jobs(std::current_exception(), true);
             }
+            if (lmcache) {
+                lmcache->stop_restores();
+                lmcache->drain_transfers();
+            }
+            try {
+                batch.release_retired_allocations();
+            } catch (...) {
+                fail_jobs(std::current_exception(), true);
+            }
+            const std::scoped_lock lock(mutex);
+            session = nullptr;
+            counters.cache = batch.prefix_cache_stats();
         });
 }
 
@@ -60,6 +70,11 @@ BatchService::State::~State() {
     {
         const std::lock_guard lock(mutex);
         closing = true;
+        if (reset_pending) {
+            reset_pending->set_exception(
+                std::make_exception_ptr(CacheResetUnavailable("Prefix cache service is closing")));
+            reset_pending.reset();
+        }
         for (auto& job : jobs) if (job) cancel_cache_read(*job);
     }
     if (lmcache) lmcache->stop_restores();
@@ -73,7 +88,10 @@ void BatchService::State::fail_jobs(std::exception_ptr error, bool permanent) {
     if (permanent) {
         failure = error;
         failed.store(true);
-        reset_pending = false;
+        if (reset_pending) {
+            reset_pending->set_exception(error);
+            reset_pending.reset();
+        }
     }
     for (auto& job : jobs) {
         if (job && (!job->retiring_prefix || permanent)) {
@@ -98,44 +116,6 @@ void BatchService::State::fail_jobs(std::exception_ptr error, bool permanent) {
     changed.notify_all();
 }
 
-bool BatchService::State::wide_decode_ready(bool buffered) const {
-    if (!cuda_graphs || mtp_steps != 0 || max_active != decoder_batch_max_lanes) {
-        return false;
-    }
-    int ready = 0;
-    for (const auto& job : jobs) {
-        if (!job || job->cancelled || job->aborted() || !job->prefill_completed) {
-            return false;
-        }
-        if (buffered && (!job->buffer_decode_output || !job->output_started)) {
-            return false;
-        }
-        ready += job->ready(buffered);
-    }
-    return ready >= wide_decode_min_ready;
-}
-
-bool BatchService::State::decode_mailboxes_ready(bool require_all) const {
-    if (!cuda_graphs || mtp_steps != 0 || max_active < mailbox_min_lanes) {
-        return false;
-    }
-    int live = 0;
-    int ready = 0;
-    for (const auto& job : jobs) {
-        if (!job) {
-            continue;
-        }
-        if (job->cancelled || job->aborted() || !job->prefill_completed ||
-            !job->buffer_decode_output || !job->output_started) {
-            return false;
-        }
-        ++live;
-        ready += job->ready(true);
-    }
-    return live >= mailbox_min_lanes && live < decoder_batch_max_lanes &&
-        (require_all ? ready == live : ready > 0);
-}
-
 bool BatchService::State::idle_for_health() const {
     return health_probe && !reset_pending && Clock::now() < health_probe->deadline &&
            !health_probe->progressed && !health_probe->job->finish && !health_probe->job->error &&
@@ -143,38 +123,75 @@ bool BatchService::State::idle_for_health() const {
            std::none_of(generating.begin(), generating.end(), [](bool active) { return active; });
 }
 
+bool BatchService::State::has_runnable_job(Clock::time_point& retry_at) const {
+    retry_at = Clock::time_point::max();
+    for (const int slot : admission) {
+        const auto& job = jobs[slot];
+        if (!job)
+            continue;
+        const bool capacity_blocked = retry_at != Clock::time_point::max();
+        if (prefix_ready(*job) || job->ready(false, capacity_blocked))
+            return true;
+        if (!capacity_blocked && job->awaiting_capacity())
+            retry_at = job->admission_retry_at;
+    }
+    return false;
+}
+
 std::optional<Work> BatchService::State::wait_for_jobs(BatchSession& batch) {
     std::unique_lock lock(mutex);
-    const auto end = jobs.begin() + max_active;
+    const auto* end = jobs.data() + max_active;
+    Clock::time_point retry_at;
     const auto ready = [&] {
-        return closing || (reset_pending && !lmcache) || wide_decode_ready(true) ||
-               decode_mailboxes_ready(false) || idle_for_health() ||
+        return closing || reset_pending || decode_cohort_ready(true) || idle_for_health() ||
                (trace && lmcache && batch.prefix_cache_stats().stores != counters.cache.stores) ||
-               std::any_of(jobs.begin(), end, [this](const auto& job) {
-                   return job && (job->ready() || prefix_ready(*job));
-               });
+               has_runnable_job(retry_at);
     };
-    if (std::none_of(jobs.begin(), end, [](const auto& job) { return bool(job); }) &&
+    if (std::none_of(jobs.cbegin(), end, [](const auto& job) { return bool(job); }) &&
         !changed.wait_for(lock, std::chrono::seconds(5), ready)) {
         lock.unlock();
         batch.release_retired_allocations();
         lock.lock();
+        counters.cache = batch.prefix_cache_stats();
     }
-    changed.wait(lock, ready);
-    const bool admitting = std::any_of(jobs.begin(), end, [](const auto& job) {
-        return job && !job->admitted && !job->cache_reading && !job->prefix_pending &&
-            !job->cancelled && !job->aborted();
-    });
-    changed.wait_for(lock, mailbox_grace, [&] {
-        return closing || reset_pending || wide_decode_ready(true) || wide_decode_ready(false) ||
-               decode_mailboxes_ready(true) ||
-               std::all_of(jobs.begin(), end, [this, admitting](const auto& job) {
-                   return job ? job->ready() || prefix_ready(*job) : !admitting;
-               });
-    });
+    while (!ready()) {
+        if (retry_at == Clock::time_point::max()) {
+            changed.wait(lock);
+        } else if (changed.wait_until(lock, retry_at) == std::cv_status::timeout) {
+            lock.unlock();
+            batch.release_retired_allocations();
+            lock.lock();
+        }
+    }
+    bool admitting = false;
+    for (const int slot : admission) {
+        const auto& job = jobs[slot];
+        if (!job)
+            continue;
+        if (job->awaiting_capacity())
+            break;
+        admitting = !job->admitted && !job->cancelled && !job->aborted() && job->ready();
+        if (admitting)
+            break;
+    }
+    if (!changed.wait_for(lock, mailbox_grace, [&] {
+            return closing || reset_pending || decode_cohort_ready(true, true) ||
+                   decode_cohort_ready(false) ||
+                   std::all_of(jobs.cbegin(), end, [admitting](const auto& job) {
+                       return job ? job->pending.empty() || job->output_grace_expired ||
+                                        job->ready()
+                                  : !admitting;
+                   });
+        })) {
+        for (const auto& job : jobs) {
+            if (job && !job->pending.empty() && !job->ready())
+                job->output_grace_expired = true;
+        }
+        ++counters.mailbox_grace_timeouts;
+    }
     if (closing) return std::nullopt;
     if (idle_for_health()) jobs.front() = health_probe->job;
-    return Work{jobs, admission, wide_decode_ready(true) || decode_mailboxes_ready(false)};
+    return Work{jobs, admission, decode_cohort_ready(true)};
 }
 
 std::uint32_t BatchService::State::refresh_prefill_roster(Work& work, int capacity) {
@@ -194,12 +211,12 @@ std::uint32_t BatchService::State::refresh_prefill_roster(Work& work, int capaci
     work.admission = admission;
     return added;
 }
-bool BatchService::State::prepare(BatchSession& batch, int slot,
-                                  const std::shared_ptr<Job>& job, bool buffered) {
+bool BatchService::State::prepare(BatchSession& batch, int slot, const std::shared_ptr<Job>& job,
+                                  bool buffered, bool capacity_blocked) {
     bool cancelled;
     {
         const std::lock_guard lock(mutex);
-        if (!job || !job->ready(buffered)) {
+        if (!job || !job->ready(buffered, capacity_blocked)) {
             return false;
         }
         cancelled = job->cancelled || job->aborted();
@@ -210,55 +227,14 @@ bool BatchService::State::prepare(BatchSession& batch, int slot,
         }
         const std::lock_guard lock(mutex);
         cancel_cache_read(*job);
+        job->admission_retry_at = {};
         publish(slot, *job, {std::nullopt, DecoderFinishReason::cancelled});
         changed.notify_all();
         return false;
     }
-    if (!job->admitted) {
-        try {
-            if ((lmcache && !job->health_check) || prefix_cache_entries) {
-                configure_checkpoint(*job);
-                job->options.claim_completion = [this, current = job.get()] {
-                    const std::lock_guard lock(mutex);
-                    if (current->cancelled || closing) return false;
-                    current->completion_claimed =
-                        !current->request_id || current->request_id->claim_completion();
-                    return current->completion_claimed;
-                };
-            }
-            if (job->media.empty()) {
-                job->cached_tokens = batch.admit(slot, std::move(job->prompt), job->options);
-            } else {
-                job->cached_tokens = batch.admit_multimodal(slot, std::move(job->prompt),
-                                                           job->options, job->media);
-                job->media.clear();
-            }
-            job->options.prefix_cache_read.reset();
-            const std::lock_guard lock(mutex);
-            job->prefix_pending = job->prefix_operation.valid();
-            job->admitted = !job->prefix_pending;
-            if (job->admitted) job->cache_read.reset();
-            job->cache_cancel.reset();
-            changed.notify_all();
-            return job->admitted;
-        } catch (...) {
-            if (!batch.available()) {
-                throw;
-            }
-            const std::lock_guard lock(mutex);
-            if (!job->request_id || job->request_id->finish()) {
-                job->error = std::current_exception();
-            } else {
-                job->request_id->finish_abort();
-                job->finish = DecoderFinishReason::aborted;
-            }
-            jobs[slot].reset();
-            changed.notify_all();
-            return false;
-        }
-    }
-    return true;
+    return job->admitted || admit(batch, slot, *job);
 }
+
 bool BatchService::State::publish(int slot, Job& job, const DecoderBatchStep& step) {
     const bool terminal = step.finish_reason || step.sampling_failed || step.constraint_failed;
     if (terminal && job.request_id && !job.request_id->finish() && !job.cancelled) {
@@ -315,24 +291,11 @@ void BatchService::State::publish_steps(const Jobs& snapshot, const Selection& s
         }
     }
 }
-std::optional<std::uint64_t> BatchService::State::begin_iteration(BatchSession& batch) {
-    std::unique_lock lock(mutex);
-    if (reset_pending && !lmcache) {
-        lock.unlock();
-        batch.reset_prefix_cache();
-        const auto stats = batch.prefix_cache_stats();
-        lock.lock();
-        counters.cache = stats;
-        reset_pending = false;
-        changed.notify_all();
-        return std::nullopt;
-    }
-    return profile && profile->steps.size() < profile_limit ? profile_epoch : 0;
-}
 
 void BatchService::State::process(BatchSession& batch) {
-    BatchTrace trace_state(trace && (lmcache || prefix_cache_entries != 0),
-                           batch.prefix_cache_stats());
+    const bool cache_enabled =
+        lmcache != nullptr || resident_prefix_cache || prefix_cache_entries != 0;
+    BatchTrace trace_state(trace && cache_enabled, batch.prefix_cache_stats());
     while (auto snapshot = wait_for_jobs(batch)) {
         const auto iteration = begin_iteration(batch);
         if (!iteration) {
@@ -341,6 +304,7 @@ void BatchService::State::process(BatchSession& batch) {
         const auto epoch = *iteration;
         Selection selected{};
         bool cold = true, has_empty_slot = false, starts_long_prefill = false;
+        bool capacity_blocked = false;
         for (const int slot : snapshot->admission) {
             const auto& job = snapshot->jobs[slot];
             if (!job) {
@@ -351,18 +315,21 @@ void BatchService::State::process(BatchSession& batch) {
             if (job->prefix_pending && !poll_prefix(batch, slot, job)) {
                 continue;
             }
-            selected[slot] = prepare(batch, slot, job, snapshot->buffered);
+            selected[slot] = prepare(batch, slot, job, snapshot->buffered, capacity_blocked);
+            capacity_blocked |= job->admission_retry_at != Clock::time_point{};
             starts_long_prefill |= cold && selected[slot] && !job->health_check &&
                 job->prompt_tokens >=
                     static_cast<std::size_t>(job->cached_tokens) + max_num_batched_tokens;
         }
         int width = std::count(selected.begin(), selected.end(), true);
         const int capacity = std::min(max_active, max_num_batched_tokens) - width;
-        if (cold && starts_long_prefill && has_empty_slot && capacity > 0) {
+        if (cold && starts_long_prefill && has_empty_slot && !capacity_blocked && capacity > 0) {
             const auto added = refresh_prefill_roster(*snapshot, capacity);
             for (const int slot : snapshot->admission) {
                 if (!(added >> slot & 1U)) continue;
-                selected[slot] = prepare(batch, slot, snapshot->jobs[slot], snapshot->buffered);
+                const auto& job = snapshot->jobs[slot];
+                selected[slot] = prepare(batch, slot, job, snapshot->buffered, capacity_blocked);
+                capacity_blocked |= job->admission_retry_at != Clock::time_point{};
                 width += selected[slot];
             }
         }
@@ -389,8 +356,7 @@ void BatchService::State::process(BatchSession& batch) {
             trace_state.step(width, steps, stats, batch.request_device_allocation_bytes(),
                              max_active, max_num_batched_tokens, mtp_steps);
         }
-        const auto cache = lmcache || prefix_cache_entries ? batch.prefix_cache_stats()
-                                                           : DecoderPrefixCacheStats{};
+        const auto cache = cache_enabled ? batch.prefix_cache_stats() : DecoderPrefixCacheStats{};
         trace_state.cache(cache, steps);
         {
             const std::lock_guard lock(mutex);
@@ -448,13 +414,15 @@ DecoderResult BatchService::State::consume(std::unique_lock<std::mutex>& lock, i
             }
             job.pending.pop();
             job.output_started = true;
+            job.output_grace_expired = false;
             changed.notify_all();
         } else if (job.error) {
             std::rethrow_exception(job.error);
         } else if (job.finish && can_emit) {
             result.finish_reason = *job.finish;
             return result;
-        } else if (!job.has_output() && !job.finish) {
+        } else if (!job.has_output() && !job.finish &&
+                   (announced || !notify_admission || !job.admitted)) {
             changed.wait_for(lock, disconnect_poll);
         }
     }
@@ -485,6 +453,8 @@ void BatchService::State::cancel_batch(std::unique_lock<std::mutex>& lock,
 
 void BatchService::State::enqueue_batch(int owner, const std::vector<BatchPrompt>& prompts,
                                         BatchJobs& active, std::size_t& next, bool buffered) {
+    if (reset_pending)
+        return;
     const bool indexed = prompts.size() > 1;
     if (indexed && next < prompts.size()) {
         std::uint32_t slots = 0;
@@ -615,6 +585,7 @@ bool BatchService::State::drain_batch(std::unique_lock<std::mutex>& lock, int ow
         if (has_step) {
             job.pending.pop();
             job.output_started = true;
+            job.output_grace_expired = false;
             changed.notify_all();
         }
         if (finish) {
@@ -772,8 +743,20 @@ void BatchService::rethrow_failure() const {
 BatchMetrics BatchService::metrics() const {
     const std::lock_guard lock(state_->mutex);
     auto metrics = state_->counters;
+    for (const auto& job : state_->jobs) {
+        if (!job || job->admitted || job->cancelled || job->aborted())
+            continue;
+        metrics.admission_waiting_for_capacity += static_cast<int>(job->awaiting_capacity());
+        metrics.admission_waiting_for_lookup += static_cast<int>(job->cache_reading);
+        metrics.admission_waiting_for_restore +=
+            static_cast<int>(job->prefix_pending && !job->retiring_prefix);
+    }
     if (auto* cache = state_->lmcache.get()) {
+        const auto* session = state_->session;
+        const bool backup_pending = session != nullptr && session->prefix_backup_pending();
         metrics.lmcache = cache->metrics();
+        if (backup_pending && metrics.lmcache.pending_stores == 0)
+            metrics.lmcache.pending_stores = 1;
         metrics.cache.stores = metrics.lmcache.stores;
     }
     if (tp_ar_source_ != nullptr) {
@@ -797,31 +780,18 @@ bool BatchService::reset_prefix_cache() {
     if (state_->failure) {
         std::rethrow_exception(state_->failure);
     }
-    const auto& first = state_->jobs.front();
-    if (state_->reset_pending || (state_->lmcache && state_->lmcache->stores_pending()) ||
-        (first && first->health_check) ||
+    if (state_->closing || state_->reset_pending ||
         std::any_of(state_->jobs.begin(), state_->jobs.end(),
-                    [](const auto& job) { return job && job->retiring_prefix; }) ||
+                    [](const auto& job) { return bool(job); }) ||
         std::any_of(state_->generating.begin(), state_->generating.end(),
                     [](bool active) { return active; })) {
         return false;
     }
-    state_->reset_pending = true;
-    if (auto* cache = state_->lmcache.get()) {
-        lock.unlock();
-        std::exception_ptr error;
-        try { cache->reset(); } catch (...) { error = std::current_exception(); }
-        lock.lock();
-        state_->reset_pending = false;
-        state_->changed.notify_all();
-        if (error) std::rethrow_exception(error);
-        return true;
-    }
+    state_->reset_pending = std::make_shared<std::promise<void>>();
+    auto completion = state_->reset_pending->get_future();
     state_->changed.notify_all();
-    state_->changed.wait(lock, [&] { return !state_->reset_pending; });
-    if (state_->failure) {
-        std::rethrow_exception(state_->failure);
-    }
+    lock.unlock();
+    completion.get();
     return true;
 }
 

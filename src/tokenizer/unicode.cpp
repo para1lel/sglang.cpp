@@ -2,43 +2,20 @@
 
 #include "sglang/utf8.h"
 
+#include <unicode/bytestream.h>
+#include <unicode/normalizer2.h>
+#include <unicode/uchar.h>
+#include <unicode/uniset.h>
+#include <unicode/ustring.h>
+
 #include <algorithm>
 #include <array>
-#include <iterator>
-#include <utility>
+#include <limits>
+#include <stdexcept>
 #include <vector>
 
 namespace sglang::tokenizer {
 namespace {
-
-struct PropertyRange {
-    char32_t first;
-    char32_t last;
-    unsigned char flags;
-};
-
-struct ScalarPair {
-    char32_t point;
-    char32_t value;
-};
-
-struct Mapping {
-    char32_t first;
-    char32_t second;
-    char32_t third;
-};
-
-#include "sglang/tokenizer/unicode/character_properties_16.h"
-#include "sglang/tokenizer/unicode/combining_classes_9.h"
-#include "sglang/tokenizer/unicode/canonical_decompositions_9.h"
-#include "sglang/tokenizer/unicode/canonical_compositions_9.h"
-
-struct CaseFold {
-    char32_t key;
-    std::array<char32_t, 3> value;
-};
-
-#include "sglang/tokenizer/unicode/casefold_15.h"
 
 constexpr unsigned letter = 1;
 constexpr unsigned mark = 2;
@@ -46,93 +23,105 @@ constexpr unsigned number = 4;
 constexpr unsigned space = 8;
 constexpr unsigned word = letter | mark;
 
-constexpr char32_t syllable_base = 0xac00;
-constexpr char32_t leading_base = 0x1100;
-constexpr char32_t vowel_base = 0x1161;
-constexpr char32_t trailing_base = 0x11a7;
-constexpr char32_t leading_count = 19;
-constexpr char32_t vowel_count = 21;
-constexpr char32_t trailing_count = 28;
-constexpr char32_t syllable_group = vowel_count * trailing_count;
-constexpr char32_t syllable_count = leading_count * syllable_group;
+static_assert(U_ICU_VERSION_MAJOR_NUM == 78 && U_ICU_VERSION_MINOR_NUM == 3);
+
+template <unsigned Major> bool age_at_most(UChar32 scalar) {
+    UVersionInfo age{};
+    u_charAge(scalar, age);
+    return age[0] < Major || (age[0] == Major && age[1] == 0);
+}
+
+const icu::Normalizer2& nfc() {
+    static const auto* instance = [] {
+        UErrorCode status = U_ZERO_ERROR;
+        const auto* result = icu::Normalizer2::getNFCInstance(status);
+        if (U_FAILURE(status) != 0) {
+            throw std::runtime_error(u_errorName(status));
+        }
+        return result;
+    }();
+    return *instance;
+}
+
+const icu::FilteredNormalizer2& nfc9() {
+    static const auto filter = [] {
+        UErrorCode status = U_ZERO_ERROR;
+        icu::UnicodeSet result(icu::UnicodeString(u"[:age=9.0:]"), status);
+        if (U_FAILURE(status) != 0) {
+            throw std::runtime_error(u_errorName(status));
+        }
+        result.freeze();
+        return result;
+    }();
+    static const icu::FilteredNormalizer2 normalizer(nfc(), filter);
+    return normalizer;
+}
 
 struct CanonicalScalar {
     char32_t point;
     unsigned combining_class;
 };
 
-template <class Entry, std::size_t Size, class Field>
-const Entry* lookup(const Entry (&table)[Size], char32_t point, Field field) {
-    const auto entry = std::lower_bound(std::begin(table), std::end(table), point,
-        [field](const Entry& value, char32_t wanted) { return value.*field < wanted; });
-    return entry != std::end(table) && (*entry).*field == point ? entry : nullptr;
+bool ascii(std::string_view bytes) {
+    return std::all_of(bytes.begin(), bytes.end(), [](unsigned char byte) { return byte < 128; });
 }
 
 unsigned properties(char32_t scalar) {
-    const auto after = std::upper_bound(std::begin(properties_16), std::end(properties_16),
-        scalar, [](char32_t point, const PropertyRange& range) { return point < range.first; });
-    return after != std::begin(properties_16) && scalar <= (after - 1)->last
-        ? (after - 1)->flags : 0;
+    if (scalar < 128) {
+        if ((scalar | 32) >= U'a' && (scalar | 32) <= U'z') {
+            return letter;
+        }
+        if (scalar >= U'0' && scalar <= U'9') {
+            return number;
+        }
+        return scalar == U' ' || (scalar >= 9 && scalar <= 13) ? space : 0;
+    }
+    const auto point = static_cast<UChar32>(scalar);
+    const auto category = U_GET_GC_MASK(point);
+    unsigned flags = 0;
+    if ((category & U_GC_L_MASK) != 0) {
+        flags = letter;
+    } else if ((category & U_GC_M_MASK) != 0) {
+        flags = mark;
+    } else if ((category & U_GC_N_MASK) != 0) {
+        flags = number;
+    } else if (u_isUWhiteSpace(point) != 0) {
+        flags = space;
+    }
+    return flags != 0 && age_at_most<16>(point) ? flags : 0;
 }
 
 char32_t fold_contraction(char32_t scalar) {
-    const auto* entry = lookup(contraction_folds_16, scalar, &ScalarPair::point);
-    return entry ? entry->value : scalar;
+    if (scalar == 0x17f) {
+        return U's';
+    }
+    return scalar >= U'A' && scalar <= U'Z' ? scalar + 32 : scalar;
 }
 
 bool newline(char32_t scalar) {
     return scalar == U'\r' || scalar == U'\n';
 }
 
-void decompose(char32_t point, std::vector<CanonicalScalar>& output) {
-    const auto syllable = point - syllable_base;
-    if (syllable < syllable_count) {
-        output.push_back({leading_base + syllable / syllable_group, 0});
-        output.push_back({vowel_base + (syllable % syllable_group) / trailing_count, 0});
-        if (const auto trailing = syllable % trailing_count) {
-            output.push_back({trailing_base + trailing, 0});
-        }
-    } else if (const auto* mapping = lookup(decompositions_9, point, &Mapping::first)) {
-        decompose(mapping->second, output);
-        if (mapping->third) {
-            decompose(mapping->third, output);
-        }
-    } else {
-        const auto* entry = lookup(classes_9, point, &ScalarPair::point);
-        output.push_back({point, entry ? entry->value : 0});
+void decompose(const icu::Normalizer2& normalizer, UChar32 point,
+               std::vector<CanonicalScalar>& output) {
+    icu::UnicodeString mapping;
+    if (normalizer.getDecomposition(point, mapping) == 0) {
+        output.push_back({static_cast<char32_t>(point), normalizer.getCombiningClass(point)});
+        return;
+    }
+    for (int i = 0; i < mapping.length();) {
+        const auto scalar = mapping.char32At(i);
+        output.push_back({static_cast<char32_t>(scalar), normalizer.getCombiningClass(scalar)});
+        i += U16_LENGTH(scalar);
     }
 }
 
-char32_t compose(char32_t first, char32_t second) {
-    const auto leading = first - leading_base;
-    const auto vowel = second - vowel_base;
-    if (leading < leading_count && vowel < vowel_count) {
-        return syllable_base + (leading * vowel_count + vowel) * trailing_count;
-    }
-    const auto syllable = first - syllable_base;
-    const auto trailing = second - trailing_base;
-    if (syllable < syllable_count && syllable % trailing_count == 0 &&
-        trailing > 0 && trailing < trailing_count) {
-        return first + trailing;
-    }
-    const auto key = std::pair(first, second);
-    const auto found = std::lower_bound(std::begin(compositions_9), std::end(compositions_9),
-        key, [](const Mapping& value, const auto& wanted) {
-            return std::pair(value.first, value.second) < wanted;
-        });
-    return found != std::end(compositions_9) && std::pair(found->first, found->second) == key
-        ? found->third : 0;
-}
-
-std::u32string normalized_scalars(std::string_view bytes) {
-    auto input = read_utf8(bytes);
-    if (std::all_of(input.begin(), input.end(), [](char32_t point) { return point < 0x80; })) {
-        return input;
-    }
+std::u32string normalize_large(std::u32string input) {
+    const auto& normalizer = nfc9();
     std::vector<CanonicalScalar> decomposed;
     decomposed.reserve(input.size());
     for (const auto point : input) {
-        decompose(point, decomposed);
+        decompose(normalizer, static_cast<UChar32>(point), decomposed);
     }
     for (auto first = decomposed.begin(); first != decomposed.end();) {
         if (first->combining_class == 0) {
@@ -155,8 +144,10 @@ std::u32string normalized_scalars(std::string_view bytes) {
     for (const auto [point, combining_class] : decomposed) {
         if (starter != std::u32string::npos &&
             (previous_class == 0 || previous_class < combining_class)) {
-            if (const auto composite = compose(input[starter], point)) {
-                input[starter] = composite;
+            const auto composite = normalizer.composePair(static_cast<UChar32>(input[starter]),
+                                                          static_cast<UChar32>(point));
+            if (composite >= 0) {
+                input[starter] = static_cast<char32_t>(composite);
                 continue;
             }
         }
@@ -167,6 +158,60 @@ std::u32string normalized_scalars(std::string_view bytes) {
         previous_class = combining_class;
     }
     return input;
+}
+
+bool normalizer_fits(std::string_view bytes) {
+    return bytes.size() <= static_cast<std::size_t>(std::numeric_limits<int32_t>::max()) / 4;
+}
+
+std::string normalize_checked(std::string_view bytes) {
+    if (!valid_utf8(bytes)) {
+        throw std::invalid_argument("Invalid UTF-8 input");
+    }
+    std::string output;
+    output.reserve(bytes.size());
+    icu::StringByteSink<std::string> sink(&output);
+    UErrorCode status = U_ZERO_ERROR;
+    nfc9().normalizeUTF8(0, {bytes.data(), static_cast<int32_t>(bytes.size())}, sink, nullptr,
+                         status);
+    if (U_FAILURE(status) != 0) {
+        throw std::runtime_error(u_errorName(status));
+    }
+    return output;
+}
+
+std::u32string normalized_scalars(std::string_view bytes) {
+    if (ascii(bytes)) {
+        return read_utf8(bytes);
+    }
+    if (!normalizer_fits(bytes)) {
+        return normalize_large(read_utf8(bytes));
+    }
+    return read_utf8(normalize_checked(bytes));
+}
+
+void append_folded(std::u32string& output, char32_t point) {
+    if (point < 128) {
+        output += point >= U'A' && point <= U'Z' ? point + 32 : point;
+    } else if (point > 0x10ffff || U_IS_SURROGATE(point) ||
+               !age_at_most<15>(static_cast<UChar32>(point))) {
+        output += point;
+    } else {
+        UChar input[2];
+        UChar folded[6];
+        int32_t size = 0;
+        U16_APPEND_UNSAFE(input, size, point);
+        UErrorCode status = U_ZERO_ERROR;
+        const auto length = u_strFoldCase(folded, 6, input, size, U_FOLD_CASE_DEFAULT, &status);
+        if (U_FAILURE(status) != 0) {
+            throw std::runtime_error(u_errorName(status));
+        }
+        for (int32_t offset = 0; offset < length;) {
+            UChar32 scalar = 0;
+            U16_NEXT_UNSAFE(folded, offset, scalar);
+            output += static_cast<char32_t>(scalar);
+        }
+    }
 }
 
 std::size_t contraction_end(std::u32string_view text, std::size_t start) {
@@ -236,9 +281,15 @@ std::size_t piece_end(std::u32string_view text, const std::vector<unsigned char>
 }
 
 std::string normalize_nfc(std::string_view bytes) {
+    if (ascii(bytes)) {
+        return std::string(bytes);
+    }
+    if (normalizer_fits(bytes)) {
+        return normalize_checked(bytes);
+    }
     std::string output;
     output.reserve(bytes.size());
-    for (const auto scalar : normalized_scalars(bytes)) {
+    for (const auto scalar : normalize_large(read_utf8(bytes))) {
         append_utf8(output, scalar);
     }
     return output;
@@ -248,13 +299,7 @@ std::u32string casefold(std::u32string_view text) {
     std::u32string output;
     output.reserve(text.size());
     for (const auto point : text) {
-        if (const auto* mapping = lookup(casefold_15, point, &CaseFold::key)) {
-            for (const auto folded : mapping->value) {
-                if (folded) output += folded;
-            }
-        } else {
-            output += point;
-        }
+        append_folded(output, point);
     }
     return output;
 }

@@ -2,30 +2,14 @@
 
 #include "sglang/server/chat_template.h"
 #include "sglang/server/http.h"
+#include "sglang/server/text_completion.h"
 
 #include <algorithm>
-#include <random>
 
 namespace sglang::server {
 namespace {
 
 using json::OrderedObject;
-
-std::string message_id() {
-    constexpr std::string_view hex = "0123456789abcdef";
-    std::random_device random;
-    std::string id = "msg_";
-    for (int part = 0; part < 4; ++part) {
-        auto value = static_cast<std::uint32_t>(random());
-        for (int digit = 0; digit < 8; ++digit) {
-            id += hex[value & 15];
-            value >>= 4;
-        }
-    }
-    id[16] = '4';
-    id[20] = hex[8 + (hex.find(id[20]) & 3)];
-    return id;
-}
 
 std::uint64_t count(std::size_t tokens) {
     return static_cast<std::uint64_t>(tokens);
@@ -33,10 +17,11 @@ std::uint64_t count(std::size_t tokens) {
 
 }
 
-AnthropicMessages::AnthropicMessages(const Socket& connection, EventStream& stream,
-                                     bool streaming, std::size_t prompt_tokens)
+AnthropicMessages::AnthropicMessages(const Socket& connection, EventStream& stream, bool streaming,
+                                     std::size_t prompt_tokens)
     : connection_(connection), stream_(stream), streaming_(streaming),
-      prompt_tokens_(prompt_tokens), id_(message_id()) {}
+      prompt_tokens_(prompt_tokens), id_(random_request_id("msg_")) {
+}
 
 void AnthropicMessages::admit(std::size_t cached_tokens) { cached_tokens_ = cached_tokens; }
 
@@ -54,8 +39,7 @@ OrderedObject AnthropicMessages::usage(std::size_t output, std::size_t cached) c
 }
 
 bool AnthropicMessages::event(std::string_view kind, OrderedObject fields) {
-    fields.emplace_back("type", std::string(kind));
-    return stream_.write(chat_template_json(fields), kind);
+    return write_completion_event(stream_, kind, std::move(fields));
 }
 
 bool AnthropicMessages::start(bool failed) {

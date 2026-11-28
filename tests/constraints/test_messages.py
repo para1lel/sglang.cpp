@@ -2,26 +2,25 @@
 
 import argparse
 import base64
-from contextlib import closing
 import http.client
 import json
 import os
-from pathlib import Path
 import re
 import socket
 import struct
 import sys
+import zlib
+from contextlib import closing
+from pathlib import Path
 from unittest.mock import patch
 from uuid import uuid4
-import zlib
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "text"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "prefix"))
 
-from live_controls import STORES, Controls
+from live_controls import GDN_ENTRIES, Controls
 from run_chat_layer1 import server
 from test_native_chat import CHAT, CHECKPOINT, MODEL, json_response, request
-
 
 ROUTE = "/v1/messages"
 COUNT = ROUTE + "/count_tokens"
@@ -296,10 +295,10 @@ def cache(port, out):
     payload = body(max_tokens=2, cache_salt=uuid4().hex, messages=[{
         "role": "user", "content": "blue green orange pink " * 45 + "Say one color.",
     }])
+    before = controls.idle("messages-before-cold")[GDN_ENTRIES]
     cold = json_response(port, ROUTE, payload)["usage"]
-    baseline = controls.wait_for("messages-cold-idle", 0, 0, stores=0)[STORES]
-    json_response(port, ROUTE, payload | {"max_tokens": 1})
-    controls.wait_for("messages-prime-stored", 0, 0, stores=baseline + 1)
+    resident = controls.idle("messages-cold-resident")[GDN_ENTRIES]
+    assert resident > before, (before, resident)
     hot = stream(port, payload)[0]["message"]["usage"]
     different = json_response(port, ROUTE, payload | {"cache_salt": uuid4().hex})["usage"]
     assert hot["cache_read_input_tokens"] > 0 and hot["output_tokens"] == 0

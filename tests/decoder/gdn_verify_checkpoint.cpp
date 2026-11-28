@@ -1,5 +1,6 @@
 #include "sglang/decoder_prefill.h"
 #include "sglang/decoder_verify.h"
+#include "sglang/runtime/backend/device_arena.h"
 
 #include <algorithm>
 #include <array>
@@ -48,7 +49,10 @@ std::size_t equal_device(const Element* left, const Element* right, std::size_t 
     return count * sizeof(Element);
 }
 
-std::size_t equal_state(const Request& lhs, const Request& rhs, int used) {
+std::size_t equal_state(Request& lhs, Request& rhs, int used, cudaStream_t stream) {
+    lhs.materialize_gdn(stream);
+    rhs.materialize_gdn(stream);
+    check(cudaStreamSynchronize(stream), "Complete committed GDN materialization");
     std::size_t compared = 0;
     const auto left_pages = read_device(lhs.pages.device_pages, lhs.pages.page_count);
     const auto right_pages = read_device(rhs.pages.device_pages, rhs.pages.page_count);
@@ -94,10 +98,16 @@ std::size_t equal_state(const Request& lhs, const Request& rhs, int used) {
     return compared;
 }
 
-void equal_scores(const Bf16* verifier, const Request& request) {
-    const auto oracle = read_device(request.work.logits, vocab_size);
-    require(std::memcmp(oracle.data(), verifier, vocab_size * sizeof(Bf16)) == 0,
-            "full vocabulary row mismatch");
+void equal_scores(const DecoderModel& model, TargetVerification& verifier, int row,
+                  const Request& request, cudaStream_t stream) {
+    const auto& work = *verifier.row(row).work;
+    equal_device(work.normalized, request.work.normalized, hidden_size);
+    const auto& head = model.lm_head;
+    check(decode_bf16_lm_head(head.values, work.normalized, head.rows, head.columns, work.logits,
+                              stream),
+          "Score verifier row with scalar oracle head");
+    check(cudaStreamSynchronize(stream), "Complete scalar oracle head");
+    equal_device(work.logits, request.work.logits, vocab_size);
 }
 
 void seed(const DecoderModel& model, Request& request, const std::vector<int>& prompt,
@@ -147,9 +157,7 @@ void test(const DecoderModel& model, const Tokens& prompts, int base_cut, bool p
         const auto* tokens = prompts[lane].data() + prompt_length;
         for (int row = 0; row < rows; ++row) {
             advance(model, *oracle[lane], tokens[row], prompt_length + row, stream);
-            equal_scores(verifier.logits(row), *oracle[lane]);
-            compared += equal_device(verifier.row(row).work->normalized,
-                                     oracle[lane]->work.normalized, hidden_size);
+            equal_scores(model, verifier, row, *oracle[lane], stream);
         }
         const int cut = (base_cut + lane) % (rows + 1);
         verifier.commit(cut);
@@ -159,8 +167,7 @@ void test(const DecoderModel& model, const Tokens& prompts, int base_cut, bool p
                 advance(model, *oracle[lane], tokens[row], prompt_length + row, stream);
             }
         }
-        check(cudaStreamSynchronize(stream), "Finish selected state commit");
-        compared += equal_state(*oracle[lane], *candidate[lane], prompt_length + cut);
+        compared += equal_state(*oracle[lane], *candidate[lane], prompt_length + cut, stream);
 
         const auto& neighbor = prompts[(lane + 1) % lanes];
         const auto different = std::find_if(neighbor.begin() + prompt_length + rows + base_cut,
@@ -174,12 +181,9 @@ void test(const DecoderModel& model, const Tokens& prompts, int base_cut, bool p
                 "replacement path");
         verifier.read();
         advance(model, *oracle[lane], correction, prompt_length + cut, stream);
-        equal_scores(verifier.logits(0), *oracle[lane]);
-        compared += equal_device(verifier.row(0).work->normalized,
-                                 oracle[lane]->work.normalized, hidden_size);
+        equal_scores(model, verifier, 0, *oracle[lane], stream);
         verifier.commit(1);
-        check(cudaStreamSynchronize(stream), "Finish replacement commit");
-        compared += equal_state(*oracle[lane], *candidate[lane], prompt_length + cut + 1);
+        compared += equal_state(*oracle[lane], *candidate[lane], prompt_length + cut + 1, stream);
     }
     std::cout << "case=" << base_cut << " permuted=" << permute << " score_rows="
               << lanes * (rows + 1) << " state_bytes=" << compared << std::endl;
@@ -191,7 +195,8 @@ void test_graph(const DecoderModel& model, const Tokens& prompts) {
     const auto stream = execution.stream();
     VerificationGraph graph(execution);
     constexpr int prompt_length = 127;
-    constexpr int graph_rows = k1_verification_rows;
+    constexpr int graph_rows = target_verify_max_rows;
+    constexpr std::array<int, 3> cuts{graph_rows, 2, 0};
     for (int attempt = 0; attempt < 3; ++attempt) {
         Request candidate(0), oracle(0);
         candidate.initialize(capacity, stream);
@@ -207,13 +212,20 @@ void test_graph(const DecoderModel& model, const Tokens& prompts) {
         verifier.read();
         for (int row = 0; row < graph_rows; ++row) {
             advance(model, oracle, tokens[row], prompt_length + row, stream);
-            equal_scores(verifier.logits(row), oracle);
+            equal_scores(model, verifier, row, oracle, stream);
         }
-        verifier.commit(graph_rows);
-        check(cudaStreamSynchronize(stream), "Finish bound state commit");
-        equal_state(oracle, candidate, prompt_length + graph_rows);
+        const int cut = cuts[attempt];
+        verifier.commit(cut);
+        if (cut != graph_rows) {
+            seed(model, oracle, prompt, prompt_length, stream);
+            for (int row = 0; row < cut; ++row) {
+                advance(model, oracle, tokens[row], prompt_length + row, stream);
+            }
+        }
+        equal_state(oracle, candidate, prompt_length + cut, stream);
     }
-    std::cout << "two-row graph: eager warmup, capture, and replay passed" << std::endl;
+    std::cout << "five-row graph: eager warmup, capture, and reuse at cuts 5, 2, and 0 passed"
+              << '\n';
 }
 
 }
@@ -226,7 +238,9 @@ int main(int argc, char** argv) {
             prompts[lane] = ids(argv[lane + 2]);
             require(prompts[lane].size() >= 145, "short prompt fixture");
         }
+        const auto arena = DeviceArena::start(0, default_gpu_memory_utilization);
         const DecoderModel model(argv[1], 0);
+        arena->commit(arena->startup_remaining_bytes() / 2);
         for (int cut = 0; cut <= rows; ++cut) {
             test(model, prompts, cut, cut % 2 != 0);
         }

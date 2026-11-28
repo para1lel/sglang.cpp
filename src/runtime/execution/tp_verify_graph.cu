@@ -24,22 +24,10 @@ __global__ void row_exchange(const DeviceBinding* table, bool output) {
     }
 }
 
-__global__ void replay_exchange(const DeviceBinding* table) {
-    const auto data = table->replay[blockIdx.x][blockIdx.y];
-    copy_vectors(data.to.qkv, data.from.qkv, depth * GdnLocal::qkv_width);
-    copy_vectors(data.to.convolved, data.from.convolved, depth * GdnLocal::qkv_width);
-    copy_vectors(data.to.b, data.from.b, depth * GdnLocal::value_heads);
-    copy_vectors(data.to.a, data.from.a, depth * GdnLocal::value_heads);
-}
 }
 
-cudaError_t exchange_rows(const DeviceBinding* table, bool output, cudaStream_t stream) {
+cudaError_t exchange_rows(const DeviceBinding* table, int rows, bool output, cudaStream_t stream) {
     row_exchange<<<rows, 128, 0, stream>>>(table, output);
-    return cudaPeekAtLastError();
-}
-
-cudaError_t exchange_replay(const DeviceBinding* table, cudaStream_t stream) {
-    replay_exchange<<<dim3(gdn_layers, lanes), 256, 0, stream>>>(table);
     return cudaPeekAtLastError();
 }
 }

@@ -24,8 +24,53 @@ StepPlan plan_budget_step(const BudgetLanes& work, const BatchAdmissionOrder& or
     return plan;
 }
 
-WideMtpGroups wide_mtp_groups(const PrefillRows& decode,
-                                     const WideMtpCandidates& candidates, int limit) {
+namespace {
+
+void group_replay_packets(const PrefillRows& decode, const WideMtpCandidates& candidates,
+                          WideMtpGroups& groups) {
+    if (candidates.replay == 0)
+        return;
+    std::array<int, decoder_batch_max_lanes> slots{};
+    int count = 0;
+    for (int slot = 0; slot < decoder_batch_max_lanes; ++slot) {
+        if (decode[slot] != 0 &&
+            ((candidates.speculative >> static_cast<unsigned>(slot)) & 1U) != 0) {
+            slots[count++] = slot;
+        }
+    }
+    int pending = 0;
+    int start = 0;
+    const auto flush = [&] {
+        if (pending > decoder_batch_max_mtp_lanes) {
+            groups.width[start] = pending;
+            groups.replay |= std::uint32_t{1} << static_cast<unsigned>(start);
+        }
+        pending = 0;
+    };
+    for (int first = 0; first < count;) {
+        const int slot = slots[first];
+        const int packed = groups.width[slot];
+        const int width =
+            packed != 0 ? packed : std::min(count - first, decoder_batch_max_mtp_lanes);
+        const bool replay =
+            packed == 0 &&
+            std::all_of(slots.begin() + first, slots.begin() + first + width, [&](int lane) {
+                return ((candidates.replay >> static_cast<unsigned>(lane)) & 1U) != 0;
+            });
+        if (replay) {
+            if (pending == 0)
+                start = slot;
+            pending += width;
+        } else {
+            flush();
+        }
+        first += width;
+    }
+    flush();
+}
+
+WideMtpGroups packed_mtp_groups(const PrefillRows& decode, const WideMtpCandidates& candidates,
+                                int limit) {
     WideMtpGroups groups;
     if (limit < wide_mtp_lanes || candidates.eligible_count < wide_mtp_lanes) return groups;
     std::array<int, max_wide_mtp_lanes / wide_mtp_lanes> starts;
@@ -61,6 +106,15 @@ WideMtpGroups wide_mtp_groups(const PrefillRows& decode,
         eligible = true;
     }
     flush();
+    return groups;
+}
+
+}
+
+WideMtpGroups wide_mtp_groups(const PrefillRows& decode, const WideMtpCandidates& candidates,
+                              int limit) {
+    auto groups = packed_mtp_groups(decode, candidates, limit);
+    group_replay_packets(decode, candidates, groups);
     return groups;
 }
 

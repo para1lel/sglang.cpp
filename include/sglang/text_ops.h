@@ -24,6 +24,11 @@ struct TextFp8ActivationView {
     const float* scales;
 };
 
+struct TextFp8QuantizeRow {
+    const __nv_bfloat16* input;
+    TextFp8Activation output;
+};
+
 struct TextFp8Projection {
     TextFp8ActivationView input;
     __nv_bfloat16* output;
@@ -71,6 +76,9 @@ cudaError_t text_bf16_gemm(const __nv_bfloat16* weight, int out_width, int in_wi
 
 cudaError_t text_quantize_fp8(const __nv_bfloat16* input, int width, TextFp8Activation output,
                              cudaStream_t stream);
+
+cudaError_t text_quantize_fp8(const TextFp8QuantizeRow* rows, int count, int width,
+                              cudaStream_t stream);
 
 cudaError_t text_quantize_fp8_rows(const __nv_bfloat16* input, int width, int rows,
                                   TextFp8Activation output, cudaStream_t stream);

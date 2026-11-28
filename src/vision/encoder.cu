@@ -1,7 +1,9 @@
 #include "sglang/vision/detail.cuh"
 
 #include "sglang/checkpoint.h"
+#include "sglang/runtime/backend/device_arena.h"
 
+#include <atomic>
 #include <cstdio>
 #include <stdexcept>
 #include <string>
@@ -32,25 +34,17 @@ using namespace vision_detail;
 template <typename Element>
 class DeviceBuffer {
 public:
-    explicit DeviceBuffer(std::size_t count) {
-        check(cudaGetDevice(&device_), "Get vision allocation device");
-        void* storage = nullptr;
-        check(cudaMalloc(&storage, count * sizeof(Element)), "Allocate vision buffer");
-        data_ = static_cast<Element*>(storage);
-    }
+  DeviceBuffer(const std::shared_ptr<decoder::DeviceArena>& arena, std::size_t count)
+      : arena_(arena), data_(static_cast<Element*>(arena_->allocate(count * sizeof(Element)))) {
+  }
     ~DeviceBuffer() {
-        int previous = 0;
-        if (!cleanup(cudaGetDevice(&previous), "Get current device for vision cleanup")) {
-            return;
-        }
-        const bool changed = previous != device_;
-        if (changed && !cleanup(cudaSetDevice(device_), "Select vision allocation device")) {
-            return;
-        }
-        cleanup(cudaFree(data_), "Free vision buffer");
-        if (changed) {
-            cleanup(cudaSetDevice(previous), "Restore device after vision cleanup");
-        }
+        if (!quarantined_)
+            arena_->release(data_);
+    }
+
+    void quarantine() noexcept {
+        arena_->quarantine();
+        quarantined_ = true;
     }
 
     DeviceBuffer(const DeviceBuffer&) = delete;
@@ -58,8 +52,9 @@ public:
     Element* get() const { return data_; }
 
 private:
-    int device_;
-    Element* data_ = nullptr;
+  std::shared_ptr<decoder::DeviceArena> arena_;
+  Element* data_ = nullptr;
+  std::atomic<bool> quarantined_{false};
 };
 
 Grid checked_grid(VisionGrid grid) {
@@ -119,11 +114,29 @@ void validate_spans(const float* patches, std::size_t patch_elements,
 }
 
 struct Workspace {
-    explicit Workspace(Grid grid)
-        : patches(grid.rows * vision_patch_width), residual(grid.rows * hidden),
-          norm(grid.rows * hidden), qkv(grid.rows * 3 * hidden), qk(grid.rows * 2 * hidden),
-          context(grid.rows * hidden), projected(grid.rows * hidden),
-          intermediate(grid.rows * feedforward), rotary(grid.frame * (head_width / 2)) {}
+    Workspace(Grid grid, const std::shared_ptr<decoder::DeviceArena>& arena)
+        : patches(arena, static_cast<std::size_t>(grid.rows) * vision_patch_width),
+          residual(arena, static_cast<std::size_t>(grid.rows) * hidden),
+          norm(arena, static_cast<std::size_t>(grid.rows) * hidden),
+          qkv(arena, static_cast<std::size_t>(grid.rows) * 3 * hidden),
+          qk(arena, static_cast<std::size_t>(grid.rows) * 2 * hidden),
+          context(arena, static_cast<std::size_t>(grid.rows) * hidden),
+          projected(arena, static_cast<std::size_t>(grid.rows) * hidden),
+          intermediate(arena, static_cast<std::size_t>(grid.rows) * feedforward),
+          rotary(arena, static_cast<std::size_t>(grid.frame) * (head_width / 2)) {
+    }
+
+    void quarantine() noexcept {
+        patches.quarantine();
+        residual.quarantine();
+        norm.quarantine();
+        qkv.quarantine();
+        qk.quarantine();
+        context.quarantine();
+        projected.quarantine();
+        intermediate.quarantine();
+        rotary.quarantine();
+    }
 
     DeviceBuffer<Bf16> patches;
     DeviceBuffer<Bf16> residual;
@@ -198,12 +211,36 @@ std::size_t vision_feature_rows(VisionGrid grid) {
     return checked_grid(grid).rows / 4;
 }
 
+namespace {
+
+std::shared_ptr<decoder::DeviceArena> vision_arena(int device) {
+    if (decoder::DeviceArena::active(device))
+        return decoder::DeviceArena::current(device);
+    auto arena = decoder::DeviceArena::start(device, decoder::default_gpu_memory_utilization);
+    arena->commit();
+    return arena;
+}
+
+}
+
 struct VisionEncoder::Impl {
     explicit Impl(const Checkpoint& checkpoint)
-        : device(validated_device(checkpoint)), memory(weight_bytes / sizeof(Bf16)),
-          weights(load_weights(checkpoint, memory.get())) {}
+        : device(validated_device(checkpoint)), arena(vision_arena(device)),
+          memory(arena, weight_bytes / sizeof(Bf16)), weights(upload(checkpoint)) {
+    }
+
+    Weights upload(const Checkpoint& checkpoint) {
+        try {
+            return load_weights(checkpoint, memory.get());
+        } catch (...) {
+            if (cudaDeviceSynchronize() != cudaSuccess)
+                memory.quarantine();
+            throw;
+        }
+    }
 
     const int device;
+    const std::shared_ptr<decoder::DeviceArena> arena;
     DeviceBuffer<Bf16> memory;
     const Weights weights;
 };
@@ -218,14 +255,22 @@ void VisionEncoder::encode(VisionGrid shape, const float* patches, std::size_t p
     const Grid grid = checked_grid(shape);
     validate_stream(impl_->device, stream);
     validate_spans(patches, patch_elements, features, feature_elements, grid, impl_->device);
-    Workspace work(grid);
+    Workspace work(grid, impl_->arena);
     try {
         forward(impl_->weights, work, grid, patches, features, stream);
     } catch (...) {
-        cleanup(cudaStreamSynchronize(stream), "Drain vision stream after launch failure");
+        if (!cleanup(cudaStreamSynchronize(stream), "Drain vision stream after launch failure")) {
+            work.quarantine();
+            impl_->memory.quarantine();
+        }
         throw;
     }
-    check(cudaStreamSynchronize(stream), "Complete vision encoding");
+    const auto status = cudaStreamSynchronize(stream);
+    if (status != cudaSuccess) {
+        work.quarantine();
+        impl_->memory.quarantine();
+    }
+    check(status, "Complete vision encoding");
 }
 
 }

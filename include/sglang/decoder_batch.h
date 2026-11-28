@@ -16,7 +16,6 @@ inline constexpr int decoder_batch_max_step_tokens = 32768;
 inline constexpr int decoder_batch_max_graph_lanes = 4;
 inline constexpr int decoder_batch_max_mtp_lanes = 4;
 inline constexpr int decoder_batch_max_mtp_steps = decoder_max_mtp_steps;
-inline constexpr int decoder_batch_prefix_checkpoint_interval = 8192;
 inline constexpr int decoder_batch_prefix_max_tokens =
     decoder::QwenTextModel::max_position_embeddings;
 
@@ -69,6 +68,9 @@ struct DecoderBatchOptions {
     int max_num_batched_tokens = decoder_default_max_num_batched_tokens;
     std::optional<std::size_t> resident_memory_limit = std::nullopt;
     bool tp_verification_graphs = false;
+    bool resident_prefix_cache = false;
+    int prefix_gqa_pages = 0;
+    int prefix_gdn_slots = 0;
 };
 
 struct DecoderPrefixCacheStats {
@@ -87,6 +89,27 @@ struct DecoderPrefixCacheStats {
     std::uint64_t gqa_restored_tokens = 0;
     std::uint64_t gqa_read_only_tokens = 0;
     std::uint64_t gqa_computed_tokens = 0;
+    std::uint64_t gqa_matched_tokens = 0;
+    std::uint64_t gdn_matched_tokens = 0;
+    std::uint64_t prefill_checkpoints_planned = 0;
+    std::uint64_t prefill_checkpoints_resident = 0;
+    std::uint64_t prefill_checkpoints_published = 0;
+    std::uint64_t prefill_checkpoints_declined = 0;
+    std::size_t pending_release_bytes = 0;
+    std::size_t failed_release_bytes = 0;
+    int gqa_page_capacity = 0;
+    int gdn_slot_capacity = 0;
+    int draft_pages = 0;
+    int pending_backups = 0;
+    std::uint64_t gqa_resident_hits = 0;
+    std::uint64_t gqa_resident_tokens = 0;
+    std::uint64_t gdn_resident_hits = 0;
+    std::uint64_t gdn_resident_tokens = 0;
+    std::uint64_t backups_started = 0;
+    std::uint64_t backups_completed = 0;
+    std::uint64_t backups_failed = 0;
+    std::uint64_t backed_evictions = 0;
+    std::uint64_t unbacked_evictions = 0;
 };
 
 class DecoderBatch {
@@ -95,8 +118,11 @@ public:
     DecoderBatch(const Decoder& decoder, DecoderBatchOptions options);
     ~DecoderBatch();
 
-    int admit(int slot, std::vector<int> prompt, const DecoderOptions& options);
-    int admit_multimodal(int slot, std::vector<int> prompt, const DecoderOptions& options,
+    int admit(int slot, const std::vector<int>& prompt, const DecoderOptions& options);
+    int admit(int slot, std::vector<int>&& prompt, const DecoderOptions& options);
+    int admit_multimodal(int slot, const std::vector<int>& prompt, const DecoderOptions& options,
+                         const std::vector<DecoderMedia>& media);
+    int admit_multimodal(int slot, std::vector<int>&& prompt, const DecoderOptions& options,
                          const std::vector<DecoderMedia>& media);
     void cancel(int slot);
     DecoderBatchPrefixUpdate poll_prefix(int slot);
@@ -111,6 +137,7 @@ public:
     std::size_t request_device_allocation_bytes() const;
     void release_retired_allocations();
     DecoderPrefixCacheStats prefix_cache_stats() const;
+    bool prefix_backup_pending() const;
     void reset_prefix_cache();
     bool available() const;
 
@@ -119,7 +146,7 @@ private:
     void generate_mtp(const std::vector<int>& prompt, const DecoderOptions& options,
                       decoder::SerialOutput& output, DecoderResult& result,
                       const std::vector<DecoderMedia>* media = nullptr);
-    int admit_impl(int slot, std::vector<int> prompt, const DecoderOptions& options,
+    int admit_impl(int slot, std::vector<int>&& original, const DecoderOptions& requested,
                    const std::vector<DecoderMedia>* media);
     struct TpDriver;
     struct State;

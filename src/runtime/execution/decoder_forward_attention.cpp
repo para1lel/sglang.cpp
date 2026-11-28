@@ -1,6 +1,80 @@
 #include "sglang/runtime/execution/decoder_forward_layers.h"
+#include "sglang/runtime/execution/tp_verify_graph.h"
 #include <algorithm>
+#include <bitset>
+#include <optional>
 #include <type_traits>
+#include <utility>
+
+namespace sglang::decoder::tp_verify_graph {
+
+bool run_gdn(cudaStream_t stream, int layer, TextGdnWeights weights) {
+    auto* live = binding(stream);
+    if (live == nullptr)
+        return false;
+    ++live->gdn_calls;
+    check(gdn_replay_ssm::launch(true, live->device->gdn[layer], live->lanes, live->depth, weights,
+                                 stream),
+          "Capture bound GDN history");
+    return true;
+}
+
+void attend_gqa(HostBinding& live, const GqaLayer& layer, const VerificationRow* packet,
+                int cache_index, GqaGeometry geometry) {
+    GqaVerifyRows<GqaVerifyPreprocessRow, max_wide_mtp_rows> prep{};
+    GqaVerifyRows<GqaVerifyAppendRow, max_wide_mtp_rows> append_rows{};
+    GqaVerifyRows<GqaVerifyGateRow, max_wide_mtp_rows> gate{};
+    for (int row = 0; row < live.rows; ++row) {
+        const auto& work = *packet[row].work;
+        prep.rows[row] = {work.q_gate, work.keys, work.rope_queries, work.rope_keys, 0};
+        append_rows.rows[row].keys = work.rope_keys;
+        append_rows.rows[row].values = work.values;
+        gate.rows[row] = {work.q_gate, work.attention};
+    }
+    const auto* cache = &live.device->gqa[cache_index];
+    ++live.gqa_calls;
+    check(gqa_verify_preprocess_bound(prep, live.rows, live.device->rotary, geometry,
+                                      layer.query_norm, layer.key_norm, live.stream),
+          "Capture bound rotary");
+    check(gqa_verify_append_bound(append_rows, cache->reads, live.rows, geometry.kv_heads,
+                                  live.stream),
+          "Capture bound KV append");
+    if (live.short_count != 0) {
+        check(read(cache, live.short_rows, live.short_count, geometry.query_heads, live.stream),
+              "Capture bound short verifier attention");
+    }
+    for (int group = 0; group < live.split_groups; ++group) {
+        const auto& split = live.splits[group];
+        std::array<BoundPagedDecodeLane, verification_packet_rows> reads{};
+        for (int index = 0; index < split.count; ++index) {
+            const int row = live.split_rows[split.first + index];
+            const auto& state = cache->reads[row];
+            reads[index] = {
+                &state.cache,
+                &state.pages,
+                &state.position,
+                nullptr,
+                paged_gqa_buffers(*packet[row].work),
+            };
+        }
+        check(target_split_gqa_graph(reads.data(), split.count, split.variant, geometry.kv_heads,
+                                     live.stream),
+              "Capture bound split attention");
+    }
+    if (live.long_count != 0) {
+        gqa_decode::BoundLongBatch batch{};
+        for (int lane = 0; lane < live.long_count; ++lane) {
+            batch.requests[lane] = &cache->long_reads[lane];
+        }
+        const auto status = gqa_decode::launch_long_decode(
+            batch, live.long_count, geometry.kv_heads, live.long_shape, live.stream);
+        check(status.value_or(cudaErrorNotSupported), "Capture bound long verifier attention");
+    }
+    check(gqa_verify_postgate(gate, live.rows, live.stream, geometry),
+          "Capture bound attention gate");
+}
+
+}
 
 namespace sglang::decoder::forward_detail {
 
@@ -13,22 +87,18 @@ void each_lane(const LayerBatch<Lane>& batch, Function function) {
     }
 }
 
-constexpr int gdn_packet_rows = GdnVerificationBatch::lanes * GdnVerificationBatch::rows;
-static_assert(GdnVerificationBatch::lanes == decoder_batch_max_mtp_lanes);
-static_assert(GdnVerificationBatch::rows == target_verify_max_rows);
-
 void project_gdn_gates(const GdnLayer& layer, const LayerBatch<VerificationRow>& batch,
-                              bool batched) {
-    if (!batch.target_tc || batch.count < 2 ||
-        layer.b.rows != batch.gdn_gate_heads() || layer.a.rows != batch.gdn_gate_heads() ||
-        layer.b.columns != hidden_size || layer.a.columns != hidden_size) {
+                       bool batched) {
+    if (!batch.target_tc || batch.count < 2 || layer.b.rows != batch.gdn_gate_heads() ||
+        layer.a.rows != batch.gdn_gate_heads() || layer.b.columns != hidden_size ||
+        layer.a.columns != hidden_size) {
         project_verification_bf16(layer.b, batch.lanes, batch.count, &Workspace::gdn_b,
                                   batch.stream);
         project_verification_bf16(layer.a, batch.lanes, batch.count, &Workspace::gdn_a,
                                   batch.stream);
         return;
     }
-    std::array<VerifyGdnGateRow, gdn_packet_rows> gates;
+    std::array<VerifyGdnGateRow, max_wide_mtp_rows> gates{};
     const auto fill = [&](int first, int rows) {
         for (int index = 0; index < rows; ++index) {
             const auto& work = workspace(batch.lanes[first + index]);
@@ -38,18 +108,10 @@ void project_gdn_gates(const GdnLayer& layer, const LayerBatch<VerificationRow>&
             batch.tensor_parallel ? try_verify_bf16_gdn_gates_local : try_verify_bf16_gdn_gates;
         return gates_kernel(layer.b.values, layer.a.values, gates.data(), rows, batch.stream);
     };
-    if (batched) {
-        bool dedicated = (batch.count >= 2 && batch.count <= text_fp8_max_batch) ||
-                         batch.count % gdn_packet_rows == 0;
-        for (int first = 0; dedicated && first < batch.count; first += gdn_packet_rows) {
-            const int rows = std::min(gdn_packet_rows, batch.count - first);
-            if (const auto status = fill(first, rows)) {
-                check(*status, "Run wide verification GDN gate projections");
-            } else {
-                dedicated = false;
-            }
-        }
-        if (dedicated) {
+    if (batched && batch.count <= max_wide_mtp_rows &&
+        (batch.count <= text_fp8_max_batch || batch.count % verification_packet_rows == 0)) {
+        if (const auto status = fill(0, batch.count)) {
+            check(*status, "Run wide verification GDN gate projections");
             return;
         }
     }
@@ -73,118 +135,55 @@ void project_gdn_gates(const GdnLayer& layer, const LayerBatch<VerificationRow>&
     }
 }
 
-void run_gdn_packet(const GdnLayer& layer, const LayerBatch<VerificationRow>& packet,
-                           int state_index) {
-    project_gdn_gates(layer, packet, true);
-    GdnVerificationBatch states;
-    for (int lane = 0; lane < GdnVerificationBatch::lanes; ++lane) {
-        states.entries[lane] = packet.lanes[lane].verification->gdn_lane(
-            state_index, layer.recurrent);
-    }
-    check(packet.tensor_parallel
-              ? decode_verify_gdn_batch_local(states, layer.recurrent, packet.stream)
-              : decode_verify_gdn_batch(states, layer.recurrent, packet.stream),
-          "Advance batched target verification GDN packet");
-}
-
-bool run_compact_gdn(const GdnLayer& layer, const LayerBatch<VerificationRow>& batch,
-                            int state_index) {
-    constexpr int rows_per_lane = CompactGdnVerificationBatch::rows;
-    constexpr int row_capacity = CompactGdnVerificationBatch::lanes * rows_per_lane;
-    if (!batch.packed_activation || !batch.target_tc ||
-        batch.lanes[0].binding ||
-        (batch.count != row_capacity / 2 && batch.count != row_capacity) ||
-        layer.b.rows != batch.gdn_gate_heads() || layer.a.rows != batch.gdn_gate_heads() ||
-        layer.b.columns != hidden_size || layer.a.columns != hidden_size) {
-        return false;
-    }
-    std::array<VerifyGdnGateRow, row_capacity> gates;
-    for (int index = 0; index < batch.count; ++index) {
-        const auto& work = workspace(batch.lanes[index]);
-        gates[index] = {work.normalized, work.gdn_b, work.gdn_a};
-    }
-    const auto gates_kernel = batch.tensor_parallel ? try_verify_bf16_gdn_gates_compact_local
-                                                    : try_verify_bf16_gdn_gates_compact;
-    const auto status = gates_kernel(layer.b.values, layer.a.values, gates.data(), batch.count,
-                                     batch.stream);
-    if (!status) {
-        return false;
-    }
-    check(*status, "Run compact verification GDN gate projections");
-    CompactGdnVerificationBatch states{};
-    CompactGdnFp8Rows output{batch.packed_activation, {}};
-    const int lanes = batch.count / rows_per_lane;
-    for (int lane = 0; lane < lanes; ++lane) {
-        const int first = compact_gdn_row(lane, 0);
-        states.entries[lane] = batch.lanes[first].verification->gdn_lane(
-            state_index, layer.recurrent);
-        for (int step = 0; step < rows_per_lane; ++step) {
-            const int row = compact_gdn_row(lane, step);
-            output.scales[row] = batch.projection_activation(row, batch.gdn_attention_width())
-                                     .scales;
+void run_gdn_verification(const GdnLayer& layer, const LayerBatch<VerificationRow>& batch,
+                          int state_index) {
+    const auto& first = batch.lanes[0];
+    if (first.binding != nullptr) {
+        int lanes = 0;
+        int longest = 0;
+        for (int index = 0; index < batch.count; ++index) {
+            const auto& row = batch.lanes[index];
+            lanes += static_cast<int>(row.first);
+            longest = std::max(longest, row.binding_row + 1);
         }
+        check(gdn_replay_ssm::launch(batch.tensor_parallel,
+                                     first.binding->gdn[state_index] + first.binding_lane, lanes,
+                                     longest, layer.recurrent, batch.stream),
+              "Advance bound verification GDN history");
+        return;
     }
-    check(batch.tensor_parallel
-              ? decode_verify_gdn_compact_local(states, lanes, layer.recurrent, output,
-                                                batch.stream)
-              : decode_verify_gdn_compact(states, lanes, layer.recurrent, output, batch.stream),
-          "Advance and quantize compact verification GDN");
-    return true;
-}
+    if (tp_verify_graph::run_gdn(batch.stream, state_index, layer.recurrent))
+        return;
+    if (batch.count == first.verification->pending_rows()) {
+        check(gdn_replay_ssm::launch(batch.tensor_parallel,
+                                     first.verification->gdn_lane(state_index), layer.recurrent,
+                                     batch.stream),
+              "Advance verification GDN history");
+        return;
+    }
 
-bool run_gdn_packed_local(const GdnLayer& layer,
-                                 const LayerBatch<VerificationRow>& batch, int state_index) {
-    if (!batch.tensor_parallel) {
-        return false;
-    }
-    const VerificationRow* lane_rows[gdn_verify_tail_max_lanes] = {};
-    int row_counts[gdn_verify_tail_max_lanes] = {};
-    int lane_count = 0;
+    gdn_replay_ssm::Lanes jobs{};
+    int count = 0;
+    int rows = 0;
+    const auto submit = [&] {
+        check(gdn_replay_ssm::launch(batch.tensor_parallel, jobs, count, rows, layer.recurrent,
+                                     batch.stream),
+              "Advance packed verification GDN history");
+        count = 0;
+        rows = 0;
+    };
     for (int index = 0; index < batch.count; ++index) {
         const auto& row = batch.lanes[index];
-        if (!row.first) {
+        if (!row.first)
             continue;
-        }
-        if (lane_count == gdn_verify_tail_max_lanes) {
-            return false;
-        }
-        lane_rows[lane_count++] = &row;
+        const auto job = row.verification->gdn_lane(state_index);
+        jobs.lanes[count++] = job;
+        rows = std::max(rows, job.rows);
+        if (count == gdn_replay_ssm::max_packed_lanes)
+            submit();
     }
-    for (int index = 0; index < batch.count; ++index) {
-        const auto& row = batch.lanes[index];
-        int lane = 0;
-        while (lane < lane_count && row.verification != lane_rows[lane]->verification) {
-            ++lane;
-        }
-        if (lane == lane_count) {
-            return false;
-        }
-        ++row_counts[lane];
-    }
-    for (int lane = 1; lane < lane_count; ++lane) {
-        if (row_counts[lane] != row_counts[0]) {
-            return false;
-        }
-    }
-    if (row_counts[0] == 0 || lane_count * row_counts[0] != batch.count) {
-        return false;
-    }
-    for (int lane = 0; lane < lane_count; ++lane) {
-        const TargetVerification* verification = lane_rows[lane]->verification;
-        if (!verification->rank_local_gdn() || verification->pending_rows() != row_counts[lane] ||
-            verification->stream() != batch.stream) {
-            return false;
-        }
-    }
-    if (tp_verify_graph::run_gdn(batch.stream, state_index, layer.recurrent)) return true;
-    GdnVerifyTailLanes jobs;
-    jobs.lane_count = lane_count;
-    for (int lane = 0; lane < lane_count; ++lane) {
-        jobs.lanes[lane] = lane_rows[lane]->verification->gdn_lane(state_index, layer.recurrent);
-    }
-    check(text_gdn_verify_tail_local_lanes(row_counts[0], jobs, layer.recurrent, batch.stream),
-          "Advance packed verification GDN");
-    return true;
+    if (count != 0)
+        submit();
 }
 
 template <typename Position>
@@ -199,6 +198,12 @@ cudaError_t read_gqa(Workspace& work, Mxfp8PageTable pages, Mxfp8KvCache cache,
         if (singleton_scores.scores) {
             return exact_decode_gqa_attention(cache, pages, position, work.rope_queries,
                 work.attention, singleton_scores, stream, 0, mode == TextGdnMode::prefill);
+        }
+        if (mode == TextGdnMode::prefill && vector) {
+            const auto status = try_chunked_ordered_gqa(cache, pages, position, work.rope_queries,
+                                                        work.attention, scores, stream);
+            if (status)
+                return *status;
         }
         if (mode == TextGdnMode::prefill || position >= scores.capacity) {
             return mxfp8_gqa_attention(cache, pages, position + 1, position, 1,
@@ -248,94 +253,306 @@ void gate_gqa(Workspace& work, cudaStream_t stream, GqaGeometry geometry) {
           "Gate grouped-query attention");
 }
 
+cudaError_t read_bound_gqa(const BoundPagedDecodeLane& read, bool vector, int narrow_bytes,
+                           cudaStream_t stream) {
+    if (vector) {
+        return vector_decode_gqa_attention(read.cache, read.pages, read.position,
+                                           read.buffers.queries, read.buffers.output, read.scores,
+                                           stream);
+    }
+    return exact_decode_gqa_attention(read.cache, read.pages, read.position, read.buffers.queries,
+                                      read.buffers.output, read.scores, stream, narrow_bytes);
+}
+
 void attend_bound_gqa(const GqaLayer& layer, const LayerBatch<BatchGraphLane>& batch,
                              int cache_index) {
-    static_assert(paged_decode_lanes == decoder_batch_max_graph_lanes);
-    std::array<BoundPagedDecodeLane, paged_decode_lanes> reads;
+    const auto geometry = batch.gqa_geometry();
+    auto* tp = tp_verify_graph::binding(batch.stream);
+    if (tp != nullptr)
+        ++tp->gqa_calls;
+    const auto* live = batch.lanes[0].batch;
+    GqaVerifyRows<GqaVerifyPreprocessRow, max_wide_mtp_rows> preprocess{};
+    GqaVerifyRows<GqaVerifyAppendRow, max_wide_mtp_rows> append{};
+    GqaVerifyRows<GqaVerifyGateRow, max_wide_mtp_rows> gate{};
+    std::array<BoundPagedDecodeLane, decoder_batch_max_lanes> reads{};
     for (int index = 0; index < batch.count; ++index) {
         const auto& lane = batch.lanes[index];
         const auto* binding = lane.binding;
+        const auto* cache = &binding->caches[cache_index];
         const auto* position = &binding->position;
         auto& work = workspace(lane);
-        check(decode_gqa_preprocess(&binding->rotary_position, work.q_gate, work.keys,
-                                    layer.query_norm, layer.key_norm, work.rope_queries,
-                                    work.rope_keys, batch.stream, batch.gqa_geometry()),
-              "Normalize and rotate bound Q/K");
-        check(decode_kv_append(&binding->caches[cache_index], &binding->pages, position,
-                              work.rope_keys, work.values, batch.stream),
-              "Append bound decode MXFP8 KV");
-        reads[index] = {&binding->caches[cache_index], &binding->pages, position,
-                        &binding->scores, paged_gqa_buffers(work)};
-    }
-    if (batch.single_decode()) {
-        const auto& read = reads[0];
-        auto status = cudaSuccess;
-        if (batch.target_split_end) {
-            status = target_split_gqa(read, batch.stream, batch.target_split_end);
-        } else if (batch.vector_attention) {
-            status = vector_decode_gqa_attention(read.cache, read.pages, read.position,
-                read.buffers.queries, read.buffers.output, read.scores, batch.stream);
+        if (live != nullptr) {
+            preprocess.rows[index] = {work.q_gate, work.keys, work.rope_queries, work.rope_keys, 0};
+            append.rows[index].keys = work.rope_keys;
+            append.rows[index].values = work.values;
         } else {
-            status = exact_decode_gqa_attention(read.cache, read.pages, read.position,
-                read.buffers.queries, read.buffers.output, read.scores, batch.stream,
-                batch.ordered_attention ? 0 : vocab_size * sizeof(Bf16));
+            check(decode_gqa_preprocess(&binding->rotary_position, work.q_gate, work.keys,
+                                        layer.query_norm, layer.key_norm, work.rope_queries,
+                                        work.rope_keys, batch.stream, geometry),
+                  "Normalize and rotate bound Q/K");
+            check(decode_kv_append(cache, &binding->pages, position, work.rope_keys, work.values,
+                                   batch.stream),
+                  "Append bound decode MXFP8 KV");
         }
-        check(status, "Read bound singleton MXFP8 attention");
-    } else {
-        check(paged_decode_gqa(reads.data(), batch.count, batch.stream),
-              "Read bound causal MXFP8 attention");
+        reads[index] = {
+            cache, &binding->pages, position, &binding->scores, paged_gqa_buffers(work),
+        };
+        gate.rows[index] = {work.q_gate, work.attention};
     }
-    each_lane(batch, [&](const BatchGraphLane&, Workspace& work) {
-        gate_gqa(work, batch.stream, batch.gqa_geometry());
-    });
+    if (live != nullptr) {
+        check(gqa_verify_preprocess_bound(preprocess, batch.count, live->rotary, geometry,
+                                          layer.query_norm, layer.key_norm, batch.stream),
+              "Normalize and rotate bound decode Q/K");
+        check(gqa_verify_append_bound(append, live->reads[cache_index], batch.count,
+                                      geometry.kv_heads, batch.stream),
+              "Append packed decode MXFP8 KV");
+    }
+
+    std::array<BoundPagedDecodeLane, target_split_eager_max_rows> split{};
+    std::array<BoundPagedDecodeLane, paged_decode_lanes> paged{};
+    int split_count = 0;
+    int paged_count = 0;
+    const auto flush_split = [&] {
+        if (split_count) {
+            check(target_split_gqa_graph(split.data(), split_count,
+                                         gqa_decode::SplitVariant::multi_stage, geometry.kv_heads,
+                                         batch.stream),
+                  "Read bound split decode attention");
+            split_count = 0;
+        }
+    };
+    for (int index = 0; index < batch.count; ++index) {
+        auto attention = batch.lanes[index].attention;
+        if (tp != nullptr) {
+            const auto mask = std::uint32_t{1} << static_cast<unsigned int>(index);
+            attention = (tp->decode_split & mask) != 0 ? BatchGraphAttention::split
+                                                       : BatchGraphAttention::direct;
+        }
+        const auto& read = reads[index];
+        switch (attention) {
+        case BatchGraphAttention::split:
+            split[split_count++] = read;
+            if (split_count == target_split_eager_max_rows)
+                flush_split();
+            break;
+        case BatchGraphAttention::paged:
+            paged[paged_count++] = read;
+            break;
+        case BatchGraphAttention::direct:
+            check(read_bound_gqa(read, batch.vector_attention,
+                                 batch.single_decode() && !batch.ordered_attention
+                                     ? vocab_size * sizeof(Bf16)
+                                     : 0,
+                                 batch.stream),
+                  "Read bound direct decode attention");
+            break;
+        }
+    }
+    flush_split();
+    if (paged_count != 0) {
+        check(paged_decode_gqa(paged.data(), paged_count, batch.stream),
+              "Read bound paged decode attention");
+    }
+    check(gqa_verify_postgate(gate, batch.count, batch.stream, geometry),
+          "Gate bound decode attention");
+}
+
+using ShortVerifyRows = std::bitset<verification_packet_rows>;
+
+ShortVerifyRows shared_short_rows(const VerificationRow* rows, int count, bool bound) {
+    const auto eligible = [bound](const VerificationRow& row) {
+        return bound ? row.graph_attention == VerificationAttention::direct
+                     : row.position < target_split_first_position && !row.constrained;
+    };
+    ShortVerifyRows selected;
+    for (int index = 0; index < count; ++index) {
+        const auto& row = rows[index];
+        if (!eligible(row))
+            continue;
+        for (int previous = 0; previous < index; ++previous) {
+            const auto& other = rows[previous];
+            if (eligible(other) && other.request == row.request && other.position < row.position) {
+                selected.set(static_cast<std::size_t>(previous));
+                selected.set(static_cast<std::size_t>(index));
+            }
+        }
+    }
+    return selected;
 }
 
 void attend_verify_gqa(const GqaLayer& layer, const LayerBatch<VerificationRow>& batch,
                               int cache_index) {
-    const auto& binding = *batch.lanes[0].binding;
-    const auto* cache = &binding.caches[cache_index];
-    const bool grouped = batch.grouped_target_attention && batch.count > 1;
-    std::array<BoundPagedDecodeLane, target_verify_max_rows> reads;
+    const auto& first = batch.lanes[0];
+    const auto* live = first.binding->reads[cache_index] + first.binding_index;
+    const auto geometry = batch.gqa_geometry();
+    GqaVerifyRows<GqaVerifyPreprocessRow, max_wide_mtp_rows> preprocess{};
+    GqaVerifyRows<GqaVerifyAppendRow, max_wide_mtp_rows> append{};
+    GqaVerifyRows<GqaVerifyGateRow, max_wide_mtp_rows> gate{};
     for (int index = 0; index < batch.count; ++index) {
         auto& work = workspace(batch.lanes[index]);
-        const auto* position = &binding.positions[index];
-        check(decode_gqa_preprocess(&binding.rotary_positions[index], work.q_gate, work.keys,
-                                    layer.query_norm, layer.key_norm, work.rope_queries,
-                                    work.rope_keys, batch.stream, batch.gqa_geometry()),
-              "Normalize and rotate bound verification Q/K");
-        check(decode_kv_append(cache, &binding.pages, position, work.rope_keys, work.values,
-                               batch.stream), "Append bound verification MXFP8 KV");
-        auto status = cudaSuccess;
-        if (grouped) {
-            reads[index] = {cache, &binding.pages, position, &binding.scores[index],
-                            paged_gqa_buffers(work)};
-            continue;
-        }
-        if (batch.target_split_end) {
-            status = target_split_gqa({cache, &binding.pages, position, &binding.scores[index],
-                                       paged_gqa_buffers(work)}, batch.stream,
-                                      batch.target_split_end);
-        } else if (batch.vector_attention) {
-            status = vector_decode_gqa_attention(cache, &binding.pages, position, work.rope_queries,
-                work.attention, &binding.scores[index], batch.stream);
-        } else {
-            status = exact_decode_gqa_attention(cache, &binding.pages, position, work.rope_queries,
-                work.attention, &binding.scores[index], batch.stream);
-        }
-        check(status, "Read bound verification MXFP8 attention");
-        gate_gqa(work, batch.stream, batch.gqa_geometry());
+        preprocess.rows[index] = {work.q_gate, work.keys, work.rope_queries, work.rope_keys, 0};
+        append.rows[index].keys = work.rope_keys;
+        append.rows[index].values = work.values;
+        gate.rows[index] = {work.q_gate, work.attention};
     }
-    if (grouped) {
-        check(target_split_gqa(reads.data(), batch.count, batch.target_split_end, batch.stream),
-              "Read grouped verification MXFP8 attention");
-        each_lane(batch, [&](const VerificationRow&, Workspace& work) {
-            gate_gqa(work, batch.stream, batch.gqa_geometry());
-        });
+    check(gqa_verify_preprocess_bound(preprocess, batch.count,
+                                      first.binding->rotary + first.binding_index, geometry,
+                                      layer.query_norm, layer.key_norm, batch.stream),
+          "Normalize and rotate bound verification Q/K");
+    check(gqa_verify_append_bound(append, live, batch.count, geometry.kv_heads, batch.stream),
+          "Append bound verification MXFP8 KV");
+
+    gqa_decode::BoundLongBatch long_reads{};
+    int long_count = 0;
+    std::array<bool, max_wide_mtp_lanes> long_lanes{};
+    const int width = batch.packed_activation != nullptr ? verification_packet_rows : batch.count;
+    for (int offset = 0; offset < batch.count; offset += width) {
+        std::array<BoundPagedDecodeLane, verification_packet_rows> split{};
+        int split_count = 0;
+        std::array<int, verification_packet_rows> short_indices{};
+        std::array<const void*, verification_packet_rows> short_requests{};
+        int short_count = 0;
+        const int end = std::min(offset + width, batch.count);
+        const bool share_short = !batch.tensor_parallel && batch.ordered_attention &&
+                                 batch.vector_attention &&
+                                 batch.target_split_end == text_attention_max_tokens;
+        const auto shared = share_short
+                                ? shared_short_rows(batch.lanes + offset, end - offset, true)
+                                : ShortVerifyRows{};
+        for (int index = offset; index < end; ++index) {
+            const auto& row = batch.lanes[index];
+            if (row.graph_attention == VerificationAttention::long_context) {
+                long_lanes[row.binding_lane] = true;
+                continue;
+            }
+            if (shared.test(static_cast<std::size_t>(index - offset))) {
+                short_indices[short_count] = index;
+                short_requests[short_count++] = row.request;
+                continue;
+            }
+            const BoundPagedDecodeLane read{
+                &live[index].cache,           &live[index].pages,
+                &live[index].position,        &row.binding->scores[row.binding_index],
+                paged_gqa_buffers(*row.work),
+            };
+            if (row.graph_attention == VerificationAttention::split) {
+                split[split_count++] = read;
+            } else {
+                check(read_bound_gqa(read, batch.vector_attention, 0, batch.stream),
+                      "Read bound verification MXFP8 attention");
+            }
+        }
+        if (short_count != 0) {
+            check(short_verify_gqa_shared(live, short_indices.data(), short_requests.data(),
+                                          short_count, geometry, batch.stream),
+                  "Read shared bound target MXFP8 attention");
+        }
+        if (split_count != 0) {
+            const auto variant = batch.lanes[offset].graph_split;
+            const int group = variant == gqa_decode::SplitVariant::multi_stage
+                                  ? target_verify_max_rows
+                                  : split_count;
+            for (int i = 0; i < split_count; i += group) {
+                check(target_split_gqa_graph(split.data() + i, std::min(group, split_count - i),
+                                             variant, geometry.kv_heads, batch.stream),
+                      "Read bound split attention");
+            }
+        }
     }
+    for (int lane = 0; lane < static_cast<int>(long_lanes.size()); ++lane) {
+        if (long_lanes[lane])
+            long_reads.requests[long_count++] = &first.binding->history[lane][cache_index];
+    }
+    if (long_count != 0) {
+        const auto status = gqa_decode::launch_long_decode(
+            long_reads, long_count, geometry.kv_heads, first.graph_long_shape, batch.stream);
+        check(status.value_or(cudaErrorNotSupported), "Read bound long verification attention");
+    }
+    check(gqa_verify_postgate(gate, batch.count, batch.stream, geometry),
+          "Gate bound grouped-query attention");
 }
 
 template <typename Lane>
-void attend_eager_gqa(const GqaLayer& layer, const LayerBatch<Lane>& batch, int cache_index) {
+void prepare_eager_gqa(const GqaLayer& layer, const LayerBatch<Lane>& batch, const Lane& lane,
+                       Workspace& work, Mxfp8KvCache cache) {
+    const auto& request = *lane.request;
+    const auto geometry = batch.gqa_geometry();
+    const MropePosition* mrope = nullptr;
+    if constexpr (std::is_same_v<Lane, ForwardLane>) {
+        mrope = lane.mrope;
+        if (lane.mode == TextGdnMode::prefill && lane.position < request.cached_gqa_tokens) {
+            const int position = lane.rotary_position < 0 ? lane.position : lane.rotary_position;
+            check(prefill_gqa_queries(position, mrope, 1, work.q_gate, layer.query_norm,
+                                      work.rope_queries, batch.stream, geometry),
+                  "Normalize cached prefill Q");
+            return;
+        }
+    }
+    append_gqa(layer, work, request.pages, cache, lane.position, batch.stream, mrope,
+               lane.rotary_position, geometry);
+}
+
+template <typename Lane>
+void read_direct_eager_gqa(const LayerBatch<Lane>& batch, const Lane& lane, Workspace& work,
+                           Mxfp8KvCache cache) {
+    const bool narrow_gqa = [&] {
+        if constexpr (std::is_same_v<Lane, VerificationRow>) {
+            return false;
+        } else {
+            return lane.narrow_gqa && !batch.ordered_attention;
+        }
+    }();
+    const auto singleton_scores = [&]() -> ExactGqaWorkspace {
+        if constexpr (std::is_same_v<Lane, ForwardLane>) {
+            return lane.singleton_scores;
+        } else {
+            return {};
+        }
+    }();
+    check(read_gqa(work, lane.request->pages, cache, lane.position, lane.mode, narrow_gqa,
+                   singleton_scores, batch.vector_attention, batch.stream),
+          "Read causal MXFP8 attention");
+    gate_gqa(work, batch.stream, batch.gqa_geometry());
+}
+
+template <typename Lane>
+std::optional<PagedDecodeLane> eager_paged_read(const LayerBatch<Lane>& batch, const Lane& lane,
+                                                Workspace& work, Mxfp8KvCache cache) {
+    if constexpr (std::is_same_v<Lane, ForwardLane>) {
+        if (!batch.ordered_attention && lane.mode == TextGdnMode::decode && batch.count > 1 &&
+            batch.count <= paged_decode_lanes && paged_decode_position(lane.position)) {
+            return PagedDecodeLane{
+                cache,
+                lane.request->pages,
+                lane.position,
+                paged_gqa_buffers(work),
+            };
+        }
+    }
+    return std::nullopt;
+}
+
+template <typename Lane>
+std::optional<PagedDecodeLane> eager_split_read(const LayerBatch<Lane>& batch, const Lane& lane,
+                                                Workspace& work, Mxfp8KvCache cache) {
+    if constexpr (std::is_same_v<decltype(lane.position), int>) {
+        if (batch.target_split_end != 0 && batch.vector_attention &&
+            lane.mode == TextGdnMode::decode &&
+            target_split_position(lane.position, batch.target_split_end)) {
+            return PagedDecodeLane{
+                cache,
+                lane.request->pages,
+                lane.position,
+                paged_gqa_buffers(work),
+            };
+        }
+    }
+    return std::nullopt;
+}
+
+template <typename Lane>
+void attend_eager_gqa(const GqaLayer& layer, const LayerBatch<Lane>& batch, int cache_index,
+                      const ShortVerifyRows& skip = ShortVerifyRows{}) {
     std::array<PagedDecodeLane, decoder_batch_max_lanes> reads;
     std::array<Workspace*, decoder_batch_max_lanes> pending;
     std::array<PagedDecodeLane, target_split_eager_max_rows> split_reads;
@@ -355,67 +572,37 @@ void attend_eager_gqa(const GqaLayer& layer, const LayerBatch<Lane>& batch, int 
         }
         split_count = 0;
     };
-    each_lane(batch, [&](const Lane& lane, Workspace& work) {
-        auto& request = *lane.request;
+    for (int row = 0; row < batch.count; ++row) {
+        if constexpr (std::is_same_v<Lane, VerificationRow>) {
+            if (skip.test(static_cast<std::size_t>(row)))
+                continue;
+        }
+        const auto& lane = batch.lanes[row];
+        auto& work = workspace(lane);
+        const auto& request = *lane.request;
         const auto cache = request.caches[cache_index];
-        bool narrow_gqa = false;
-        ExactGqaWorkspace singleton_scores{};
-        bool reuse = false;
-        int cached_rotary_position = 0;
-        const MropePosition* mrope = nullptr;
-        if constexpr (!std::is_same_v<Lane, VerificationRow>) {
-            narrow_gqa = lane.narrow_gqa && !batch.ordered_attention;
+        prepare_eager_gqa(layer, batch, lane, work, cache);
+        if (const auto read = eager_paged_read(batch, lane, work, cache)) {
+            reads[count] = *read;
+            pending[count++] = &work;
+            continue;
         }
-        if constexpr (std::is_same_v<Lane, ForwardLane>) {
-            mrope = lane.mrope;
-            singleton_scores = lane.singleton_scores;
-            reuse = lane.mode == TextGdnMode::prefill &&
-                lane.position < request.cached_gqa_tokens;
-            cached_rotary_position = lane.rotary_position < 0 ? lane.position
-                                                              : lane.rotary_position;
-        }
-        if (reuse) {
-            check(prefill_gqa_queries(cached_rotary_position, mrope, 1, work.q_gate,
-                                      layer.query_norm, work.rope_queries, batch.stream,
-                                      batch.gqa_geometry()),
-                  "Normalize cached prefill Q");
-        } else {
-            append_gqa(layer, work, request.pages, cache, lane.position, batch.stream, mrope,
-                       lane.rotary_position, batch.gqa_geometry());
-        }
-        if constexpr (std::is_same_v<Lane, ForwardLane>) {
-            if (!batch.ordered_attention && lane.mode == TextGdnMode::decode &&
-                batch.count > 1 && batch.count <= paged_decode_lanes &&
-                paged_decode_position(lane.position)) {
-                reads[count] = {cache, request.pages, lane.position, paged_gqa_buffers(work)};
-                pending[count++] = &work;
-                return;
-            }
-        }
-        const bool vector = batch.vector_attention;
-        if constexpr (std::is_same_v<decltype(lane.position), int>) {
-            if (batch.target_split_end && vector && lane.mode == TextGdnMode::decode &&
-                target_split_position(lane.position, batch.target_split_end)) {
-                const PagedDecodeLane read{cache, request.pages, lane.position,
-                                           paged_gqa_buffers(work)};
-                if (grouped) {
-                    split_reads[split_count] = read;
-                    split_pending[split_count++] = &work;
-                    if (split_count == target_split_eager_max_rows) {
-                        flush_split();
-                    }
-                    return;
+        if (const auto read = eager_split_read(batch, lane, work, cache)) {
+            if (grouped) {
+                split_reads[split_count] = *read;
+                split_pending[split_count++] = &work;
+                if (split_count == target_split_eager_max_rows) {
+                    flush_split();
                 }
-                check(target_split_gqa(read, batch.stream, batch.target_split_end),
-                      "Read split target MXFP8 attention");
-                gate_gqa(work, batch.stream, batch.gqa_geometry());
-                return;
+                continue;
             }
+            check(target_split_gqa(*read, batch.stream, batch.target_split_end),
+                  "Read split target MXFP8 attention");
+            gate_gqa(work, batch.stream, batch.gqa_geometry());
+            continue;
         }
-        check(read_gqa(work, request.pages, cache, lane.position, lane.mode, narrow_gqa,
-                       singleton_scores, vector, batch.stream), "Read causal MXFP8 attention");
-        gate_gqa(work, batch.stream, batch.gqa_geometry());
-    });
+        read_direct_eager_gqa(batch, lane, work, cache);
+    }
     flush_split();
     if (count > 0) {
         const auto status = paged_decode_gqa(reads.data(), count, batch.stream);
@@ -424,6 +611,24 @@ void attend_eager_gqa(const GqaLayer& layer, const LayerBatch<Lane>& batch, int 
             gate_gqa(*pending[index], batch.stream, batch.gqa_geometry());
         }
     }
+}
+
+ShortVerifyRows attend_shared_short(const GqaLayer& layer,
+                                    const LayerBatch<VerificationRow>& packet, int cache_index) {
+    if (packet.tensor_parallel || !packet.ordered_attention || !packet.vector_attention)
+        return {};
+    const auto selected = shared_short_rows(packet.lanes, packet.count, false);
+    if (selected.none())
+        return {};
+    std::array<VerificationRow, verification_packet_rows> rows;
+    int count = 0;
+    for (int index = 0; index < packet.count; ++index) {
+        if (selected.test(static_cast<std::size_t>(index)))
+            rows[count++] = packet.lanes[index];
+    }
+    return try_gqa_verify_short(layer, rows.data(), count, cache_index, true, packet.stream, true)
+               ? selected
+               : ShortVerifyRows{};
 }
 
 void attend_eager_verification(const GqaLayer& layer,
@@ -441,7 +646,8 @@ void attend_eager_verification(const GqaLayer& layer,
         if (!try_gqa_verify_batch(layer, packet.lanes, packet.count, cache_index,
                                   packet.vector_attention, packet.target_split_end,
                                   packet.stream)) {
-            attend_eager_gqa(layer, packet, cache_index);
+            attend_eager_gqa(layer, packet, cache_index,
+                             attend_shared_short(layer, packet, cache_index));
         }
     };
     const int width = batch.packed_activation ? verification_packet_rows : batch.count;
@@ -478,6 +684,10 @@ void attend_eager_verification(const GqaLayer& layer,
 
 template <typename Lane>
 void run_gdn(const GdnLayer& layer, const LayerBatch<Lane>& batch, int state_index) {
+    if constexpr (std::is_same_v<Lane, BatchGraphLane>) {
+        if (auto* live = tp_verify_graph::binding(batch.stream))
+            ++live->gdn_calls;
+    }
     batch.quantize(&Workspace::normalized, hidden_size);
     batch.project_group({{layer.qkv, &Workspace::gdn_qkv}, {layer.z, &Workspace::gdn_z}});
     each_lane(batch, [&](const Lane& lane, Workspace& work) {
@@ -493,29 +703,39 @@ void run_gdn(const GdnLayer& layer, const LayerBatch<Lane>& batch, int state_ind
             project(layer.b, work.normalized, work.gdn_b, stream);
             project(layer.a, work.normalized, work.gdn_a, stream);
         }
-        if constexpr (std::is_same_v<Lane, BatchGraphLane>) {
-            check(batch.tensor_parallel
-                      ? decode_gdn_local(work.gdn_qkv, work.gdn_z, work.gdn_b, work.gdn_a,
-                                         layer.recurrent, &lane.binding->states[state_index],
-                                         work.gdn_scratch, work.attention, stream)
-                      : decode_gdn(work.gdn_qkv, work.gdn_z, work.gdn_b, work.gdn_a,
-                                   layer.recurrent, &lane.binding->states[state_index],
-                                   work.gdn_scratch, work.attention, stream),
-                  "Advance bound Gated DeltaNet state");
-        } else {
-            check(batch.tensor_parallel
-                      ? text_gdn_forward_local(1, lane.mode, work.gdn_qkv, work.gdn_z,
-                                               work.gdn_b, work.gdn_a, layer.recurrent,
-                                               lane.request->states[state_index],
-                                               work.gdn_scratch,
-                                               text_gdn_local_workspace_bytes(1),
-                                               work.attention, stream)
-                      : text_gdn_forward(1, lane.mode, work.gdn_qkv, work.gdn_z, work.gdn_b,
-                                         work.gdn_a, layer.recurrent,
-                                         lane.request->states[state_index], work.gdn_scratch,
-                                         text_gdn_workspace_bytes(1), work.attention, stream),
-                  "Advance Gated DeltaNet state");
+        if constexpr (!std::is_same_v<Lane, BatchGraphLane>) {
+            if (lane.mode == TextGdnMode::prefill) {
+                check(batch.tensor_parallel
+                          ? text_gdn_forward_local(
+                                1, lane.mode, work.gdn_qkv, work.gdn_z, work.gdn_b, work.gdn_a,
+                                layer.recurrent, lane.request->states[state_index],
+                                work.gdn_scratch, text_gdn_local_workspace_bytes(1), work.attention,
+                                stream)
+                          : text_gdn_forward(1, lane.mode, work.gdn_qkv, work.gdn_z, work.gdn_b,
+                                             work.gdn_a, layer.recurrent,
+                                             lane.request->states[state_index], work.gdn_scratch,
+                                             text_gdn_workspace_bytes(1), work.attention, stream),
+                      "Advance Gated DeltaNet state");
+                return;
+            }
         }
+        const int qkv_width = batch.tensor_parallel ? GdnLocal::qkv_width : GdnFull::qkv_width;
+        const auto [state, bound] =
+            [&]() -> std::pair<gdn_replay_ssm::State, const gdn_replay_ssm::State*> {
+            if constexpr (std::is_same_v<Lane, BatchGraphLane>) {
+                return {{}, &lane.binding->gdn_replay[state_index]};
+            } else {
+                return {lane.request->gdn_replay[state_index], nullptr};
+            }
+        }();
+        const gdn_replay_ssm::Lane job{
+            state,          {work.gdn_qkv, work.gdn_scratch, work.gdn_b, work.gdn_a},
+            work.gdn_z,     work.gdn_scratch + qkv_width,
+            work.attention, 1,
+            true,
+        };
+        check(gdn_replay_ssm::launch(batch.tensor_parallel, job, layer.recurrent, stream, bound),
+              "Advance decode GDN history");
     });
     batch.quantize(&Workspace::attention, batch.gdn_attention_width());
     batch.project(layer.output, &Workspace::projected_attention);
@@ -523,57 +743,12 @@ void run_gdn(const GdnLayer& layer, const LayerBatch<Lane>& batch, int state_ind
 
 void run_gdn(const GdnLayer& layer, const LayerBatch<VerificationRow>& batch,
                     int state_index) {
-    const auto& first = batch.lanes[0];
-    if (first.binding) {
-        auto& scratch = *first.graph_workspace;
-        scratch.bind_gdn(state_index, batch.count);
-        scratch.replay[state_index].weights = layer.recurrent;
-    }
-    if (!tp_verify_graph::bind_gdn_inputs(batch.stream, batch.lanes, state_index)) {
-        each_lane(batch, [&](const VerificationRow& row, Workspace&) {
-            if (row.first && !row.binding) row.verification->bind_gdn(state_index);
-        });
-    }
     if (!batch.fuse_verify_activation() && !batch.fuse_wide_verify_norm()) {
         batch.quantize(&Workspace::normalized, hidden_size);
     }
     batch.project_group({{layer.qkv, &Workspace::gdn_qkv}, {layer.z, &Workspace::gdn_z}});
-    if (run_compact_gdn(layer, batch, state_index)) {
-        batch.project(layer.output, &Workspace::projected_attention);
-        return;
-    }
-
-    if (batch.packed_activation && batch.count % gdn_packet_rows == 0) {
-        for (int start = 0; start < batch.count; start += gdn_packet_rows) {
-            run_gdn_packet(layer, batch.verification_packet(start), state_index);
-        }
-    } else if (batch.target_tc && !first.binding && batch.count == gdn_packet_rows) {
-        run_gdn_packet(layer, batch, state_index);
-    } else {
-        project_gdn_gates(layer, batch, false);
-        if (first.binding) {
-            auto& scratch = *first.graph_workspace;
-            check(batch.tensor_parallel
-                      ? decode_verify_gdn_local(batch.count, scratch.replay[state_index].inputs,
-                                                first.work->gdn_z, layer.recurrent,
-                                                &first.binding->initial[state_index],
-                                                &first.binding->tail[state_index],
-                                                scratch.observable, first.work->attention,
-                                                batch.stream)
-                      : decode_verify_gdn(batch.count, scratch.replay[state_index].inputs,
-                                          first.work->gdn_z, layer.recurrent,
-                                          &first.binding->initial[state_index],
-                                          &first.binding->tail[state_index], scratch.observable,
-                                          first.work->attention, batch.stream),
-                  "Advance bound verification GDN");
-        } else if (!run_gdn_packed_local(layer, batch, state_index)) {
-            each_lane(batch, [&](const VerificationRow& row, Workspace&) {
-                if (row.first) {
-                    row.verification->advance_gdn(state_index, layer.recurrent);
-                }
-            });
-        }
-    }
+    project_gdn_gates(layer, batch, batch.packed_activation != nullptr);
+    run_gdn_verification(layer, batch, state_index);
     batch.quantize(&Workspace::attention, batch.gdn_attention_width());
     batch.project(layer.output, &Workspace::projected_attention);
 }

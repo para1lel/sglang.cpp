@@ -1,32 +1,32 @@
 """Compare sampled HTTP output and stop behavior against native K0."""
 
 import argparse
-from base64 import b64encode
-from concurrent.futures import ThreadPoolExecutor
-from contextlib import ExitStack, closing, contextmanager
 import http.client
 import json
 import os
-from pathlib import Path
 import re
 import subprocess
 import sys
-from threading import Barrier
 import time
+from base64 import b64encode
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack, closing, contextmanager
+from pathlib import Path
+from threading import Barrier
+from typing import TypedDict
 from uuid import uuid4
-
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from batch.run_native import Stream, choose_port, require, stop_server, wait_until_ready, write_json
+from checkpoint_prompts import load_prompt
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "prefix"))
-from live_controls import STORES, Controls
-
+from live_controls import GDN_ENTRIES, Controls
 
 CHECKPOINT = Path("/data0/shared/Qwen3.8-27B-FP8")
 TOKEN_BUDGET = 32768
 CACHE_BOUNDARY = 8192
-NO_DEVICE = "Get current CUDA device: no CUDA-capable device is detected"
+NO_DEVICE = "Select device for CUDA arena startup: no CUDA-capable device is detected"
 TEXT = "/v1/completions"
 CHAT = "/v1/chat/completions"
 COMMON = {"model": "Qwen3.8-27B-FP8", "return_token_ids": True}
@@ -205,6 +205,77 @@ def check_cancellation(port, log, width, depth, wanted):
     return {"interrupted": interrupted, "before_replay_trace": trace.decode(), "replay": replay}
 
 
+class CompletionLogprobs(TypedDict):
+    tokens: list[str]
+    text_offset: list[int]
+    token_logprobs: list[float]
+    top_logprobs: list[dict[str, float]]
+
+
+def check_minimum_logprobs(actual: CompletionLogprobs, expected: CompletionLogprobs) -> None:
+    tolerance = 4e-6
+    require(actual["tokens"] == expected["tokens"], "Scored tokens differ")
+    require(actual["text_offset"] == expected["text_offset"], "Scored token offsets differ")
+    for value, target in zip(actual["token_logprobs"], expected["token_logprobs"], strict=True):
+        require(abs(value - target) <= tolerance, (value, target))
+    for row, target in zip(actual["top_logprobs"], expected["top_logprobs"], strict=True):
+        require(row.keys() == target.keys(), (row, target))
+        require(all(abs(row[token] - target[token]) <= tolerance for token in row), (row, target))
+
+
+def check_minimum(args: argparse.Namespace) -> None:
+    budget = 8
+    control = None
+    for depth in (0, 4):
+        output = args.evidence / f"minimum-k{depth}"
+        flags = ("--prefix-cache-entries", "0", "--tp", str(args.minimum_tp))
+        with server(args, output, 1, depth, flags) as (port, log):
+            base = MAIN | {
+                "max_tokens": budget,
+                "temperature": 1,
+                "top_k": 20,
+                "top_p": 0.95,
+                "min_p": 0,
+                "ignore_eos": True,
+            }
+            sampled = transcript(post(port, TEXT, base))["tokens"]
+            greedy = transcript(post(port, TEXT, base | {"temperature": 0}))["tokens"]
+            requests = {
+                "minimum-equals-maximum": base
+                | {"min_tokens": budget, "stop_token_ids": sampled[:1]},
+                "minimum-crossing": base | {"min_tokens": 3, "stop_token_ids": sampled[:1]},
+                "minimum-greedy": base
+                | {"min_tokens": 3, "temperature": 0, "stop_token_ids": greedy[:1]},
+            }
+            wire, observed = {}, {}
+            for name, request in requests.items():
+                offset = log.stat().st_size
+                wire[name] = post(port, TEXT, request)
+                row = observed[name] = transcript(wire[name])
+                require(row["finish"] == "length" and len(row["tokens"]) == budget, row)
+                (stopped,) = request["stop_token_ids"]
+                require(stopped not in row["tokens"][: request["min_tokens"]], row)
+                trace = log.read_bytes()[offset:]
+                drafts = COUNTERS.findall(trace)
+                drafted = any(int(row[0]) > 0 and int(row[2]) > 0 for row in drafts)
+                require(
+                    drafted == bool(depth and not args.minimum_baseline),
+                    f"Unexpected minimum-output verification activity for {name}: {drafts}",
+                )
+            scored = requests["minimum-greedy"] | {"logprobs": 3}
+            wire["minimum-greedy-logprobs"] = post(port, TEXT, scored, stream=False)
+            (choice,) = wire["minimum-greedy-logprobs"]["choices"]
+            require(choice["token_ids"] == observed["minimum-greedy"]["tokens"], choice)
+            logprobs = choice["logprobs"]
+            require(len(logprobs["token_logprobs"]) == budget, choice)
+        write_json(output / "minimum.json", {"requests": requests, "wire": wire})
+        if control is None:
+            control = observed, logprobs
+        else:
+            check_against_control(observed, control[0], f"minimum K{depth}")
+            check_minimum_logprobs(logprobs, control[1])
+
+
 def run_cases(port, log, width, depth):
     main = post(port, TEXT, MAIN)
     wanted = transcript(main)
@@ -344,20 +415,19 @@ def finish_stream(stream):
 
 
 def checkpoint_prompt():
-    fixture = Path(__file__).resolve().parents[2] / "benchmarks/streaming/W2.json"
-    return json.loads(fixture.read_text())["prompt_token_ids"] * 4
+    return load_prompt("prefill") * 4
 
 
 def check_queue_and_reset(args):
-    output = args.evidence / "w2-prefix-queue"
+    output = args.evidence / "prefix-queue"
     flags = ("--batch-cuda-graphs", "--lmcache-socket", str(args.lmcache_socket))
     with server(args, output, 2, 0, flags=flags, token_budget=CACHE_BOUNDARY) as (port, _):
         controls = Controls(port, output)
         body = LONG | {"prompt": checkpoint_prompt(), "cache_salt": uuid4().hex}
-        baseline = controls.metrics("before-cold")[STORES]
+        baseline = controls.idle("before-cold")[GDN_ENTRIES]
         wanted = transcript(post(port, TEXT, body))
         require(wanted["usage"]["prompt_tokens_details"] == {"cached_tokens": 0}, wanted)
-        controls.wait_for("cold-stored", 0, 0, stores=baseline + 1)
+        require(controls.idle("cold-resident")[GDN_ENTRIES] > baseline, "Cold prefix missing")
         with ExitStack() as streams:
             active = [streams.enter_context(sampled_stream(port, body | {"max_tokens": 4096}))
                       for _ in range(2)]
@@ -376,13 +446,13 @@ def check_queue_and_reset(args):
                 stream.reset()
             replay = finish_stream(survivor)
             records = [stream.evidence() for stream in [*active, queued, survivor]]
-        before = controls.wait_for("retired", 0, 0, stores=baseline + 1)
+        before = controls.idle("retired")
         controls.reset("idle-reset")
         after = controls.metrics("after-reset")
         replay_after_reset = transcript(post(port, TEXT, body))
         write_json(output / "wire.json", {"streams": records, "cold": wanted, "survivor": replay,
                                         "after_reset": replay_after_reset})
-        require(before[STORES] == after[STORES] and before[STORES] > 0, (before, after))
+        require(before[GDN_ENTRIES] > 0 and after[GDN_ENTRIES] == 0, (before, after))
         for key in ("prompt", "tokens", "text", "finish"):
             require(replay[key] == wanted[key] == replay_after_reset[key], key)
         warm_cache = replay["usage"]["prompt_tokens_details"]["cached_tokens"]
@@ -391,20 +461,22 @@ def check_queue_and_reset(args):
 
 
 def check_eager_cache(args):
-    output = args.evidence / "w1-eager-prefix"
+    output = args.evidence / "eager-prefix"
     flags = ("--eager", "--lmcache-socket", str(args.lmcache_socket))
     prompt = checkpoint_prompt()
     body = LONG | {"prompt": prompt + [31], "cache_salt": uuid4().hex}
     prime = body | {"prompt": prompt, "max_tokens": 1}
     with server(args, output, 1, 4, flags=flags, token_budget=CACHE_BOUNDARY) as (port, log):
         controls = Controls(port, output)
-        baseline = controls.metrics("before-cold")[STORES]
+        baseline = controls.idle("before-cold")[GDN_ENTRIES]
         cold_wire = post(port, TEXT, body | {"cache_salt": uuid4().hex})
         cold = transcript(cold_wire)
         offset = log.stat().st_size
-        baseline = controls.wait_for("cold-stored", 0, 0, stores=baseline + 1)[STORES]
+        cold_entries = controls.idle("cold-resident")[GDN_ENTRIES]
+        require(cold_entries > baseline, (baseline, cold_entries))
         prime_wire = post(port, TEXT, prime)
-        controls.wait_for("prime-stored", 0, 0, stores=baseline + 1)
+        prime_entries = controls.idle("prime-resident")[GDN_ENTRIES]
+        require(prime_entries > cold_entries, (cold_entries, prime_entries))
         warm_begin = log.stat().st_size
         warm_wire = post(port, TEXT, body)
         warm = transcript(warm_wire)
@@ -423,17 +495,23 @@ def check_eager_cache(args):
                 "Cold or warm sampled request did not use MTP")
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--server", type=Path, required=True)
     parser.add_argument("--checkpoint", type=Path, default=CHECKPOINT)
     parser.add_argument("--evidence", type=Path, required=True)
     parser.add_argument("--eager-cache-only", action="store_true")
+    parser.add_argument("--minimum-only", action="store_true")
+    parser.add_argument("--minimum-tp", type=int, choices=(1, 2), default=1)
+    parser.add_argument("--minimum-baseline", action="store_true")
     parser.add_argument("--lmcache-socket", type=Path)
     args = parser.parse_args()
     if args.eager_cache_only and not args.lmcache_socket:
         parser.error("--lmcache-socket is required for --eager-cache-only")
     args.evidence.mkdir(parents=True)
+    if args.minimum_only:
+        check_minimum(args)
+        return
     check_startup(args)
     if args.eager_cache_only:
         check_eager_cache(args)

@@ -15,6 +15,13 @@ struct SamplingParameters {
     double min_p = 0.0;
 };
 
+struct SamplingRow {
+    const __nv_bfloat16* scores = nullptr;
+    int* token = nullptr;
+    SamplingParameters parameters{};
+    int position = 0;
+};
+
 struct OutputPenalties {
     float* frequency_totals = nullptr;
     std::uint8_t* seen = nullptr;
@@ -41,10 +48,14 @@ struct RepetitionSelection {
 };
 
 SamplingParameters request_sampling(const DecoderOptions& options);
+double sampling_uniform(std::uint64_t seed, int position);
 std::size_t sampling_workspace_bytes();
 cudaError_t sample_logits(const __nv_bfloat16* scores, int vocabulary, int* token,
                           SamplingParameters parameters, int position, void* workspace,
                           cudaStream_t stream);
+cudaError_t sample_logits_rows(const SamplingRow* rows, int count, int vocabulary,
+                               void* single_workspace, std::size_t batch_bytes,
+                               void* batch_workspace, cudaStream_t stream);
 std::size_t biased_sampling_workspace_bytes(int vocabulary);
 cudaError_t sample_logits(const float* scores, int vocabulary, int* token,
                           SamplingParameters parameters, int position, void* workspace,
@@ -53,10 +64,11 @@ cudaError_t adjust_logits(const __nv_bfloat16* source, float* scores, int vocabu
                           const DecoderLogitBias* bias, int count, LogitMasks masks,
                           OutputPenalties penalties, int previous_token, cudaStream_t stream);
 std::size_t repetition_workspace_bytes(int vocabulary, bool ranked);
-cudaError_t select_repetition_logits(
-    const __nv_bfloat16* source, int vocabulary, const DecoderLogitBias* bias, int bias_count,
-    LogitMasks masks, OutputPenalties penalties, int previous_token,
-    RepetitionSelection selection, void* workspace, std::size_t bytes, cudaStream_t stream);
+cudaError_t select_repetition_logits(const __nv_bfloat16* source, int vocabulary,
+                                     const DecoderLogitBias* bias, int bias_count, LogitMasks masks,
+                                     OutputPenalties penalties, int previous_token,
+                                     RepetitionSelection selection, void* workspace,
+                                     std::size_t bytes, cudaStream_t stream);
 cudaError_t check_allowed_logit(const float* scores, int* token, cudaStream_t stream);
 
 }

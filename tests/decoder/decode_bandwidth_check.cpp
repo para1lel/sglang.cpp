@@ -1,4 +1,5 @@
 #include "sglang/decoder_cuda.cuh"
+#include "sglang/decoder_verify.h"
 
 #include <array>
 #include <cstdint>
@@ -11,11 +12,16 @@ namespace {
 
 using BFloat = __nv_bfloat16;
 using sglang::TextFp8Activation;
-using sglang::decoder::DecodeHeadProjections;
 using sglang::decoder::decode_bf16_gdn_gates;
 using sglang::decoder::decode_bf16_lm_head;
 using sglang::decoder::decode_bf16_lm_head_batch;
 using sglang::decoder::decode_quantize_fp8;
+using sglang::decoder::DecodeHeadProjections;
+using sglang::decoder::max_wide_mtp_rows;
+using sglang::decoder::try_verify_bf16_gdn_gates;
+using sglang::decoder::try_verify_bf16_gdn_gates_local;
+using sglang::decoder::verification_packet_rows;
+using sglang::decoder::VerifyGdnGateRow;
 
 constexpr int hidden = 5120;
 constexpr int gates = sglang::text_gdn_value_heads;
@@ -29,6 +35,7 @@ struct ExpectedLaunches {
     unsigned count;
     unsigned blocks;
     unsigned threads;
+    unsigned packets = 1;
 };
 
 std::array<Launch, 4> launches;
@@ -48,7 +55,7 @@ void require_launches(ExpectedLaunches expected, const char* message) {
     }
     for (unsigned index = 0; index < expected.count; ++index) {
         const auto [grid, block] = launches[index];
-        if (grid.x != expected.blocks || grid.y != 1 || grid.z != 1 ||
+        if (grid.x != expected.blocks || grid.y != expected.packets || grid.z != 1 ||
             block.x != expected.threads || block.y != 1 || block.z != 1) {
             throw std::runtime_error(message);
         }
@@ -97,6 +104,74 @@ void fill(Device<BFloat>& device, int count, int seed) {
         host[index] = __float2bfloat16(sample * 0.03125f);
     }
     device.upload(host);
+}
+
+void verification_gates(int channels, decltype(&try_verify_bf16_gdn_gates) gate) {
+    constexpr int packet = verification_packet_rows;
+    constexpr int capacity = max_wide_mtp_rows;
+    constexpr int input_elements = (capacity * hidden) + 1;
+    const auto channel_count = static_cast<std::size_t>(channels);
+    const auto weight_elements = channel_count * hidden;
+    const auto result_elements = (channel_count * 2 * capacity) + 2;
+    Device<BFloat> input(input_elements);
+    Device<BFloat> weight_b(weight_elements);
+    Device<BFloat> weight_a(weight_elements);
+    Device<BFloat> expected(result_elements);
+    Device<BFloat> actual(result_elements);
+    fill(input, input_elements, 5);
+    fill(weight_b, channels * hidden, 17);
+    fill(weight_a, channels * hidden, 19);
+    const auto make_rows = [&](BFloat* output) {
+        std::array<VerifyGdnGateRow, capacity> rows{};
+        for (std::size_t row = 0; row < rows.size(); ++row) {
+            rows[row] = {
+                input.data + (row * hidden),
+                output + 1 + (row * channel_count),
+                output + 1 + ((capacity + row) * channel_count),
+            };
+        }
+        return rows;
+    };
+    const auto reference = make_rows(expected.data);
+    auto rows = make_rows(actual.data);
+    const auto launch = [&](const VerifyGdnGateRow* projection_rows, int count) {
+        if (const auto result =
+                gate(weight_b.data, weight_a.data, projection_rows, count, nullptr)) {
+            check(*result);
+        } else {
+            throw std::runtime_error("Verification gate rejected a supported shape");
+        }
+    };
+    for (const int count : {2, 3, 4, 5, packet, 2 * packet, 3 * packet, 4 * packet, capacity}) {
+        actual.reset();
+        expected.reset();
+        const int tile_rows = count < packet ? count : packet;
+        for (int first = 0; first < count; first += tile_rows) {
+            launch(reference.data() + first, tile_rows);
+        }
+        successful_launches = 0;
+        launch(rows.data(), count);
+        require_launches(
+            {
+                1,
+                static_cast<unsigned>(2 * channels),
+                static_cast<unsigned>(32 * tile_rows),
+                static_cast<unsigned>(count / tile_rows),
+            },
+            "Verification gate grid mismatch");
+        actual.match(expected, "Verification gates changed BF16 output or guards");
+    }
+    attempted_launches = 0;
+    for (const int count : {1, 6, 19, packet + 1, capacity - 1, capacity + 1}) {
+        if (gate(weight_b.data, weight_a.data, rows.data(), count, nullptr)) {
+            throw std::runtime_error("Verification gates accepted an unsupported tail");
+        }
+    }
+    rows.back().input += 1;
+    if (gate(weight_b.data, weight_a.data, rows.data(), capacity, nullptr) ||
+        attempted_launches != 0) {
+        throw std::runtime_error("Verification gates submitted an invalid wide packet");
+    }
 }
 
 void projection(int width, int rows, int offset, bool gdn, ExpectedLaunches expected_launches) {
@@ -301,6 +376,8 @@ int main() try {
     projection(hidden, gates - 1, 0, true, {2, 6, 256});
     projection(hidden, gates, 1, true, {2, 6, 256});
     projection(hidden - 1, gates, 0, true, {2, 6, 256});
+    verification_gates(gates, try_verify_bf16_gdn_gates);
+    verification_gates(gates / 2, try_verify_bf16_gdn_gates_local);
     quantization(256, 0, 4, {1, 2, 32});
     quantization(257, 0, 4, {1, 3, 128});
     quantization(256, 1, 4, {1, 2, 128});

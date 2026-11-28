@@ -1,21 +1,18 @@
 #include "sglang/decoder_internal.h"
+#include "sglang/runtime/backend/device_arena.h"
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <iostream>
 #include <stdexcept>
-#include <unordered_set>
-#include <utility>
 
 namespace {
 
 struct Runtime {
-    std::size_t requested = 0;
-    std::size_t attempts = 0;
-    std::uintptr_t next_address = 0x10000;
-    std::unordered_set<const void*> live;
-    std::size_t rejected_attempt = 0;
-    cudaError_t last = cudaSuccess;
+    int allocations = 0;
+    int frees = 0;
+    void* backing = nullptr;
     int captures = 0;
     int launches = 0;
 } runtime;
@@ -74,24 +71,26 @@ extern "C" {
 
 cudaError_t cudaGetDevice(int* device) { *device = 0; return cudaSuccess; }
 cudaError_t cudaSetDevice(int) { return cudaSuccess; }
-cudaError_t cudaGetLastError() { return std::exchange(runtime.last, cudaSuccess); }
+cudaError_t cudaGetLastError() {
+    return cudaSuccess;
+}
 const char* cudaGetErrorString(cudaError_t) { return "injected test status"; }
 
+cudaError_t cudaMemGetInfo(std::size_t* free, std::size_t* total) {
+    *free = *total = std::size_t{3} << 30;
+    return cudaSuccess;
+}
+
 cudaError_t cudaMalloc(void** address, std::size_t bytes) {
-    runtime.requested = bytes;
-    ++runtime.attempts;
-    if (runtime.attempts == runtime.rejected_attempt) {
-        runtime.last = cudaErrorMemoryAllocation;
-        return runtime.last;
-    }
-    *address = handle<void*>(runtime.next_address);
-    runtime.next_address += 0x10000;
-    require(runtime.live.insert(*address).second, "Duplicate allocation");
+    require(runtime.allocations == 0 && bytes != 0, "Invalid physical arena allocation");
+    ++runtime.allocations;
+    runtime.backing = *address = handle<void*>(0x100000);
     return cudaSuccess;
 }
 
 cudaError_t cudaFree(void* address) {
-    require(runtime.live.erase(address) == 1, "Invalid or duplicate release");
+    require(runtime.frees == 0 && address == runtime.backing, "Invalid physical release");
+    ++runtime.frees;
     return cudaSuccess;
 }
 
@@ -135,88 +134,88 @@ cudaError_t cudaStreamDestroy(cudaStream_t) { return cudaSuccess; }
 
 }
 
-void capacity_bounds() {
-    using sglang::decoder::Request;
+static void capacity_bounds(sglang::decoder::DeviceArena& arena) {
+    using namespace sglang::decoder;
     Request request(0);
     const auto base = request.memory.bytes();
-    const auto count = runtime.attempts;
-    require(request.work.gqa_scores(262144).capacity == 5120 &&
-            request.work.gqa_scores(5119).capacity == 5119 &&
-            runtime.attempts == count, "Inline workspace changed");
-    struct Case {
-        int pages;
-        int positions;
-        std::size_t bytes;
-    };
-    for (const auto test : {Case{41, 5248, 503808}, {64, 8192, 786432},
-                            {72, 9216, 884736}, {73, 9344, 897024},
-                            {2048, 262144, 25165824}}) {
-        Request lane(0);
-        lane.pages.page_count = test.pages;
-        const auto before = runtime.attempts;
-        const auto scores = lane.batch_graph_scores();
-        require(scores.scores && scores.capacity == test.positions &&
-                runtime.requested == test.bytes && lane.memory.bytes() == base + test.bytes,
-                "Wrong page-rounded score capacity");
-        require(lane.batch_graph_scores().scores == scores.scores &&
-                runtime.attempts == before + 1, "Rebinding allocated another score slab");
-        lane.memory.close();
-        require(runtime.live.find(scores.scores) == runtime.live.end(),
-                "Released slab remains live");
+    const auto available = arena.available_bytes();
+    const auto* scratch = reinterpret_cast<float*>(request.work.logits);
+    for (const int length : {1, 5119, 5120, 5248, 8192, 32768, 262144}) {
+        const auto scores = request.work.gqa_scores(length);
+        require(scores.scores == scratch && scores.capacity == std::min(length, 5120),
+                "Exact attention lost its bounded logits backing");
     }
+    require(request.memory.bytes() == base && arena.available_bytes() == available,
+            "Binding exact scores changed request storage");
 }
 
-void binding_rejection(int failed_lane) {
+static void binding_rejection(sglang::decoder::DeviceArena& arena, int failed_lane) {
     using namespace sglang::decoder;
     constexpr int width = 4;
-    constexpr std::size_t slab_bytes = 503808;
     Allocations execution(0);
     execution.open_stream();
     std::array<Request, width> lanes{Request(0), Request(0), Request(0), Request(0)};
+    std::array<Workspace*, width> bindings{};
+    for (int slot = 0; slot < width; ++slot)
+        bindings[slot] = &lanes[slot].work;
     const auto base = lanes.front().memory.bytes();
-    for (auto& lane : lanes) {
-        lane.pages.page_count = 41;
-    }
+    const auto available = arena.available_bytes();
+    auto* const reserved = arena.allocate(available);
+    const auto launches = runtime.launches;
+    const auto captures = runtime.captures;
+    int visited = 0;
     auto bind = [&] {
-        for (auto& lane : lanes) {
-            if (lane.batch_graph_scores().capacity <= 5120) {
+        visited = 0;
+        for (const auto* workspace : bindings) {
+            ++visited;
+            if (!workspace)
                 return false;
-            }
+            require(workspace->gqa_scores(5120).scores ==
+                        reinterpret_cast<float*>(workspace->logits),
+                    "Wrong short score backing");
         }
         return true;
     };
-    const auto attempts = runtime.attempts;
-    const auto launches = runtime.launches;
-    const auto captures = runtime.captures;
-    runtime.rejected_attempt = attempts + failed_lane + 1;
     const auto nop = [] {};
-    const auto ready = [] { return true; };
-    require(!execution.replay_batch_graph(width, nop, nop, bind), "OOM submitted a graph");
-    require(!execution.replay_batch_graph(width, nop, nop, bind), "Remembered OOM submitted");
-    require(runtime.launches == launches && runtime.attempts == runtime.rejected_attempt &&
-            cudaGetLastError() == cudaSuccess, "OOM relaunched, retried or left an error");
-    for (int slot = 0; slot < width; ++slot) {
-        const auto bytes = slot < failed_lane ? base + slab_bytes : base;
-        require(lanes[slot].memory.bytes() == bytes, "Unexpected partial binding ownership");
+    bindings[failed_lane] = nullptr;
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        require(!execution.replay_batch_graph(width, nop, nop, bind) && visited == failed_lane + 1,
+                "Missing graph binding advanced beyond the rejected lane");
     }
+    require(runtime.launches == launches && arena.available_bytes() == 0 &&
+                cudaGetLastError() == cudaSuccess,
+            "Rejected binding submitted, allocated storage, or left a CUDA error");
+    for (const auto& lane : lanes) {
+        require(lane.memory.bytes() == base, "Rejected binding changed request ownership");
+    }
+    arena.release(reserved);
     lanes[failed_lane].memory.close();
-    require(execution.replay_batch_graph(width, nop, nop, ready), "Short binding lost executable");
     Request replacement(0);
-    replacement.pages.page_count = 73;
-    require(replacement.batch_graph_scores().capacity == 9344 &&
-            replacement.memory.bytes() == base + 897024, "Replacement could not grow");
+    bindings[failed_lane] = &replacement.work;
+    require(replacement.memory.bytes() == base && arena.available_bytes() == available,
+            "Replacing the rejected request changed its storage budget");
+    require(execution.replay_batch_graph(width, nop, nop, bind) && visited == width,
+            "Replacing the rejected lane did not replay");
     require(runtime.captures == captures + 1 && runtime.launches == launches + 1,
-            "Rejected binding discarded or disabled its executable");
+            "Rejected binding discarded its reusable graph");
     std::cout << "Score allocation rejected at packed lane " << failed_lane << '\n';
 }
 
 int main() {
+    using namespace sglang::decoder;
     check_driver_statuses();
-    capacity_bounds();
-    require(runtime.live.empty(), "Capacity test leaked allocations");
-    for (int slot = 0; slot < 4; ++slot) {
-        binding_rejection(slot);
-        require(runtime.live.empty(), "Rejected binding leaked allocations");
+    {
+        const auto arena = DeviceArena::start(0, default_gpu_memory_utilization);
+        arena->commit();
+        const auto available = arena->available_bytes();
+        capacity_bounds(*arena);
+        require(arena->available_bytes() == available, "Capacity test leaked leases");
+        for (int slot = 0; slot < 4; ++slot) {
+            binding_rejection(*arena, slot);
+            require(arena->available_bytes() == available, "Rejected binding leaked leases");
+        }
+        require(runtime.allocations == 1 && runtime.frees == 0, "Serving changed physical storage");
     }
+    require(runtime.frees == 1, "Arena backing did not release on shutdown");
     std::cout << "Score bounds, bounded ownership and executable reuse passed\n";
 }

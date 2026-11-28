@@ -1,13 +1,14 @@
 #include "sglang/checkpoint.h"
 #include "sglang/decoder_internal.h"
 #include "sglang/runtime/backend/cuda_resources.h"
+#include "sglang/runtime/backend/device_arena.h"
 #include "sglang/text/bf16_head_projection.h"
 #include "sglang/text/mtp/tc_vocab.h"
 
 #include <algorithm>
 #include <array>
-#include <bit>
 #include <chrono>
+#include <cstdint>
 #include <cstring>
 #include <fstream>
 #include <iomanip>
@@ -145,8 +146,12 @@ public:
         for (int row = 0; row < rows; ++row) {
             const auto a = reference.data[row];
             const auto b = observed.data[row];
-            if (a.token_id != b.token_id || std::bit_cast<unsigned>(a.score) !=
-                                            std::bit_cast<unsigned>(b.score)) {
+            std::uint32_t expected_bits = 0;
+            std::uint32_t observed_bits = 0;
+            static_assert(sizeof(expected_bits) == sizeof(a.score));
+            std::memcpy(&expected_bits, &a.score, sizeof(expected_bits));
+            std::memcpy(&observed_bits, &b.score, sizeof(observed_bits));
+            if (a.token_id != b.token_id || expected_bits != observed_bits) {
                 std::cerr << name << " winner " << row << " expected " << a.token_id << ' '
                           << a.score << " observed " << b.token_id << ' ' << b.score << '\n';
                 throw std::runtime_error("Packed BF16 winner mismatch");
@@ -242,11 +247,14 @@ private:
 
 int main(int argc, char** argv) {
     try {
-        expect(argc >= 2, "Supply the checkpoint and optional captured W1 packets");
+        expect(argc >= 2, "Supply the checkpoint and optional captured short decode packets");
         int devices = 0;
         check(cudaGetDeviceCount(&devices), "Locate isolated accelerator");
         expect(devices == 1, "Run with only the reserved GPU visible");
         check(cudaSetDevice(0), "Select isolated accelerator");
+        const auto arena =
+            sglang::decoder::DeviceArena::start(0, sglang::decoder::default_gpu_memory_utilization);
+        arena->commit();
         const Checkpoint checkpoint(argv[1]);
         OperatorTest test(checkpoint);
         for (int i = 2; i < argc; ++i) test.capture(argv[i]);

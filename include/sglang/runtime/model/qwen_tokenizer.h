@@ -14,5 +14,8 @@ inline constexpr int qwen_tokenizer_base_vocab = 248044;
 inline constexpr int qwen_tokenizer_mapped_vocab = 248077;
 inline constexpr int qwen_end_of_text = 248044;
 inline constexpr int qwen_end_of_message = 248046;
-
+inline constexpr int vision_start = 248053;
+inline constexpr int vision_end = 248054;
+inline constexpr int image_pad = 248056;
+inline constexpr int video_pad = 248057;
 }

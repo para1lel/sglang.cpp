@@ -16,7 +16,8 @@ bool DecoderOptions::adjusts_logits(int generated) const {
 }
 
 bool DecoderOptions::requires_target_only() const {
-    return adjusts_logits(0);
+    return has_output_penalties() || (logit_bias && !logit_bias->empty()) ||
+           (min_new_tokens > 0 && (constraint || top_logits > 0));
 }
 
 bool DecoderOptions::stops_at(int token) const {

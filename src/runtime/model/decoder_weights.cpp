@@ -112,8 +112,8 @@ Decoder::Model::Model(const std::filesystem::path& directory, int cuda_device,
     auto selected_backend = read_cuda_backend_device(device);
     backend = selected_backend.policy;
     accelerator_name = std::move(selected_backend.name);
-    execution = DecoderExecutionPolicy::for_backend(
-        backend, {1, batch_prefill_tile_rows, prefill_chunk_rows});
+    execution =
+        DecoderExecutionPolicy::for_backend(backend, {batch_prefill_tile_rows, prefill_chunk_rows});
     auto& checkpoint = memory->transfers().checkpoint;
     checkpoint = std::make_unique<Checkpoint>(directory);
     const auto& model = checkpoint->text_model();

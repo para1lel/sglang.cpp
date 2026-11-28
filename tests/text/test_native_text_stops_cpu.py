@@ -2,13 +2,16 @@
 
 import json
 import unittest
-from unittest.mock import patch
 
 from test_native_chat import tokenizer_pieces
-from test_native_generate_cpu import GENERATE, batch_frames
-from test_sampling_routes_cpu import (
-    TEXT, body, checked_body, post_response, receipts, run_cpu_suite, server,
+from test_native_generate_cpu import GENERATE
+from test_native_generated_logprobs_cpu import (
+    ReplyChecks,
+    assert_output_logprobs,
+    checked_exchange,
+    scripted_server,
 )
+from test_sampling_routes_cpu import TEXT, body, post_response, receipts, run_cpu_suite, server
 
 
 def options(seed, budget, **extra):
@@ -48,23 +51,18 @@ class NativeTextStops(unittest.TestCase):
             130: [a, cls.special, *cls.snow, b, q],
             131: [a, cls.hello, cls.special, q],
         }
-        script = cls.output / "text-stops.ids"
-        script.write_text("".join(f"{seed} {' '.join(map(str, ids))}\n"
-                                  for seed, ids in scripts.items()), encoding="ascii")
-        cls.enterClassContext(patch.dict("os.environ", SGLANG_TEST_CHAT_OUTPUT_IDS=str(script),
-                                         SGLANG_TEST_SCRIPTED_MTP="1"))
         cls.log = cls.output / "text-stops.log"
-        cls.port = cls.enterClassContext(server(cls.binary, cls.checkpoint, cls.log,
-                                               "--max-active", "2", "--mtp-steps", "0"))
+        flags = ("--max-active", "2", "--mtp-steps", "0")
+        with_script = scripted_server(
+            cls, "text-stops.ids", scripts, cls.log, *flags, SGLANG_TEST_SCRIPTED_MTP="1"
+        )
+        cls.port = cls.enterClassContext(with_script)
 
     def exchange(self, params, stream, *, port=None, inputs=None, expected_status=200, **fields):
         packet = {"input_ids": inputs or [32], "sampling_params": params, "stream": stream,
                   **fields}
-        with post_response(self.port if port is None else port, GENERATE, packet) as response:
-            self.assertEqual(response.status, expected_status)
-            streamed = stream and expected_status == 200
-            frames = batch_frames(response, "EOF before DONE") if streamed else None
-            return checked_body(self, response, frames)
+        checks = ReplyChecks(status=expected_status, native_eof="EOF before DONE")
+        return checked_exchange(self, GENERATE, packet, self.port if port is None else port, checks)
 
     def terminal(self, packet, text, ids, reason, prompts=1):
         self.assertEqual(packet["text"], text)
@@ -96,6 +94,43 @@ class NativeTextStops(unittest.TestCase):
         frames = self.exchange(params, True, **kwargs)
         self.assertTrue(all("index" not in frame for frame in frames))
         self.sequence(frames, text, ids, reason, intermediate=intermediate)
+
+    def check_batch(
+        self,
+        params: dict[str, object] | list[dict[str, object]],
+        inputs: list[list[int]],
+        expected: list[tuple[str, list[int], dict[str, object]]],
+        *,
+        samples: int = 1,
+        require_unindexed: bool = True,
+        **fields: object,
+    ) -> list[list[dict[str, object]]]:
+        plain = self.exchange(params, stream=False, inputs=inputs, **fields)
+        frames = self.exchange(params, stream=True, inputs=inputs, **fields)
+        self.assertEqual(len(plain), len(expected))
+        self.assertEqual({frame["index"] for frame in frames}, set(range(len(expected))))
+        packets = []
+        for index, (text, ids, reason) in enumerate(expected):
+            lane = [frame for frame in frames if frame["index"] == index]
+            with self.subTest(index=index):
+                if require_unindexed:
+                    self.assertNotIn("index", plain[index])
+                prompts = len(inputs[index // samples])
+                self.terminal(plain[index], text, ids, reason, prompts)
+                self.sequence(lane, text, ids, reason, prompts=prompts)
+            packets.append([plain[index], *lane])
+        return packets
+
+    def check_invalid_batch(
+        self, seed: int, field: str, values: tuple[object, ...], **valid: object
+    ) -> None:
+        before = len(receipts(self.log))
+        for value in values:
+            with self.subTest(value=value):
+                params = [options(seed, 2, **valid), options(seed, 2, **{field: value})]
+                error = self.exchange(params, stream=True, inputs=[[32], [33]], expected_status=400)
+                self.assertIn(field, error["error"]["message"])
+        self.assertEqual(len(receipts(self.log)), before)
 
     def test_partial_token_and_cross_token_overlap(self):
         a, b, _, _, _, _, z = self.letters
@@ -172,21 +207,14 @@ class NativeTextStops(unittest.TestCase):
         scores = {"return_logprob": True, "top_logprobs_num": 2,
                   "return_text_in_logprobs": True}
         inputs = [[self.special], [self.special, a], [self.special, a, b]]
-        plain = self.exchange(params, False, inputs=inputs, **scores)
-        frames = self.exchange(params, True, inputs=inputs, **scores)
         expected = [("A", [a, self.special], stopped(special)),
                     ("A" + special, [a, self.special], stopped(special)),
                     ("A", [a, self.special], stopped(special))]
-        self.assertEqual(len(plain), len(expected))
-        self.assertEqual({frame["index"] for frame in frames}, set(range(len(expected))))
-        for index, (text, ids, reason) in enumerate(expected):
+        packets = self.check_batch(params, inputs, expected, require_unindexed=False, **scores)
+        for index, lane in enumerate(packets):
             with self.subTest(index=index):
-                self.terminal(plain[index], text, ids, reason, index + 1)
-                lane = [frame for frame in frames if frame["index"] == index]
-                self.sequence(lane, text, ids, reason, prompts=index + 1)
-                for frame in [plain[index], *lane]:
-                    meta = frame["meta_info"]
-                    selected = meta["output_token_logprobs"]
+                for frame in lane:
+                    selected = frame["meta_info"]["output_token_logprobs"]
                     self.assertEqual([entry[1] for entry in selected], frame["output_ids"])
                     if len(selected) > 1:
                         self.assertEqual(selected[1], [-0.5, self.special, special])
@@ -249,28 +277,14 @@ class NativeTextStops(unittest.TestCase):
                         text, [*initial, q, a, b], stopped("AB"), [""] * 5)
 
     def test_invalid_skip_special_tokens_does_not_admit_batch(self):
-        before = len(receipts(self.log))
-        for value in (0, "false", [], {}):
-            with self.subTest(value=value):
-                params = [options(127, 2), options(127, 2, skip_special_tokens=value)]
-                error = self.exchange(params, True, inputs=[[32], [33]], expected_status=400)
-                self.assertIn("skip_special_tokens", error["error"]["message"])
-        self.assertEqual(len(receipts(self.log)), before)
+        self.check_invalid_batch(127, "skip_special_tokens", (0, "false", [], {}))
 
     def test_no_stop_trim_broadcast_to_parallel_samples(self):
         a, b, c, *_ = self.letters
         params = options(123, 6, n=2, stop="BC", no_stop_trim=True)
         inputs = [[a], [a, b]]
-        plain = self.exchange(params, False, inputs=inputs)
-        frames = self.exchange(params, True, inputs=inputs)
-        self.assertEqual(len(plain), 4)
-        self.assertEqual({frame["index"] for frame in frames}, set(range(4)))
-        for index, packet in enumerate(plain):
-            self.assertNotIn("index", packet)
-            prompts = len(inputs[index // 2])
-            self.terminal(packet, "ABC", [a, b, c], stopped("BC"), prompts)
-            lane = [frame for frame in frames if frame["index"] == index]
-            self.sequence(lane, "ABC", [a, b, c], stopped("BC"), prompts=prompts)
+        expected = [("ABC", [a, b, c], stopped("BC"))] * 4
+        self.check_batch(params, inputs, expected, samples=2)
 
     def test_no_stop_trim_indexed_json_and_scored_sse(self):
         a, b, c, *_ = self.letters
@@ -280,38 +294,23 @@ class NativeTextStops(unittest.TestCase):
         inputs = [[a], [a, b], [a, b, c]]
         scores = {"return_logprob": [True, True, False],
                   "top_logprobs_num": [2, 2, 0], "return_text_in_logprobs": True}
-        plain = self.exchange(params, False, inputs=inputs, **scores)
-        frames = self.exchange(params, True, inputs=inputs, **scores)
         expected = [("ABC", [a, b, c], stopped("BC")), ("AB", [a, b], stopped(b)),
                     ("A", [a, b, c], stopped("BC"))]
-        self.assertEqual(len(plain), len(expected))
-        self.assertEqual({frame["index"] for frame in frames}, set(range(len(expected))))
-        for index, (text, ids, reason) in enumerate(expected):
+
+        def token_text(token: int) -> str:
+            return chr(ord("A") + self.letters.index(token))
+
+        packets = self.check_batch(params, inputs, expected, **scores)
+        for index, lane in enumerate(packets):
             with self.subTest(index=index):
-                self.assertNotIn("index", plain[index])
-                self.terminal(plain[index], text, ids, reason, index + 1)
-                lane = [frame for frame in frames if frame["index"] == index]
-                self.sequence(lane, text, ids, reason, prompts=index + 1)
-                for frame in [plain[index], *lane]:
-                    meta = frame["meta_info"]
+                for frame in lane:
                     if index == 2:
-                        self.assertFalse(any("logprob" in key for key in meta))
-                        continue
-                    selected = [[-0.25 * ordinal, token, chr(ord("A") + self.letters.index(token))]
-                                for ordinal, token in enumerate(frame["output_ids"], 1)]
-                    self.assertEqual(meta["output_token_logprobs_length"], len(selected))
-                    self.assertEqual(meta["output_token_logprobs"], selected)
-                    alternatives = [[row, [row[0] - 1, 1, '"']] for row in selected]
-                    self.assertEqual(meta["output_top_logprobs"], alternatives)
+                        self.assertFalse(any("logprob" in key for key in frame["meta_info"]))
+                    else:
+                        assert_output_logprobs(self, frame, token_text, 2, alternative_text='"')
 
     def test_invalid_no_stop_trim_does_not_admit_batch(self):
-        before = len(receipts(self.log))
-        for value in (0, "true", [], {}):
-            with self.subTest(value=value):
-                params = [options(123, 2), options(123, 2, no_stop_trim=value)]
-                error = self.exchange(params, True, inputs=[[32], [33]], expected_status=400)
-                self.assertIn("no_stop_trim", error["error"]["message"])
-        self.assertEqual(len(receipts(self.log)), before)
+        self.check_invalid_batch(123, "no_stop_trim", (0, "true", [], {}))
 
     def test_per_item_batch_json_and_sse(self):
         a, b, c, d, *_ = self.letters
@@ -320,25 +319,10 @@ class NativeTextStops(unittest.TestCase):
         inputs = [[a], [a, b], [a, b, c]]
         expected = [("A", [a, b, c], stopped("BC")), ("ABCD", [a, b, c, d], length(4)),
                     ("h", [self.hello], stopped("ell"))]
-        plain = self.exchange(params, False, inputs=inputs)
-        frames = self.exchange(params, True, inputs=inputs)
-        self.assertEqual(len(plain), len(expected))
-        self.assertEqual({frame["index"] for frame in frames}, set(range(len(expected))))
-        for index, (text, ids, reason) in enumerate(expected):
-            with self.subTest(index=index):
-                self.assertNotIn("index", plain[index])
-                self.terminal(plain[index], text, ids, reason, index + 1)
-                lane = [frame for frame in frames if frame["index"] == index]
-                self.sequence(lane, text, ids, reason, prompts=index + 1)
+        self.check_batch(params, inputs, expected)
 
     def test_invalid_stop_does_not_admit_batch(self):
-        before = len(receipts(self.log))
-        for value in (3, {"text": "B"}, ["B", None], ["B"] * 33):
-            with self.subTest(value=value):
-                params = [options(123, 2, stop="B"), options(123, 2, stop=value)]
-                error = self.exchange(params, True, inputs=[[32], [33]], expected_status=400)
-                self.assertIn("stop", error["error"]["message"])
-        self.assertEqual(len(receipts(self.log)), before)
+        self.check_invalid_batch(123, "stop", (3, {"text": "B"}, ["B", None], ["B"] * 33), stop="B")
 
     def check_openai(self, port, seed, stop, text, ids, reason, budget):
         payload = body(TEXT, seed=seed, stop=stop, max_tokens=budget, temperature=0)

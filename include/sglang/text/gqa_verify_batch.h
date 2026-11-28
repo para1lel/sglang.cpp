@@ -50,6 +50,14 @@ cudaError_t gqa_verify_postgate(const GqaVerifyRows<GqaVerifyGateRow, Capacity>&
                                 int count, cudaStream_t stream,
                                 GqaGeometry geometry = gqa_full_geometry);
 
+cudaError_t
+gqa_verify_preprocess_bound(const GqaVerifyRows<GqaVerifyPreprocessRow, max_wide_mtp_rows>& batch,
+                            int rows, const int* rotary, GqaGeometry geometry, const Bf16* q_norm,
+                            const Bf16* k_norm, cudaStream_t stream);
+cudaError_t
+gqa_verify_append_bound(const GqaVerifyRows<GqaVerifyAppendRow, max_wide_mtp_rows>& batch,
+                        const PagedDecodeLane* reads, int rows, int kv_heads, cudaStream_t stream);
+
 bool cache_covers(Mxfp8KvCache cache, Mxfp8PageTable pages, std::int64_t token_count);
 PagedDecodeBuffers paged_gqa_buffers(Workspace& work);
 
@@ -58,9 +66,13 @@ bool try_gqa_verify_batch(const GqaLayer& layer, const VerificationRow* rows, in
                           cudaStream_t stream);
 
 bool try_gqa_verify_short(const GqaLayer& layer, const VerificationRow* rows, int count,
-                          int cache_index, bool vector_attention, cudaStream_t stream);
+                          int cache_index, bool vector_attention, cudaStream_t stream,
+                          bool share_kv = false);
 
 using GqaVerifySelection = std::array<bool, max_wide_mtp_rows>;
+
+int plan_gqa_verify_long(const VerificationRow* rows, int count, int cache_index,
+                         gqa_decode::LongBatch& read, GqaVerifySelection& selected);
 
 struct GqaVerifyRemainder {
     const void* context;

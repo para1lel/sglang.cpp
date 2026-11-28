@@ -58,7 +58,7 @@ __global__ __launch_bounds__(threads) void project_gdn_gate_partials(
         init_pipeline(pipe);
     }
     if (warp == mma_warp) {
-        allocate_tmem<columns, 1>(pipe);
+        allocate_tmem(&pipe.tmem, tmem_columns<columns, 1>);
     }
     __syncthreads();
     if (warp == copy_warp && lane == 0) {
@@ -83,7 +83,7 @@ __global__ __launch_bounds__(threads) void project_gdn_gate_partials(
     __syncthreads();
     if (warp == mma_warp) {
         fence_after_sync();
-        free_tmem<columns, 1>(pipe);
+        free_tmem(&pipe.tmem, tmem_columns<columns, 1>);
     }
     for (int index = threadIdx.x * 2; index < columns * gates; index += threads * 2) {
         const int local_row = index / gates;
@@ -116,14 +116,10 @@ __global__ void round_gdn_gates(const float* partials, int elements, Bf16* b, Bf
 
 CUresult encode_gate_map(const LaunchTarget& target, CUtensorMap& map, const Bf16* data,
                          int height, int tile) {
-    constexpr cuuint64_t stride[] = {hidden_size * sizeof(Bf16)};
-    const cuuint64_t dimensions[] = {stride[0], static_cast<cuuint64_t>(height)};
-    const cuuint32_t box[] = {128, static_cast<cuuint32_t>(tile)};
-    constexpr cuuint32_t step[] = {1, 1};
-    return target.encode(&map, CU_TENSOR_MAP_DATA_TYPE_UINT8, 2, const_cast<Bf16*>(data),
-                         dimensions, stride, box, step, CU_TENSOR_MAP_INTERLEAVE_NONE,
-                         CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE,
-                         CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+    return encode_tiled_map(
+        target.encode, map, data,
+        {CU_TENSOR_MAP_DATA_TYPE_UINT8, 1, height, hidden_size * sizeof(Bf16), tile},
+        CU_TENSOR_MAP_L2_PROMOTION_NONE);
 }
 
 cudaError_t take_launch_status(cudaError_t direct) {

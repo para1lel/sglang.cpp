@@ -13,14 +13,8 @@
 namespace sglang::server {
 namespace {
 
-[[noreturn]] void invalid(std::string_view field, std::string_view description) {
-    throw std::invalid_argument(std::string(field) + ": " + std::string(description));
-}
-
-const json::Value* supplied(const json::OrderedObject& object, std::string_view key) {
-    const auto* value = json::get(object, key);
-    return value && !value->is_null() ? value : nullptr;
-}
+using request_validation::invalid;
+using request_validation::optional_bool;
 
 std::string_view optional_text(const json::OrderedObject& object, std::string_view key) {
     if (const auto* value = supplied(object, key)) {
@@ -28,24 +22,6 @@ std::string_view optional_text(const json::OrderedObject& object, std::string_vi
         invalid(key, "Input should be a valid string");
     }
     return {};
-}
-
-bool read_flag(const json::Value* value, std::string_view key, bool fallback) {
-    if (!value) return fallback;
-    if (const auto flag = chat_boolean(*value)) return *flag;
-    invalid(key, "Input should be a valid boolean");
-}
-
-bool unicode_whitespace(char32_t character) {
-    return (character >= 9 && character <= 13) || character == 0x20 ||
-        character == 0x85 || character == 0xa0 || character == 0x1680 ||
-        (character >= 0x2000 && character <= 0x200a) || character == 0x2028 ||
-        character == 0x2029 || character == 0x202f || character == 0x205f ||
-        character == 0x3000;
-}
-
-bool python_whitespace(char32_t character) {
-    return (character >= 0x1c && character <= 0x1f) || unicode_whitespace(character);
 }
 
 bool context_integer(const json::Value& value) {
@@ -84,8 +60,8 @@ void validate_common(const json::OrderedObject& object) {
 void validate_generate(const json::OrderedObject& object) {
     optional_text(object, "suffix");
     optional_text(object, "template");
-    read_flag(json::get(object, "raw"), "raw", false);
-    read_flag(supplied(object, "think"), "think", false);
+    optional_bool(json::get(object, "raw"), "raw");
+    optional_bool(supplied(object, "think"), "think");
     if (const auto* value = supplied(object, "context")) {
         const auto* list = value->array();
         if (!list || !std::all_of(list->begin(), list->end(), context_integer)) {
@@ -125,7 +101,7 @@ void validate_chat(const json::OrderedObject& object) {
     const auto* think = supplied(object, "think");
     if (think && think->string() != "low" && think->string() != "medium" &&
         think->string() != "high") {
-        read_flag(think, "think", false);
+        optional_bool(think, "think");
     }
 }
 
@@ -174,7 +150,7 @@ OllamaRequest parse_ollama_request(std::string_view body, OllamaCompletion compl
         request.prompt = plain_prompt(*object);
     }
     validate_common(*object);
-    request.stream = read_flag(json::get(*object, "stream"), "stream", true);
+    request.stream = optional_bool(json::get(*object, "stream"), "stream", true);
     for (auto& [key, value] : *object) {
         if (key == "options" && !value.is_null()) {
             auto* options = value.ordered_object();

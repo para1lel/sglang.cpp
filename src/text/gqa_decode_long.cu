@@ -4,6 +4,7 @@
 
 #include <cuda.h>
 #include <cudaTypedefs.h>
+#include <type_traits>
 
 namespace sglang::gqa_decode {
 namespace {
@@ -167,13 +168,8 @@ struct alignas(128) RawTile {
     std::uint8_t scale[2][mxfp8_group_size][raw_scale_width];
 };
 
-struct alignas(128) TensorMaps {
-    CUtensorMap payload[2];
-    CUtensorMap scale[2];
-};
-
 struct BatchMaps {
-    TensorMaps requests[long_requests];
+    LongTensorMaps requests[long_requests];
 };
 
 struct alignas(1024) Shared {
@@ -270,7 +266,7 @@ __device__ __forceinline__ bool expand(std::uint16_t* target, int swizzled,
 }
 
 template <int Operand>
-__device__ void issue_raw(Shared& shared, const TensorMaps& maps, int kv_head, int kv_heads,
+__device__ void issue_raw(Shared& shared, const LongTensorMaps& maps, int kv_head, int kv_heads,
                           int begin, int chunks) {
     constexpr int tiles_per_page = mxfp8_page_size / raw_tokens;
     for (int tile = 0; tile < chunks; ++tile) {
@@ -550,12 +546,9 @@ __device__ void softmax(Shared& shared, const LongRequest& request, int begin, i
     }
 }
 
-template <int Splits, bool RemapRows = false>
-__global__ __launch_bounds__(threads, 1) void decode_long(
-    const __grid_constant__ LongBatch batch, const __grid_constant__ BatchMaps maps) {
-    alignas(1024) extern __shared__ unsigned char storage[];
-    auto& shared = *reinterpret_cast<Shared*>(storage);
-    const auto& request = batch.requests[blockIdx.z];
+template <int Splits, bool RemapRows>
+__device__ __forceinline__ void decode_long_body(Shared& shared, const LongRequest& request,
+                                                 const LongTensorMaps& maps) {
     const int last_position = request.first + request.count - 1;
     const int split = blockIdx.x;
     const int splits = Splits == max_splits ? split_count(last_position) : Splits;
@@ -580,11 +573,9 @@ __global__ __launch_bounds__(threads, 1) void decode_long(
     } else if (warp >= raw_warp) {
         if (threadIdx.x % 32 == 0) {
             if (warp == raw_warp) {
-                issue_raw<0>(shared, maps.requests[blockIdx.z], kv_head,
-                             request.cache.kv_heads, first, last - first);
+                issue_raw<0>(shared, maps, kv_head, request.cache.kv_heads, first, last - first);
             } else {
-                issue_raw<1>(shared, maps.requests[blockIdx.z], kv_head,
-                             request.cache.kv_heads, first, last - first);
+                issue_raw<1>(shared, maps, kv_head, request.cache.kv_heads, first, last - first);
             }
         }
     } else if (warp < value_warp) {
@@ -598,7 +589,37 @@ __global__ __launch_bounds__(threads, 1) void decode_long(
     if (warp == mma_warp) tensor_dealloc(shared.tensor, tensor_columns);
 }
 
-std::optional<cudaError_t> encode_maps(const LongBatch& batch, int requests, BatchMaps& maps) {
+__device__ __forceinline__ Shared& long_decode_shared() {
+    alignas(1024) extern __shared__ unsigned char storage[];
+    return *reinterpret_cast<Shared*>(storage);
+}
+
+template <int Splits, bool RemapRows = false>
+__global__ __launch_bounds__(threads, 1) void decode_long(const __grid_constant__ LongBatch batch,
+                                                          const __grid_constant__ BatchMaps maps) {
+    decode_long_body<Splits, RemapRows>(long_decode_shared(), batch.requests[blockIdx.z],
+                                        maps.requests[blockIdx.z]);
+}
+
+template <int Splits, bool RemapRows = false>
+__global__
+__launch_bounds__(threads, 1) void decode_bound_long(const __grid_constant__ BoundLongBatch batch) {
+    const auto& binding = *batch.requests[blockIdx.z];
+    const int warp = static_cast<int>(threadIdx.x) / 32;
+    if ((warp == raw_warp || warp == raw_warp + 1) && threadIdx.x % 32 == 0) {
+        const int operand = warp - raw_warp;
+        asm volatile("fence.proxy.tensormap::generic.acquire.gpu [%0], 128;" ::"l"(
+                         &binding.maps.payload[operand])
+                     : "memory");
+        asm volatile("fence.proxy.tensormap::generic.acquire.gpu [%0], 128;" ::"l"(
+                         &binding.maps.scale[operand])
+                     : "memory");
+    }
+    decode_long_body<Splits, RemapRows>(long_decode_shared(), binding.request, binding.maps);
+}
+
+std::optional<cudaError_t> encode_maps(const LongRequest* batch, int requests,
+                                       LongTensorMaps* maps) {
     void* symbol = nullptr;
     cudaDriverEntryPointQueryResult query{};
     const auto status = cudaGetDriverEntryPointByVersion(
@@ -618,7 +639,7 @@ std::optional<cudaError_t> encode_maps(const LongBatch& batch, int requests, Bat
     constexpr cuuint32_t scale_box[]{raw_scale_width, mxfp8_group_size, 1};
     constexpr cuuint32_t elements[]{1, 1, 1};
     for (int request = 0; request < requests; ++request) {
-        const auto& cache = batch.requests[request].cache;
+        const auto& cache = batch[request].cache;
         const auto pages = static_cast<cuuint64_t>(cache.page_count);
         const cuuint64_t payload_width =
             static_cast<cuuint64_t>(cache.kv_heads) * columns;
@@ -628,7 +649,7 @@ std::optional<cudaError_t> encode_maps(const LongBatch& batch, int requests, Bat
                                        pages * cache.kv_heads};
         void* payload[]{cache.key_payload, cache.value_payload};
         void* scale[]{cache.key_scales, cache.value_scales};
-        auto& map = maps.requests[request];
+        auto& map = maps[request];
         for (int operand = 0; operand < 2; ++operand) {
             auto result = encode(&map.payload[operand], CU_TENSOR_MAP_DATA_TYPE_UINT8, 2,
                                  payload[operand], payload_shape, payload_strides, payload_box,
@@ -654,7 +675,7 @@ std::optional<cudaError_t> encode_maps(const LongBatch& batch, int requests, Bat
     return cudaSuccess;
 }
 
-}   
+}
 
 cudaError_t long_decode_status(cudaError_t status) {
     const auto pending = cudaGetLastError();
@@ -663,14 +684,13 @@ cudaError_t long_decode_status(cudaError_t status) {
         ? pending : status;
 }
 
-std::optional<cudaError_t> launch_long_decode(const LongBatch& batch, int requests,
-                                             cudaStream_t stream) {
-    if (requests < 1 || requests > long_requests) return std::nullopt;
+LongDecodeShape long_decode_shape(const LongBatch& batch, int requests) {
     bool rank_wide = requests == long_rank_wide_requests;
     bool deep_rank = requests == decoder::wide_mtp_lanes;
     for (int index = 0; index < requests; ++index) {
         const auto& request = batch.requests[index];
-        if (request.count < 1 || request.count > long_rows) return std::nullopt;
+        if (request.count < 1 || request.count > long_rows)
+            return {};
         rank_wide &= request.count == long_rows &&
                      request.cache.kv_heads == gqa_rank_geometry.kv_heads &&
                      request.first >= long_min_position && request.first < long_rank_wide_end;
@@ -678,6 +698,16 @@ std::optional<cudaError_t> launch_long_decode(const LongBatch& batch, int reques
                      request.cache.kv_heads == gqa_rank_geometry.kv_heads &&
                      request.first >= 1024 * mxfp8_page_size;
     }
+    if (rank_wide)
+        return {long_rank_wide_splits, true};
+    if (requests == 1 && batch.requests[0].cache.kv_heads == gqa_rank_geometry.kv_heads &&
+        batch.requests[0].first >= long_min_position)
+        return {long_single_rank_splits, false};
+    return {max_splits, deep_rank};
+}
+
+namespace {
+std::optional<cudaError_t> long_decode_supported() {
     if (const auto pending = cudaPeekAtLastError(); pending != cudaSuccess) return pending;
     int device;
     auto status = long_decode_status(cudaGetDevice(&device));
@@ -688,22 +718,70 @@ std::optional<cudaError_t> launch_long_decode(const LongBatch& batch, int reques
     if (prop.major != 10 || prop.minor != 0 || prop.sharedMemPerBlockOptin < sizeof(Shared)) {
         return std::nullopt;
     }
-    BatchMaps maps{};
-    const auto encoded = encode_maps(batch, requests, maps);
-    if (const auto pending = cudaPeekAtLastError(); pending != cudaSuccess) return pending;
-    if (!encoded || *encoded != cudaSuccess) return encoded;
-    const int splits = rank_wide ? long_rank_wide_splits : max_splits;
-    const auto kernel = rank_wide ? decode_long<long_rank_wide_splits, true>
-        : deep_rank ? decode_long<max_splits, true> : decode_long<max_splits>;
-    status = long_decode_status(cudaFuncSetAttribute(
-        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, sizeof(Shared)));
-    if (status != cudaSuccess) return status;
-    void* arguments[] = {const_cast<LongBatch*>(&batch), &maps};
-    status = long_decode_status(cudaLaunchKernel(kernel,
-        dim3(splits, batch.requests[0].cache.kv_heads, requests), threads, arguments,
-        sizeof(Shared), stream));
-    if (status != cudaSuccess) return status;
-    return long_decode_status(combine_long_decode(batch, requests, splits, stream));
+    return cudaSuccess;
 }
 
+template <auto Regular, auto Remapped, auto Rank, auto Wide, typename Batch>
+cudaError_t submit_long_decode(const Batch& batch, int requests, int kv_heads,
+                               LongDecodeShape shape, void** arguments, cudaStream_t stream) {
+    auto kernel = shape.remap_rows ? Remapped : Regular;
+    if (shape.splits == long_rank_wide_splits) {
+        kernel = Wide;
+    } else if (shape.splits == long_single_rank_splits) {
+        kernel = Rank;
+    }
+    auto status = long_decode_status(
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, sizeof(Shared)));
+    if (status != cudaSuccess) return status;
+    status = long_decode_status(cudaLaunchKernel(kernel, dim3(shape.splits, kv_heads, requests),
+                                                 threads, arguments, sizeof(Shared), stream));
+    if (status != cudaSuccess) return status;
+    if constexpr (std::is_same_v<Batch, LongBatch>) {
+        return long_decode_status(combine_long_decode(batch, requests, shape.splits, stream));
+    } else {
+        return long_decode_status(
+            combine_long_decode(batch, requests, kv_heads, shape.splits, stream));
+    }
+}
+}
+
+std::optional<cudaError_t> prepare_long_decode_binding(LongGraphBinding& binding) {
+    const auto supported = long_decode_supported();
+    if (!supported || *supported != cudaSuccess)
+        return supported;
+    return encode_maps(&binding.request, 1, &binding.maps);
+}
+
+std::optional<cudaError_t> launch_long_decode(LongBatch& batch, int requests, cudaStream_t stream) {
+    if (requests < 1 || requests > long_requests)
+        return std::nullopt;
+    const auto shape = long_decode_shape(batch, requests);
+    if (shape.splits == 0)
+        return std::nullopt;
+    const auto supported = long_decode_supported();
+    if (!supported || *supported != cudaSuccess)
+        return supported;
+    BatchMaps maps{};
+    const auto encoded = encode_maps(batch.requests, requests, maps.requests);
+    if (const auto pending = cudaPeekAtLastError(); pending != cudaSuccess)
+        return pending;
+    if (!encoded || *encoded != cudaSuccess)
+        return encoded;
+    void* arguments[] = {&batch, &maps};
+    return submit_long_decode<decode_long<max_splits>, decode_long<max_splits, true>,
+                              decode_long<long_single_rank_splits>,
+                              decode_long<long_rank_wide_splits, true>>(
+        batch, requests, batch.requests[0].cache.kv_heads, shape, arguments, stream);
+}
+
+std::optional<cudaError_t> launch_long_decode(BoundLongBatch& batch, int requests, int kv_heads,
+                                              LongDecodeShape shape, cudaStream_t stream) {
+    if (requests < 1 || requests > long_requests || shape.splits == 0)
+        return std::nullopt;
+    void* arguments[] = {&batch};
+    return submit_long_decode<decode_bound_long<max_splits>, decode_bound_long<max_splits, true>,
+                              decode_bound_long<long_single_rank_splits>,
+                              decode_bound_long<long_rank_wide_splits, true>>(
+        batch, requests, kv_heads, shape, arguments, stream);
+}
 }

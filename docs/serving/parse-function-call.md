@@ -6,13 +6,13 @@ Send `POST /parse_function_call` to extract function calls from supplied Qwen-st
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| HTTP reader | Check the media type and dispatch the request. | [Media types](../../apps/server/http.cpp#L117)<!-- prefix: "bool json_me" --> · [Dispatch](../../apps/server/prefix_controls.cpp#L661)<!-- prefix: ": path == pa" --> |
-| Native parser | Validate the request, select the detector, and return the parsed text and calls. | [Request handler](../../apps/server/parse_function_call.cpp#L26)<!-- prefix: "void parse_f" --> · [Text parser](../../apps/server/qwen/qwen_tool_output.cpp#L468)<!-- prefix: "std::string " --> |
+| HTTP reader | Check the media type and enqueue the request on the CPU FIFO. | [Media types](../../apps/server/http.cpp#L224)<!-- prefix: "const auto p" --> · [Dispatch](../../apps/server/prefix_controls.cpp#L612)<!-- prefix: "enqueue_auxi" --> |
+| Native parser | Validate the request, select the detector, and return the parsed text and calls. | [Request handler](../../apps/server/parse_function_call.cpp#L95)<!-- prefix: "void parse_f" --> · [Text parser](../../apps/server/qwen/qwen_tool_output.cpp#L471)<!-- prefix: "std::string " --> |
 | SGLang reference | Define the upstream route and detector aliases. | [Pinned route](https://github.com/sgl-project/sglang/blob/f04d886bf79aa3d6237cbb12a3311838eb9f9bd8/python/sglang/srt/entrypoints/http_server.py#L1739)<!-- prefix: "@app.post(\"/" --> · [Pinned detector registry](https://github.com/sgl-project/sglang/blob/f04d886bf79aa3d6237cbb12a3311838eb9f9bd8/python/sglang/srt/function_call/function_call_parser.py#L110)<!-- prefix: "\"qwen3_coder" --> |
 
 ## Runtime path
 
-The HTTP reader parses the supplied text without a completion slot, tokenizer call, or model inference. The request selects the detector independently of the [chat parser flags](../chat-serving.md#qwen-reasoning-and-tool-calls).
+The [CPU FIFO](../http-server.md#http-admission-and-shutdown) shares one worker with tokenization, Anthropic token counting, and `/separate_reasoning`. The worker parses the supplied text without a completion slot, tokenizer call, or model inference. The request selects the detector independently of the [chat parser flags](../chat-serving.md#qwen-reasoning-and-tool-calls). [CPU worker](../../apps/server/prefix_controls.cpp#L796)<!-- prefix: "void Connect" -->
 
 With a nonempty `tools` array and a literal `<tool_call>` marker, `normal_text` contains the exact text before the first marker. Otherwise, `normal_text` contains the full input and `calls` is empty.
 
@@ -36,10 +36,11 @@ Send a JSON object within the [shared HTTP limits](../http-server.md#http-admiss
 | Missing, null, or unsupported parser name | HTTP 400 with a JSON error. |
 | Method other than POST on the canonical path | HTTP 405 with `Allow: POST`. |
 | Trailing slash | HTTP 307 under the [shared redirect rules](../http-server.md#request-targets-and-redirects). |
+| CPU FIFO full | HTTP 503 with a JSON `ServiceUnavailableError`. |
 
 ### Compatibility limits
 
-For object and array arguments, the parser tries JSON first, then a subset of Python literals. The subset includes dictionaries with string keys, lists, tuples, quoted strings, decimal numbers, `True`, `False`, and `None`. For example, `{'days': (1, 2), 'active': True}` becomes `{"days": [1, 2], "active": true}`. Inputs with non-string dictionary keys, hexadecimal numbers, or byte strings stay strings. [Native structured conversion](../../apps/server/qwen/qwen_tool_output.cpp#L332)<!-- prefix: "bool append_" --> · [Native literal parser](../../apps/server/tool_literal.cpp#L236)<!-- prefix: "std::optiona" --> · [SGLang literal fallback](https://github.com/sgl-project/sglang/blob/f04d886bf79aa3d6237cbb12a3311838eb9f9bd8/python/sglang/srt/function_call/qwen3_coder_detector.py#L181)<!-- prefix: "param_value " -->
+For object and array arguments, the parser tries JSON first, then a subset of Python literals. The subset includes dictionaries with string keys, lists, tuples, quoted strings, decimal numbers, `True`, `False`, and `None`. For example, `{'days': (1, 2), 'active': True}` becomes `{"days": [1, 2], "active": true}`. Inputs with non-string dictionary keys, hexadecimal numbers, or byte strings stay strings. [Native structured conversion](../../apps/server/qwen/qwen_tool_output.cpp#L335)<!-- prefix: "bool append_" --> · [Native literal parser](../../apps/server/tool_literal.cpp#L236)<!-- prefix: "std::optiona" --> · [SGLang literal fallback](https://github.com/sgl-project/sglang/blob/f04d886bf79aa3d6237cbb12a3311838eb9f9bd8/python/sglang/srt/function_call/qwen3_coder_detector.py#L181)<!-- prefix: "param_value " -->
 
 For a string argument with `anyOf` or `oneOf`, the parser checks JSON objects and arrays against the schema. It converts a value only when it can confirm a match. For `oneOf`, exactly one branch must match. For a tag such as `"kind": "city"`, add `kind` to the branch's `required` list. Set a `const` or scalar `enum` constraint on the `kind` property. The parser treats `discriminator` as an annotation.
 
@@ -47,7 +48,7 @@ Union conversion accepts JSON input and uses a subset of JSON Schema Draft 2020-
 
 The matcher resolves `$ref` from `function.parameters` using `#` or an object-key JSON Pointer such as `#/$defs/Lookup`. It supports `~0` and `~1` escapes. External references, named anchors, percent-encoded paths, array indexes, and nested `$id` scopes are outside this subset. A value stays a string if the parser cannot confirm a match within its supported rules, depth limit, and work budget. [Reference resolution](../../apps/server/tool_union.cpp#L163)<!-- prefix: "const json::" --> · [Depth and work limits](../../apps/server/tool_union.cpp#L155)<!-- prefix: "Match UnionM" --> · [SGLang union conversion](https://github.com/sgl-project/sglang/blob/f04d886bf79aa3d6237cbb12a3311838eb9f9bd8/python/sglang/srt/function_call/utils.py#L467)<!-- prefix: "def convert_" -->
 
-The request body rejects bare `NaN` and `Infinity`. Numeric argument text can produce these tokens inside `parameters`, where strict JSON decoders reject them. A floating-point value outside the JSON decoder's range causes HTTP 400 in the request body. If a structured argument contains such a value, the parser keeps the original argument text as a string. [JSON number parser](../../src/json.cpp#L195)<!-- prefix: "Value Parser" --> · [Argument number writer](../../apps/server/qwen/qwen_tool_output.cpp#L232)<!-- prefix: "void append_" -->
+The request body rejects bare `NaN` and `Infinity`. Numeric argument text can produce these tokens inside `parameters`, where strict JSON decoders reject them. A floating-point value outside the JSON decoder's range causes HTTP 400 in the request body. If a structured argument contains such a value, the parser keeps the original argument text as a string. [JSON number parser](../../src/json.cpp#L195)<!-- prefix: "Value Parser" --> · [Argument number writer](../../apps/server/qwen/qwen_tool_output.cpp#L235)<!-- prefix: "void append_" -->
 
 Validation messages can differ from SGLang.
 

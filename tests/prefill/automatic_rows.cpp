@@ -1,4 +1,6 @@
 #include "sglang/decoder.h"
+#include "sglang/runtime/backend/cuda_resources.h"
+#include "sglang/runtime/backend/device_arena.h"
 
 #include <cuda_runtime_api.h>
 
@@ -11,8 +13,15 @@
 #include <utility>
 #include <vector>
 
-extern "C" cudaError_t __real_cudaMallocFromPoolAsync(void**, std::size_t, cudaMemPool_t,
-                                                      cudaStream_t);
+using sglang::decoder::CudaError;
+using sglang::decoder::DeviceArena;
+
+extern "C" void*
+real_arena_lease(DeviceArena* arena,
+                 std::size_t bytes) asm("__real__ZN6sglang7decoder11DeviceArena8allocateEm");
+extern "C" void*
+wrap_arena_lease(DeviceArena* arena,
+                 std::size_t bytes) asm("__wrap__ZN6sglang7decoder11DeviceArena8allocateEm");
 
 namespace {
 
@@ -24,6 +33,11 @@ constexpr std::size_t bytes_1024 = 255557632;
 constexpr int vocabulary = 248320;
 std::vector<Attempt> attempts;
 std::size_t reject_at = 0;
+
+bool& observe() {
+    static bool active = false;
+    return active;
+}
 
 void require(bool condition, const char* message) {
     if (!condition) {
@@ -41,12 +55,17 @@ std::vector<int> prompt(int length) {
     return result;
 }
 
-sglang::DecoderResult generate(const sglang::Decoder& decoder, int length,
-                               std::size_t reject, const char* label,
-                               const std::vector<Attempt>& expected) {
+sglang::DecoderResult generate(const sglang::Decoder& decoder, int length, const char* label,
+                               std::size_t reject, const std::vector<Attempt>& expected,
+                               int rows = 0) {
     attempts.clear();
     reject_at = reject;
-    const auto result = decoder.generate(prompt(length), {.top_logits = vocabulary});
+    observe() = true;
+    sglang::DecoderOptions options;
+    options.top_logits = vocabulary;
+    options.max_num_batched_tokens = rows;
+    const auto result = decoder.generate(prompt(length), options);
+    observe() = false;
     reject_at = 0;
     std::cout << label << " prompt=" << length << " allocations=";
     for (const auto& [bytes, status] : attempts) {
@@ -73,30 +92,36 @@ void compare(const sglang::DecoderResult& control, const sglang::DecoderResult& 
 
 }
 
-extern "C" cudaError_t __wrap_cudaMallocFromPoolAsync(void** storage, std::size_t bytes,
-                                                      cudaMemPool_t pool, cudaStream_t stream) {
-    const auto status = reject_at && bytes >= reject_at
-        ? cudaErrorMemoryAllocation : __real_cudaMallocFromPoolAsync(storage, bytes, pool, stream);
-    attempts.emplace_back(bytes, status);
-    return status;
+void* wrap_arena_lease(DeviceArena* arena, std::size_t bytes) {
+    constexpr auto row_bytes = bytes_128 / 128;
+    if (!observe() || bytes < bytes_128 || bytes > bytes_1024 || bytes % row_bytes != 0)
+        return real_arena_lease(arena, bytes);
+    if (reject_at != 0 && bytes >= reject_at) {
+        attempts.emplace_back(bytes, cudaErrorMemoryAllocation);
+        throw CudaError(cudaErrorMemoryAllocation, "Test prefill workspace arena exhaustion");
+    }
+    auto* storage = real_arena_lease(arena, bytes);
+    attempts.emplace_back(bytes, cudaSuccess);
+    return storage;
 }
 
 int main(int argc, char** argv) try {
     require(argc == 2, "Usage: automatic-rows CHECKPOINT (reserved NVIDIA B200 visible)");
     const sglang::Decoder decoder(argv[1]);
-    generate(decoder, 128, 0, "128 rows", {{bytes_128, cudaSuccess}});
-    generate(decoder, 129, 0, "129 rows", {{bytes_129, cudaSuccess}});
-    generate(decoder, 1025, 0, "1024 rows and tail", {{bytes_1024, cudaSuccess}});
-    const auto control = generate(decoder, 512, 0, "512 rows", {{bytes_512, cudaSuccess}});
-    compare(control, generate(decoder, 512, bytes_512, "retry-small",
-                              {{bytes_512, cudaErrorMemoryAllocation},
-                               {bytes_128, cudaSuccess}}));
+    generate(decoder, 128, "128 rows", 0, {{bytes_128, cudaSuccess}});
+    generate(decoder, 129, "129 rows", 0, {{bytes_129, cudaSuccess}});
+    generate(decoder, 1025, "1024 rows and tail", 0, {{bytes_1024, cudaSuccess}});
+    const auto control = generate(decoder, 512, "512 rows", 0, {{bytes_512, cudaSuccess}});
+    const auto tiled = generate(decoder, 512, "128-row tiles", 0, {{bytes_128, cudaSuccess}}, 128);
+    require(tiled.output_token_ids == control.output_token_ids, "128-row tiles changed the token");
+    compare(tiled, generate(decoder, 512, "retry-small", bytes_512,
+                            {{bytes_512, cudaErrorMemoryAllocation}, {bytes_128, cudaSuccess}}));
     const std::vector<Attempt> rowwise_failures{
         {bytes_512, cudaErrorMemoryAllocation}, {bytes_128, cudaErrorMemoryAllocation}};
-    const auto rowwise = generate(decoder, 512, bytes_128, "retry-row-wise", rowwise_failures);
-    compare(rowwise, generate(decoder, 512, bytes_128, "repeat-row-wise", rowwise_failures));
-    compare(control, generate(decoder, 512, 0, "after-allocation-failure",
-                              {{bytes_512, cudaSuccess}}));
+    const auto rowwise = generate(decoder, 512, "retry-row-wise", bytes_128, rowwise_failures);
+    compare(rowwise, generate(decoder, 512, "direct-row-wise", 0, {}, 1));
+    compare(control,
+            generate(decoder, 512, "after-allocation-failure", 0, {{bytes_512, cudaSuccess}}));
     std::cout << "Automatic serial prefill selection passed\n";
     return 0;
 } catch (const std::exception& error) {

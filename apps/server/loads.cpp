@@ -259,44 +259,80 @@ void append_tp_ar_metrics(std::string& text, const decoder::TpArCounters& counte
     }
 }
 
+template <typename Emit>
+void emit_resident_prefix_metrics(const DecoderPrefixCacheStats& cache, const Emit& emit) {
+    emit("sglang_cpp:prefix_cache_entries", cache.entries);
+    emit("sglang_cpp:prefix_cache_pages", cache.pages);
+    emit("sglang_cpp:prefix_cache_device_bytes", cache.device_bytes);
+    emit("sglang_cpp:prefix_cache_hits_total", cache.hits);
+    emit("sglang_cpp:prefix_cache_stores_total", cache.stores);
+    emit("sglang_cpp:prefix_cache_evictions_total", cache.evictions);
+    emit("sglang_cpp:prefix_cache_draft_device_bytes", cache.draft_device_bytes);
+    emit("sglang_cpp:prefix_cache_draft_cached_rows_total", cache.draft_cached_rows);
+    emit("sglang_cpp:prefix_cache_draft_prefill_rows_total", cache.draft_prefill_rows);
+    emit("sglang_cpp:prefix_cache_draft_misses_total", cache.draft_misses);
+    emit("sglang_cpp:prefix_gqa_page_capacity", cache.gqa_page_capacity);
+    emit("sglang_cpp:prefix_gdn_slot_capacity", cache.gdn_slot_capacity);
+    emit("sglang_cpp:prefix_gqa_resident_hits_total", cache.gqa_resident_hits);
+    emit("sglang_cpp:prefix_gqa_resident_tokens_total", cache.gqa_resident_tokens);
+    emit("sglang_cpp:prefix_gdn_resident_hits_total", cache.gdn_resident_hits);
+    emit("sglang_cpp:prefix_gdn_resident_tokens_total", cache.gdn_resident_tokens);
+    emit("sglang_cpp:prefix_backups_started_total", cache.backups_started);
+    emit("sglang_cpp:prefix_backups_completed_total", cache.backups_completed);
+    emit("sglang_cpp:prefix_backups_failed_total", cache.backups_failed);
+    emit("sglang_cpp:prefix_backed_evictions_total", cache.backed_evictions);
+    emit("sglang_cpp:prefix_unbacked_evictions_total", cache.unbacked_evictions);
+}
 }
 
 std::string format_metrics(const BatchMetrics& metrics, int running, std::size_t waiting) {
-    std::string text = "# Native sglang.cpp metrics with frozen W3-prefix compatibility names\n";
+    std::string text = "# Native sglang.cpp metrics\n";
     const auto emit = [&text](std::string_view name, auto value) {
         text += name;
         text += "{engine=\"0\"} ";
         text += std::to_string(value);
         text += '\n';
     };
-    const int capacity = metrics.cache_capacity * (decoder_batch_prefix_max_tokens /
-                                                   mxfp8_page_size);
+    const int capacity = metrics.cache.gqa_page_capacity;
     emit("vllm:num_requests_running", running);
     emit("vllm:num_requests_waiting", waiting);
-    emit("vllm:kv_cache_usage_perc", capacity ? double(metrics.cache.pages) / capacity : 0.0);
+    emit("vllm:kv_cache_usage_perc",
+         capacity > 0 ? static_cast<double>(metrics.cache.pages) / capacity : 0.0);
     emit("vllm:prompt_tokens_total", metrics.prompt_tokens);
     emit("vllm:generation_tokens_total", metrics.generation_tokens);
     emit("vllm:external_prefix_cache_hits_total", 0);
     emit("vllm:prefix_cache_hits_total", metrics.cache.cached_tokens);
     emit("vllm:request_prefill_kv_computed_tokens_count", metrics.prefill_requests);
     emit("vllm:request_prefill_kv_computed_tokens_sum", metrics.cache.prefill_tokens);
-    emit("sglang_cpp:prefix_cache_entries", metrics.cache.entries);
-    emit("sglang_cpp:prefix_cache_pages", metrics.cache.pages);
-    emit("sglang_cpp:prefix_cache_device_bytes", metrics.cache.device_bytes);
-    emit("sglang_cpp:prefix_cache_hits_total", metrics.cache.hits);
-    emit("sglang_cpp:prefix_cache_stores_total", metrics.cache.stores);
-    emit("sglang_cpp:prefix_cache_evictions_total", metrics.cache.evictions);
-    emit("sglang_cpp:prefix_cache_draft_device_bytes", metrics.cache.draft_device_bytes);
-    emit("sglang_cpp:prefix_cache_draft_cached_rows_total", metrics.cache.draft_cached_rows);
-    emit("sglang_cpp:prefix_cache_draft_prefill_rows_total", metrics.cache.draft_prefill_rows);
-    emit("sglang_cpp:prefix_cache_draft_misses_total", metrics.cache.draft_misses);
+    emit_resident_prefix_metrics(metrics.cache, emit);
+    emit("sglang_cpp:resident_admission_retries_total", metrics.resident_admission_retries);
+    emit("sglang_cpp:mailbox_grace_timeouts_total", metrics.mailbox_grace_timeouts);
+    emit("sglang_cpp:admission_waiting_for_capacity", metrics.admission_waiting_for_capacity);
+    emit("sglang_cpp:admission_waiting_for_lookup", metrics.admission_waiting_for_lookup);
+    emit("sglang_cpp:admission_waiting_for_restore", metrics.admission_waiting_for_restore);
     emit("sglang_cpp:lmcache_enabled", metrics.lmcache.enabled);
     emit("sglang_cpp:lmcache_available", metrics.lmcache.available);
     emit("sglang_cpp:lmcache_lookup_misses_total", metrics.lmcache.lookup_misses);
     emit("sglang_cpp:lmcache_io_errors_total", metrics.lmcache.io_errors);
     emit("sglang_cpp:lmcache_stores_total", metrics.lmcache.stores);
+    emit("sglang_cpp:lmcache_prefill_checkpoint_stores_total",
+         metrics.lmcache.prefill_checkpoint_stores);
+    emit("sglang_cpp:lmcache_prefill_checkpoint_failures_total",
+         metrics.lmcache.prefill_checkpoint_failures);
+    emit("sglang_cpp:lmcache_prefill_checkpoints_planned_total",
+         metrics.cache.prefill_checkpoints_planned);
+    emit("sglang_cpp:lmcache_prefill_checkpoints_resident_total",
+         metrics.cache.prefill_checkpoints_resident);
+    emit("sglang_cpp:lmcache_prefill_checkpoints_published_total",
+         metrics.cache.prefill_checkpoints_published);
+    emit("sglang_cpp:lmcache_prefill_checkpoints_declined_total",
+         metrics.cache.prefill_checkpoints_declined);
     emit("sglang_cpp:lmcache_declined_stores_total", metrics.lmcache.declined_stores);
     emit("sglang_cpp:lmcache_pending_stores", metrics.lmcache.pending_stores);
+    emit("sglang_cpp:decoder_pending_release_bytes", metrics.cache.pending_release_bytes);
+    emit("sglang_cpp:decoder_failed_release_bytes", metrics.cache.failed_release_bytes);
+    emit("sglang_cpp:lmcache_gqa_matched_tokens_total", metrics.cache.gqa_matched_tokens);
+    emit("sglang_cpp:lmcache_gdn_matched_tokens_total", metrics.cache.gdn_matched_tokens);
     emit("sglang_cpp:lmcache_gqa_restored_tokens_total", metrics.cache.gqa_restored_tokens);
     emit("sglang_cpp:lmcache_gqa_read_only_tokens_total", metrics.cache.gqa_read_only_tokens);
     emit("sglang_cpp:lmcache_gqa_computed_tokens_total", metrics.cache.gqa_computed_tokens);

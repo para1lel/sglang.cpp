@@ -1,3 +1,5 @@
+#include "fixtures/service_mtp_mailbox_fixture.h"
+
 #include "sglang/runtime/server/single_device_batch_executor.h"
 #include "sglang/server/batch_service.h"
 #include "sglang/server/text_stop.h"
@@ -5,7 +7,6 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
-#include <condition_variable>
 #include <cstdlib>
 #include <future>
 #include <iostream>
@@ -16,16 +17,9 @@
 #include <string_view>
 #include <utility>
 
-namespace {
-using namespace sglang;
-using namespace sglang::server;
-using namespace std::chrono_literals;
-using Selection = std::array<bool, decoder_batch_max_lanes>;
-using Steps = std::array<DecoderBatchStep, decoder_batch_max_lanes>;
-using Finish = DecoderFinishReason;
+namespace sglang::server::mailbox_fixture {
 
-enum class Outcome { length, abort, disconnect, failure };
-enum class Arrival { none, during_admit, during_advance, aborted, disconnected, blocked_writer };
+using namespace std::chrono_literals;
 
 void require(bool condition, const char* message) {
     if (!condition) {
@@ -34,53 +28,56 @@ void require(bool condition, const char* message) {
     }
 }
 
-struct Barrier {
-    bool entered = false;
-    bool released = false;
-};
+namespace {
+Fixture*& active_fixture() {
+    static Fixture* active = nullptr;
+    return active;
+}
+}
 
-struct Fixture {
-    std::mutex mutex;
-    std::condition_variable changed;
-    Barrier seed, writer, peer, fault;
-    Barrier before_claim, after_claim;
-    Barrier prefill_admit, prefill_advance;
-    std::array<Barrier, decoder_batch_max_lanes> consumers{};
-    std::array<int, decoder_batch_max_lanes> admissions{};
-    std::vector<int> admission_order;
-    std::vector<Selection> prefill_grants;
-    bool inspect_prefill = false;
-    int max_lanes = 4;
-    int hold_prefill_slot = 0;
-    int fail_admission_slot = -1;
-    int primary_steps = 0;
-    int fail_at = 0;
-    int cancels = 0;
-    int terminal_stores = 0;
-    bool claim_terminal = false;
-    bool fail_after_claim = false;
-    bool permanent = false;
-    bool unavailable = false;
+Fixture::Fixture() {
+    active_fixture() = this;
+}
+Fixture::~Fixture() {
+    active_fixture() = nullptr;
+}
+Fixture* Fixture::current() {
+    return active_fixture();
+}
 
-    template<class Predicate>
-    void await(std::unique_lock<std::mutex>& lock, Predicate ready,
-               const char* message = "Timed out at a decoder or writer barrier") {
-        require(changed.wait_for(lock, 5s, ready), message);
-    }
+void Fixture::await(std::unique_lock<std::mutex>& lock, const std::function<bool()>& ready,
+                    const char* message) {
+    require(changed.wait_for(lock, 5s, ready), message);
+}
 
-    void hold(std::unique_lock<std::mutex>& lock, Barrier& barrier) {
-        barrier.entered = true;
-        changed.notify_all();
-        await(lock, [&] { return barrier.released; });
-    }
+void Fixture::wait_for(const Barrier& barrier) {
+    std::unique_lock lock(mutex);
+    await(lock, [&] { return barrier.entered; });
+}
 
-    void release(Barrier& barrier) {
-        barrier.released = true;
-        changed.notify_all();
-    }
-};
+void Fixture::hold(std::unique_lock<std::mutex>& lock, Barrier& barrier) {
+    barrier.entered = true;
+    changed.notify_all();
+    await(lock, [&] { return barrier.released; });
+}
 
-Fixture* fixture;
+void Fixture::release(Barrier& barrier) {
+    barrier.released = true;
+    changed.notify_all();
+}
+
+}
+
+namespace {
+using namespace sglang;
+using namespace sglang::server;
+using namespace sglang::server::mailbox_fixture;
+using namespace std::chrono_literals;
+using Steps = std::array<DecoderBatchStep, decoder_batch_max_lanes>;
+using Finish = DecoderFinishReason;
+
+enum class Outcome { length, abort, disconnect, failure };
+enum class Arrival { none, during_admit, during_advance, aborted, disconnected, blocked_writer };
 
 std::vector<int> prefix(std::size_t length) {
     std::vector<int> ids(length);
@@ -107,7 +104,6 @@ void run_arrival(BatchService& service) {
 
 void check_scalar_output(Outcome outcome) {
     Fixture observed;
-    fixture = &observed;
     if (outcome == Outcome::failure) {
         observed.fail_at = 3;
         observed.fault.released = true;
@@ -180,7 +176,6 @@ void check_scalar_output(Outcome outcome) {
 
 void check_backpressure(DecoderOptions options, bool opt_in) {
     Fixture observed;
-    fixture = &observed;
     const Decoder decoder({}, 0, true);
     BatchService service(std::make_unique<SingleDeviceBatchExecutor>(decoder,
         BatchExecutor::Options{true, 4, 0, decoder_default_max_num_batched_tokens}), false, 4);
@@ -214,7 +209,6 @@ void check_backpressure(DecoderOptions options, bool opt_in) {
 
 void check_step_delivery(bool stop, bool permanent) {
     Fixture observed;
-    fixture = &observed;
     observed.permanent = permanent;
     observed.fault.released = true;
     const Decoder decoder({}, 0, true);
@@ -280,7 +274,6 @@ void check_step_delivery(bool stop, bool permanent) {
 
 void check_abort_fault(bool permanent) {
     Fixture observed;
-    fixture = &observed;
     observed.fail_at = 3;
     observed.permanent = permanent;
     const Decoder decoder({}, 0, true);
@@ -351,7 +344,6 @@ void check_abort_fault(bool permanent) {
 
 void check_completion_claim(bool abort_first, bool fail_after_claim) {
     Fixture observed;
-    fixture = &observed;
     observed.claim_terminal = true;
     observed.fail_after_claim = fail_after_claim;
     const Decoder decoder({}, 0, true);
@@ -425,7 +417,6 @@ void check_prefill_output(const DecoderResult& result, int token) {
 
 void check_prefill_roster(Arrival arrival, bool trace = false) {
     Fixture observed;
-    fixture = &observed;
     observed.inspect_prefill = true;
     const bool in_flight = arrival == Arrival::during_advance;
     observed.prefill_admit.released = in_flight || arrival == Arrival::none;
@@ -511,7 +502,6 @@ void check_prefill_roster(Arrival arrival, bool trace = false) {
 
 void check_prefill_publication_order() {
     Fixture observed;
-    fixture = &observed;
     observed.inspect_prefill = true;
     observed.max_lanes = 8;
     observed.prefill_admit.released = true;
@@ -546,7 +536,6 @@ void check_prefill_publication_order() {
 
 void check_prefill_replacement_order(bool fail_admission) {
     Fixture observed;
-    fixture = &observed;
     observed.inspect_prefill = true;
     observed.hold_prefill_slot = 2;
     observed.fail_admission_slot = fail_admission ? 0 : -1;
@@ -627,6 +616,8 @@ void check_prefill_trace() {
 }
 
 namespace sglang {
+using namespace server::mailbox_fixture;
+
 struct Tokenizer::Model {};
 Tokenizer::Tokenizer(const std::filesystem::path&) {}
 Tokenizer::~Tokenizer() = default;
@@ -642,18 +633,35 @@ struct DecoderBatch::State {
         std::function<bool()> claim_completion;
     };
     std::array<Lane, decoder_batch_max_lanes> lanes{};
+    Fixture* fixture = Fixture::current();
 };
 
 DecoderBatch::DecoderBatch(const Decoder&, DecoderBatchOptions options)
     : state_(std::make_unique<State>()) {
-    require(options.max_lanes == fixture->max_lanes && options.cuda_graphs,
+    require(options.max_lanes == Fixture::current()->max_lanes && options.cuda_graphs,
             "Unexpected worker configuration");
 }
 DecoderBatch::~DecoderBatch() = default;
-int DecoderBatch::admit(int slot, std::vector<int> prompt, const DecoderOptions& options) {
+int DecoderBatch::admit(int slot, const std::vector<int>& prompt, const DecoderOptions& options) {
+    auto* const fixture = Fixture::current();
     auto& lane = state_->lanes[slot];
-    require((prompt.size() == 1 || fixture->inspect_prefill) && !lane.remaining,
+    require((prompt.size() == 1 || fixture->inspect_prefill) && lane.remaining == 0,
             "Bad or reused live slot");
+    if (fixture->limit_capacity) {
+        const bool busy = slot == 1
+                              ? fixture->exhaust_capacity || state_->lanes[0].remaining != 0 ||
+                                    state_->lanes[2].remaining != 0
+                              : state_->lanes[1].remaining != 0;
+        std::unique_lock lock(fixture->mutex);
+        if (busy) {
+            if (++fixture->capacity_rejections == 1) {
+                fixture->hold(lock, fixture->capacity_rejected);
+            }
+            fixture->changed.notify_all();
+            throw DecoderCapacityError("fixture resident capacity busy", true);
+        }
+        fixture->capacity_admissions.push_back(slot);
+    }
     if (slot == fixture->fail_admission_slot) {
         fixture->fail_admission_slot = -1;
         throw std::runtime_error("fixture step failure");
@@ -671,16 +679,32 @@ int DecoderBatch::admit(int slot, std::vector<int> prompt, const DecoderOptions&
     }
     return 0;
 }
-int DecoderBatch::admit_multimodal(int, std::vector<int>, const DecoderOptions&,
-                                  const std::vector<DecoderMedia>&) { std::abort(); }
+
+int DecoderBatch::admit(int slot, std::vector<int>&& prompt, const DecoderOptions& options) {
+    auto owned = std::move(prompt);
+    try {
+        return admit(slot, owned, options);
+    } catch (...) {
+        prompt = std::move(owned);
+        throw;
+    }
+}
+int DecoderBatch::admit_multimodal(int slot, std::vector<int>&& prompt,
+                                   const DecoderOptions& options,
+                                   const std::vector<DecoderMedia>& media) {
+    require(media.empty(), "Unexpected multimodal admission");
+    return admit(slot, std::move(prompt), options);
+}
 void DecoderBatch::cancel(int slot) {
+    auto* const fixture = Fixture::current();
     require(std::exchange(state_->lanes[slot].remaining, 0) > 0, "Cancel of a retired slot");
-    const std::lock_guard lock(fixture->mutex);
+    const std::scoped_lock lock(fixture->mutex);
     ++fixture->cancels;
     fixture->changed.notify_all();
 }
 
-void publish_fixture_checkpoint(const std::function<bool()>& claim, DecoderBatchStep& step) {
+static void publish_fixture_checkpoint(const std::function<bool()>& claim, DecoderBatchStep& step) {
+    auto* const fixture = Fixture::current();
     std::unique_lock lock(fixture->mutex);
     fixture->hold(lock, fixture->before_claim);
     lock.unlock();
@@ -697,6 +721,7 @@ void publish_fixture_checkpoint(const std::function<bool()>& claim, DecoderBatch
 }
 
 Steps DecoderBatch::advance_chunked(const Selection& selected, DecoderBatchStepStats*) {
+    auto* const fixture = Fixture::current();
     if (fixture->inspect_prefill) {
         std::unique_lock lock(fixture->mutex);
         fixture->prefill_grants.push_back(selected);
@@ -750,15 +775,18 @@ Steps DecoderBatch::advance_chunked(const Selection& selected, DecoderBatchStepS
     return steps;
 }
 
-bool DecoderBatch::available() const { return !fixture->unavailable; }
+bool DecoderBatch::available() const {
+    return !state_->fixture->unavailable;
+}
 void DecoderBatch::reset_prefix_cache() {}
 }
 
 int main(int argc, char** argv) {
     const std::string_view mode = argc == 2 ? argv[1] : "all";
-    require(argc <= 2 && (mode == "all" || mode == "scalar" || mode == "backpressure" ||
-                          mode == "step" || mode == "abort" || mode == "prefill" ||
-                          mode == "trace"), "Unknown mailbox scenario");
+    require(argc <= 2 &&
+                (mode == "all" || mode == "scalar" || mode == "backpressure" || mode == "step" ||
+                 mode == "abort" || mode == "prefill" || mode == "trace" || mode == "progress"),
+            "Unknown mailbox scenario");
     if (mode == "all" || mode == "scalar") {
         for (auto outcome : {Outcome::length, Outcome::abort,
                              Outcome::disconnect, Outcome::failure}) {
@@ -793,6 +821,9 @@ int main(int argc, char** argv) {
         check_completion_claim(false, false);
         check_completion_claim(false, true);
         std::cout << "Abort ownership across recoverable and permanent failures passed\n";
+    }
+    if (mode == "all" || mode == "progress") {
+        check_progress();
     }
     if (mode == "all" || mode == "trace") check_prefill_trace();
     if (mode == "all" || mode == "prefill") {

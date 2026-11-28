@@ -4,6 +4,7 @@
 #include <cuda_bf16.h>
 #include <math_constants.h>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 
@@ -609,8 +610,8 @@ int input_kv_heads(const TargetLane& lane) {
     return lane.bound.position ? mxfp8_kv_heads : lane.eager.cache.kv_heads;
 }
 
-int input_kv_heads(const TargetBatch&) {
-    return mxfp8_kv_heads;
+int input_kv_heads(const TargetBatch& batch) {
+    return batch.kv_heads;
 }
 
 int input_kv_heads(const EagerTargetBatch& batch) {
@@ -636,8 +637,8 @@ constexpr int reuse_requests = decoder::target_split_eager_max_rows / reuse_rows
 constexpr int reuse_threads = reuse_rows * threads;
 static_assert(reuse_rows == 5 && reuse_requests == 4);
 
-struct ReusePacket {
-    decoder::PagedDecodeLane rows[reuse_requests][reuse_rows];
+template <typename Lane> struct ReusePacket {
+    Lane rows[reuse_requests][reuse_rows];
 };
 
 struct ReuseStorage {
@@ -650,14 +651,25 @@ struct ReuseStorage {
     Query queries[reuse_rows];
 };
 
-__global__ __launch_bounds__(reuse_threads, 1)
-void reuse_split_kernel(const __grid_constant__ ReusePacket input) {
+__device__ decoder::PagedDecodeLane reuse_lane(decoder::PagedDecodeLane lane) {
+    return lane;
+}
+
+__device__ decoder::PagedDecodeLane reuse_lane(decoder::BoundPagedDecodeLane lane) {
+    const decoder::PagedDecodeLane eager{};
+    return resolve(TargetLane{eager, lane, text_attention_max_tokens});
+}
+
+template <typename Lane>
+__global__
+__launch_bounds__(reuse_threads,
+                  1) void reuse_split_kernel(const __grid_constant__ ReusePacket<Lane> input) {
     alignas(16) extern __shared__ unsigned char shared_raw[];
     auto& shared = *reinterpret_cast<ReuseStorage*>(shared_raw);
     const auto& group = input.rows[blockIdx.z];
-    const auto& newest = group[reuse_rows - 1];
+    const auto newest = reuse_lane(group[reuse_rows - 1]);
     const int query_index = threadIdx.x / threads;
-    const auto& lane = group[query_index];
+    const auto lane = reuse_lane(group[query_index]);
     const int position = lane.position;
     const int split = blockIdx.x;
     const int kv_head = blockIdx.y;
@@ -725,7 +737,8 @@ bool same_cache(const decoder::PagedDecodeLane& a, const decoder::PagedDecodeLan
            a.cache.page_count == b.cache.page_count;
 }
 
-bool make_reuse_packet(const EagerTargetBatch& batch, int count, ReusePacket& packet) {
+bool make_reuse_packet(const EagerTargetBatch& batch, int count,
+                       ReusePacket<decoder::PagedDecodeLane>& packet) {
     if (count != reuse_requests * reuse_rows || batch.end != text_attention_max_tokens) {
         return false;
     }
@@ -778,24 +791,21 @@ std::optional<cudaError_t> reuse_failure(cudaError_t status, bool can_fall_back)
     return std::nullopt;
 }
 
-std::optional<cudaError_t> launch_reuse(const EagerTargetBatch& batch, int count,
-                                       cudaStream_t stream) {
-    ReusePacket packet;
-    if (!make_reuse_packet(batch, count, packet)) {
-        return std::nullopt;
-    }
+template <typename Lane>
+std::optional<cudaError_t> launch_reuse(const ReusePacket<Lane>& packet, int kv_heads,
+                                        cudaStream_t stream) {
     if (const auto pending = cudaPeekAtLastError(); pending != cudaSuccess) {
         return pending;
     }
-    const auto kernel = reuse_split_kernel;
+    const auto kernel = reuse_split_kernel<Lane>;
     auto status = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                        sizeof(ReuseStorage));
     if (status != cudaSuccess) {
         return reuse_failure(status, status == cudaErrorInvalidValue ||
                                          reuse_kernel_unavailable(status));
     }
-    void* arguments[] = {&packet};
-    const dim3 blocks(max_splits, packet.rows[0][0].cache.kv_heads, reuse_requests);
+    void* arguments[] = {const_cast<ReusePacket<Lane>*>(&packet)};
+    const dim3 blocks(max_splits, kv_heads, reuse_requests);
     status = cudaLaunchKernel(kernel, blocks, reuse_threads, arguments, sizeof(ReuseStorage),
                               stream);
     if (status != cudaSuccess) {
@@ -805,12 +815,41 @@ std::optional<cudaError_t> launch_reuse(const EagerTargetBatch& batch, int count
     }
     return cudaSuccess;
 }
-
 }
 
 std::optional<cudaError_t> try_launch_reuse(const EagerTargetBatch& batch, int count,
                                            cudaStream_t stream) {
-    return launch_reuse(batch, count, stream);
+    ReusePacket<decoder::PagedDecodeLane> packet;
+    if (!make_reuse_packet(batch, count, packet))
+        return std::nullopt;
+    return launch_reuse(packet, packet.rows[0][0].cache.kv_heads, stream);
+}
+
+std::optional<cudaError_t> try_launch_reuse(const TargetBatch& batch, int kv_heads,
+                                            cudaStream_t stream) {
+    ReusePacket<decoder::BoundPagedDecodeLane> packet{};
+    for (int lane = 0; lane < reuse_requests; ++lane) {
+        for (int row = 0; row < reuse_rows; ++row)
+            packet.rows[lane][row] = batch.lanes[(row * reuse_requests) + lane];
+    }
+    return launch_reuse(packet, kv_heads, stream);
+}
+
+SplitVariant split_variant(const decoder::PagedDecodeLane* lanes, int count, int end,
+                           bool allow_reuse) {
+    if (end != text_attention_max_tokens || count < 2 * text_gdn_max_verify_rows)
+        return SplitVariant::multi_stage;
+    if (allow_reuse && count == decoder::target_split_eager_max_rows) {
+        EagerTargetBatch batch{{}, end};
+        std::copy_n(lanes, count, batch.lanes);
+        ReusePacket<decoder::PagedDecodeLane> reuse;
+        if (make_reuse_packet(batch, count, reuse))
+            return SplitVariant::reuse;
+    }
+    const bool wide = std::all_of(lanes, lanes + count, [](const auto& lane) {
+        return tensor_aligned(lane) && supports_eager_wide_split(lane.position);
+    });
+    return wide ? SplitVariant::single_stage : SplitVariant::multi_stage;
 }
 
 cudaError_t launch(TargetLane lane, cudaStream_t stream) {
@@ -818,6 +857,8 @@ cudaError_t launch(TargetLane lane, cudaStream_t stream) {
 }
 
 cudaError_t launch(const TargetBatch& batch, int count, cudaStream_t stream) {
+    if (batch.single_stage)
+        return launch_split<true>(batch, count, stream);
     return launch_split(batch, count, stream);
 }
 

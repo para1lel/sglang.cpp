@@ -350,6 +350,29 @@ void stop_serving() { stop_requested.store(true, std::memory_order_relaxed); }
 
 bool stopping() { return stop_requested.load(std::memory_order_relaxed); }
 
+std::string random_request_id(std::string_view prefix, std::random_device& random) {
+    constexpr std::string_view hex = "0123456789abcdef";
+    std::string id;
+    id.reserve(prefix.size() + 32);
+    id += prefix;
+    for (int part = 0; part < 4; ++part) {
+        auto value = static_cast<std::uint32_t>(random());
+        for (int digit = 0; digit < 8; ++digit) {
+            id += hex[value & 15];
+            value >>= 4;
+        }
+    }
+    id[prefix.size() + 12] = '4';
+    const auto variant = prefix.size() + 16;
+    id[variant] = hex[8 + (hex.find(id[variant]) & 3)];
+    return id;
+}
+
+std::string random_request_id(std::string_view prefix) {
+    std::random_device random;
+    return random_request_id(prefix, random);
+}
+
 std::string decode_url(std::string_view text, bool form) {
     std::string decoded;
     decoded.reserve(text.size());

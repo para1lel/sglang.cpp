@@ -29,6 +29,7 @@ public:
 
     virtual bool available() const = 0;
     virtual DecoderPrefixCacheStats prefix_cache_stats() const = 0;
+    virtual bool prefix_backup_pending() const = 0;
     virtual void reset_prefix_cache() = 0;
     virtual std::size_t request_device_allocation_bytes() const = 0;
     virtual void release_retired_allocations() = 0;

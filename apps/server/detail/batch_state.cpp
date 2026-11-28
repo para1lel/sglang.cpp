@@ -165,23 +165,50 @@ bool Job::discard_deferred_store() const {
 
 bool Job::has_output() const { return !pending.empty() && !(output_overlapped && aborted()); }
 
+bool Job::awaiting_capacity() const {
+    return admission_retry_at != Clock::time_point{} && !cancelled && !aborted();
+}
+
 bool Job::can_overlap_mtp_output() const {
     return options.mtp_steps > 0 && buffer_decode_output && output_started;
 }
 
-bool Job::ready(bool buffered) const {
-    return !prefix_pending && (cancelled || aborted() || (!cache_reading &&
-        (buffered || can_overlap_mtp_output() ? !pending.full() : pending.empty())));
+bool Job::ready(bool buffered, bool capacity_blocked) const {
+    return !prefix_pending &&
+           (cancelled || aborted() ||
+            ((!capacity_blocked || admitted) && !cache_reading &&
+             (admission_retry_at == Clock::time_point{} || Clock::now() >= admission_retry_at) &&
+             (buffered || can_overlap_mtp_output() ? !pending.full() : pending.empty())));
 }
 
 bool Job::can_buffer(bool per_token) const {
-    const bool eligible = options.mtp_steps > 0
-        ? per_token && !options.requires_target_only() && !options.label_token_ids
-        : prompt.size() >= decoder_batch_max_step_tokens;
-    return eligible && media.empty() &&
-        !options.samples() && !options.constraint && !options.eager && options.top_logits == 0;
+    const bool eligible =
+        options.mtp_steps > 0
+            ? per_token && !options.requires_target_only() && !options.label_token_ids &&
+                  !options.score_prompt && options.generated_top_logprobs < 0
+            : prompt.size() >= decoder_batch_max_step_tokens && !options.samples();
+    return eligible && media.empty() && !options.constraint && !options.eager &&
+           options.top_logits == 0;
+}
 }
 
+bool BatchService::State::decode_cohort_ready(bool buffered, bool require_all) const {
+    if (!cuda_graphs || mtp_steps != 0 || max_active < mailbox_min_lanes)
+        return false;
+    int live = 0;
+    int ready = 0;
+    for (const auto& job : jobs) {
+        if (!job)
+            continue;
+        if (job->cancelled || job->aborted() || !job->prefill_completed ||
+            (buffered && (!job->buffer_decode_output || !job->output_started)))
+            return false;
+        ++live;
+        ready += static_cast<int>(job->ready(buffered));
+    }
+    if (live == decoder_batch_max_lanes)
+        return ready >= wide_decode_min_ready;
+    return buffered && live >= mailbox_min_lanes && ready >= (require_all ? live : 1);
 }
 
 bool BatchService::State::prefix_ready(const Job& job) const {

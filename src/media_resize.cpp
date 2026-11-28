@@ -3,7 +3,6 @@
 #include <algorithm>
 #include <cmath>
 #include <stdexcept>
-#include <type_traits>
 
 namespace sglang::media_detail {
 namespace {
@@ -124,8 +123,10 @@ int Resize::make_fixed_weights(int input, int output, std::vector<Tap<int>>& axi
     return precision;
 }
 
-void Resize::apply_axis(const std::uint8_t* input, Size source, std::uint8_t* output, Size target,
-                        const std::vector<Tap<int>>& axis, int precision, bool horizontal) {
+template <typename Input, typename Output, typename Weight, typename Accumulate>
+void Resize::apply_axis(const Input* input, Size source, Output* output, Size target,
+                        const std::vector<Tap<Weight>>& axis, bool horizontal,
+                        Accumulate accumulate) {
     const auto row_bytes = static_cast<std::size_t>(source.width) * 3;
     const std::size_t stride = horizontal ? 3 : row_bytes;
     for (int row = 0; row < target.height; ++row) {
@@ -135,64 +136,65 @@ void Resize::apply_axis(const std::uint8_t* input, Size source, std::uint8_t* ou
             const int from_x = horizontal ? tap.first : column;
             const auto* start = input + from_y * row_bytes + from_x * 3;
             for (int channel = 0; channel < 3; ++channel) {
-                std::int64_t value = std::int64_t{1} << (precision - 1);
-                for (std::size_t index = 0; index < tap.weights.size(); ++index) {
-                    value += start[index * stride + channel] * tap.weights[index];
-                }
-                const auto pixel = std::min<std::int64_t>(
-                    std::max(value, std::int64_t{0}) >> precision, 255);
-                *output++ = static_cast<std::uint8_t>(pixel);
+                *output++ = accumulate(start + channel, stride, tap.weights);
             }
         }
     }
 }
 
-template <typename Input, typename Output>
-void Resize::apply_bilinear(const Input* input, Size source, Output* output, Size target,
-                            const std::vector<Tap<float>>& axis, bool horizontal) {
-    const auto row_bytes = static_cast<std::size_t>(source.width) * 3;
-    const std::size_t stride = horizontal ? 3 : row_bytes;
-    for (int row = 0; row < target.height; ++row) {
-        for (int column = 0; column < target.width; ++column) {
-            const auto& tap = axis[horizontal ? column : row];
-            const int from_y = horizontal ? row : tap.first;
-            const int from_x = horizontal ? tap.first : column;
-            const auto* start = input + from_y * row_bytes + from_x * 3;
-            for (int channel = 0; channel < 3; ++channel) {
-                float value = start[channel] * tap.weights.front();
-                for (std::size_t index = 1; index < tap.weights.size(); ++index) {
-                    value = std::fma(start[index * stride + channel], tap.weights[index], value);
-                }
-                if constexpr (std::is_same_v<Output, float>) {
-                    *output++ = value;
-                } else {
-                    *output++ = round_to_byte(value);
-                }
-            }
-        }
+namespace {
+
+template <typename Input>
+float bilinear(const Input* input, std::size_t stride, const std::vector<float>& weights) {
+    float value = input[0] * weights.front();
+    for (std::size_t index = 1; index < weights.size(); ++index) {
+        value = std::fma(input[index * stride], weights[index], value);
     }
+    return value;
+}
+
+constexpr auto bilinear_byte = [](const auto* input, std::size_t stride, const auto& weights) {
+    return round_to_byte(bilinear(input, stride, weights));
+};
+
+auto bicubic(int precision) {
+    const auto shift = static_cast<unsigned>(precision);
+    return [shift](const std::uint8_t* input, std::size_t stride, const auto& weights) {
+        auto value = static_cast<std::int64_t>(std::uint64_t{1} << (shift - 1U));
+        for (std::size_t index = 0; index < weights.size(); ++index) {
+            value += input[index * stride] * weights[index];
+        }
+        const auto nonnegative = static_cast<std::uint64_t>(std::max(value, std::int64_t{0}));
+        return static_cast<std::uint8_t>(std::min<std::uint64_t>(nonnegative >> shift, 255));
+    };
+}
+
 }
 
 const std::uint8_t* Resize::apply(const std::uint8_t* input) {
     if (!bilinear_horizontal_.empty() && !bilinear_vertical_.empty()) {
         auto* stage = bilinear_temporary_.data();
-        apply_bilinear(input, input_, stage, middle_, bilinear_horizontal_, true);
-        apply_bilinear(stage, middle_, result_.data(), output_, bilinear_vertical_, false);
+        apply_axis(input, input_, stage, middle_, bilinear_horizontal_, true,
+                   bilinear<std::uint8_t>);
+        apply_axis(stage, middle_, result_.data(), output_, bilinear_vertical_, false,
+                   bilinear_byte);
         return result_.data();
     }
     if (!bilinear_horizontal_.empty() || !bilinear_vertical_.empty()) {
         const bool horizontal = !bilinear_horizontal_.empty();
         const auto& axis = horizontal ? bilinear_horizontal_ : bilinear_vertical_;
-        apply_bilinear(input, input_, result_.data(), output_, axis, horizontal);
+        apply_axis(input, input_, result_.data(), output_, axis, horizontal, bilinear_byte);
         return result_.data();
     }
     if (!horizontal_.empty()) {
         auto* stage = vertical_.empty() ? result_.data() : temporary_.data();
-        apply_axis(input, input_, stage, middle_, horizontal_, horizontal_precision_, true);
+        apply_axis(input, input_, stage, middle_, horizontal_, true,
+                   bicubic(horizontal_precision_));
         input = stage;
     }
     if (!vertical_.empty()) {
-        apply_axis(input, middle_, result_.data(), output_, vertical_, vertical_precision_, false);
+        apply_axis(input, middle_, result_.data(), output_, vertical_, false,
+                   bicubic(vertical_precision_));
         input = result_.data();
     }
     return input;

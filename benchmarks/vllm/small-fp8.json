@@ -1,8 +1,0 @@
-{
-  "prompt_token_ids": [760, 6511, 314, 9338, 369],
-  "output_tokens": 8,
-  "warmup": 2,
-  "repeats": 7,
-  "kv_cache_dtype": "fp8_e4m3",
-  "expected_output_ids": [11751, 13, 198, 760, 6511, 314, 9564, 369]
-}

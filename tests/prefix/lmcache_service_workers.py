@@ -10,12 +10,13 @@ from tempfile import TemporaryDirectory
 from threading import Event, Thread
 from types import SimpleNamespace
 
-from lmcache_relay import RECEIPT
+from lmcache_relay import GDN, RECEIPT
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tools/lmcache"))
 from sglang_lmcache import GdnEndpoints, SocketServer
 
 RANK_DEVICES = (bytes([1]) + bytes(15), bytes([2]) + bytes(15))
+GDN_FIXTURE_BYTES = 4
 
 
 class ControlledRecords:
@@ -40,7 +41,9 @@ class ControlledRecords:
 
     def transfer(self, request, view, store):
         rank = RANK_DEVICES.index(bytes(view.device))
-        assert len(view.records) == 1 and view.records[0].size == 4
+        (checkpoint,) = view.records
+        assert checkpoint.key.object_group_id == GDN
+        assert checkpoint.size == GDN_FIXTURE_BYTES
         self.entered[rank].set()
         if rank == 1:
             if not self.release.wait(5):
@@ -51,7 +54,7 @@ class ControlledRecords:
                 return 3, b""
             if self.mode == "miss":
                 return 1, b""
-        copied = 4 if store or rank == 0 else 1
+        copied = GDN_FIXTURE_BYTES if store or rank == 0 else 1
         return 0, RECEIPT.pack(0, copied, 0, 3 if store else 0)
 
     def store(self, request, view):
@@ -101,7 +104,7 @@ def exercise(
                     assert select.select([child.stdout], [], [], 3)[0], "readiness timeout"
                     assert child.stdout.readline() == "restart\n"
                     assert records.resets == 1
-                    assert not records.digests
+                    assert not records.digests, records.digests
                     startup.close()
                     records = startup.enter_context(daemon(endpoint, mode, RANK_DEVICES[::-1]))
                     child.stdin.write("held\n")

@@ -109,7 +109,7 @@ DecoderResult serial(const Decoder& decoder, const std::vector<int>& prompt, con
 struct BatchRow {
     DecoderResult result;
     int verified = 0;
-    int replayed = 0;
+    int discarded = 0;
     int boundary = 0;
     int terminal_drafts = 0;
     int full = 0;
@@ -129,7 +129,10 @@ void consume(BatchRow& lane, const sglang::DecoderBatchStep& step) {
     result.mtp_accepted_tokens += step.mtp_accepted_tokens;
     result.mtp_rounds += step.mtp_verified_rows != 0;
     lane.verified += step.mtp_verified_rows;
-    lane.replayed += step.mtp_replayed_rows;
+    require(step.mtp_replayed_rows == 0, "Constrained MTP replayed committed GDN rows");
+    lane.discarded +=
+        std::max(0, step.mtp_verified_rows - static_cast<int>(step.token.has_value()) -
+                        step.extra_token_count);
     lane.boundary += step.mtp_boundary;
     if (step.mtp_drafted_tokens) {
         lane.full += step.mtp_accepted_tokens == step.mtp_drafted_tokens;
@@ -148,7 +151,7 @@ void print_batch(const Case& test, const BatchRow& lane) {
     std::cout << "batch " << test.name << " K" << test.options.mtp_steps
               << " drafted=" << result.mtp_drafted_tokens
               << " accepted=" << result.mtp_accepted_tokens << " verified=" << lane.verified
-              << " replayed=" << lane.replayed << " boundary=" << lane.boundary
+              << " discarded=" << lane.discarded << " boundary=" << lane.boundary
               << " full=" << lane.full << " partial=" << lane.partial << " zero=" << lane.zero
               << " terminal_draft=" << lane.terminal_drafts
               << " finish=" << static_cast<int>(result.finish_reason) << " ids=";
@@ -321,7 +324,7 @@ void check_mtp(const Decoder& decoder, const Tokenizer& tokenizer, const std::ve
             require(lane.result.mtp_drafted_tokens > 0 && lane.verified > 0,
                     "batch lane did not execute a speculative round");
             if (index < 3) {
-                corrections += lane.replayed;
+                corrections += lane.discarded;
                 partial += lane.partial;
                 rejected += lane.zero;
                 terminal += lane.terminal_drafts;

@@ -1,5 +1,6 @@
 #include "sglang/testing/prefix_fixture.h"
 #include "sglang/decoder_internal.h"
+#include "sglang/runtime/backend/device_arena.h"
 #include "sglang/text_ops.h"
 #include "sglang/text/gqa_verify_batch.h"
 #include "sglang/tokenizer/tokenizer.h"
@@ -53,12 +54,31 @@ struct MtpRoutes {
     unsigned kv_heads = mxfp8_kv_heads;
 };
 MtpRoutes* mtp_routes = nullptr;
-int* serial_reads = nullptr;
-bool reject_prefill_arena = false;
-int arena_failures = 0;
+
+struct SerialRoutes {
+    int scores = 0;
+    int replays = 0;
+    int tiled = 0;
+    bool ordered = true;
+};
+
+SerialRoutes*& serial_routes() {
+    static SerialRoutes* active = nullptr;
+    return active;
+}
 
 void check(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
+}
+
+void check_serial_launches(const SerialRoutes& launches, int rows, const char* label) {
+    constexpr int chunks_per_row = 3;
+    const int expected = rows * gqa_layers * chunks_per_row;
+    std::cout << label << " scores=" << launches.scores << " replays=" << launches.replays
+              << " tiled=" << launches.tiled << '\n';
+    check(launches.scores == expected && launches.replays == expected && launches.tiled == 0 &&
+              launches.ordered,
+          "Restored serial prefill did not use ordered score/replay chunk pairs");
 }
 
 struct LogitCapture {
@@ -293,15 +313,15 @@ void check_crossing_tokens(const DecoderBatchStep& result, int& ordinal) {
     check(result.decode && !result.finish_reason && result.mtp_drafted_tokens == 4 &&
               result.mtp_accepted_tokens == 4 && result.mtp_verified_rows == 5 &&
               result.mtp_replayed_rows == 0 && result.extra_token_count == 4,
-          "W5 K4 acceptance changed");
-    check(result.token == cycle[ordinal++ % cycle.size()], "W5 first ID changed");
+          "K4 crossing acceptance changed");
+    check(result.token == cycle[ordinal++ % cycle.size()], "K4 crossing first ID changed");
     for (int index = 0; index < result.extra_token_count; ++index) {
-        check(result.extra_tokens[index] == cycle[ordinal++ % cycle.size()], "W5 draft ID changed");
+        check(result.extra_tokens[index] == cycle[ordinal++ % cycle.size()], "Draft ID changed");
     }
 }
 
 template <typename Setup, typename Expect>
-void check_mtp_w4(Setup setup_lane, Expect expect, decoder::VerificationRow& last) {
+void check_mtp_ranked_wide(Setup setup_lane, Expect expect, decoder::VerificationRow& last) {
     constexpr int lanes = gqa_decode::long_rank_wide_requests;
     constexpr int steps = decoder::target_verify_max_rows;
     constexpr int full = lanes * steps;
@@ -329,8 +349,8 @@ void check_mtp_w4(Setup setup_lane, Expect expect, decoder::VerificationRow& las
 }
 
 template <typename Setup, typename Expect>
-void check_mtp_w3(Setup setup_lane, Expect expect, decoder::Request& first,
-                  decoder::Request& last, decoder::VerificationRow& row) {
+void check_mtp_ranked_narrow(Setup setup_lane, Expect expect, decoder::Request& first,
+                             decoder::Request& last, decoder::VerificationRow& row) {
     constexpr int lanes = decoder::wide_mtp_lanes;
     constexpr int steps = decoder::target_verify_max_rows;
     constexpr int full = lanes * steps;
@@ -356,21 +376,22 @@ void check_mtp_w3(Setup setup_lane, Expect expect, decoder::Request& first,
     setup_lane(0, 10236);
     expect(full, 0, 0);
     setup_lane(0, gqa_decode::long_min_position - 1);
-    expect(full, 1, full - steps + 1);
+    expect(full, 1, full - steps + 1, gqa_decode::long_single_rank_splits);
 }
 
-template <bool W4>
-void mtp_rank_long() {
+template <bool Wide> void mtp_rank_long() {
     using namespace decoder;
-    constexpr int lanes = W4 ? gqa_decode::long_rank_wide_requests : wide_mtp_lanes;
+    constexpr int lanes = Wide ? gqa_decode::long_rank_wide_requests : wide_mtp_lanes;
     constexpr int steps = target_verify_max_rows;
-    constexpr int last_position = W4 ? gqa_decode::long_rank_wide_end + steps - 1
-                                     : gqa_decode::long_min_position;
+    constexpr int last_position =
+        Wide ? gqa_decode::long_rank_wide_end + steps - 1 : gqa_decode::long_min_position;
     constexpr int logical_pages = last_position / mxfp8_page_size + 1;
     constexpr int physical_pages = lanes * logical_pages;
     constexpr int kv_heads = gqa_rank_geometry.kv_heads;
     const auto payload = physical_pages * gqa_payload_bytes_per_page(kv_heads);
     const auto scales = physical_pages * gqa_scale_bytes_per_page(kv_heads);
+    const auto arena = DeviceArena::start(0, default_gpu_memory_utilization);
+    arena->commit();
     Allocations memory(0);
     memory.open_stream();
     const auto stream = memory.stream();
@@ -404,7 +425,7 @@ void mtp_rank_long() {
         requests[lane] = std::make_unique<Request>(0);
         requests[lane]->pages = {table + lane * logical_pages, logical_pages};
         requests[lane]->caches[0] = cache;
-        setup_lane(lane, W4 ? gqa_decode::long_min_position : 8191 + lane);
+        setup_lane(lane, Wide ? gqa_decode::long_min_position : 8191 + lane);
     }
     for (auto& row : work) {
         row = Workspace(memory);
@@ -435,15 +456,15 @@ void mtp_rank_long() {
                   launches.merges == launches.readers && !launches.legacy && remaining == left,
               "Unexpected ranked shared-KV routing or remainder");
     };
-    if constexpr (W4) {
-        check_mtp_w4(setup_lane, expect, rows.back());
-        synchronize_cuda(stream, "Complete W4 route regression");
-        std::cout << "w4_shared_kv_routes=pass\n";
+    if constexpr (Wide) {
+        check_mtp_ranked_wide(setup_lane, expect, rows.back());
+        synchronize_cuda(stream, "Complete wide ranked route regression");
+        std::cout << "wide_ranked_routes=pass\n";
         return;
     }
-    check_mtp_w3(setup_lane, expect, *requests.front(), *requests.back(), rows.back());
-    synchronize_cuda(stream, "Complete W3 route regression");
-    std::cout << "w3_shared_kv_routes=pass\n";
+    check_mtp_ranked_narrow(setup_lane, expect, *requests.front(), *requests.back(), rows.back());
+    synchronize_cuda(stream, "Complete narrow ranked route regression");
+    std::cout << "narrow_ranked_routes=pass\n";
 }
 
 void mtp_crossings(const char* checkpoint, const char* fixture) {
@@ -451,7 +472,7 @@ void mtp_crossings(const char* checkpoint, const char* fixture) {
     constexpr int quota = 8192;
     constexpr std::array ahead{0, 2, 3, 4, 7, 10, 12, 24, 27, 29, 30, 31};
     const Decoder decoder(checkpoint, 0, true);
-    check(slots == 32 && decoder.uses_b200_operators(), "W5 route check requires a B200");
+    check(slots == 32 && decoder.uses_b200_operators(), "K4 crossing check requires a B200");
     DecoderBatch batch(decoder, {true, slots, 0, quota});
     DecoderOptions options;
     options.mtp_steps = 4;
@@ -460,20 +481,21 @@ void mtp_crossings(const char* checkpoint, const char* fixture) {
     std::ifstream file(fixture);
     for (int slot = 0; slot < slots; ++slot) {
         std::string line;
-        check(bool(std::getline(file, line)), "Missing W5 fixture lane");
+        check(static_cast<bool>(std::getline(file, line)), "Missing K4 crossing fixture lane");
         std::istringstream ids(line);
         std::vector<int> prompt{std::istream_iterator<int>(ids), {}};
-        check(ids.eof() && prompt.size() == prompt_length, "Invalid W5 fixture lane");
-        check(batch.admit(slot, std::move(prompt), options) == 0, "Unexpected W5 prefix hit");
+        check(ids.eof() && prompt.size() == prompt_length, "Invalid K4 crossing fixture lane");
+        check(batch.admit(slot, std::move(prompt), options) == 0, "Unexpected prefix hit");
     }
     Selection all;
     all.fill(true);
     DecoderBatchStepStats stats;
     for (int start = 0; start < prompt_length; start += quota / slots) {
         const auto steps = batch.advance_chunked(all, &stats);
-        check(stats.target_rows == quota && stats.verification_lanes == 0, "W5 prefill changed");
+        check(stats.target_rows == quota && stats.verification_lanes == 0, "K4 prefill changed");
         if (start + quota / slots == prompt_length) {
-            for (const auto& step : steps) check(step.token == 760, "W5 seed changed");
+            for (const auto& step : steps)
+                check(step.token == 760, "K4 seed changed");
         }
     }
     std::array<int, slots> ordinals;
@@ -481,7 +503,7 @@ void mtp_crossings(const char* checkpoint, const char* fixture) {
     Selection lead{};
     for (int slot : ahead) lead[slot] = true;
     const auto first = batch.advance_chunked(lead, &stats);
-    check(stats.verification_lanes == int(ahead.size()), "W5 lead roster changed");
+    check(stats.verification_lanes == static_cast<int>(ahead.size()), "K4 lead roster changed");
     for (int slot : ahead) check_crossing_tokens(first[slot], ordinals[slot]);
 
     int crossing_waves = 0;
@@ -497,12 +519,13 @@ void mtp_crossings(const char* checkpoint, const char* fixture) {
         mtp_routes = nullptr;
         check(stats.verification_lanes == slots && stats.verification_rows == 5 * slots &&
                   std::all_of(stats.prefill_rows.begin(), stats.prefill_rows.end(),
-                              [](int rows) { return rows == 0; }), "W5 verify geometry changed");
+                              [](int rows) { return rows == 0; }),
+              "K4 verify geometry changed");
         check(launches.readers == gqa_layers && launches.merges == gqa_layers && !launches.legacy,
-              "W5 verification lost its grouped long reader or merge");
+              "K4 verification lost its grouped long reader or merge");
         for (int slot = 0; slot < slots; ++slot) check_crossing_tokens(steps[slot], ordinals[slot]);
         if (crossings) {
-            check(crossings == (crossing_waves % 2 == 0 ? 12 : 20), "W5 crossing setup changed");
+            check(crossings == (crossing_waves % 2 == 0 ? 12 : 20), "K4 crossing setup changed");
             ++crossing_waves;
             std::cout << "K4 crossing lanes=" << crossings << " readers=" << launches.readers
                       << " merges=" << launches.merges << " legacy=" << launches.legacy << '\n';
@@ -521,7 +544,7 @@ std::vector<std::vector<int>> read_mtp_cohort(const char* fixture) {
         prompt.assign(std::istream_iterator<int>(ids), {});
         check(ids.eof() && prompt.size() == 32768, "Invalid 32K MTP fixture lane");
     }
-    check(prompts.size() == 16 || prompts.size() == slots, "Expected W4 or W5 MTP cohort");
+    check(prompts.size() == 16 || prompts.size() == slots, "Expected 16 or 32 MTP lanes");
     return prompts;
 }
 
@@ -580,46 +603,76 @@ void mtp_mixed(const char* checkpoint, const char* fixture) {
 }
 
 void serial_prefill(const char* checkpoint, const char* fixture) {
-    constexpr int prefix = decoder_batch_prefix_checkpoint_interval;
+    constexpr int seed_rows = 9216;
+    constexpr int prefix = seed_rows - 1024;
     const Decoder decoder(checkpoint, 0, false);
     check(decoder.uses_b200_operators(), "Serial prefill route check requires a B200");
     DecoderBatch batch(decoder, {.max_lanes = 1});
     const auto cache = prefix_fixture::client();
     constexpr auto salt = "serial-prefill";
     const auto tokens = read_prompt(fixture);
-    check(tokens.size() >= prefix + 3, "Expected at least 8195 prompt IDs");
-    DecoderOptions options{.max_new_tokens = 2, .generated_top_logprobs = 2,
-                           .ignore_eos = true};
+    check(tokens.size() >= seed_rows, "Expected at least 9216 prompt IDs");
+    DecoderOptions options;
+    options.max_new_tokens = 2;
+    options.generated_top_logprobs = 2;
+    options.ignore_eos = true;
+    options.publish_prefix_checkpoints = false;
     const auto selected = select({0});
     DecoderOptions export_options{.max_new_tokens = 1, .ignore_eos = true};
-    const std::vector<int> cached(tokens.begin(), tokens.begin() + prefix);
+    const std::vector<int> cached(tokens.begin(), tokens.begin() + seed_rows);
     const auto stores = prefix_fixture::attach(export_options, cache, cached, salt);
     check(batch.admit(0, cached, export_options) == 0,
           "Unexpected initial prefix hit");
-    const auto terminal = batch.advance_chunked(selected)[0];
-    check(terminal.finish_reason && !terminal.prefix_pending, "Terminal store blocked completion");
+    for (int remaining = seed_rows; remaining > 0;) {
+        DecoderBatchStepStats stats;
+        const auto step = batch.advance_chunked(selected, &stats)[0];
+        const int rows = stats.prefill_rows[0];
+        check(rows > 0 && rows <= remaining, "Seed prefill did not advance to its endpoint");
+        remaining -= rows;
+        const bool finished = step.finish_reason == DecoderFinishReason::length;
+        check(finished == (remaining == 0) && !step.prefix_pending,
+              "Unexpected completion or deferred store during seed prefill");
+    }
     stores->wait();
+    prefix_fixture::read_checkpoint(cache, cached, salt, seed_rows);
     batch.release_retired_allocations();
-    const auto tail = [&](int rows, bool without_arena, int* reads) {
+    const auto tail = [&](int rows, bool without_arena, SerialRoutes* launches) {
         const std::vector<int> prompt(tokens.begin(), tokens.begin() + prefix + rows);
         auto restore = options;
         restore.prefix_cache_read = prefix_fixture::read_checkpoint(cache, prompt, salt, prefix);
         prefix_fixture::attach(restore, cache, prompt, salt);
         check(batch.admit(0, prompt, restore) == 0,
               "Restore should complete asynchronously");
-        check(prefix_fixture::wait(batch, 0).restored == prefix,
-              "Missing restored 8192-token prefix");
-        serial_reads = reads;
-        arena_failures = 0;
-        reject_prefill_arena = without_arena;
+        const auto restored = prefix_fixture::wait(batch, 0).restored;
+        check(restored == prefix, "Missing restored interior prefix");
+        const auto arena = decoder::DeviceArena::current(0);
+        decoder::Allocations held(0);
+        if (without_arena) {
+            std::size_t bytes = 256;
+            while (bytes <= arena->available_bytes() / 2)
+                bytes *= 2;
+            for (; bytes >= 256; bytes /= 2) {
+                for (;;) {
+                    try {
+                        held.allocate<std::byte>(bytes);
+                    } catch (const decoder::CudaError& error) {
+                        if (error.status != cudaErrorMemoryAllocation)
+                            throw;
+                        break;
+                    }
+                }
+            }
+            check(held.bytes() > 0 && arena->available_bytes() == 0,
+                  "Unable to exhaust the committed prefill arena");
+        }
         DecoderBatchStepStats stats;
+        serial_routes() = launches;
         const auto step = batch.advance_chunked(selected, &stats)[0];
-        reject_prefill_arena = false;
-        serial_reads = nullptr;
+        serial_routes() = nullptr;
+        held.close();
         check(step.token && step.generated_logprobs && stats.prefill_rows[0] == rows,
               "Missing token, scores, or restored prefill rows");
-        check(arena_failures == int(without_arena) &&
-                  (stats.prefill_workspace_bytes == 0) == (without_arena || rows == 1),
+        check((stats.prefill_workspace_bytes == 0) == (without_arena || rows == 1),
               "Unexpected prefill arena outcome");
         check(std::isfinite(step.generated_logprobs->selected.value), "Nonfinite selected score");
         batch.cancel(0);
@@ -627,19 +680,18 @@ void serial_prefill(const char* checkpoint, const char* fixture) {
         check(batch.request_device_allocation_bytes() == 0, "Request allocations remained live");
         return step.generated_logprobs->selected;
     };
-    int singleton_reads = 0, fallback_reads = 0;
-    tail(1, false, &singleton_reads);
+    SerialRoutes singleton_routes;
+    SerialRoutes fallback_routes;
+    tail(1, false, &singleton_routes);
     const auto control = tail(3, false, nullptr);
-    const auto fallback = tail(3, true, &fallback_reads);
+    const auto fallback = tail(3, true, &fallback_routes);
     const auto recovered = tail(3, false, nullptr);
     const auto repeated = tail(3, true, nullptr);
     check(control.token_id == recovered.token_id && control.value == recovered.value &&
               fallback.token_id == repeated.token_id && fallback.value == repeated.value,
           "Allocation fallback or recovery changed its token or score");
-    if (singleton_reads != gqa_layers) std::cerr << "Wrong reader for restored singleton\n";
-    if (fallback_reads != 3 * gqa_layers) std::cerr << "Wrong reader for no-arena tail\n";
-    check(singleton_reads == gqa_layers && fallback_reads == 3 * gqa_layers,
-          "Restored serial prefill did not use the scratch-free tiled reader");
+    check_serial_launches(singleton_routes, 1, "Restored singleton");
+    check_serial_launches(fallback_routes, 3, "Restored arena-exhausted tail");
     std::cout << "Restored singleton and allocation-limited prefill passed\n";
 }
 
@@ -689,24 +741,20 @@ void wrap_select(RequestProgress* progress, Request& request, Workspace& work,
 extern "C" cudaError_t __real_cudaLaunchKernel(const void*, dim3, dim3, void**, std::size_t,
                                                cudaStream_t);
 
-extern "C" cudaError_t __real_cudaMallocFromPoolAsync(void**, std::size_t, cudaMemPool_t,
-                                                      cudaStream_t);
-extern "C" cudaError_t __wrap_cudaMallocFromPoolAsync(
-    void** output, std::size_t bytes, cudaMemPool_t pool, cudaStream_t stream) {
-    if (reject_prefill_arena) {
-        std::size_t free = 0, total = 0;
-        const auto status = cudaMemGetInfo(&free, &total);
-        if (status != cudaSuccess) return status;
-        bytes = total + (1ull << 30);
-    }
-    const auto status = __real_cudaMallocFromPoolAsync(output, bytes, pool, stream);
-    arena_failures += reject_prefill_arena && status == cudaErrorMemoryAllocation;
-    return status;
-}
-
 static void record_launch(std::string_view symbol, dim3 grid, dim3 block) {
-    if (serial_reads) {
-        *serial_reads += symbol.find("tiled_prefill_attention") != symbol.npos;
+    if (auto* serial = serial_routes(); serial != nullptr) {
+        auto& launches = *serial;
+        if (symbol.find("exact_scores_kernel") != std::string_view::npos) {
+            launches.ordered &= launches.scores == launches.replays;
+            ++launches.scores;
+        }
+        if (symbol.find("draft_range_replay_kernel") != std::string_view::npos) {
+            launches.ordered &= launches.scores == launches.replays + 1;
+            ++launches.replays;
+        }
+        if (symbol.find("tiled_prefill_attention") != std::string_view::npos) {
+            ++launches.tiled;
+        }
         return;
     }
     if (mtp_routes) {
@@ -751,7 +799,7 @@ extern "C" cudaError_t __cudaLaunchKernel(cudaKernel_t kernel, dim3 grid, dim3 b
     static const auto launch = reinterpret_cast<decltype(&__cudaLaunchKernel)>(
         dlsym(RTLD_NEXT, "__cudaLaunchKernel"));
     check(launch != nullptr, "Cannot resolve CUDA kernel launch");
-    if (watch || mtp_routes || serial_reads) {
+    if (watch || mtp_routes != nullptr || serial_routes() != nullptr) {
         static void* const driver = dlopen("libcuda.so.1", RTLD_NOW | RTLD_LOCAL);
         check(driver != nullptr, "Cannot load the CUDA driver");
         static const auto get_name = reinterpret_cast<decltype(&cuKernelGetName)>(
@@ -767,11 +815,11 @@ extern "C" cudaError_t __cudaLaunchKernel(cudaKernel_t kernel, dim3 grid, dim3 b
 extern "C" cudaError_t __wrap_cudaLaunchKernel(const void* function, dim3 grid, dim3 block,
                                                void** args, std::size_t shared,
                                                cudaStream_t stream) {
-    if (watch || mtp_routes || serial_reads) {
+    if (watch || mtp_routes != nullptr || serial_routes() != nullptr) {
         const char* name = nullptr;
         check(cudaFuncGetName(&name, function) == cudaSuccess, "Cannot identify decode kernel");
         record_launch(name, grid, block);
-        if (mtp_routes || serial_reads) {
+        if (mtp_routes != nullptr || serial_routes() != nullptr) {
             return __real_cudaLaunchKernel(function, grid, block, args, shared, stream);
         }
         const std::string_view symbol(name);
@@ -797,11 +845,11 @@ extern "C" cudaError_t __wrap_cudaLaunchKernel(const void* function, dim3 grid, 
 }
 
 int main(int argc, char** argv) try {
-    if (argc == 2 && std::string_view(argv[1]) == "--mtp-w3") {
+    if (argc == 2 && std::string_view(argv[1]) == "--mtp-ranked-narrow") {
         mtp_rank_long<false>();
         return 0;
     }
-    if (argc == 2 && std::string_view(argv[1]) == "--mtp-w4") {
+    if (argc == 2 && std::string_view(argv[1]) == "--mtp-ranked-wide") {
         mtp_rank_long<true>();
         return 0;
     }
@@ -819,8 +867,8 @@ int main(int argc, char** argv) try {
     }
     check(argc >= 3 && argc <= 5,
           "Usage: long-decode-routes CHECKPOINT "
-          "{PROMPT [LOGITS [TEACHER]]|--mtp-crossings W5|--mtp-mixed IDS|--serial-prefill IDS} "
-          "or long-decode-routes --mtp-w3|--mtp-w4");
+          "{PROMPT [LOGITS [TEACHER]]|--mtp-crossings IDS|--mtp-mixed IDS|--serial-prefill IDS} "
+          "or long-decode-routes --mtp-ranked-narrow|--mtp-ranked-wide");
     const Decoder decoder(argv[1], 0, false);
     check(decoder.uses_b200_operators(), "Long decode route check requires a B200");
     const DecoderBatchOptions options{.cuda_graphs = true, .max_lanes = slots,

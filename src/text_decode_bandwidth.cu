@@ -1,6 +1,7 @@
 #include "sglang/decoder_cuda.cuh"
-#include "sglang/decoder_internal.h"
+#include "sglang/decoder_verify.h"
 #include "sglang/text/decode_proj.h"
+#include "sglang/text/text_cuda_primitives.cuh"
 #include "sglang/text_ops.h"
 
 #include <algorithm>
@@ -14,45 +15,10 @@
 namespace sglang {
 namespace {
 
-constexpr int warp_width = 32;
-constexpr int block_threads = 256;
-constexpr int block_warps = block_threads / warp_width;
+using namespace text_kernel;
+
 constexpr int prefill_gate_tile_rows = 4;
 constexpr int prefill_gate_warps = 4;
-constexpr unsigned int warp_mask = 0xffffffffu;
-constexpr float fp8_max = 448.0f;
-constexpr float quant_epsilon = 1.0e-10f;
-
-constexpr int divide_up(int count, int tile) {
-    return count / tile + (count % tile != 0);
-}
-
-bool aligned(const void* pointer, std::size_t alignment) {
-    return reinterpret_cast<std::uintptr_t>(pointer) % alignment == 0;
-}
-
-__device__ float warp_sum(float value) {
-    for (int offset = warp_width / 2; offset > 0; offset /= 2) {
-        value += __shfl_down_sync(warp_mask, value, offset);
-    }
-    return value;
-}
-
-__device__ float warp_max(float value) {
-    for (int offset = warp_width / 2; offset > 0; offset /= 2) {
-        value = fmaxf(value, __shfl_down_sync(warp_mask, value, offset));
-    }
-    return value;
-}
-
-__device__ uint4 load_128(const void* address) {
-    uint4 bits;
-    const auto global = __cvta_generic_to_global(address);
-    asm("ld.global.v4.b32 {%0, %1, %2, %3}, [%4];"
-        : "=r"(bits.x), "=r"(bits.y), "=r"(bits.z), "=r"(bits.w)
-        : "l"(global) : "memory");
-    return bits;
-}
 
 __device__ float bf16x2_dot(unsigned int lhs, unsigned int rhs, float sum) {
     sum = fmaf(__uint_as_float(lhs << 16), __uint_as_float(rhs << 16), sum);
@@ -111,50 +77,34 @@ __global__ void bf16_gdn_prefill_gates(const __nv_bfloat16* weight_b,
     const int first_row = blockIdx.y * prefill_gate_tile_rows;
     Bf16Dot dots_b[prefill_gate_tile_rows];
     Bf16Dot dots_a[prefill_gate_tile_rows];
-    if constexpr (FullTile) {
+    const int tile_rows =
+        FullTile ? prefill_gate_tile_rows : min(prefill_gate_tile_rows, rows - first_row);
 #pragma unroll 4
-        for (int col = lane * 8; col < width; col += warp_width * 8) {
-            const uint4 packed_b = load_128(weight_b + col);
-            const uint4 packed_a = load_128(weight_a + col);
-#pragma unroll
-            for (int item = 0; item < prefill_gate_tile_rows; ++item) {
-                const uint4 packed_input =
-                    load_128(input + (first_row + item) * width + col);
-                accumulate_packed_gate(dots_b[item], packed_b, packed_input);
-                accumulate_packed_gate(dots_a[item], packed_a, packed_input);
-            }
-        }
+    for (int col = lane * 8; col < width; col += warp_width * 8) {
+        const uint4 packed_b = load_128(weight_b + col);
+        const uint4 packed_a = load_128(weight_a + col);
 #pragma unroll
         for (int item = 0; item < prefill_gate_tile_rows; ++item) {
-            const float result_b = warp_sum(dots_b[item].sum());
-            const float result_a = warp_sum(dots_a[item].sum());
-            if (lane == 0) {
-                const int offset = (first_row + item) * Channels + channel;
-                output_b[offset] = __float2bfloat16_rn(result_b);
-                output_a[offset] = __float2bfloat16_rn(result_a);
+            if (!FullTile && item >= tile_rows) {
+                break;
             }
+            const auto offset = static_cast<std::ptrdiff_t>(first_row + item) * width;
+            const uint4 packed_input = load_128(input + offset + col);
+            accumulate_packed_gate(dots_b[item], packed_b, packed_input);
+            accumulate_packed_gate(dots_a[item], packed_a, packed_input);
         }
-    } else {
-        const int tile_rows = min(prefill_gate_tile_rows, rows - first_row);
-#pragma unroll 4
-        for (int col = lane * 8; col < width; col += warp_width * 8) {
-            const uint4 packed_b = load_128(weight_b + col);
-            const uint4 packed_a = load_128(weight_a + col);
-            for (int item = 0; item < tile_rows; ++item) {
-                const uint4 packed_input =
-                    load_128(input + (first_row + item) * width + col);
-                accumulate_packed_gate(dots_b[item], packed_b, packed_input);
-                accumulate_packed_gate(dots_a[item], packed_a, packed_input);
-            }
+    }
+#pragma unroll
+    for (int item = 0; item < prefill_gate_tile_rows; ++item) {
+        if (!FullTile && item >= tile_rows) {
+            break;
         }
-        for (int item = 0; item < tile_rows; ++item) {
-            const float result_b = warp_sum(dots_b[item].sum());
-            const float result_a = warp_sum(dots_a[item].sum());
-            if (lane == 0) {
-                const int offset = (first_row + item) * Channels + channel;
-                output_b[offset] = __float2bfloat16_rn(result_b);
-                output_a[offset] = __float2bfloat16_rn(result_a);
-            }
+        const float result_b = warp_sum(dots_b[item].sum());
+        const float result_a = warp_sum(dots_a[item].sum());
+        if (lane == 0) {
+            const int offset = ((first_row + item) * Channels) + channel;
+            output_b[offset] = __float2bfloat16_rn(result_b);
+            output_a[offset] = __float2bfloat16_rn(result_a);
         }
     }
 }
@@ -337,7 +287,8 @@ __global__ __launch_bounds__(draft_four_lane_threads) void draft_head_int8_four_
 
 template <int Count>
 cudaError_t launch_draft_head_batch(const std::uint8_t* weights, const float* weight_maxima,
-                                    const decoder::DraftInt8Projection* rows, cudaStream_t stream) {
+                                    const decoder::DraftInt8Projection* rows, cudaStream_t stream,
+                                    int vocabulary_rows) {
     DraftHeadArguments<Count> batch;
     std::copy_n(rows, Count, batch.rows);
     void* quantize[] = {&batch};
@@ -349,12 +300,12 @@ cudaError_t launch_draft_head_batch(const std::uint8_t* weights, const float* we
     void* score[] = {&weights, &weight_maxima, &batch};
     if constexpr (Count == 4) {
         return cudaLaunchKernel(draft_head_int8_four_lane_kernel,
-                                decoder::vocab_size / draft_four_lane_rows_per_block,
+                                vocabulary_rows / draft_four_lane_rows_per_block,
                                 draft_four_lane_threads, score, 0, stream);
     } else {
         return cudaLaunchKernel(draft_head_int8_batch_kernel<Count>,
-                                decoder::vocab_size / (2 * block_warps), block_threads,
-                                score, 0, stream);
+                                vocabulary_rows / (2 * block_warps), block_threads, score, 0,
+                                stream);
     }
 }
 
@@ -407,8 +358,8 @@ __global__ void bf16_gdn_decode_shared(const __nv_bfloat16* weight_b,
     }
 }
 
-constexpr int wide_gdn_gate_rows = decoder::GdnVerificationBatch::lanes *
-                                    decoder::GdnVerificationBatch::rows;
+constexpr int wide_gdn_gate_rows = decoder::verification_packet_rows;
+constexpr int max_gdn_gate_rows = decoder::max_wide_mtp_rows;
 
 template <int capacity>
 struct VerifyGdnGateArguments {
@@ -585,9 +536,9 @@ template <int Channels>
 std::optional<cudaError_t> try_verify_bf16_gdn_gates_impl(
     const __nv_bfloat16* weight_b, const __nv_bfloat16* weight_a,
     const decoder::VerifyGdnGateRow* rows, int count, cudaStream_t stream) {
-    if (count < 2 || (count > text_fp8_max_batch && count != wide_gdn_gate_rows) ||
-        !rows || !weight_b || !weight_a ||
-        !aligned(weight_b, 16) || !aligned(weight_a, 16)) {
+    if (count < 2 || count > max_gdn_gate_rows ||
+        (count > text_fp8_max_batch && count % wide_gdn_gate_rows != 0) || !rows || !weight_b ||
+        !weight_a || !aligned(weight_b, 16) || !aligned(weight_a, 16)) {
         return std::nullopt;
     }
     for (int index = 0; index < count; ++index) {
@@ -602,45 +553,16 @@ std::optional<cudaError_t> try_verify_bf16_gdn_gates_impl(
         }
         void* args[] = {&weight_b, &weight_a, &arguments};
         constexpr int capacity = sizeof(arguments.rows) / sizeof(*arguments.rows);
-        return cudaLaunchKernel(bf16_gdn_verify_gates<capacity, Channels>, 2 * Channels,
-                                count * warp_width, args, 0, stream);
+        const int packet = count <= wide_gdn_gate_rows ? count : wide_gdn_gate_rows;
+        const dim3 grid(2 * Channels, count / packet);
+        return cudaLaunchKernel(bf16_gdn_verify_gates<capacity, Channels>, grid,
+                                packet * warp_width, args, 0, stream);
     };
+    if (count > wide_gdn_gate_rows) {
+        return launch(VerifyGdnGateArguments<max_gdn_gate_rows>{});
+    }
     return count == wide_gdn_gate_rows ? launch(VerifyGdnGateArguments<wide_gdn_gate_rows>{})
                                        : launch(VerifyGdnGateArguments<text_fp8_max_batch>{});
-}
-
-template <int Channels>
-std::optional<cudaError_t> try_verify_bf16_gdn_gates_compact_impl(
-    const __nv_bfloat16* weight_b, const __nv_bfloat16* weight_a,
-    const decoder::VerifyGdnGateRow* rows, int count, cudaStream_t stream) {
-    constexpr int capacity =
-        decoder::CompactGdnVerificationBatch::lanes * decoder::CompactGdnVerificationBatch::rows;
-    const auto pending = cudaGetLastError();
-    if (pending != cudaSuccess) {
-        return pending;
-    }
-    if ((count != capacity / 2 && count != capacity) || !rows || !weight_b || !weight_a ||
-        !aligned(weight_b, 16) || !aligned(weight_a, 16)) {
-        return std::nullopt;
-    }
-    VerifyGdnGateArguments<capacity> arguments;
-    for (int index = 0; index < count; ++index) {
-        const auto& row = rows[index];
-        if (!row.input || !row.output_b || !row.output_a || !aligned(row.input, 16)) {
-            return std::nullopt;
-        }
-        arguments.rows[index] = row;
-    }
-    void* args[] = {&weight_b, &weight_a, &arguments};
-    const dim3 grid(2 * Channels, count / wide_gdn_gate_rows);
-    const auto direct = cudaLaunchKernel(bf16_gdn_verify_gates<capacity, Channels>, grid,
-                                         wide_gdn_gate_rows * warp_width, args, 0, stream);
-    const auto recorded = cudaGetLastError();
-    if (direct == cudaSuccess ||
-        (!decoder::CudaError::terminal(direct) && decoder::CudaError::terminal(recorded))) {
-        return recorded;
-    }
-    return direct;
 }
 
 }
@@ -731,20 +653,6 @@ std::optional<cudaError_t> decoder::try_verify_bf16_gdn_gates_local(
         weight_b, weight_a, rows, count, stream);
 }
 
-std::optional<cudaError_t> decoder::try_verify_bf16_gdn_gates_compact(
-    const __nv_bfloat16* weight_b, const __nv_bfloat16* weight_a,
-    const VerifyGdnGateRow* rows, int count, cudaStream_t stream) {
-    return try_verify_bf16_gdn_gates_compact_impl<text_gdn_value_heads>(
-        weight_b, weight_a, rows, count, stream);
-}
-
-std::optional<cudaError_t> decoder::try_verify_bf16_gdn_gates_compact_local(
-    const __nv_bfloat16* weight_b, const __nv_bfloat16* weight_a,
-    const VerifyGdnGateRow* rows, int count, cudaStream_t stream) {
-    return try_verify_bf16_gdn_gates_compact_impl<local_gdn_gate_channels>(
-        weight_b, weight_a, rows, count, stream);
-}
-
 cudaError_t decoder::decode_bf16_lm_head(const __nv_bfloat16* weight, const __nv_bfloat16* input,
                                        int rows, int width, __nv_bfloat16* output,
                                        cudaStream_t stream) {
@@ -770,11 +678,13 @@ cudaError_t decoder::quantize_draft_head_int8(const __nv_bfloat16* input, int ro
 }
 
 cudaError_t decoder::decode_draft_head_int8(const std::uint8_t* weight, const float* weight_maxima,
-                                           const __nv_bfloat16* input,
-                                           std::uint8_t* input_values, float* input_maximum,
-                                           __nv_bfloat16* output, cudaStream_t stream) {
-    if (!weight || !weight_maxima || !output || !input_values ||
-        !aligned(weight, 16) || !aligned(input_values, 16)) {
+                                            const __nv_bfloat16* input, std::uint8_t* input_values,
+                                            float* input_maximum, __nv_bfloat16* output,
+                                            cudaStream_t stream, int vocabulary_rows) {
+    if (weight == nullptr || weight_maxima == nullptr || output == nullptr ||
+        input_values == nullptr || vocabulary_rows <= 0 ||
+        vocabulary_rows % (2 * block_warps) != 0 || !aligned(weight, 16) ||
+        !aligned(input_values, 16)) {
         return cudaErrorInvalidValue;
     }
     const auto status = quantize_draft_head_int8(input, 1, input_values, input_maximum, stream);
@@ -782,30 +692,37 @@ cudaError_t decoder::decode_draft_head_int8(const std::uint8_t* weight, const fl
         return status;
     }
     void* args[] = {&weight, &weight_maxima, &input_values, &input_maximum, &output};
-    return cudaLaunchKernel(draft_head_int8_kernel, vocab_size / (2 * block_warps),
+    return cudaLaunchKernel(draft_head_int8_kernel, vocabulary_rows / (2 * block_warps),
                             block_threads, args, 0, stream);
 }
 
-cudaError_t decoder::decode_draft_head_int8_batch(
-    const std::uint8_t* weight, const float* weight_maxima, const DraftInt8Projection* rows,
-    int count, cudaStream_t stream) {
-    if (!weight || !weight_maxima || !rows || count < 1 || count > draft_wave_rows ||
-        !aligned(weight, 16)) {
+cudaError_t decoder::decode_draft_head_int8_batch(const std::uint8_t* weight,
+                                                  const float* weight_maxima,
+                                                  const DraftInt8Projection* rows, int count,
+                                                  cudaStream_t stream, int vocabulary_rows) {
+    if (weight == nullptr || weight_maxima == nullptr || rows == nullptr || count < 1 ||
+        count > draft_wave_rows || !aligned(weight, 16) || vocabulary_rows <= 0 ||
+        vocabulary_rows % (2 * block_warps) != 0 ||
+        (count == 4 && vocabulary_rows % draft_four_lane_rows_per_block != 0)) {
         return cudaErrorInvalidValue;
     }
     for (int index = 0; index < count; ++index) {
         const auto& row = rows[index];
-        if (!row.input || !row.values || !row.maximum || !row.output || !aligned(row.values, 16)) {
+        if (row.input == nullptr || row.values == nullptr || row.maximum == nullptr ||
+            row.output == nullptr || !aligned(row.values, 16)) {
             return cudaErrorInvalidValue;
         }
     }
     switch (count) {
-    case 4: return launch_draft_head_batch<4>(weight, weight_maxima, rows, stream);
-    case 3: return launch_draft_head_batch<3>(weight, weight_maxima, rows, stream);
-    case 2: return launch_draft_head_batch<2>(weight, weight_maxima, rows, stream);
+    case 4:
+        return launch_draft_head_batch<4>(weight, weight_maxima, rows, stream, vocabulary_rows);
+    case 3:
+        return launch_draft_head_batch<3>(weight, weight_maxima, rows, stream, vocabulary_rows);
+    case 2:
+        return launch_draft_head_batch<2>(weight, weight_maxima, rows, stream, vocabulary_rows);
     default:
         return decode_draft_head_int8(weight, weight_maxima, rows[0].input, rows[0].values,
-                                     rows[0].maximum, rows[0].output, stream);
+                                      rows[0].maximum, rows[0].output, stream, vocabulary_rows);
     }
 }
 

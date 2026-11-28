@@ -21,17 +21,37 @@ Utf8Lead utf8_lead(unsigned byte) {
     };
 }
 
+namespace {
+
+template <bool Decode> unsigned read_scalar(std::string_view bytes, char32_t& scalar) {
+    const auto first = static_cast<unsigned char>(bytes.front());
+    const auto [size, low, high] = utf8_lead(first);
+    if (size == 0 || size > bytes.size()) {
+        return 0;
+    }
+    if constexpr (Decode) {
+        scalar = first & (0xffU >> (size == 1 ? 1 : size + 1));
+    }
+    for (unsigned index = 1; index < size; ++index) {
+        const auto byte = static_cast<unsigned char>(bytes[index]);
+        if (byte < (index == 1 ? low : 0x80) || byte > (index == 1 ? high : 0xbf)) {
+            return 0;
+        }
+        if constexpr (Decode) {
+            scalar = (scalar << 6) | (byte & 0x3fU);
+        }
+    }
+    return size;
+}
+
+}
+
 bool valid_utf8(std::string_view bytes) {
     while (!bytes.empty()) {
-        const auto [size, low, high] = utf8_lead(static_cast<unsigned char>(bytes.front()));
-        if (!size || size > bytes.size()) {
+        char32_t unused = 0;
+        const auto size = read_scalar<false>(bytes, unused);
+        if (size == 0) {
             return false;
-        }
-        for (unsigned index = 1; index < size; ++index) {
-            const auto byte = static_cast<unsigned char>(bytes[index]);
-            if (byte < (index == 1 ? low : 0x80) || byte > (index == 1 ? high : 0xbf)) {
-                return false;
-            }
         }
         bytes.remove_prefix(size);
     }
@@ -41,22 +61,14 @@ bool valid_utf8(std::string_view bytes) {
 std::u32string read_utf8(std::string_view bytes) {
     std::u32string output;
     output.reserve(bytes.size());
-    for (std::size_t offset = 0; offset < bytes.size();) {
-        const unsigned first = static_cast<unsigned char>(bytes[offset]);
-        const auto [size, low, high] = utf8_lead(first);
-        if (!size || size > bytes.size() - offset) {
+    while (!bytes.empty()) {
+        char32_t scalar = 0;
+        const auto size = read_scalar<true>(bytes, scalar);
+        if (size == 0) {
             throw std::invalid_argument("Invalid UTF-8 input");
         }
-        char32_t scalar = first & (0xffU >> (size == 1 ? 1 : (size + 1)));
-        for (unsigned index = 1; index < size; ++index) {
-            const unsigned byte = static_cast<unsigned char>(bytes[offset + index]);
-            if (byte < (index == 1 ? low : 0x80) || byte > (index == 1 ? high : 0xbf)) {
-                throw std::invalid_argument("Invalid UTF-8 input");
-            }
-            scalar = (scalar << 6) | (byte & 0x3fU);
-        }
         output.push_back(scalar);
-        offset += size;
+        bytes.remove_prefix(size);
     }
     return output;
 }

@@ -446,8 +446,8 @@ cudaError_t decoder::verify_quantize_partial_fp8(VerifyQuantizeRows rows, int co
 
 cudaError_t decoder::verify_quantize_fp8_wide(WideVerifyQuantizeRows rows, int count, int width,
                                              cudaStream_t stream) {
-    if (count <= fused_verify_rows || count > WideVerifyQuantizeRows::capacity ||
-        width <= 0 || width % text_fp8_group_size != 0) {
+    if (count <= 0 || count > WideVerifyQuantizeRows::capacity || width <= 0 ||
+        width % text_fp8_group_size != 0) {
         return cudaErrorInvalidValue;
     }
     return wide_verify_launch_status(launch_verify_quantize(rows, count, width, stream));
@@ -472,7 +472,7 @@ cudaError_t decoder::verify_rms_quantize_partial(VerifyRmsQuantizeRows rows, int
 
 cudaError_t decoder::verify_rms_quantize_wide(WideVerifyRmsQuantizeRows rows, int count,
                                              const __nv_bfloat16* weight, cudaStream_t stream) {
-    if (count <= fused_verify_rows || count > WideVerifyRmsQuantizeRows::capacity) {
+    if (count <= 0 || count > WideVerifyRmsQuantizeRows::capacity) {
         return cudaErrorInvalidValue;
     }
     void* args[] = {&rows, &weight};

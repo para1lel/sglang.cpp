@@ -1,6 +1,5 @@
 #include "sglang/text/gqa/decode_kernels.cuh"
 #include "sglang/text/gqa_verify_batch.h"
-#include "sglang/runtime/execution/tp_verify_graph.h"
 #include <algorithm>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
@@ -796,9 +795,6 @@ template cudaError_t launch_gqa_kernel(
     void (*)(Mxfp8KvCache, const std::int32_t*, int, const float*, float*, bool, bool, Bf16*),
     dim3, dim3, cudaStream_t, Mxfp8KvCache, const std::int32_t*, int, const float*, float*,
     bool, bool, Bf16*);
-template cudaError_t launch_gqa_kernel(
-    void (*)(const decoder::tp_verify_graph::GqaBinding*), dim3, dim3, cudaStream_t,
-    const decoder::tp_verify_graph::GqaBinding*);
 
 }
 

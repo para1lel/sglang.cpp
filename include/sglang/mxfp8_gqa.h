@@ -90,7 +90,11 @@ std::optional<cudaError_t> try_prefill_gqa_postgate_quantize(int rows,
 bool short_verify_supported(const PagedDecodeLane* lanes, int count);
 
 cudaError_t short_verify_gqa(const PagedDecodeLane* lanes, int count, cudaStream_t stream);
-
+cudaError_t short_verify_gqa_shared(const PagedDecodeLane* lanes, const void* const* requests,
+                                    int count, cudaStream_t stream);
+cudaError_t short_verify_gqa_shared(const PagedDecodeLane* device_lanes, const int* indices,
+                                    const void* const* requests, int count, GqaGeometry geometry,
+                                    cudaStream_t stream);
 }
 
 cudaError_t text_gqa_preprocess(int first_position, int token_count,

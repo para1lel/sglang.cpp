@@ -36,22 +36,25 @@ python tests/media/http_routes.py build/bin/sglang-server "$checkpoint" /tmp/med
 In the saved `/server_info` responses, require `prefix_cache_entries` to equal zero in
 both modes. `lmcache_enabled` and `lmcache_available` must both be true for the daemon
 worker and false for the explicit cache-off control. The test verifies K4, the
-32,768-row budget, cold text, and checkpoint hits. It compares ordered label scores
-and exact prompt and output logprobs with cache-off workers using matched prefill grants.
-Decoded image and video branches reuse the first
-8,192 processed tokens and return identical IDs over JSON and SSE. Changing
-pixels, grid geometry, video positions, or a binary cache salt prevents reuse.
+32,768-row budget, cold text, and checkpoint hits. Ordered label scores and
+aligned prompt and output logprobs are compared with cache-off workers using
+matched prefill grants. The unaligned score replay checks JSON and SSE against
+the same resident GQA schedule with zero usable GDN rows.
+Decoded image and video branches reuse the exact `b−1,024` checkpoint and return
+identical IDs over JSON and SSE. Changing pixels, grid geometry, video positions,
+or a binary cache salt prevents reuse.
 The test also cancels a live media stream and checks that a replacement succeeds.
 The evidence directory contains the requests and responses.
 
 ## Optional codecs
 
 Build the default server and a second server with `--media-codec-prefix`. Use a pinned codec
-prefix and follow the RGB8 decoding steps in [chat serving](../../docs/chat-serving.md).
-Put the concatenated frame bytes for each case in `<rgb>/W1-{image,video}/input/frames.rgb8`.
-The test verifies each frame against the frozen fixture before submission.
+prefix. Run the RGB8 preparer with Python, NumPy, and OpenCV (available in the pinned vLLM
+environment). It decodes the [PNG](fixtures/image.http-body) and [MP4](fixtures/video.http-body)
+requests, then checks the RGB8 frame digests. The video fixture uses frames 0, 2, 4, and 7.
 
 ```bash
+python -B tests/media/make_codec_rgb.py "$rgb"
 python tests/media/codec_routes.py "$default_server" "$codec_server" "$codec_prefix" \
   "$checkpoint" "$rgb" /tmp/media-codecs
 ```

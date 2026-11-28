@@ -1,4 +1,6 @@
 #include "sglang/decoder.h"
+#include "sglang/runtime/backend/cuda_resources.h"
+#include "sglang/runtime/backend/device_arena.h"
 
 #include <cuda_runtime_api.h>
 
@@ -32,12 +34,12 @@ struct CudaCalls {
     std::unordered_set<void*> allocations;
     std::unordered_set<cudaStream_t> streams;
     Fault pending = Fault::none;
-    int allocation_countdown = 0;
     std::size_t completed_reads = 0;
     bool read_pending = false;
     int injections = 0;
     bool bad_handle = false;
     WeightRead* weight_read = nullptr;
+    const void** weight_upload = nullptr;
 
     bool consume(Fault fault) {
         if (pending != fault) {
@@ -61,14 +63,13 @@ void require(bool condition, const char* message) {
 }
 
 struct WeightRead {
-    explicit WeightRead(std::unordered_set<void*> weights) : model(std::move(weights)) {
-        require(!model.empty(), "No model allocation for the pending read");
-        early_releases.reserve(model.size());
+    explicit WeightRead(const void* weight) : model(weight) {
+        require(model != nullptr, "No model allocation for the pending read");
         void* pinned = nullptr;
         auto status = cudaMallocHost(&pinned, sizeof(*result));
         require(status == cudaSuccess, "Cannot allocate pinned weight readback");
         result = static_cast<unsigned char*>(pinned);
-        status = cudaMemcpy(&expected, *model.begin(), sizeof(expected), cudaMemcpyDeviceToHost);
+        status = cudaMemcpy(&expected, model, sizeof(expected), cudaMemcpyDeviceToHost);
         if (status != cudaSuccess) {
             cudaFreeHost(result);
             throw std::runtime_error("Cannot read initial model byte");
@@ -82,11 +83,6 @@ struct WeightRead {
         calls.weight_read = nullptr;
         if (calls.streams.count(stream) && __real_cudaStreamSynchronize(stream) != cudaSuccess) {
             return;
-        }
-        for (auto* storage : early_releases) {
-            if (__real_cudaFree(storage) == cudaSuccess) {
-                calls.allocations.erase(storage);
-            }
         }
         cudaFreeHost(result);
     }
@@ -105,8 +101,8 @@ struct WeightRead {
         if (status != cudaSuccess) {
             return status;
         }
-        return __real_cudaMemcpyAsync(result, *model.begin(), sizeof(*result),
-                                      cudaMemcpyDeviceToHost, stream);
+        return __real_cudaMemcpyAsync(result, model, sizeof(*result), cudaMemcpyDeviceToHost,
+                                      stream);
     }
 
     void release() {
@@ -125,8 +121,7 @@ struct WeightRead {
         return drained && !timed_out && *result == expected;
     }
 
-    std::unordered_set<void*> model;
-    std::unordered_set<void*> early_releases;
+    const void* model;
     cudaStream_t stream = nullptr;
     unsigned char* result = nullptr;
     unsigned char expected = 0;
@@ -243,10 +238,10 @@ void check_live(std::size_t allocation_count, std::size_t stream_count = 0) {
 
 void expect_failure(const sglang::Decoder& decoder, const sglang::DecoderOptions& options,
                     Fault fault) {
-    calls.pending = fault;
-    calls.allocation_countdown = 3;
-    const std::string_view expected = fault == Fault::allocation ? "Allocate CUDA memory" :
-                                                                  "Complete decoder step";
+    if (fault == Fault::synchronize)
+        calls.pending = fault;
+    const std::string_view expected =
+        fault == Fault::allocation ? "Lease CUDA arena storage" : "Complete decoder step";
     std::vector<int> emitted;
     sglang::DecoderCallbacks callbacks;
     callbacks.on_token = [&](int token) {
@@ -268,14 +263,23 @@ void expect_failure(const sglang::Decoder& decoder, const sglang::DecoderOptions
     } else {
         require(emitted.empty(), "Allocation failure published a token");
     }
-    require(calls.injections == 1 && calls.pending == Fault::none,
-            "The selected CUDA fault was not injected");
+    if (fault == Fault::synchronize) {
+        require(calls.injections == 1 && calls.pending == Fault::none,
+                "The selected CUDA fault was not injected");
+    }
     require(error.find(expected) != std::string::npos,
             "Generate did not report the injected failure at the expected operation");
 }
 
+std::size_t available_bytes(sglang::decoder::DeviceArena& arena) {
+    return arena.available_bytes() + arena.cache_available_bytes();
+}
+
 void check_cleanup(const sglang::Decoder& decoder, Fault fault) {
     const auto model_allocations = calls.allocations;
+    using namespace sglang::decoder;
+    const auto arena = DeviceArena::current(0);
+    const auto available = available_bytes(*arena);
     require(!model_allocations.empty(), "No model allocations reached the CUDA observer");
     check_live(model_allocations.size());
     sglang::DecoderOptions options;
@@ -284,30 +288,53 @@ void check_cleanup(const sglang::Decoder& decoder, Fault fault) {
         check_ids(decoder.generate(prompt, options));
     }
     if (fault != Fault::none) {
+        Allocations held(0);
+        if (fault == Fault::allocation) {
+            std::size_t block = 256;
+            while (block <= arena->available_bytes() / 2)
+                block *= 2;
+            for (; block >= 256; block /= 2) {
+                while (arena->available_bytes() >= block) {
+                    try {
+                        held.allocate<std::byte>(block);
+                    } catch (const CudaError& error) {
+                        if (error.status != cudaErrorMemoryAllocation)
+                            throw;
+                        break;
+                    }
+                }
+            }
+            require(arena->available_bytes() == 0, "Failed to exhaust startup workspace");
+        }
         expect_failure(decoder, options, fault);
+        held.close();
+        require(available_bytes(*arena) == available, "Error path retained request storage");
         check_live(model_allocations.size());
         require(calls.allocations == model_allocations, "Failure changed the model allocations");
     }
     const auto first = decoder.generate(prompt, options);
     check_ids(first);
-    require(calls.allocations.size() > model_allocations.size(),
-            "Reusable request storage was released");
-    check_live(calls.allocations.size(), 1);
+    require(available_bytes(*arena) < available, "Reusable request storage was released");
+    check_live(model_allocations.size(), 1);
     const auto warm_allocations = calls.allocations;
     const auto warm_streams = calls.streams;
+    const auto warm_available = available_bytes(*arena);
     const auto second = decoder.generate(prompt, options);
     check_ids(second);
     require(calls.allocations == warm_allocations && calls.streams == warm_streams &&
+                available_bytes(*arena) == warm_available &&
                 second.peak_device_allocation_bytes == first.peak_device_allocation_bytes,
             "Warm generation replaced reusable request storage");
 }
 
 void check_growth(const sglang::Decoder& decoder) {
+    const auto arena = sglang::decoder::DeviceArena::current(0);
     sglang::DecoderOptions options;
     options.max_new_tokens = 2;
     const auto first = decoder.generate(prompt, options);
     check_ids(first);
     const auto allocation_count = calls.allocations.size();
+    const auto initial_available = available_bytes(*arena);
     check_live(allocation_count, 1);
     options.max_new_tokens = 130;
     options.stop_token_id = two_ids.back();
@@ -317,14 +344,18 @@ void check_growth(const sglang::Decoder& decoder) {
             "Capacity growth changed the early stop result");
     require(grown.peak_device_allocation_bytes > first.peak_device_allocation_bytes,
             "Larger request did not increase page capacity");
+    require(available_bytes(*arena) < initial_available,
+            "Larger request leased no additional storage");
     check_live(allocation_count, 1);
     const auto retained_allocations = calls.allocations;
     const auto retained_streams = calls.streams;
+    const auto grown_available = available_bytes(*arena);
     options.max_new_tokens = 2;
     options.stop_token_id.reset();
     const auto reused = decoder.generate(prompt, options);
     check_ids(reused);
     require(calls.allocations == retained_allocations && calls.streams == retained_streams &&
+                available_bytes(*arena) == grown_available &&
                 reused.peak_device_allocation_bytes == grown.peak_device_allocation_bytes,
             "Short request replaced the grown reusable capacity");
 }
@@ -334,14 +365,23 @@ void check_weight_lifetime(const char* checkpoint) {
     sglang::DecoderOptions options;
     options.max_new_tokens = 2;
     check_ids(standby.generate(prompt, options));
+    const auto arena = sglang::decoder::DeviceArena::current(0);
     const auto baseline = calls.allocations;
-    auto victim = std::make_unique<sglang::Decoder>(checkpoint);
-    auto weights = calls.allocations;
-    for (auto* allocation : baseline) {
-        weights.erase(allocation);
+    const auto standby_available = available_bytes(*arena);
+    const void* weight = nullptr;
+    calls.weight_upload = &weight;
+    std::unique_ptr<sglang::Decoder> victim;
+    try {
+        victim = std::make_unique<sglang::Decoder>(checkpoint);
+    } catch (...) {
+        calls.weight_upload = nullptr;
+        throw;
     }
+    calls.weight_upload = nullptr;
+    require(sglang::decoder::DeviceArena::current(0) == arena && calls.allocations == baseline,
+            "Concurrent models did not share the startup backing");
     check_ids(victim->generate(prompt, options));
-    WeightRead read(std::move(weights));
+    WeightRead read(weight);
     std::string error;
     try {
         victim->generate(prompt, options);
@@ -352,26 +392,22 @@ void check_weight_lifetime(const char* checkpoint) {
             "Generation did not surface the pending read synchronization failure");
     require(read.sync_failures >= 2, "Fault did not prevent both completion checks");
     read.check_pending();
+    const auto victim_available = available_bytes(*arena);
     victim.reset();
     read.check_pending();
-    std::cout << "Failed completion checks " << read.sync_failures
-              << ", early model releases " << read.early_releases.size() << '\n';
-    require(read.early_releases.empty(), "Model release attempted while weight read was pending");
+    require(available_bytes(*arena) == victim_available && calls.allocations == baseline,
+            "Model storage became available while GPU weight read was pending");
     read.release();
     check_ids(standby.generate(prompt, options));
     require(read.finished(), "Deferred request did not complete its real CUDA weight read");
     require(calls.allocations == baseline, "Deferred model storage was not reclaimed");
+    require(available_bytes(*arena) == standby_available, "Retired model slices remain leased");
     check_live(baseline.size(), 1);
 }
 
 }
 
 extern "C" cudaError_t __wrap_cudaMalloc(void** storage, std::size_t bytes) {
-    if (calls.pending == Fault::allocation && --calls.allocation_countdown == 0 &&
-        calls.consume(Fault::allocation)) {
-        *storage = nullptr;
-        return cudaErrorMemoryAllocation;
-    }
     const auto status = __real_cudaMalloc(storage, bytes);
     if (status == cudaSuccess && !calls.allocations.insert(*storage).second) {
         calls.bad_handle = true;
@@ -383,14 +419,6 @@ extern "C" cudaError_t __wrap_cudaFree(void* storage) {
     if (storage != nullptr && calls.allocations.count(storage) == 0) {
         calls.bad_handle = true;
         return cudaErrorInvalidValue;
-    }
-    auto* read = calls.weight_read;
-    if (read && !read->drained && read->model.count(storage)) {
-        if (!read->early_releases.insert(storage).second) {
-            calls.bad_handle = true;
-            return cudaErrorInvalidValue;
-        }
-        return cudaSuccess;
     }
     const auto status = __real_cudaFree(storage);
     if (status == cudaSuccess) {
@@ -423,6 +451,10 @@ extern "C" cudaError_t __wrap_cudaMemcpyAsync(void* destination, const void* sou
                                              std::size_t bytes, cudaMemcpyKind kind,
                                              cudaStream_t stream) {
     const auto status = __real_cudaMemcpyAsync(destination, source, bytes, kind, stream);
+    if (status == cudaSuccess && calls.weight_upload != nullptr &&
+        *calls.weight_upload == nullptr && kind == cudaMemcpyHostToDevice && bytes >= (1 << 20)) {
+        *calls.weight_upload = destination;
+    }
     auto* read = calls.weight_read;
     if (status == cudaSuccess && read && !read->stream && kind == cudaMemcpyDeviceToHost &&
         --read->reads_until_queue == 0) {

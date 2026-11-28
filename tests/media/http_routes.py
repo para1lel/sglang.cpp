@@ -2,23 +2,36 @@
 
 import argparse
 import base64
-from concurrent.futures import ThreadPoolExecutor
-from contextlib import closing, contextmanager
-from copy import deepcopy
 import http.client
 import json
 import math
-from pathlib import Path
 import select
 import socket
 import struct
 import subprocess
 import sys
 import time
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing, contextmanager
+from copy import deepcopy
+from pathlib import Path
+from typing import Any, TypedDict, Unpack
 
-
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "prefix"))
-from live_controls import STORES, Controls
+from checkpoint_prompts import load_prompt
+from live_controls import GDN_ENTRIES, Controls
+
+Json = dict[str, Any]
+NativeResult = tuple[list[int], str, Json]
+
+
+class TextOptions(TypedDict, total=False):
+    start: int | None
+    stream: bool
+    budget: int
+    salt: str | None
 
 
 CHAT = "/v1/chat/completions"
@@ -29,7 +42,7 @@ MODEL = "Qwen3.8-27B-FP8"
 HEADERS = {"Content-Type": "application/json", "Connection": "close"}
 RGB8 = "data:application/x-sglang-rgb8;base64,"
 CACHE_PAGE_TOKENS = 128
-CHECKPOINT_INTERVAL = 8192
+FIRST_ANCHOR_DISTANCE = 1024
 
 
 def exchange(port, route, body=None, *, timeout=90):
@@ -177,12 +190,20 @@ def mixed_content():
             visual("video_url"), {"type": "text", "text": " and the clip."}]
 
 
-def ordinary(args, port, label, content):
+def ordinary(
+    args: argparse.Namespace,
+    port: int,
+    label: str,
+    content: str | list[Json],
+    *,
+    resident: bool = False,
+) -> tuple[tuple[list[int], Json], list[int] | None]:
     reply = capture(args, f"{label}-json", port, CHAT, chat(content))
     expected = received(reply, 4)
     prompt = reply.get("prompt_token_ids")
     raw = capture(args, f"{label}-sse", port, CHAT, chat(content, stream=True))
-    ids, stats, streamed_prompt = stream_result(raw, 4)
+    cached_rows = expected[1]["prompt_tokens"] if resident else 0
+    ids, stats, streamed_prompt = stream_result(raw, 4, cached_rows)
     assert (ids, without_cached_tokens(stats)) == (expected[0], without_cached_tokens(expected[1]))
     assert streamed_prompt == prompt
     return expected, prompt
@@ -313,17 +334,21 @@ def main(args):
             if label == "cached":
                 cache_info(args, port, label, True)
                 Controls(port, args.evidence).reset("cached-reset")
-            assert ordinary(args, port, f"{label}-media", content) == (expected, prompt)
+            assert ordinary(args, port, f"{label}-media", content, resident=label == "cached") == (
+                expected,
+                prompt,
+            )
             if label == "cached":
-                cancel_and_replace(args, port, log, content, (*expected, prompt), fragment=True)
-            ordinary(args, port, f"{label}-plain", "Say hello.")
+                cancel_and_replace(
+                    args, port, log, content, (*expected, prompt), fragment=True, cached=len(prompt)
+                )
+            ordinary(args, port, f"{label}-plain", "Say hello.", resident=label == "cached")
     print("Decoded media HTTP route contract passed.")
 
 
 def mixed_service(args):
     args.evidence.mkdir()
-    prompt = json.loads((Path(__file__).parents[2] / "benchmarks/streaming/W1.json").read_text())[
-        "prompt_token_ids"]
+    prompt = load_prompt("checkpoint")
     description = {"type": "text", "text": "Describe the visual content in detail. " * 16}
     queries = {
         "image": (CHAT, chat([visual("image_url"), description])),
@@ -411,26 +436,31 @@ def server_policy(args, port, label, enabled):
 def feature_media(args, port, log, cache, image_or_video, media, controls):
     for name in ("image", "video"):
         output, prompt = controls[name]
-        assert len(prompt) > CHECKPOINT_INTERVAL, len(prompt)
-        stores = cache.wait_for(f"before-{name}", 0, 0, stores=0)[STORES]
+        anchor = len(prompt) - FIRST_ANCHOR_DISTANCE
+        assert anchor > 0, prompt
+        before = cache.idle(f"before-{name}")[GDN_ENTRIES]
         assert image_or_video(port, f"default-cold-{name}", media[name], 0) == (output, prompt)
-        cache.wait_for(f"stored-{name}", 0, 0, stores=stores + 1)
+        assert cache.idle(f"resident-{name}")[GDN_ENTRIES] > before
         branch = f"{name}-branch"
         branch_prompt = controls[branch][1]
         assert branch_prompt != prompt
-        assert branch_prompt[:CHECKPOINT_INTERVAL] == prompt[:CHECKPOINT_INTERVAL]
-        for stream in (True, False):
-            assert image_or_video(port, f"default-{branch}-{stream}", media[branch],
-                                  CHECKPOINT_INTERVAL, stream=stream) == controls[branch]
+        assert branch_prompt[:anchor] == prompt[:anchor]
+        for stream, hit in ((True, anchor), (False, len(branch_prompt))):
+            assert (
+                image_or_video(
+                    port, f"default-{branch}-{stream}", media[branch], hit, stream=stream
+                )
+                == controls[branch]
+            )
     assert controls["image"][1] == controls["changed-pixels"][1]
     assert controls["image"][1] == controls["changed-grid"][1]
     assert controls["video"][1] != controls["changed-positions"][1]
     for name, base in (("changed-pixels", "image"), ("changed-grid", "image"),
                        ("changed-positions", "video"), ("salt-distinct", "image")):
-        stores = cache.wait_for(f"before-reset-{name}", 0, 0, stores=0)[STORES]
+        cache.idle(f"before-reset-{name}")
         cache.reset(f"reset-before-{name}")
         assert image_or_video(port, f"prime-before-{name}", media[base], 0) == controls[base]
-        cache.wait_for(f"stored-before-{name}", 0, 0, stores=stores + 1)
+        assert cache.idle(f"resident-before-{name}")[GDN_ENTRIES] > 0
         assert image_or_video(port, f"default-{name}", media[name], 0) == controls[name]
     cancelled = media["short"] | {"max_tokens": 1024, "stream": True, "cache_salt": "cancelled"}
     with closing(start(port, cancelled)) as active:
@@ -442,8 +472,12 @@ def feature_media(args, port, log, cache, image_or_video, media, controls):
             transport.close()
     wait_retired(log, offset)
     replacement = media["short"] | {"cache_salt": "cancelled"}
-    assert image_or_video(port, "default-after-cancel", replacement, 0,
-                          stream=True) == controls["short"]
+    assert (
+        image_or_video(
+            port, "default-after-cancel", replacement, len(controls["short"][1]), stream=True
+        )
+        == controls["short"]
+    )
     wait_retired(log, 0)
 
 
@@ -471,20 +505,73 @@ def checkpoint_media_fixtures():
     def media_body(visual_part, suffix=""):
         return chat([visual_part, {"type": "text", "text": stem + suffix}], budget=8)
 
-    return {"image": media_body(image), "video": media_body(video),
-            "image-branch": media_body(image, "Explain the result in French."),
-            "video-branch": media_body(video, "Describe the last frame."),
-            "changed-pixels": media_body(changed_pixels),
-            "changed-grid": media_body(visual("image_url", 64, 32)),
-            "changed-positions": media_body(changed_positions),
-            "salt-distinct": media_body(image) | {"cache_salt": "media\0a"},
-            "short": chat([image, {"type": "text", "text": "Describe the image."}], budget=8)}
+    return {
+        "image": media_body(image),
+        "video": media_body(video),
+        "image-branch": media_body(image, "Explain the result in French."),
+        "video-branch": media_body(video, "Explain the result in French."),
+        "changed-pixels": media_body(changed_pixels),
+        "changed-grid": media_body(visual("image_url", 64, 32)),
+        "changed-positions": media_body(changed_positions),
+        "salt-distinct": media_body(image) | {"cache_salt": "media\0a"},
+        "short": chat([image, {"type": "text", "text": "Describe the image."}], budget=8),
+    }
+
+
+def resident_scores(
+    cache: Controls,
+    text: Callable[..., NativeResult],
+    request: Callable[..., Json],
+    score_inputs: tuple[list[int], Json],
+    controls: tuple[NativeResult, NativeResult, list[Json]],
+) -> None:
+    scoring, score = score_inputs
+    boundary_control, split_control, label_controls = controls
+    port = cache.port
+    cold_boundary = text(
+        port, "default-cold-prompt-score-127", scoring, 0, start=127, salt="score-boundary-cold"
+    )
+    assert cold_boundary == boundary_control
+    resident_boundary = None
+    for start, expected in ((127, 0), (CACHE_PAGE_TOKENS, CACHE_PAGE_TOKENS)):
+        for stream in (False, True):
+            salt = f"score-boundary-{start}-{stream}"
+            before = cache.idle(f"before-{salt}")[GDN_ENTRIES]
+            text(
+                port, f"prime-{salt}", scoring[:CACHE_PAGE_TOKENS], 0, start=-1, budget=1, salt=salt
+            )
+            assert cache.idle(f"resident-{salt}")[GDN_ENTRIES] > before
+            result = text(port, salt, scoring, expected, start=start, stream=stream, salt=salt)
+            if expected:
+                assert result == split_control
+            elif resident_boundary is None:
+                assert result[:2] == boundary_control[:2]
+                resident_boundary = result
+            else:
+                assert result == resident_boundary
+    cache.reset("reset-label-score")
+    text(port, "prime-label-score", scoring[:CACHE_PAGE_TOKENS], 0, start=-1, budget=1)
+    got = request(port, "default-labels", SCORE, score)
+    assert got["token_logprobs"] == [row["token_logprobs"][0] for row in label_controls], got
+    assert got["scores"] == [row["scores"][0] for row in label_controls], got
+    assert got["usage"]["completion_tokens"] == 0, got
+    scored_prompt_tokens = 260
+    assert got["usage"]["prompt_tokens"] == scored_prompt_tokens, got
+    assert got["usage"]["total_tokens"] == scored_prompt_tokens, got
+    cache.reset("reset-label-score-reversed")
+    text(port, "prime-label-score-reversed", scoring[:CACHE_PAGE_TOKENS], 0, start=-1, budget=1)
+    reversed_labels = request(
+        port,
+        "default-labels-reversed",
+        SCORE,
+        score | {"label_token_ids": [row[::-1] for row in score["label_token_ids"]]},
+    )
+    check_label_order(got, reversed_labels)
 
 
 def feature_complete(args):
     args.evidence.mkdir()
-    fixture = Path(__file__).resolve().parents[2] / "benchmarks/streaming/W2.json"
-    ids = json.loads(fixture.read_text())["prompt_token_ids"]
+    ids = load_prompt("prefill")
     prefix = ids * 4
     extension = prefix + ids[:1024]
     scoring = ids[:132]
@@ -503,8 +590,16 @@ def feature_complete(args):
             with timeline.open("a") as stream:
                 stream.write(json.dumps(record) + "\n")
 
-    def text(port, name, prompt, cached, *, start=None, stream=False, budget=8):
+    def text(
+        port: int, name: str, prompt: list[int], cached: int, **options: Unpack[TextOptions]
+    ) -> NativeResult:
+        start = options.get("start")
+        stream = options.get("stream", False)
+        budget = options.get("budget", 8)
+        salt = options.get("salt")
         body = native_text(prompt, budget) if start is None else score_body(prompt, start)
+        if salt is not None:
+            body["cache_salt"] = salt
         body["sampling_params"]["max_new_tokens"] = budget if start is None or start == -1 else 4
         budget = body["sampling_params"]["max_new_tokens"]
         reply = request(port, name, GENERATE, body | {"stream": stream})
@@ -553,22 +648,14 @@ def feature_complete(args):
             assert text(port, f"default-text-{name}", prompt, hits, stream=name != "cold") == (
                 text_controls[len(prompt)])
             if name == "cold":
-                cache.wait_for("stored-text-prefix", 0, 0, stores=1)
-        stores = cache.wait_for("before-score-prime", 0, 0, stores=0)[STORES]
-        text(port, "prime-prompt-scores", scoring[:128], 0, start=-1, budget=1)
-        cache.wait_for("stored-score-prime", 0, 0, stores=stores + 1)
-        for score_start, hits, control in ((128, 128, split_control), (127, 0, boundary_control)):
-            for stream in (False, True):
-                assert text(port, f"default-prompt-score-{score_start}-{stream}", scoring, hits,
-                            start=score_start, stream=stream) == control
-        got = request(port, "default-labels", SCORE, score)
-        assert got["token_logprobs"] == [row["token_logprobs"][0] for row in label_controls], got
-        assert got["scores"] == [row["scores"][0] for row in label_controls], got
-        assert got["usage"]["completion_tokens"] == 0, got
-        assert got["usage"]["prompt_tokens"] == 260 and got["usage"]["total_tokens"] == 260, got
-        reversed_labels = request(port, "default-labels-reversed", SCORE,
-                                  score | {"label_token_ids": [row[::-1] for row in labels]})
-        check_label_order(got, reversed_labels)
+                assert cache.idle("resident-text-prefix")[GDN_ENTRIES] > 0
+        resident_scores(
+            cache,
+            text,
+            request,
+            (scoring, score),
+            (boundary_control, split_control, label_controls),
+        )
         feature_media(args, port, log, cache, image_or_video, media, controls)
     print("Default B200 cache, decoded media, and exact score route contract passed.")
 

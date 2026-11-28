@@ -1,28 +1,202 @@
 #include "sglang/runtime/execution/decoder_prefill_plan.h"
 #include <algorithm>
+#include <bitset>
+#include <optional>
 #include <stdexcept>
+
+namespace sglang::decoder {
+
+PrefillGrant prefill_tile(PrefillGrant grant, PrefillTileSpan span) {
+    grant.tokens += span.offset;
+    grant.position += span.offset;
+    grant.prompt_remaining -= span.offset;
+    grant.rows = span.rows;
+    return grant;
+}
+
+}
 
 namespace sglang::decoder::prefill_detail {
 
-PrefillGroup partial_projection_group(const PrefillGrant* grants, int count,
-                                             int min_rows) {
+namespace {
+
+struct ProjectionStep {
     PrefillGroup group{};
-    while (group.grants < count) {
-        const auto& grant = grants[group.grants];
-        if (grant.rows < min_rows || grant.rows > batch_prefill_tile_rows ||
-            grant.rows != grant.tile_rows || grant.rows > grouped_prefill_max_rows - group.rows) {
-            break;
-        }
-        ++group.grants;
-        group.rows += grant.rows;
+    PrefillAttentionMode attention = PrefillAttentionMode::serial_segments;
+    std::array<PrefillSegment, decoder_batch_max_lanes> segments{};
+};
+
+struct ProjectionCursor {
+    const PrefillGrant* grants = nullptr;
+    int count = 0;
+    int min_rows = 0;
+    int max_rows = 0;
+    bool whole_tiles = false;
+    bool ranked = false;
+    std::array<int, decoder_batch_max_lanes> offsets{};
+
+    int remaining(int source) const {
+        return grants[source].rows - offsets[source];
     }
-    return group;
+    int position(int source) const {
+        return grants[source].position + offsets[source];
+    }
+
+    bool has_tile(int source) const {
+        return grants[source].tile_rows == batch_prefill_tile_rows &&
+               remaining(source) >= batch_prefill_tile_rows;
+    }
+
+    void add(ProjectionStep& step, int source, int rows) {
+        step.segments[step.group.grants++] = {source, offsets[source]};
+        step.group.rows += rows;
+        offsets[source] += rows;
+    }
+
+    bool cold_pair(ProjectionStep& step, int first) {
+        constexpr int tile = batch_prefill_tile_rows;
+        const auto cold = [&](int source) {
+            const auto& grant = grants[source];
+            return has_tile(source) && remaining(source) >= 2 * tile && position(source) == 0 &&
+                   grant.media == nullptr && grant.request != nullptr &&
+                   grant.request->cached_gqa_tokens == 0;
+        };
+        if (!ranked || max_rows < 4 * tile || !cold(first))
+            return false;
+        for (int peer = first + 1; peer < count; ++peer) {
+            if (!cold(peer))
+                continue;
+            for (const int source : {first, peer}) {
+                add(step, source, tile);
+                add(step, source, tile);
+            }
+            return true;
+        }
+        return false;
+    }
+
+    void select_warm_pairs(std::bitset<decoder_batch_max_lanes>& sources, int first,
+                           int& lanes) const {
+        constexpr int tile = batch_prefill_tile_rows;
+        const int available = max_rows / tile;
+        for (int next = first + 1; lanes + 2 <= available && next + 1 < count; ++next) {
+            const int start = position(next);
+            if (sources[next] || !has_tile(next) || grants[next].media != nullptr ||
+                start % tile != 0 || start <= staged_prefill_batch_max_position ||
+                start > 65536 - tile)
+                continue;
+            for (int partner = next + 1; partner < count; ++partner) {
+                if (sources[partner] || !has_tile(partner) || grants[partner].media != nullptr ||
+                    position(partner) != start)
+                    continue;
+                sources.set(next);
+                sources.set(partner);
+                lanes += 2;
+                break;
+            }
+        }
+    }
+
+    bool full_tiles(ProjectionStep& step, int first) {
+        constexpr int tile = batch_prefill_tile_rows;
+        if (!whole_tiles || !has_tile(first) || max_rows < 2 * tile)
+            return false;
+        std::bitset<decoder_batch_max_lanes> sources;
+        sources.set(first);
+        int lanes = 1;
+        const int available = max_rows / tile;
+        const int start = position(first);
+        const bool prefer_equal = grants[first].media == nullptr &&
+                                  start >= staged_prefill_batch_min_position &&
+                                  start <= 65536 - tile && start % tile == 0 &&
+                                  (start > staged_prefill_batch_max_position || available == 4);
+        if (prefer_equal) {
+            for (int next = first + 1; next < count && lanes < available; ++next) {
+                if (has_tile(next) && grants[next].media == nullptr && position(next) == start) {
+                    sources.set(next);
+                    ++lanes;
+                }
+            }
+        }
+        select_warm_pairs(sources, first, lanes);
+        for (int next = first + 1; next < count && lanes < available; ++next) {
+            if (has_tile(next) && !sources[next]) {
+                sources.set(next);
+                ++lanes;
+            }
+        }
+        if (lanes < 2)
+            return false;
+        for (int source = first; source < count; ++source) {
+            if (sources[source])
+                add(step, source, tile);
+        }
+        step.attention = step.group.rows == grouped_prefill_max_rows
+                             ? PrefillAttentionMode::full_group
+                             : PrefillAttentionMode::batched;
+        return true;
+    }
+
+    bool next(ProjectionStep& step) {
+        step.group = {};
+        step.attention = PrefillAttentionMode::serial_segments;
+        int first = 0;
+        while (first < count && remaining(first) == 0)
+            ++first;
+        if (first == count)
+            return false;
+        if (cold_pair(step, first) || full_tiles(step, first))
+            return true;
+        const int first_rows = remaining(first);
+        const int causal_rows = std::min(first_rows, max_rows) / batch_prefill_tile_rows;
+        if (has_tile(first) && causal_rows >= 3) {
+            step.attention = PrefillAttentionMode::causal_segments;
+            for (int lane = 0; lane < causal_rows; ++lane) {
+                add(step, first, batch_prefill_tile_rows);
+            }
+            return true;
+        }
+        add(step, first, first_rows);
+        if (first_rows < min_rows || first_rows > grants[first].tile_rows ||
+            first_rows > batch_prefill_tile_rows)
+            return true;
+        for (int next = first + 1; next < count; ++next) {
+            const int rows = remaining(next);
+            if (rows >= min_rows && rows <= grants[next].tile_rows &&
+                rows <= batch_prefill_tile_rows && rows <= max_rows - step.group.rows) {
+                add(step, next, rows);
+            }
+        }
+        return true;
+    }
+};
+
+void dispatch_projection_groups(ProjectionCursor& cursor, const PartialProjectionSchedule& schedule,
+                                PrefillWorkspace& workspace, int serial_capacity,
+                                DecoderBatchStepStats& stats) {
+    ProjectionStep step;
+    std::array<PrefillGrant, decoder_batch_max_lanes> tiles;
+    while (cursor.next(step)) {
+        const auto [source, offset] = step.segments[0];
+        if (step.group.grants == 1) {
+            schedule.native(schedule.state, source, cursor.grants + source, workspace,
+                            serial_capacity, offset);
+            continue;
+        }
+        for (int lane = 0; lane < step.group.grants; ++lane) {
+            const auto [owner, begin] = step.segments[lane];
+            const auto& grant = cursor.grants[owner];
+            const int rows = std::min(grant.tile_rows, grant.rows - begin);
+            tiles[lane] = prefill_tile(grant, {.offset = begin, .rows = rows});
+            validate_prefill_tile(tiles[lane], workspace, serial_capacity);
+        }
+        schedule.group(schedule.state, step.segments.data(), tiles.data(), step.group, workspace,
+                       step.attention, serial_capacity);
+        ++stats.layerwise_prefill_groups;
+        stats.layerwise_prefill_rows += step.group.rows;
+    }
 }
 
-PrefillGroup causal_projection_group(int rows) {
-    if (rows >= causal_full_group.rows) return causal_full_group;
-    if (rows >= causal_three_tile_group.rows) return causal_three_tile_group;
-    return {};
 }
 
 int long_serial_visible(const PrefillGrant* grants, int count, bool grouped) {
@@ -44,107 +218,111 @@ int long_serial_visible(const PrefillGrant* grants, int count, bool grouped) {
     return visible;
 }
 
+bool wants_resident_gqa_staging(int cached_tokens, int position, int rows) {
+    return cached_tokens >= staged_serial_min_position && position >= staged_serial_min_position &&
+           rows >= staged_serial_min_rows && position <= text_attention_max_tokens - rows;
+}
+
+int resident_gqa_staging_visible(const PrefillGrant* grants, int count) {
+    int visible = 0;
+    for (int index = 0; index < count; ++index) {
+        const auto& grant = grants[index];
+        if (grant.request == nullptr || grant.media != nullptr ||
+            grant.tile_rows < staged_serial_min_rows)
+            continue;
+        const int tail = grant.rows % grant.tile_rows;
+        const int rows = tail >= staged_serial_min_rows ? tail : grant.tile_rows;
+        const int end = grant.position + grant.rows - (tail < staged_serial_min_rows ? tail : 0);
+        if (end - grant.position >= rows &&
+            wants_resident_gqa_staging(grant.request->cached_gqa_tokens, end - rows, rows)) {
+            visible = std::max(visible, end);
+        }
+    }
+    return visible;
+}
+
 void validate_prefill_tile(const PrefillGrant& grant, const PrefillWorkspace& workspace,
                                   int capacity) {
     const auto rows = grant.rows;
     const auto position = grant.position;
-    if (!workspace.stream() || !grant.request || !grant.tokens || rows < 1 || rows > capacity ||
-        capacity > workspace.capacity() || position < 0 ||
+    if (workspace.stream() == nullptr || grant.request == nullptr || grant.tokens == nullptr ||
+        rows < 1 || rows > capacity || capacity > workspace.capacity() || position < 0 ||
         position > text_attention_max_tokens - rows ||
         (position + rows - 1) / mxfp8_page_size >= grant.request->pages.page_count ||
-        (grant.draft && grant.prompt_remaining < rows)) {
+        (grant.draft != nullptr && grant.prompt_remaining < rows)) {
         throw std::invalid_argument("Invalid decoder prefill tile");
     }
 }
 
-bool can_pack_paired_tiles(const PrefillGrant* grants, int count) {
-    return count == 2 && grants[0].rows == paired_tile_grant_rows &&
-        full_tile_prefill_grants(grants, count) && grants[0].request != grants[1].request &&
-        std::all_of(grants, grants + count, [](const PrefillGrant& grant) {
-            return grant.position == 0 && grant.prompt_remaining == paired_tile_grant_rows &&
-                grant.request && grant.request->cached_gqa_tokens == 0;
-        });
-}
-
-std::array<PrefillGrant, 4> paired_tile_segments(const PrefillGrant* grants,
-    const PrefillWorkspace& workspace) {
-    validate_prefill_tile(grants[0], workspace, paired_tile_grant_rows);
-    validate_prefill_tile(grants[1], workspace, paired_tile_grant_rows);
-    return std::array{prefill_tile(grants[0], 0), prefill_tile(grants[0], batch_prefill_tile_rows),
-                      prefill_tile(grants[1], 0), prefill_tile(grants[1], batch_prefill_tile_rows)};
-}
-
-void record_projection_group(DecoderBatchStepStats& stats, int rows) {
-    ++stats.layerwise_prefill_groups;
-    stats.layerwise_prefill_rows += rows;
-}
-
-void peer_causal_segments(const PrefillGrant* peer_grants, int source, int offset,
-                                 PrefillGrant* segments, int lanes) {
-    for (int lane = 0; lane < lanes; ++lane) {
-        segments[lane] =
-            prefill_tile(peer_grants[source], offset + lane * batch_prefill_tile_rows);
+void validate_ranked_prefill_grants(std::array<const PrefillGrant*, 2> ranks, int count) {
+    for (int index = 0; index < count; ++index) {
+        const auto& grant = ranks[0][index];
+        const auto& mirror = ranks[1][index];
+        if (grant.tokens != mirror.tokens || grant.position != mirror.position ||
+            grant.rows != mirror.rows || grant.tile_rows != mirror.tile_rows ||
+            grant.prompt_remaining != mirror.prompt_remaining ||
+            grant.request->cached_gqa_tokens != mirror.request->cached_gqa_tokens) {
+            throw std::invalid_argument("Mismatched prefill grants across tensor-parallel ranks");
+        }
+        if ((grant.draft != nullptr) != (mirror.draft != nullptr) || mirror.scores != nullptr ||
+            mirror.media != nullptr) {
+            throw std::invalid_argument("Invalid peer prefill draft, media, or score capture");
+        }
+        if (grant.media != nullptr) {
+            throw std::invalid_argument(
+                "Multimodal prefill is unsupported under tensor parallelism");
+        }
     }
 }
 
 bool execute_partial_projection_groups(const PrefillGrant* grants, int count, cudaStream_t stream,
                                        DecoderBatchStepStats& stats,
-                                       const PartialProjectionSchedule& schedule,
-                                       int min_rows,
-                                       int staged_visible) {
+                                       const PartialProjectionSchedule& schedule, int min_rows,
+                                       GqaGeometry staged_geometry, int staged_visible,
+                                       bool resident_staging, bool whole_tiles, bool ranked) {
+    if (count == 0)
+        return false;
+    if (count < 0 || count > decoder_batch_max_lanes) {
+        throw std::invalid_argument("Invalid number of prefill grants");
+    }
     int serial_capacity = 1;
-    int grouped_capacity = 0;
-    for (int index = 0; index < count;) {
-        const auto partial = partial_projection_group(grants + index, count - index, min_rows);
-        const int consumed = std::max(1, partial.grants);
-        for (int lane = 0; lane < consumed; ++lane) {
-            serial_capacity = std::max(serial_capacity, grants[index + lane].tile_rows);
+    for (int index = 0; index < count; ++index) {
+        serial_capacity = std::max(serial_capacity, grants[index].tile_rows);
+        for (int prior = 0; prior < index; ++prior) {
+            if (grants[prior].request == grants[index].request)
+                return false;
         }
-        if (partial.grants >= 2) grouped_capacity = std::max(grouped_capacity, partial.rows);
-        if (grants[index].tile_rows == batch_prefill_tile_rows) {
-            grouped_capacity = std::max(grouped_capacity,
-                                        causal_projection_group(grants[index].rows).rows);
-        }
-        index += consumed;
     }
-    if (!grouped_capacity) return false;
+    int max_rows = grouped_prefill_max_rows;
+    std::optional<PrefillWorkspace> workspace;
+    for (;;) {
+        ProjectionCursor cursor{grants, count, min_rows, max_rows, whole_tiles, ranked};
+        ProjectionStep step;
+        int capacity = 0;
+        while (cursor.next(step)) {
+            if (step.group.grants > 1)
+                capacity = std::max(capacity, step.group.rows);
+        }
+        if (capacity == 0)
+            return false;
+        capacity = std::max(capacity, serial_capacity);
+        workspace.emplace(stream, capacity, staged_geometry, staged_visible, resident_staging);
+        if (workspace->data() != nullptr) {
+            if (schedule.prepare == nullptr || schedule.prepare(schedule.state, capacity))
+                break;
+            workspace->close();
+            check(cudaStreamSynchronize(stream), "Release provisional prefill workspace");
+        }
+        constexpr int pair_rows = 2 * batch_prefill_tile_rows;
+        if (capacity <= std::max(pair_rows, serial_capacity))
+            return false;
+        max_rows = pair_rows;
+    }
 
-    PrefillWorkspace workspace(stream, std::max(serial_capacity, grouped_capacity), staged_visible);
-    if (!workspace.data()) return false;
-    stats.prefill_workspace_bytes = std::max(stats.prefill_workspace_bytes, workspace.bytes());
-    for (int index = 0; index < count;) {
-        const auto partial = partial_projection_group(grants + index, count - index, min_rows);
-        if (partial.grants >= 2) {
-            schedule.group(schedule.state, index, 0, grants + index, partial, workspace,
-                      PrefillAttentionMode::serial_segments, serial_capacity);
-            record_projection_group(stats, partial.rows);
-            index += partial.grants;
-            continue;
-        }
-        const int source = index;
-        const auto& grant = grants[index++];
-        int offset = 0;
-        if (grant.tile_rows == batch_prefill_tile_rows) {
-            std::array<PrefillGrant, causal_full_group.grants> segments;
-            for (auto group = causal_projection_group(grant.rows); group.grants != 0;
-                 group = causal_projection_group(grant.rows - offset)) {
-                for (int lane = 0; lane < group.grants; ++lane) {
-                    auto& segment = segments[lane];
-                    segment = prefill_tile(grant, offset + lane * batch_prefill_tile_rows);
-                    validate_prefill_tile(segment, workspace, serial_capacity);
-                }
-                schedule.group(schedule.state, source, offset, segments.data(), group, workspace,
-                          PrefillAttentionMode::causal_segments, serial_capacity);
-                record_projection_group(stats, group.rows);
-                offset += group.rows;
-            }
-        }
-        if (offset < grant.rows) {
-            schedule.native(schedule.state, source, &grant, workspace, serial_capacity, offset);
-        }
-    }
-    workspace.close();
+    stats.prefill_workspace_bytes = std::max(stats.prefill_workspace_bytes, workspace->bytes());
+    ProjectionCursor cursor{grants, count, min_rows, max_rows, whole_tiles, ranked};
+    dispatch_projection_groups(cursor, schedule, *workspace, serial_capacity, stats);
+    workspace->close();
     return true;
 }
-
 }

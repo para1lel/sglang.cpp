@@ -150,16 +150,23 @@ def scheduler(path, offset):
     for line in path.read_bytes()[offset:].splitlines():
         if step := native.TRACE.fullmatch(line):
             width, decode, request_bytes = map(int, step.groups())
-            rows.append({"width": width, "decode": decode, "request_bytes": request_bytes,
-                         "graph_slots": 0})
+            rows.append(
+                {
+                    "width": width,
+                    "decode": decode,
+                    "request_bytes": request_bytes,
+                    "graph_slots": 0,
+                    "verification_graph_slots": 0,
+                }
+            )
         elif prefill := re.fullmatch(rb"batch prefill_rows=([\d,]+) workspace_bytes=(\d+)", line):
             rows[-1]["prefill"] = [int(value) for value in prefill[1].split(b",")]
             rows[-1]["workspace_bytes"] = int(prefill[2])
         elif groups := re.fullmatch(rb"batch layerwise_prefill_groups=(\d+) rows=(\d+)", line):
             rows[-1]["layerwise_prefill_groups"], rows[-1]["layerwise_prefill_rows"] = map(
                 int, groups.groups())
-        elif graph := re.fullmatch(rb"batch graph_slots=(\d+)", line):
-            rows[-1]["graph_slots"] = int(graph[1])
+        elif graph := re.fullmatch(rb"batch (graph_slots|verification_graph_slots)=(\d+)", line):
+            rows[-1][graph[1].decode()] = int(graph[2])
         elif sampling := re.fullmatch(rb"batch sampling_workspace_bytes=([1-9]\d*)", line):
             assert rows and rows[-1]["width"] and "sampling_workspace_bytes" not in rows[-1], line
             rows[-1]["sampling_workspace_bytes"] = int(sampling[1])
@@ -204,9 +211,16 @@ def check(port, out, maximum_width, graph_enabled):
         streams = parallel(port, cases, exact=False)
         rows = scheduler(log, offset)
         assert any(row["width"] == row["decode"] == width for row in rows), (width, rows)
-        assert all(row["graph_slots"].bit_count() <= int(graph_enabled) for row in rows)
-        if width == 1 and graph_enabled:
-            assert any(row["graph_slots"] for row in rows)
+        assert all(
+            row["verification_graph_slots"] == 0
+            and row["graph_slots"].bit_count() <= row["decode"] * graph_enabled
+            for row in rows
+        )
+        if graph_enabled:
+            assert any(row["decode"] == row["graph_slots"].bit_count() == width for row in rows), (
+                width,
+                rows,
+            )
         result[f"width{width}"] = {"streams": streams, "rows": rows}
         save(out / "http.json", result)
     offset = log.stat().st_size
@@ -222,12 +236,17 @@ def check(port, out, maximum_width, graph_enabled):
         "temperature": 0.8, "top_k": 20, "seed": 42,
     }}
     offset = log.stat().st_size
-    streams = parallel(port, [greedy, sampled], exact=False)
+    pair = [greedy, sampled]
+    streams = parallel(port, pair, exact=False)
     assert all(stream["finish"] == "length" and len(stream["tokens"]) == 32 for stream in streams)
     rows = scheduler(log, offset)
-    joint_decode = [row for row in rows
-                    if row["decode"] == 2 and row.get("sampling_workspace_bytes")]
-    assert joint_decode and all(row["graph_slots"] == 0 for row in joint_decode), rows
+    joint_decode = [
+        row for row in rows if row["decode"] == len(pair) and row.get("sampling_workspace_bytes")
+    ]
+    assert joint_decode, rows
+    assert any(row["graph_slots"].bit_count() == len(pair) for row in joint_decode) == (
+        graph_enabled
+    ), rows
     result["sampling-and-replay"] = {"streams": streams, "rows": rows}
     save(out / "http.json", result)
     offset = log.stat().st_size

@@ -1,28 +1,49 @@
 """Exercise the native generate route through the host-only server."""
 
-from contextlib import closing
 import http.client
 import json
-from pathlib import Path
 import select
-import socket
-import struct
-from tempfile import TemporaryDirectory
+import sys
 import time
 import unittest
+from contextlib import closing
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from test_native_chat import tokenizer_pieces
-from test_native_text import EOS, HEADERS, MODEL, check, event
+from test_native_text import EOS, HEADERS, MODEL, event
 from test_sampling_routes_cpu import (
-    CHAT, MODELS, TEXT, body, receipts, run_cpu_suite, send, server, wire,
+    CHAT,
+    MODELS,
+    TEXT,
+    body,
+    receipts,
+    run_cpu_suite,
+    send,
+    server,
+    wire,
 )
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import http_test
+from http_test import batch_frame, raw_post, raw_response, reset_on_close
+
+batch_frames = http_test.batch_frames
 
 GENERATE = "/generate"
 ABORT_REQUEST = "/abort_request"
 ABORTED = {"type": "abort", "message": "Aborted", "status_code": None, "err_type": None}
 ABORTED_WAITING = {"type": "abort", "message": "Abort in waiting queue"}
+ADMISSION_REJECTION = {"max_new_tokens": 7, "sampling_seed": -900}
+ADMISSION_ERROR = {"error": {"message": "Injected batch admission failure"}}
+ADMISSION_OPTIONS = [
+    {"max_new_tokens": 2048, "sampling_seed": -41},
+    {"max_new_tokens": 1},
+    ADMISSION_REJECTION,
+    {"max_new_tokens": 9},
+]
+ADMISSION_BATCH = {"input_ids": [[32], [33, 33], [34], [35]], "sampling_params": ADMISSION_OPTIONS}
 
 
 def get(port, path):
@@ -31,18 +52,7 @@ def get(port, path):
 
 
 def generate_client(port, payload):
-    wire = json.dumps(payload).encode()
-    client = socket.create_connection(("127.0.0.1", port), timeout=5)
-    try:
-        client.sendall(
-            b"POST /generate HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n"
-            b"Content-Type: application/json\r\nContent-Length: "
-            + str(len(wire)).encode() + b"\r\n\r\n" + wire
-        )
-        return client
-    except OSError:
-        client.close()
-        raise
+    return raw_post(port, GENERATE, payload)
 
 
 def queue_client(port, budget):
@@ -59,30 +69,21 @@ def named(rid, *, budget=2, stream=True, seed=-41):
 
 
 def abort(client):
-    client.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+    reset_on_close(client)
     client.close()
 
 
-def batch_frame(reply):
-    line = reply.readline()
-    if not line:
-        return None
-    if line == b":\n":
-        assert reply.readline() == b"\n"
-        return "keepalive"
-    assert line.startswith(b"data: ") and line.endswith(b"\n"), line
-    assert reply.readline() == b"\n"
-    return "[DONE]" if line == b"data: [DONE]\n" else json.loads(line[6:])
-
-
-def batch_frames(reply, eof_message):
-    while (frame := batch_frame(reply)) != "[DONE]":
-        check(frame is not None, eof_message)
-        if frame != "keepalive":
-            yield frame
+def admitted_long_lanes(lines: list[str]) -> list[str]:
+    return [
+        line for line in lines if line.startswith("cpu admit ") and line.endswith(" budget=2048")
+    ]
 
 
 class NativeGenerate(unittest.TestCase):
+    def check_batch_end(self, reply: http.client.HTTPResponse) -> None:
+        self.assertEqual(batch_frame(reply), "[DONE]")
+        self.assertIsNone(batch_frame(reply))
+
     @classmethod
     def setUpClass(cls):
         pieces = tokenizer_pieces(cls.checkpoint)
@@ -447,35 +448,54 @@ class NativeGenerate(unittest.TestCase):
             last = self.check_batch_frame(batch_frame(reply), 0, "AB", [32, 33],
                                           {"type": "length", "length": 2}, prompt_tokens=1)
             self.assertEqual(first, last)
-            self.assertEqual(batch_frame(reply), "[DONE]")
-            self.assertIsNone(batch_frame(reply))
+            self.check_batch_end(reply)
 
     def test_batch_stream_admission_failure_before_and_after_headers(self):
-        log = self.output / "batch-stream-error.log"
-        with patch.dict("os.environ", SGLANG_TEST_BATCH_ADMISSION_FAILURE="-900"), \
-             server(self.binary, self.checkpoint, log, "--max-active", "2") as port:
-            failing = {"max_new_tokens": 7, "sampling_seed": -900}
-            early = {"text": ["A"], "stream": True, "sampling_params": failing}
-            status, error = send(port, GENERATE, early)
-            self.assertEqual(status, 503)
-            self.assertEqual(error, {"error": {"message": "Injected batch admission failure"}})
+        port, _, log = self.start_abort_server(active=2, fail=True)
+        early = {"text": ["A"], "stream": True, "sampling_params": ADMISSION_REJECTION}
+        status, error = send(port, GENERATE, early)
+        self.assertEqual(status, 503)
+        self.assertEqual(error, ADMISSION_ERROR)
+        self.assertEqual(receipts(log), [])
+        late = ADMISSION_BATCH | {"stream": True}
+        with generate_client(port, late) as client, http.client.HTTPResponse(client) as reply:
+            self.check_batch_headers(reply)
+            frames = list(iter(lambda: batch_frame(reply), None))
+        self.assertEqual(
+            frames.pop(),
+            {
+                "error": {
+                    "message": "Native decoder failed",
+                    "type": "server_error",
+                    "code": 500,
+                    "retryable": False,
+                }
+            },
+        )
+        (done,) = [frame for frame in frames if frame["index"] == 1]
+        self.check_batch_frame(done, 1, "A", [32], {"type": "length", "length": 1}, prompt_tokens=2)
+        self.assertEqual(sorted(item["budget"] for item in receipts(log)), [1, 2048])
+        log_text = log.read_text()
+        (admitted,) = admitted_long_lanes(log_text.splitlines())
+        self.assertIn(admitted.replace("cpu admit ", "cpu cancel ", 1), log_text)
+        self.check_batch_reuse(port)
+
+    def test_batch_retryable_admission_failure_preserves_prompt(self) -> None:
+        log = self.output / "batch-admission-retry.log"
+        with (
+            patch.dict(
+                "os.environ",
+                SGLANG_TEST_BATCH_ADMISSION_FAILURE="-900",
+                SGLANG_TEST_BATCH_ADMISSION_RETRYABLE="1",
+            ),
+            server(self.binary, self.checkpoint, log, "--max-active", "2") as port,
+        ):
+            payload = {"input_ids": [[32]], "stream": True, "sampling_params": ADMISSION_REJECTION}
+            status, error = send(port, GENERATE, payload)
+            self.assertEqual(status, 503, error)
+            self.assertEqual(error, ADMISSION_ERROR)
+            self.assertEqual(log.read_text().count("cpu reject seed=-900"), 2)
             self.assertEqual(receipts(log), [])
-            late = {"input_ids": [[32], [33, 33], [34], [35]], "stream": True,
-                    "sampling_params": [{"max_new_tokens": 2048}, {"max_new_tokens": 1},
-                                        failing, {"max_new_tokens": 9}]}
-            with generate_client(port, late) as client, http.client.HTTPResponse(client) as reply:
-                self.check_batch_headers(reply)
-                frames = list(iter(lambda: batch_frame(reply), None))
-            self.assertEqual(frames.pop(), {"error": {"message": "Native decoder failed",
-                                                      "type": "server_error", "code": 500,
-                                                      "retryable": False}})
-            done, = [frame for frame in frames if frame["index"] == 1]
-            self.check_batch_frame(done, 1, "A", [32], {"type": "length", "length": 1},
-                                   prompt_tokens=2)
-            self.assertEqual(sorted(item["budget"] for item in receipts(log)), [1, 2048])
-            admitted, = [line for line in log.read_text().splitlines()
-                         if line.startswith("cpu admit ") and line.endswith(" budget=2048")]
-            self.assertIn(admitted.replace("cpu admit ", "cpu cancel ", 1), log.read_text())
             self.check_batch_reuse(port)
 
     def test_batch_stream_disconnect_after_partial_output(self):
@@ -499,8 +519,7 @@ class NativeGenerate(unittest.TestCase):
                     self.assertEqual(batch_frame(reply), "[DONE]")
             self.wait_queue(port, 0, 0)
             lines = log.read_text().splitlines()
-            admitted = {line for line in lines
-                        if line.startswith("cpu admit ") and line.endswith(" budget=2048")}
+            admitted = set(admitted_long_lanes(lines))
             cancelled = {line for line in lines if line.startswith("cpu cancel ")}
             self.assertEqual(cancelled, {line.replace("cpu admit ", "cpu cancel ", 1)
                                          for line in admitted})
@@ -517,27 +536,22 @@ class NativeGenerate(unittest.TestCase):
             self.check_packet(packet, "A", [32], {"type": "length", "length": 1})
 
     def test_batch_admission_failure_cancels_running_sibling(self):
-        log = self.output / "batch-admission-failure.log"
-        with patch.dict("os.environ", SGLANG_TEST_BATCH_ADMISSION_FAILURE="-900"), \
-             server(self.binary, self.checkpoint, log, "--max-active", "2") as port:
-            status, result = send(port, GENERATE, {
-                "input_ids": [[32], [33, 33], [34], [35]],
-                "sampling_params": [{"max_new_tokens": 2048, "sampling_seed": 0},
-                                    {"max_new_tokens": 1},
-                                    {"max_new_tokens": 7, "sampling_seed": -900},
-                                    {"max_new_tokens": 9}],
-            })
-            self.assertEqual(status, 503, result)
-            self.assertEqual(result, {"error": {"message": "Injected batch admission failure"}})
-            log_text = log.read_text()
-            admitted, = [line for line in log_text.splitlines()
-                         if line.startswith("cpu admit ") and line.endswith(" budget=2048")]
-            markers = (admitted, "cpu finish budget=1", "cpu reject seed=-900",
-                       admitted.replace("cpu admit ", "cpu cancel ", 1))
-            offsets = [log_text.index(marker) for marker in markers]
-            self.assertEqual(offsets, sorted(offsets))
-            self.assertEqual(sorted(receipt["budget"] for receipt in receipts(log)), [1, 2048])
-            self.check_batch_reuse(port)
+        port, _, log = self.start_abort_server(active=2, fail=True)
+        status, result = send(port, GENERATE, ADMISSION_BATCH)
+        self.assertEqual(status, 503, result)
+        self.assertEqual(result, ADMISSION_ERROR)
+        log_text = log.read_text()
+        (admitted,) = admitted_long_lanes(log_text.splitlines())
+        markers = (
+            admitted,
+            "cpu finish budget=1",
+            "cpu reject seed=-900",
+            admitted.replace("cpu admit ", "cpu cancel ", 1),
+        )
+        offsets = [log_text.index(marker) for marker in markers]
+        self.assertEqual(offsets, sorted(offsets))
+        self.assertEqual(sorted(receipt["budget"] for receipt in receipts(log)), [1, 2048])
+        self.check_batch_reuse(port)
         self.assertIn("cpu admit slot=1 prompt=1 budget=1", log.read_text())
 
     def test_batch_disconnect_cancels_all_admitted_lanes(self):
@@ -549,8 +563,7 @@ class NativeGenerate(unittest.TestCase):
             }) as client:
                 deadline = time.monotonic() + 3
                 while True:
-                    admitted = {line for line in log.read_text().splitlines()
-                                if line.startswith("cpu admit ") and line.endswith(" budget=2048")}
+                    admitted = set(admitted_long_lanes(log.read_text().splitlines()))
                     if len(admitted) == 2:
                         break
                     self.assertLess(time.monotonic(), deadline, log.read_text())
@@ -560,8 +573,7 @@ class NativeGenerate(unittest.TestCase):
                     self.assertEqual(sorted(item["prompt_tokens"] for item in receipts(log)),
                                      [1, 2])
                     abort(client)
-                    with http.client.HTTPResponse(scalar) as reply:
-                        reply.begin()
+                    with raw_response(scalar) as reply:
                         self.assertEqual(reply.status, 200)
                         self.check_packet(event(reply), "A", [32],
                                           {"type": "length", "length": 1})
@@ -634,8 +646,7 @@ class NativeGenerate(unittest.TestCase):
         self.check_batch_headers(reply)
         self.check_named_finish(batch_frame(reply), rid, tokens,
                                 ABORTED_WAITING if waiting else ABORTED)
-        self.assertEqual(batch_frame(reply), "[DONE]")
-        self.assertIsNone(batch_frame(reply))
+        self.check_batch_end(reply)
 
     def check_reused_ids(self, port, ids):
         values = self.generate({"input_ids": [[32]] * len(ids), "rid": ids,
@@ -720,8 +731,7 @@ class NativeGenerate(unittest.TestCase):
                 gate.with_suffix(".1").touch()
                 finish = {"type": "length", "length": 2}
                 self.check_named_finish(batch_frame(batch), ids[0], [32, 33], finish, index=0)
-                self.assertEqual(batch_frame(batch), "[DONE]")
-                self.assertIsNone(batch_frame(batch))
+                self.check_batch_end(batch)
         self.assertEqual([row["budget"] for row in receipts(log)], [2, 2])
 
     def test_aborted_http_queue_entry_releases_capacity_while_active_request_runs(self):
@@ -781,8 +791,7 @@ class NativeGenerate(unittest.TestCase):
             self.abort_request(port, {"rid": "missing", "abort_all": True})
             lane = batch_frame(stream)
             self.check_named_finish(lane, "batch_1", [32], ABORTED, index=1)
-            self.assertEqual(batch_frame(stream), "[DONE]")
-            self.assertIsNone(batch_frame(stream))
+            self.check_batch_end(stream)
         self.wait_queue(port, 0, 0)
         self.check_reused_ids(port, ["batch_0", "batch_1", "batch_2"])
 
@@ -804,8 +813,7 @@ class NativeGenerate(unittest.TestCase):
             gate.with_suffix(".1").touch()
             finish = {"type": "length", "length": 2}
             self.check_named_finish(batch_frame(reply), ids[2], [32, 33], finish, index=2)
-            self.assertEqual(batch_frame(reply), "[DONE]")
-            self.assertIsNone(batch_frame(reply))
+            self.check_batch_end(reply)
 
     def test_finished_batch_item_reuse_survives_old_request_cleanup(self):
         self.check_id_reuse_with_owner(busy_owner=False)
@@ -837,8 +845,7 @@ class NativeGenerate(unittest.TestCase):
                 self.wait_queue(port, 2, 0)
                 self.abort_request(port, {"rid": "parked"})
                 self.check_named_finish(batch_frame(parked_reply), "parked", [32], ABORTED)
-                self.assertEqual(batch_frame(parked_reply), "[DONE]")
-                self.assertIsNone(batch_frame(parked_reply))
+                self.check_batch_end(parked_reply)
                 deadline = time.monotonic() + 3
                 while True:
                     admitted = [line for line in log.read_bytes()[log_offset:].splitlines()
@@ -874,8 +881,7 @@ class NativeGenerate(unittest.TestCase):
             self.abort_request(port, {"rid": "old-sibling"})
             self.check_named_finish(batch_frame(stream), "old-sibling", [32], ABORTED,
                                     index=sibling_index)
-            self.assertEqual(batch_frame(stream), "[DONE]")
-            self.assertIsNone(batch_frame(stream))
+            self.check_batch_end(stream)
             self.wait_queue(port, 1, 0)
             self.check_named_finish(batch_frame(reply), "companion", [],
                                     {"type": "length", "length": 0}, index=1)
@@ -884,14 +890,12 @@ class NativeGenerate(unittest.TestCase):
             self.assertIn("Duplicate request ID", result["error"]["message"])
             self.abort_request(port, {"rid": "reusable"})
             self.check_named_finish(batch_frame(reply), "reusable", [32], ABORTED, index=0)
-            self.assertEqual(batch_frame(reply), "[DONE]")
-            self.assertIsNone(batch_frame(reply))
+            self.check_batch_end(reply)
 
     def test_ids_released_after_batch_failure(self):
         port, _, log = self.start_abort_server(active=2, fail=True)
         ids = ["running", "done", "failed", "tail"]
-        options = [{"max_new_tokens": 20, "sampling_seed": -41}, {"max_new_tokens": 1},
-                   {"max_new_tokens": 7, "sampling_seed": -900}, {"max_new_tokens": 9}]
+        options = [{"max_new_tokens": 20, "sampling_seed": -41}, *ADMISSION_OPTIONS[1:]]
         invalid = named(ids) | {"input_ids": [[32], [33], [34], [-1]]}
         status, result = send(port, GENERATE, invalid)
         self.assertEqual(status, 400, result)
@@ -901,9 +905,7 @@ class NativeGenerate(unittest.TestCase):
             with self.subTest(stream=stream):
                 payload = {"input_ids": [[32], [33], [34], [35]], "rid": ids, "stream": stream,
                            "sampling_params": options}
-                with generate_client(port, payload) as client, \
-                     http.client.HTTPResponse(client) as reply:
-                    reply.begin()
+                with generate_client(port, payload) as client, raw_response(client) as reply:
                     if stream:
                         self.assertEqual(reply.status, 200)
                         lane = batch_frame(reply)
@@ -954,8 +956,7 @@ class NativeGenerate(unittest.TestCase):
     def test_queue_overflow_disconnect_and_reuse(self):
         log = self.output / "queue.log"
         with server(self.binary, self.checkpoint, log, "--max-active", "1") as port:
-            with queue_client(port, 2048) as active, http.client.HTTPResponse(active) as reply:
-                reply.begin()
+            with queue_client(port, 2048) as active, raw_response(active) as reply:
                 self.assertEqual(reply.status, 200)
                 self.assertEqual(event(reply)["output_ids"], [32])
                 with queue_client(port, 77) as dropped:
@@ -970,8 +971,7 @@ class NativeGenerate(unittest.TestCase):
                     self.wait_queue(port, 1, 1)
                     reply.close()
                     abort(active)
-                    with http.client.HTTPResponse(queued) as resumed:
-                        resumed.begin()
+                    with raw_response(queued) as resumed:
                         self.assertEqual(resumed.status, 200)
                         self.check_packet(event(resumed), "A", [32], None)
                         self.check_packet(event(resumed), "AA", [32, 32],

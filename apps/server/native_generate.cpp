@@ -8,7 +8,6 @@
 #include "sglang/utf8.h"
 
 #include <algorithm>
-#include <charconv>
 #include <iostream>
 #include <iterator>
 #include <random>
@@ -18,32 +17,14 @@ namespace sglang::server {
 namespace {
 
 std::string_view finish_type(const DecoderResult& result, const DecoderOptions& options) {
-    const auto& ids = result.output_token_ids;
-    const auto budget = static_cast<std::size_t>(options.max_new_tokens);
-    const bool matched_stop = !ids.empty() && options.stops_at(ids.back());
-    if (result.finish_reason == DecoderFinishReason::constraint &&
-        options.constraint && !ids.empty() && ids.size() <= budget) {
-        return ids.size() == budget && !matched_stop ? "length" : "stop";
-    }
-    if (result.finish_reason == DecoderFinishReason::stop &&
-        (matched_stop || result.matched_text_stop) &&
-        ids.size() <= budget) {
-        return "stop";
-    }
-    if (result.finish_reason == DecoderFinishReason::length && !matched_stop &&
-        ids.size() == budget) {
-        return "length";
-    }
-    throw std::logic_error("Decoder returned an inconsistent /generate result");
+    return completion_reason(options, result, result.matched_text_stop.has_value(), true);
 }
 
 void append_logprob(std::string& output, int id, std::optional<float> value,
                     const Tokenizer* tokenizer) {
     output += '[';
     if (value) {
-        char number[32];
-        const auto formatted = std::to_chars(number, number + sizeof(number), *value);
-        output.append(number, formatted.ptr);
+        append_score(output, *value);
     } else {
         output += "null";
     }
@@ -88,9 +69,7 @@ void append_score_rows(std::string& output, const DecoderPromptLogprobs& scores,
 void append_logprobs(std::string& output, const BatchPrompt& request, const Tokenizer& tokenizer,
                      const DecoderResult& result) {
     const auto& scores = result.generated_logprobs;
-    if (scores.size() != result.output_token_ids.size()) {
-        throw std::logic_error("Generated logprob count differs from output token count");
-    }
+    check_generated_scores(result);
     const auto* pieces = request.return_text_in_logprobs ? &tokenizer : nullptr;
     const DecoderPromptLogprobs empty;
     const auto& prompt = result.prompt_logprobs ? *result.prompt_logprobs : empty;
@@ -277,8 +256,8 @@ void complete_single(const Socket& connection, BatchService& service, int slot,
         }
         if (!streaming) {
             write_json(connection, "200 OK", output);
-        } else if (stream.start() && stream.write(output) && stream.write("[DONE]")) {
-            stream.end();
+        } else if (stream.start() && stream.write(output)) {
+            finish_completion_stream(stream);
         }
     } catch (const std::exception& error) {
         if (!stream.started()) {
@@ -306,56 +285,44 @@ void write_batch(const Socket& connection, const Tokenizer& tokenizer,
 }
 
 void complete_batch(const Socket& connection, BatchService& service, int slot,
-                    const CompletionTokenizer& tokenizer, const std::vector<BatchPrompt>& items,
-                    bool indexed, const RecordTurn& record) {
-    const auto& pieces = tokenizer.get();
-    const BatchCallbacks callbacks{[&] { return disconnected(connection); }, {}, {}, {}};
-    if (const auto results = service.generate_batch(slot, items, callbacks)) {
-        if (indexed) {
-            write_batch(connection, pieces, items, *results);
-        } else if (!disconnected(connection)) {
-            GenerateResponse response(items.front(), pieces);
-            const auto output = response.frame(std::nullopt, results->front(), true);
-            if (record) {
-                record(results->front());
-            }
-            write_json(connection, "200 OK", output);
-        }
-    }
-}
-
-void stream_batch(const Socket& connection, BatchService& service, int slot,
-                  const CompletionTokenizer& tokenizer, const std::vector<BatchPrompt>& items,
-                  bool indexed, const RecordTurn& record) {
-    const auto& pieces = tokenizer.get();
+                    const Tokenizer& tokenizer, const std::vector<BatchPrompt>& items, bool indexed,
+                    bool streaming, const RecordTurn& record) {
     EventStream stream(connection);
     std::vector<GenerateResponse> responses;
-    responses.reserve(items.size());
-    for (const auto& item : items) {
-        responses.emplace_back(item, pieces);
-    }
-    const BatchCallbacks callbacks{
-        [&] { return disconnected(connection); },
-        [&] { return stream.start(); },
-        [&] { return stream.poll(); },
-        [&](std::size_t index, const DecoderResult& result, bool terminal) {
+    BatchCallbacks callbacks{[&] { return disconnected(connection); }, {}, {}, {}};
+    if (streaming) {
+        responses.reserve(items.size());
+        for (const auto& item : items)
+            responses.emplace_back(item, tokenizer);
+        callbacks.on_admitted = [&] { return stream.start(); };
+        callbacks.on_stream_poll = [&] { return stream.poll(); };
+        callbacks.on_output = [&](std::size_t index, const DecoderResult& result, bool terminal) {
             const auto frame_index = indexed ? std::optional{index} : std::nullopt;
             const auto output = responses[index].frame(frame_index, result, terminal);
-            if (terminal && record) {
+            if (terminal && record)
                 record(result);
-            }
             return stream.write(output);
-        },
-        !indexed,
-    };
+        };
+        callbacks.buffer_decode_output = !indexed;
+    }
     try {
-        if (service.generate_batch(slot, items, callbacks) && stream.write("[DONE]")) {
-            stream.end();
+        const auto results = service.generate_batch(slot, items, callbacks);
+        if (!results)
+            return;
+        if (streaming) {
+            finish_completion_stream(stream);
+        } else if (indexed) {
+            write_batch(connection, tokenizer, items, *results);
+        } else if (!disconnected(connection)) {
+            GenerateResponse response(items.front(), tokenizer);
+            const auto output = response.frame(std::nullopt, results->front(), true);
+            if (record)
+                record(results->front());
+            write_json(connection, "200 OK", output);
         }
     } catch (const std::exception& error) {
-        if (!stream.started()) {
+        if (!stream.started())
             throw;
-        }
         write_stream_error(stream, error);
     }
 }
@@ -384,9 +351,7 @@ void complete_aborted(const Socket& connection, const Tokenizer& tokenizer,
             return;
         }
     }
-    if (stream.write("[DONE]")) {
-        stream.end();
-    }
+    finish_completion_stream(stream);
 }
 
 void complete_generate(const Socket& connection, BatchService& service, std::optional<int> slot,
@@ -405,40 +370,12 @@ void complete_generate(const Socket& connection, BatchService& service, std::opt
     } else if (!input.indexed() && !items.front().text_stops && !scored &&
                !items.front().options.constraint) {
         complete_single(connection, service, *slot, tokenizer, items.front(), input.stream, record);
-    } else if (input.stream) {
-        stream_batch(connection, service, *slot, tokenizer, items, input.indexed(), record);
     } else {
-        complete_batch(connection, service, *slot, tokenizer, items, input.indexed(), record);
+        complete_batch(connection, service, *slot, tokenizer.get(), items, input.indexed(),
+                       input.stream, record);
     }
 }
 
-void stream_ollama(EventStream& stream, const Socket& connection, BatchService& service, int slot,
-                   const Tokenizer& tokenizer, const std::vector<BatchPrompt>& items,
-                   OllamaCompletion completion) {
-    GenerateResponse response(items.front(), tokenizer);
-    std::size_t emitted = 0;
-    const BatchCallbacks callbacks{
-        [&] { return disconnected(connection); }, {}, {},
-        [&](std::size_t, const DecoderResult& result, bool terminal) {
-            if (result.finish_reason == DecoderFinishReason::aborted) {
-                return false;
-            }
-            if (terminal) {
-                return stream.write(ollama_frame(completion, "", true));
-            }
-            const auto text = response.decoded_text(result, false);
-            if (response.holds_stop_prefix()) {
-                return true;
-            }
-            const auto delta = text.substr(emitted);
-            emitted = text.size();
-            return stream.write(ollama_frame(completion, delta, false));
-        },
-    };
-    if (service.generate_batch(slot, items, callbacks)) {
-        stream.end();
-    }
-}
 
 std::string ollama_chat_prompt(json::Array messages, const CompletionTokenizer& tokenizer) {
     for (const auto& item : messages) {
@@ -493,17 +430,34 @@ void complete_ollama(const Socket& connection, BatchService& service, std::optio
         auto items = ollama_prompts(request, tokenizer);
         auto& item = items.front();
         item.request_id = &id;
+        BatchCallbacks callbacks{[&] { return disconnected(connection); }, {}, {}, {}};
+        std::optional<GenerateResponse> response;
+        std::size_t emitted = 0;
         if (request.stream) {
-            stream_ollama(stream, connection, service, *slot, tokenizer.get(), items,
-                          request.completion);
-            return;
+            response.emplace(item, tokenizer.get());
+            callbacks.on_output = [&](std::size_t, const DecoderResult& result, bool terminal) {
+                if (result.finish_reason == DecoderFinishReason::aborted)
+                    return false;
+                if (terminal)
+                    return stream.write(ollama_frame(request.completion, "", true));
+                const auto text = response->decoded_text(result, false);
+                if (response->holds_stop_prefix())
+                    return true;
+                const auto delta = text.substr(emitted);
+                emitted = text.size();
+                return stream.write(ollama_frame(request.completion, delta, false));
+            };
         }
-        const BatchCallbacks callbacks{[&] { return disconnected(connection); }, {}, {}, {}};
-        if (const auto results = service.generate_batch(*slot, items, callbacks)) {
+        const auto results = service.generate_batch(*slot, items, callbacks);
+        if (!results)
+            return;
+        if (request.stream) {
+            stream.end();
+        } else {
             const auto& result = results->front();
             finish_type(result, item.options);
-            GenerateResponse response(item, tokenizer.get());
-            const auto text = response.decoded_text(result, true);
+            response.emplace(item, tokenizer.get());
+            const auto text = response->decoded_text(result, true);
             const auto elapsed = std::chrono::steady_clock::now() - start;
             const OllamaGenerateUsage usage{elapsed, item.prompt.size(),
                                             result.output_token_ids.size()};
@@ -549,18 +503,7 @@ std::vector<std::optional<std::string>> generate_ids(const GenerateInput& input)
 }
 
 std::string NativeGenerate::random_id(std::random_device& random) {
-    constexpr std::string_view hex = "0123456789abcdef";
-    std::string id(32, '0');
-    for (std::size_t offset = 0; offset < id.size(); offset += 8) {
-        auto bits = static_cast<std::uint32_t>(random());
-        for (std::size_t digit = 0; digit < 8; ++digit) {
-            id[offset + digit] = hex[bits & 15];
-            bits >>= 4;
-        }
-    }
-    id[12] = '4';
-    id[16] = hex[8 + (hex.find(id[16]) & 3)];
-    return id;
+    return random_request_id({}, random);
 }
 
 struct NativeGenerate::Registration {

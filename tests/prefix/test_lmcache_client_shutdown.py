@@ -2,14 +2,26 @@
 
 import multiprocessing
 import os
-from pathlib import Path
 import signal
 import socket
 import subprocess
 import sys
+from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from lmcache_relay import ADMISSION, GET, HEADER, LEASE, MAGIC, frame_metadata, header, receive
+from lmcache_relay import (
+    ADMISSION,
+    GDN,
+    HEADER,
+    LEASE,
+    MAGIC,
+    RANK_GET,
+    frame_metadata,
+    header,
+    receive,
+)
+
+LEASE_ACTIVE, LEASE_STALE, LEASE_RELEASED = 4, 3, 0
 
 
 def accept_request(listener, opcode):
@@ -30,26 +42,26 @@ def accept_request(listener, opcode):
 
 def serve_lease(listener, stop_write, final_probe, release, finished, kill_daemon):
     identity, token = os.urandom(16), os.urandom(16)
-    get, entry = accept_request(listener, GET)
+    get, entry = accept_request(listener, RANK_GET)
     with get:
-        if entry["records"] != [{"bytes": 4, "tokens": 0, "endpoint": 1}]:
-            raise AssertionError("Expected one GDN destination")
+        expected = {"bytes": 4, "tokens": 0, "family": GDN, "endpoint": 1, "widths": [1] * 4}
+        if entry["records"] != [expected]:
+            raise AssertionError(f"Expected one GDN destination, got {entry['records']}")
         admission = ADMISSION.pack(identity, token, os.getpid())
         get.sendall(HEADER.pack(MAGIC, 4, len(admission)) + admission)
         if receive(get, 1) != b"\x01":
             raise AssertionError("GET failed to arm")
         os.write(stop_write, b"\x01")
-        for state in (4, 3, 0):  # active, wrong daemon incarnation, released
+        for state in (LEASE_ACTIVE, LEASE_STALE, LEASE_RELEASED):
             status, entry = accept_request(listener, LEASE)
             with status:
                 if (entry["incarnation"], entry["lease"]) != (identity.hex(), token.hex()):
                     raise AssertionError("Status probe did not identify the original lease")
-                if state == 0:
+                if state == LEASE_RELEASED:
                     final_probe.set()
                     if not release.wait(5) or kill_daemon:
                         raise AssertionError("Daemon failed to reach its expected terminal state")
                 status.sendall(HEADER.pack(MAGIC, state, 0))
-        # Keep the original connection and process alive until the client has returned.
         if not finished.wait(5):
             raise AssertionError("GET failed to return after confirmed lease release")
 

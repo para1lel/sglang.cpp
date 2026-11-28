@@ -72,13 +72,17 @@ void validate_request(const std::vector<int>& prompt, const DecoderOptions& opti
                       bool allow_mtp = false);
 
 struct RequestMemoryBudget {
+    RequestBlockCache* retired;
     std::size_t capacity;
     std::size_t charged;
     std::size_t extra_bytes;
+    int device;
+    int kv_heads;
 };
 
-std::size_t reserve_request_memory(RequestBlockCache& retired, DecoderOptions& request, int prompt,
-                                   RequestMemoryBudget budget, bool pooled = false);
+std::array<std::size_t, 2> reserve_request_memory(DecoderOptions& request, int prompt,
+                                                  const std::array<RequestMemoryBudget, 2>& ranks,
+                                                  int num_ranks, bool pooled);
 
 std::size_t logit_adjustment_bytes(const DecoderOptions& options);
 

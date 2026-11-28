@@ -41,7 +41,7 @@ On clean allocation pressure the workspace retries with row scratch only. TP2 us
 
 ## Multi-request text prefill
 
-The [batch planner](batch-graphs.md#runtime-path) sends generation and scoring to one prefill executor, separate from decode. Compatible work groups into tiles of at most 1,024 rows. Order, KV, recurrence, rotary positions, media, scores and outputs stay request-local. On [Cache restore](prefix-cache.md#checkpoint-compatibility-and-resume), fully covered GQA tiles project only queries and gates. Others append only uncovered KV. [Attention dispatch](flash-prefill.md#runtime-path) · [Step dispatch](../src/decoder_batch.cpp#L504)<!-- prefix: "if (max_rows" --> · [Grant assembly](../src/decoder_batch.cpp#L535)<!-- prefix: "void Decoder" --> · [Cached GQA append](../src/runtime/execution/decoder_prefill_tiles.cpp#L265)<!-- prefix: "void Chunk::" -->
+The [batch planner](batch-graphs.md#runtime-path) sends generation and scoring to one prefill executor, separate from decode. Compatible work groups into tiles of at most 1,024 rows. Order, KV, recurrence, rotary positions, media, scores and outputs stay request-local. On [Cache restore](prefix-cache.md#checkpoint-compatibility-and-resume), fully covered GQA tiles project only queries and gates. Others append only uncovered KV. [Attention dispatch](flash-prefill.md#runtime-path) · [Step dispatch](../src/decoder_batch.cpp#L496)<!-- prefix: "if (max_rows" --> · [Grant assembly](../src/decoder_batch.cpp#L527)<!-- prefix: "void Decoder" --> · [Cached GQA append](../src/runtime/execution/decoder_prefill_tiles.cpp#L265)<!-- prefix: "void Chunk::" -->
 
 ### Projection pairs for MTP
 

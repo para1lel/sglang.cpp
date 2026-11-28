@@ -39,7 +39,7 @@ struct Lane {
     std::shared_ptr<const MultimodalInput> media = nullptr;
     DecoderPromptLogprobs prompt_logprobs = {};
     MediaPrefill media_prefill{};
-    std::size_t resident_bytes = 0;
+    std::array<std::size_t, 2> resident_bytes{};
     std::unique_ptr<PendingBatchPrefix> prefix = nullptr;
     std::optional<DeferredPrefixStore> prefix_store = std::nullopt;
 

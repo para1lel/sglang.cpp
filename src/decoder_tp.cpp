@@ -83,7 +83,7 @@ void DecoderBatch::TpDriver::drain_peer(const decoder::Lane& lane) const {
     decoder::DeviceScope peer(tp.peer_device);
     decoder::check(cudaStreamSynchronize(tp.peer_stream), "Drain peer decoder lane");
     lane.peer_request->memory.recycle_after_completion();
-    if (lane.peer_draft && (lane.resident_bytes != 0 || lane.checkpoints()))
+    if (lane.peer_draft && (lane.resident_bytes[1] != 0 || lane.checkpoints()))
         lane.peer_draft->recycle_after_completion();
 }
 
@@ -168,12 +168,13 @@ void DecoderBatch::TpDriver::prefill(const decoder::PrefillGrant* grants,
                             *tp.group, stats);
 }
 
-void DecoderBatch::TpDriver::prepare_peer_verification(decoder::Lane& lane, int capacity) const {
+void DecoderBatch::TpDriver::prepare_peer_verification(decoder::Lane& lane, int prefix,
+                                                       int rows) const {
     if (lane.peer_verification) return;
     decoder::DeviceScope peer(tp.peer_device);
     lane.peer_verification = std::make_unique<decoder::TargetVerification>(
-        *lane.peer_request, lane.capacity(), lane.progress.position, capacity, false,
-        tp.peer_stream, nullptr, -1, true);
+        *lane.peer_request, lane.capacity(), prefix, rows, false, tp.peer_stream, nullptr, -1,
+        true);
 }
 
 decoder::MtpRound DecoderBatch::TpDriver::peer_round(const decoder::Lane& lane, int rows) {

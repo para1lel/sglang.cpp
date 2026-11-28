@@ -49,7 +49,7 @@ struct DecoderBatch::TpDriver {
     void prefill(const decoder::PrefillGrant* grants, const decoder::PrefillGrant* peer_grants,
                  int count, cudaStream_t stream, DecoderBatchStepStats& stats) const;
 
-    void prepare_peer_verification(decoder::Lane& lane, int capacity) const;
+    void prepare_peer_verification(decoder::Lane& lane, int prefix, int rows) const;
     static decoder::MtpRound peer_round(const decoder::Lane& lane, int rows);
     bool propose(decoder::MtpRound* rounds, decoder::MtpRound* peer_rounds, int count,
                  cudaStream_t stream, const decoder::ConstraintWorkspace& scratch,

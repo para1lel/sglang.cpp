@@ -2,7 +2,7 @@
 
 ## Responsibilities and sources of truth
 
-Each target request keeps one FP32 recurrent checkpoint and a bounded replay log per GDN layer and rank. The log stores processed keys, recurrent updates and decays, and raw BF16 convolution inputs. A cursor identifies the oldest row and the committed and tentative lengths. [State](../include/sglang/text/gdn/replay_ssm.h#L18)<!-- prefix: "struct State" --> · [Request storage](../src/runtime/model/qwen_request.cpp#L56)<!-- prefix: "template \u003cty" --> · [ReplaySSM](https://dao-lab.ai/blog/2026/replayssm/)
+Each target request keeps one FP32 recurrent checkpoint and a bounded replay log per GDN layer and rank. The log stores processed keys, recurrent updates and decays, and raw BF16 convolution inputs. A cursor identifies the oldest row and the committed and tentative lengths. [State](../include/sglang/text/gdn/replay_ssm.h#L18)<!-- prefix: "struct State" --> · [Request storage](../src/runtime/model/qwen_request.cpp#L57)<!-- prefix: "template <ty" --> · [ReplaySSM](https://dao-lab.ai/blog/2026/replayssm/)
 
 ## Runtime path
 
@@ -18,7 +18,7 @@ Each recurrence warp carries four value channels and interleaves their independe
 
 Tensor Core target verification can project B/A together in one launch for any valid count of 2–160 rows, including unequal packet tails. It requires checkpoint gate dimensions, nonnull outputs, and 16-byte-aligned weights and inputs. Each block assigns one warp per row, and grid Y selects groups of up to 20 rows. Inactive tail warps skip output. Full and rank-local operators preserve the existing FP32 dot-product and reduction order and BF16 rounding. If the full group declines, the runtime tries grouped gates and then separate B/A projections. CUDA errors propagate. [Gate dispatch](../src/runtime/execution/decoder_forward_attention.cpp#L90)<!-- prefix: "void project" --> · [Kernel and tail](../src/text_decode_bandwidth.cu#L377)<!-- prefix: "const int ch" --> · [Packet launch](../src/text_decode_bandwidth.cu#L542)<!-- prefix: "std::optiona" -->
 
-The replay log stays in the request. Terminal LMCache stores materialize committed GDN into the usual convolution and recurrent spans on each rank. Prefill captures the state at each selected prompt endpoint. [Materialization](../src/runtime/model/qwen_request.cpp#L421)<!-- prefix: "void Request" --> · [Checkpoint boundaries](prefix-cache.md#checkpoint-boundaries)
+The replay log stays in the request. Terminal LMCache stores materialize committed GDN into the usual convolution and recurrent spans on each rank. Prefill captures the state at each selected prompt endpoint. [Materialization](../src/runtime/model/qwen_request.cpp#L408)<!-- prefix: "void Request" --> · [Checkpoint boundaries](prefix-cache.md#checkpoint-boundaries)
 
 ## Constraints and failure behavior
 

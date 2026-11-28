@@ -151,7 +151,8 @@ struct DecoderBatch::State {
                                      const WideMtpCandidates& candidates, bool& contains_mtp);
     void collect_scores(const std::array<Request*, decoder_batch_max_lanes>& scoring,
                         Steps& results);
-    std::size_t reserve(DecoderOptions& request, int prompt, std::size_t extra_bytes) const;
+    std::array<std::size_t, 2> reserve(int prompt, DecoderOptions& request,
+                                       std::size_t extra_bytes) const;
     RequestBlockCache* request_cache(const DecoderOptions& request);
     RequestBlockCache* peer_request_cache(const Lane& lane);
     void validate_admission(DecoderOptions& options, const std::vector<int>& prompt,
@@ -172,6 +173,7 @@ struct DecoderBatch::State {
     const Decoder::Model& model;
     const DecoderBatchOptions options;
     KvResidencyPolicy residency;
+    std::optional<KvResidencyPolicy> peer_residency;
     std::unique_ptr<PrefixResidency> prefix_pool;
     std::shared_ptr<BatchStorage> storage;
     Allocations execution;

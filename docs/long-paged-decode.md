@@ -58,7 +58,7 @@ The rotating-weight MLP graphs used three nodes per call instead of four. Their 
 
 ### Sixteen-row TP2 draft repair
 
-The current ranked draft repairs each rank’s KV after target commit. With no output callback, TP2 commit can collect up to sixteen lanes before repair for a qualifying wide target group. Each rank binds its own KV pages; narrow and shortened groups preserve the same per-request commit order. [Commit width](../src/decoder_batch.cpp#L791)<!-- prefix: "if (output =" --> · [Ranked repair](../src/decoder_tp.cpp#L305)<!-- prefix: "void Decoder" -->
+The current ranked draft repairs each rank’s KV after target commit. With no output callback, TP2 commit can collect up to sixteen lanes before repair for a qualifying wide target group. Each rank binds its own KV pages; narrow and shortened groups preserve the same per-request commit order. [Commit width](../src/decoder_batch.cpp#L783)<!-- prefix: "if (output =" --> · [Ranked repair](../src/decoder_tp.cpp#L306)<!-- prefix: "void Decoder" -->
 
 The earlier primary-only wide repair is archived with the [former request-memory contract](https://github.com/para1lel/sglang.cpp/blob/6cf81a27829354551397d463113be002ea025343/docs/serving/request-memory.md#peer-draft-repair).
 

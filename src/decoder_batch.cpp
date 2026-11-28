@@ -32,7 +32,7 @@ void DecoderBatch::State::retire(std::optional<Lane>& lane) const {
         tp_driver->drain_peer(*lane);
     if (lane->request)
         lane->request->memory.recycle_after_completion();
-    if (lane->draft && (lane->resident_bytes != 0 || lane->checkpoints())) {
+    if (lane->draft && (lane->resident_bytes[0] != 0 || lane->checkpoints())) {
         lane->draft->recycle_after_completion();
     }
     lane.reset();
@@ -68,17 +68,6 @@ int DecoderBatch::admit_multimodal(int slot, std::vector<int>&& prompt,
     return admit_impl(slot, std::move(prompt), options, &media);
 }
 
-std::size_t DecoderBatch::State::reserve(DecoderOptions& request, int prompt,
-                                         std::size_t extra_bytes) const {
-    if (!residency.resident()) return 0;
-    std::size_t charged = 0;
-    for (const auto& lane : storage->slots) {
-        charged += lane ? lane->resident_bytes : 0;
-    }
-    return reserve_request_memory(storage->retired, request, prompt,
-                                  {residency.capacity(), charged, extra_bytes},
-                                  prefix_pool != nullptr);
-}
 void DecoderBatch::State::initialize(Lane& lane, int slot, ResidentPrefixRead& reuse) {
     const auto& opts = lane.options;
     const auto stream = execution.stream();
@@ -119,7 +108,7 @@ void DecoderBatch::State::initialize(Lane& lane, int slot, ResidentPrefixRead& r
                                    peer_request_cache(lane));
     }
     lane.prefill_lookup = std::exchange(lane.options.prefix_cache_read, {});
-    if (lane.resident_bytes != 0)
+    if (lane.resident_bytes[0] != 0)
         initialize_request_workspace(lane, slot);
     check(cudaStreamSynchronize(stream), "Initialize decoder batch slot");
     initialize_prefix(lane, reuse);
@@ -135,6 +124,8 @@ void DecoderBatch::State::initialize_request_workspace(Lane& lane, int slot) {
             *lane.request, lane.capacity(), lane.prompt_size, rows, false, execution.stream(),
             std::shared_ptr<TextLogitCandidate>(winners, readback), opts.generated_top_logprobs,
             tp != nullptr);
+        if (tp_driver)
+            tp_driver->prepare_peer_verification(lane, lane.prompt_size, rows);
     }
     if (lane.sampling && !opts.requires_target_only() && sampling_workspace == nullptr) {
         sampling_workspace = execution.allocate<std::byte>(sampling_workspace_bytes());
@@ -280,9 +271,10 @@ int DecoderBatch::admit_impl(int slot, std::vector<int>&& original, const Decode
         }
         if (input) validate_feature_device(*input, state_->model.device);
         reclaim_prefill_workspaces(state_->model.device);
-        const auto resident = state_->reserve(options, static_cast<int>(prompt.size()),
+        const auto resident = state_->reserve(
+            static_cast<int>(prompt.size()), options,
             logit_adjustment_bytes(options) +
-            (input ? input->prompt.positions.size() * sizeof(MropePosition) : 0));
+                (input ? input->prompt.positions.size() * sizeof(MropePosition) : 0));
         if (options.max_new_tokens != requested.max_new_tokens) {
             validate_request(prompt, options, true);
         }

@@ -1,4 +1,5 @@
 #include "sglang/runtime/execution/decoder_batch_state.h"
+#include "sglang/runtime/backend/device_arena.h"
 #include <algorithm>
 #include <cstdlib>
 #include <stdexcept>
@@ -100,8 +101,44 @@ DecoderBatch::State::State(const Decoder::Model& owner, DecoderBatchOptions opti
     }
     if (options.resident_memory_limit) {
         residency.measure_available(available_device_bytes());
+        if (tp != nullptr) {
+            peer_residency.emplace(options);
+            const auto peer_arena = DeviceArena::current(tp->peer_device);
+            peer_residency->measure_available(peer_arena->available_bytes());
+        }
     }
     device.restore();
+}
+
+std::array<std::size_t, 2> DecoderBatch::State::reserve(int prompt, DecoderOptions& request,
+                                                        std::size_t extra_bytes) const {
+    if (!residency.resident())
+        return {};
+    std::array<std::size_t, 2> charged{};
+    for (const auto& lane : storage->slots) {
+        if (lane) {
+            charged[0] += lane->resident_bytes[0];
+            charged[1] += lane->resident_bytes[1];
+        }
+    }
+    const int heads = tp != nullptr ? gqa_rank_geometry.kv_heads : mxfp8_kv_heads;
+    std::array<RequestMemoryBudget, 2> ranks{
+        RequestMemoryBudget{
+            &storage->retired,
+            residency.capacity(),
+            charged[0],
+            extra_bytes,
+            model.device,
+            heads,
+        },
+        {},
+    };
+    if (peer_residency) {
+        auto* retired = storage->peer_retired ? &*storage->peer_retired : nullptr;
+        ranks[1] = {retired, peer_residency->capacity(), charged[1], 0, tp->peer_device, heads};
+    }
+    return reserve_request_memory(request, prompt, ranks, tp != nullptr ? 2 : 1,
+                                  prefix_pool != nullptr);
 }
 
 DecoderBatch::State::~State() {
@@ -234,7 +271,7 @@ int DecoderBatch::State::collect_rounds(const PrefillRows& verification_rows, in
                 tp != nullptr);
         }
         if (tp_driver)
-            tp_driver->prepare_peer_verification(lane, capacity);
+            tp_driver->prepare_peer_verification(lane, lane.progress.position, capacity);
         if (lane.options.constraint) {
             if (!lane.constraint_round) {
                 lane.constraint_round.emplace(*lane.request, *lane.options.constraint, capacity);

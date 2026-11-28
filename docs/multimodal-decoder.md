@@ -46,7 +46,7 @@ Use `DecoderBatch::admit_multimodal` to mix media and text lanes, score tokens, 
 
 Media lanes share the [prefill executor](native-prefill-workspace.md#runtime-path) and use eligible Tensor Core tiles. Each lane supplies its embeddings and rotary positions. Decode binds the physical KV position and rotary position separately. Eligible K0 decode can replay a graph. [Lane inputs](../src/runtime/model/decoder_batch_lane.cpp#L30)<!-- prefix: "ForwardLane " --> · [Graph binding](../src/text/decoder_graph.cpp#L105)<!-- prefix: "const int ro" -->
 
-The batch decoder accepts ordinary sampling and stop options. [Prefix reuse](prefix-cache.md#media-identity-and-prefill) matches the covered media as well as token IDs and salt. A hit reports restored prompt IDs as `cached_prompt_tokens`. [Batch restore](../src/decoder_batch.cpp#L180)<!-- prefix: "lane.restore" -->
+The batch decoder accepts ordinary sampling and stop options. [Prefix reuse](prefix-cache.md#media-identity-and-prefill) matches the covered media as well as token IDs and salt. A hit reports restored prompt IDs as `cached_prompt_tokens`. [Batch restore](../src/decoder_batch.cpp#L171)<!-- prefix: "lane.restore" -->
 
 - The grid requires a positive pair count and positive even spatial axes. Apply the encoder's separate patch limits when it produces the features.
 - Expanded prompt length plus output budget must fit 262,144 tokens. Use IDs in `[0, 248320)`.

@@ -1,4 +1,5 @@
 #include "sglang/decoder_internal.h"
+#include "sglang/runtime/backend/device_arena.h"
 
 #include "sglang/text/decoder_logprobs.h"
 #include "sglang/text/gdn_local.h"
@@ -102,51 +103,41 @@ int reserved_verification_rows(int output, int mtp_steps) {
 
 namespace {
 
-struct ResidentRequestShape {
-    int capacity;
-    int verification_rows;
-    bool draft;
-    bool pooled;
-};
-
-std::size_t request_resident_bytes(ResidentRequestShape shape) {
-    constexpr std::size_t gdn_bytes = gdn_layers *
-        (gdn_history_elements * sizeof(Bf16) + gdn_state_elements * sizeof(float));
+std::size_t request_resident_bytes(int prompt, int output, const DecoderOptions& options,
+                                   const RequestMemoryBudget& rank, bool pooled) {
+    const bool local = rank.kv_heads != mxfp8_kv_heads;
+    const auto history = local ? gdn_local_history_elements : gdn_history_elements;
+    const auto state = local ? gdn_local_state_elements : gdn_state_elements;
+    const auto replay = local ? ReplayStorage<GdnLocal>::bytes : ReplayStorage<GdnFull>::bytes;
+    const auto gdn_bytes = gdn_layers * ((history * sizeof(Bf16)) + (state * sizeof(float)));
     constexpr std::size_t workspace_allowance = 16 * 1024 * 1024;
-    const int pages = pages_for(shape.capacity);
+    const bool scoring = options.score_prompt || options.label_token_ids != nullptr;
+    const int pages = pages_for(prompt + std::max(output, static_cast<int>(scoring)) - 1);
     const auto table = pages * sizeof(std::int32_t);
-    const auto target_kv = shape.pooled ? 0 : kv_bytes(pages, mxfp8_kv_heads);
-    const auto target = target_kv + table + gdn_bytes + ReplayStorage<GdnFull>::bytes;
-    const auto draft_kv = (target_kv / full_attention_layers) + table;
-    const auto verifier = shape.verification_rows * workspace_allowance;
-    return target + workspace_allowance + (shape.draft ? draft_kv + workspace_allowance : 0) +
-           verifier;
+    const auto target_kv = pooled ? 0 : kv_bytes(pages, rank.kv_heads);
+    const auto target = target_kv + table + gdn_bytes + replay + workspace_allowance;
+    const auto draft = options.mtp_steps != 0
+                           ? (target_kv / full_attention_layers) + table + workspace_allowance
+                           : 0;
+    const auto verify_rows = reserved_verification_rows(output, options.mtp_steps);
+    const auto verifier = verify_rows * workspace_allowance;
+    return target + draft + verifier + rank.extra_bytes;
 }
 
-struct ResidentRequestBudget {
-    std::size_t total;
-    std::size_t free;
-    std::size_t extra;
-};
-
-int limit_resident_output(int prompt, const DecoderOptions& options, ResidentRequestBudget budget,
+int limit_resident_output(int prompt, const DecoderOptions& options,
+                          const RequestMemoryBudget* first, const RequestMemoryBudget* last,
                           bool pooled) {
-    const auto fits = [&](int output, std::size_t bytes) {
-        const bool scoring = options.score_prompt || bool(options.label_token_ids);
-        const auto resident = request_resident_bytes({
-            prompt + std::max(output, int(scoring)) - 1,
-            reserved_verification_rows(output, options.mtp_steps),
-            options.mtp_steps != 0,
-            pooled,
+    const auto fits = [&](int output) {
+        return std::all_of(first, last, [&](const auto& rank) {
+            return request_resident_bytes(prompt, output, options, rank, pooled) <= rank.capacity;
         });
-        return resident + budget.extra <= bytes;
     };
     int output = options.max_new_tokens;
     if (options.incremental_kv) {
         int low = 0;
         while (low < output) {
             const int middle = low + (output - low + 1) / 2;
-            if (fits(middle, budget.total)) {
+            if (fits(middle)) {
                 low = middle;
             } else {
                 output = middle - 1;
@@ -155,63 +146,59 @@ int limit_resident_output(int prompt, const DecoderOptions& options, ResidentReq
     }
     if ((output == 0 &&
          ((!options.score_prompt && !options.label_token_ids) || options.max_new_tokens > 0)) ||
-        !fits(output, budget.total)) {
+        !fits(output)) {
         throw DecoderCapacityError("Prompt and output budget exceed resident decoder capacity",
                                    false);
-    }
-    if (!fits(output, budget.free)) {
-        throw DecoderCapacityError("Insufficient free resident decoder memory. Retry later.", true);
     }
     return output;
 }
 
-}
-
-std::size_t reserve_request_memory(RequestBlockCache& retired, DecoderOptions& request, int prompt,
-                                   RequestMemoryBudget budget, bool pooled) {
-    const auto capacity = budget.capacity;
+bool has_resident_headroom(const RequestMemoryBudget& rank, std::size_t bytes) {
+    auto* retired = rank.retired;
+    const auto arena = DeviceArena::current(rank.device);
     const auto headroom = [&] {
-        return capacity - std::min(capacity, budget.charged + retired.unavailable_bytes());
+        const auto unavailable = retired ? retired->unavailable_bytes() : 0;
+        return rank.capacity - std::min(rank.capacity, rank.charged + unavailable);
     };
-    const auto after_reserve = [](std::size_t free) {
+    const auto free_after_reserve = [](std::size_t free) {
         return free - std::min(free, decoder_shared_reserve);
     };
-    auto free = available_device_bytes();
-    try {
-        request.max_new_tokens =
-            limit_resident_output(prompt, request,
-                                  {
-                                      capacity,
-                                      std::min(headroom(), after_reserve(free + retired.bytes())),
-                                      budget.extra_bytes,
-                                  },
-                                  pooled);
-    } catch (const DecoderCapacityError& error) {
-        if (!error.retryable || retired.pending_bytes() == 0)
-            throw;
-        retired.clear();
-        free = available_device_bytes();
-        const auto free_bytes = std::min(headroom(), after_reserve(free));
-        request.max_new_tokens = limit_resident_output(
-            prompt, request, {capacity, free_bytes, budget.extra_bytes}, pooled);
+    const auto free = arena->available_bytes();
+    const auto reusable = retired != nullptr ? retired->bytes() : 0;
+    const auto available = headroom();
+    if (bytes <= available && bytes <= free_after_reserve(free) && reusable <= available - bytes) {
+        return true;
     }
-    request.min_new_tokens = std::min(request.min_new_tokens, request.max_new_tokens);
-    request.incremental_kv = false;
-    const auto resident = request_resident_bytes({
-        RequestProgress::capacity(prompt, request),
-        reserved_verification_rows(request.max_new_tokens, request.mtp_steps),
-        request.mtp_steps != 0,
-        pooled,
-    });
-    const auto reserved = budget.extra_bytes + resident;
-    if (reserved > after_reserve(free) || retired.bytes() > headroom() - reserved) {
-        retired.clear();
-        if (reserved > headroom() || reserved > after_reserve(available_device_bytes())) {
+    if (retired != nullptr &&
+        ((bytes <= available && bytes <= free_after_reserve(free + reusable)) ||
+         retired->pending_bytes() != 0)) {
+        retired->clear();
+        return bytes <= headroom() && bytes <= free_after_reserve(arena->available_bytes());
+    }
+    return false;
+}
+
+}
+
+std::array<std::size_t, 2> reserve_request_memory(DecoderOptions& request, int prompt,
+                                                  const std::array<RequestMemoryBudget, 2>& ranks,
+                                                  int num_ranks, bool pooled) {
+    const int output =
+        limit_resident_output(prompt, request, ranks.begin(), ranks.begin() + num_ranks, pooled);
+    std::array<std::size_t, 2> charges{};
+    for (int index = 0; index < num_ranks; ++index) {
+        const auto& rank = ranks[index];
+        const auto bytes = request_resident_bytes(prompt, output, request, rank, pooled);
+        if (!has_resident_headroom(rank, bytes)) {
             throw DecoderCapacityError("Insufficient free resident decoder memory. Retry later.",
                                        true);
         }
+        charges[index] = bytes;
     }
-    return reserved;
+    request.max_new_tokens = output;
+    request.min_new_tokens = std::min(request.min_new_tokens, output);
+    request.incremental_kv = false;
+    return charges;
 }
 
 std::shared_ptr<const DecoderTokenLogprobs>

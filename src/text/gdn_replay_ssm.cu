@@ -16,7 +16,7 @@ constexpr int drafts = text_gdn_max_verify_rows;
 constexpr int max_committed = window + drafts - 1;
 constexpr int key_parts = head_dim / warp_size;
 constexpr int value_warps = 8;
-constexpr int values_per_warp = 2;
+constexpr int values_per_warp = 4;
 constexpr int tile_values = value_warps * values_per_warp;
 constexpr int tiles = head_dim / tile_values;
 constexpr int finish_warps = 4;
@@ -335,25 +335,54 @@ __device__ void load_draft_qk(const Lane& job, Cursor cursor, int qk, DraftTile<
     }
 }
 
-__device__ float solve_row(float (&state)[key_parts], const float (&qk)[2][head_dim], int lane,
-                           float2 gates, float target, float& observable) {
-    float prediction = 0.0F;
+struct DraftResult {
+    float update[values_per_warp];
+    float observable[values_per_warp];
+};
+
+__device__ DraftResult solve_row(float (&held)[values_per_warp][key_parts],
+                                 const float (&qk)[2][head_dim], int lane, float2 gates,
+                                 const float (&target)[values_per_warp]) {
+    DraftResult result{};
+    float prediction[values_per_warp]{};
 #pragma unroll
     for (int part = 0; part < key_parts; ++part) {
         const int channel = (part * warp_size) + lane;
-        state[part] *= gates.x;
-        prediction = fmaf(state[part], qk[1][channel], prediction);
+        const float key = qk[1][channel];
+#pragma unroll
+        for (int pair = 0; pair < values_per_warp; ++pair) {
+            held[pair][part] *= gates.x;
+            prediction[pair] = fmaf(held[pair][part], key, prediction[pair]);
+        }
     }
-    const float correction = gates.y * (target - warp_sum(prediction));
-    float result = 0.0F;
+    for (int offset = warp_size / 2; offset != 0; offset /= 2) {
+#pragma unroll
+        for (auto& value : prediction) {
+            value += __shfl_xor_sync(0xffffffffU, value, offset);
+        }
+    }
+#pragma unroll
+    for (int pair = 0; pair < values_per_warp; ++pair) {
+        result.update[pair] = gates.y * (target[pair] - prediction[pair]);
+    }
 #pragma unroll
     for (int part = 0; part < key_parts; ++part) {
         const int channel = (part * warp_size) + lane;
-        state[part] = fmaf(correction, qk[1][channel], state[part]);
-        result = fmaf(state[part], qk[0][channel], result);
+        const float key = qk[1][channel];
+        const float query = qk[0][channel];
+#pragma unroll
+        for (int pair = 0; pair < values_per_warp; ++pair) {
+            held[pair][part] = fmaf(result.update[pair], key, held[pair][part]);
+            result.observable[pair] = fmaf(held[pair][part], query, result.observable[pair]);
+        }
     }
-    observable = warp_sum(result);
-    return correction;
+    for (int offset = warp_size / 2; offset != 0; offset /= 2) {
+#pragma unroll
+        for (auto& value : result.observable) {
+            value += __shfl_xor_sync(0xffffffffU, value, offset);
+        }
+    }
+    return result;
 }
 
 template <typename S, int Rows>
@@ -365,16 +394,20 @@ __device__ void solve_drafts(const Lane& job, Cursor cursor, const DraftTile<Row
         if (row >= job.rows)
             break;
         const int append = slot(cursor, cursor.committed + row);
+        float target[values_per_warp];
 #pragma unroll
         for (int pair = 0; pair < values_per_warp; ++pair) {
             const int val = feature + (pair * value_warps);
-            const float target = __bfloat162float(value_row<S>(job, row)[val]);
-            float observable = 0.0F;
-            const float update =
-                solve_row(held[pair], draft.qk[row], lane, draft.gates[row], target, observable);
-            if (lane == 0) {
-                job.state.updates[append * S::value_width + val] = update;
-                job.observable[row * S::value_width + val] = __float2bfloat16(observable);
+            target[pair] = __bfloat162float(value_row<S>(job, row)[val]);
+        }
+        const auto result = solve_row(held, draft.qk[row], lane, draft.gates[row], target);
+        if (lane == 0) {
+#pragma unroll
+            for (int pair = 0; pair < values_per_warp; ++pair) {
+                const int val = feature + (pair * value_warps);
+                job.state.updates[append * S::value_width + val] = result.update[pair];
+                job.observable[row * S::value_width + val] =
+                    __float2bfloat16(result.observable[pair]);
             }
         }
     }

@@ -98,11 +98,11 @@ checker="${BUILD_WORK_DIR:?set the printed build directory}/build/bin/mxfp8-gqa-
 
 Expect `compute_capability=10.0`, `MXFP8 GQA check passed`, and exit zero. The
 [Flash checks](flash-prefill.md#verification) cover automatic dispatch,
-regular Flash, split graph nodes, and ordered replay. The [verifier](../tests/mxfp8_gqa_check.cu#L638)<!-- prefix: "void run_che" --> covers append, attention, and page reuse with packed KV and BF16.
+regular Flash, split graph nodes, and ordered replay. The [verifier](../tests/mxfp8_gqa_check.cu#L598)<!-- prefix: "void run_che" --> covers append, attention, and page reuse with packed KV and BF16.
 
-The [ordered decode check](../tests/mxfp8_gqa_check.cu#L540)<!-- prefix: "void check_e" --> covers BF16 parity, tile and page boundaries, graph and eager execution, input preservation, and validation.
+The [ordered decode check](../tests/mxfp8_gqa_check.cu#L501)<!-- prefix: "void check_e" --> covers BF16 parity, tile and page boundaries, graph and eager execution, input preservation, and validation.
 
-Check [exponents 0 and 255](../tests/mxfp8_gqa_prefill_check.cu#L768)<!-- prefix: "void check_o" -->, [remaps and graphs](../tests/mxfp8_gqa_check.cu#L871)<!-- prefix: "void check_o" -->, [chunk edges and tails](../tests/mxfp8_gqa_prefill_check.cu#L720)<!-- prefix: "void check_o" -->, [rounding](../tests/mxfp8_gqa_prefill_check.cu#L768)<!-- prefix: "void check_o" -->, and [masked-score recovery](../tests/mxfp8_gqa_check.cu#L934)<!-- prefix: "void check_o" -->.
+Check [exponents 0 and 255](../tests/mxfp8_gqa_prefill_check.cu#L639)<!-- prefix: "void check_o" -->, [remaps and graphs](../tests/mxfp8_gqa_check.cu#L811)<!-- prefix: "void check_o" -->, [chunk edges and tails](../tests/mxfp8_gqa_prefill_check.cu#L591)<!-- prefix: "void check_o" -->, [rounding](../tests/mxfp8_gqa_prefill_check.cu#L639)<!-- prefix: "void check_o" -->, and [masked-score recovery](../tests/mxfp8_gqa_check.cu#L874)<!-- prefix: "void check_o" -->.
 
 Use the [ordered prefill replay checks](ordered-gqa-prefill.md#verification) for staged tails and overflow controls.
 

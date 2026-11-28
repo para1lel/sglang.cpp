@@ -44,7 +44,7 @@ Zero rows succeed. For other inputs, negative positions, negative rows, and posi
 
 ## Verification
 
-Run the [GQA checker](development.md#gqa-verification) on a reserved B200. The [public multirow overflow control](../tests/mxfp8_gqa_prefill_check.cu#L820)<!-- prefix: "void check_o" --> covers 65 rows at 65, 32,768, 32,769, 131,072, and 131,073 visible tokens. It compares aligned graph replay against an FP64 known answer and requires bitwise parity with unaligned K. The [evidence gate](../tests/batch/check_graph_evidence.py#L346)<!-- prefix: "def verify_o" --> requires the matching CUPTI graph sequence and CTA counts of 33, 17, 2, 2, and 2.
+Run the [GQA checker](development.md#gqa-verification) on a reserved B200. The [public multirow overflow control](../tests/mxfp8_gqa_prefill_check.cu#L691)<!-- prefix: "void check_o" --> covers 65 rows at 65, 32,768, 32,769, 131,072, and 131,073 visible tokens. It compares aligned graph replay against an FP64 known answer and requires bitwise parity with unaligned K. The [evidence gate](../tests/batch/check_graph_evidence.py#L346)<!-- prefix: "def verify_o" --> requires the matching CUPTI graph sequence and CTA counts of 33, 17, 2, 2, and 2.
 
 Replay identical checkpoint Q and KV with remapped pages and guarded outputs. Compare complete BF16 outputs and the corresponding rows from a shortened causal grant. Run memcheck, initcheck, and synccheck on eager replays with unwritten tail slots.
 

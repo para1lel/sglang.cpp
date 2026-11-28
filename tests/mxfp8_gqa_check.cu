@@ -14,18 +14,10 @@
 #include <string>
 #include <utility>
 #include <vector>
-namespace gqa_test {
-std::vector<__nv_bfloat16> make_queries(int start_token, int count);
-double decode_value(std::uint8_t code, std::uint8_t scale);
-void check_bound_gdn(cudaStream_t stream);
-void check_raw_attention(cudaStream_t stream);
-void verify_ordered_prefill(const char* phase, sglang::Mxfp8KvCache cache,
-                            sglang::Mxfp8PageTable pages, int first, int rows,
-                            const __nv_bfloat16* queries, const std::vector<__nv_bfloat16>& actual,
-                            cudaStream_t stream);
-}
 
 namespace {
+
+using namespace gqa_test;
 
 constexpr int head_width = 256;
 constexpr int kv_heads = 4;
@@ -46,14 +38,8 @@ constexpr std::size_t scale_bytes = physical_pages * kv_heads * page_tokens * gr
 
 using BFloat = __nv_bfloat16;
 using Byte = std::uint8_t;
-using gqa_test::decode_value;
-using gqa_test::make_queries;
 
 enum class KvKind { key, value };
-
-std::size_t row_index(int token, int head, int heads) {
-    return static_cast<std::size_t>(token) * heads + head;
-}
 
 std::size_t scale_index(int page, int head, int slot, int group) {
     const auto page_head = row_index(page, head, kv_heads);
@@ -109,6 +95,69 @@ double gqa_test::decode_value(Byte code, Byte scale) {
     const double magnitude = positive_e4m3(code & 0x7f);
     const double value = (code & 0x80) != 0 ? -magnitude : magnitude;
     return std::ldexp(value, static_cast<int>(scale) - 127);
+}
+
+void gqa_test::check_cuda(cudaError_t status, const char* operation) {
+    if (status != cudaSuccess) {
+        throw std::runtime_error(std::string(operation) + " failed with " +
+                                 cudaGetErrorString(status));
+    }
+}
+
+gqa_test::Graph::Graph() = default;
+
+gqa_test::Graph::Graph(cudaStream_t stream) {
+    check_cuda(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal),
+               "Begin attention capture");
+}
+
+gqa_test::Graph::~Graph() {
+    if (executable_ != nullptr) {
+        cudaGraphExecDestroy(executable_);
+    }
+    if (graph_ != nullptr) {
+        cudaGraphDestroy(graph_);
+    }
+}
+
+void gqa_test::Graph::finish(cudaStream_t stream, cudaError_t launch_status) {
+    const auto capture_status = end_capture(stream);
+    check_cuda(launch_status, "Submit captured attention");
+    check_cuda(capture_status, "End attention capture");
+    instantiate();
+}
+
+cudaGraph_t gqa_test::Graph::get() const {
+    return graph_;
+}
+
+cudaError_t gqa_test::Graph::end_capture(cudaStream_t stream) {
+    return cudaStreamEndCapture(stream, &graph_);
+}
+
+void gqa_test::Graph::instantiate() {
+    check_cuda(cudaGraphInstantiate(&executable_, graph_, 0), "Instantiate attention graph");
+}
+
+void gqa_test::Graph::replay(cudaStream_t stream) const {
+    check_cuda(cudaGraphLaunch(executable_, stream), "Replay attention graph");
+}
+
+sglang::Mxfp8PageTable gqa_test::Pages::view() const {
+    return {device.get(), static_cast<int>(mapping.size())};
+}
+
+std::size_t gqa_test::row_index(int token, int head, int heads) {
+    return (static_cast<std::size_t>(token) * heads) + head;
+}
+
+std::vector<__nv_bfloat16> gqa_test::download_prefill(const DeviceBuffer<__nv_bfloat16>& output,
+                                                      cudaStream_t stream, int guard) {
+    const auto actual = output.download(stream);
+    if (!poisoned(actual, 0, guard) || !poisoned(actual, actual.size() - guard, actual.size())) {
+        throw std::runtime_error("Multirow prefill overwrote an output guard");
+    }
+    return {actual.begin() + guard, actual.end() - guard};
 }
 
 namespace {
@@ -259,13 +308,6 @@ void check_reference_codes() {
     }
 }
 
-void check_cuda(cudaError_t status, const char* operation) {
-    if (status != cudaSuccess) {
-        throw std::runtime_error(std::string(operation) + " failed with " +
-                                 cudaGetErrorString(status));
-    }
-}
-
 class Stream {
 public:
     Stream() {
@@ -280,86 +322,6 @@ public:
 
 private:
     cudaStream_t stream_ = nullptr;
-};
-
-template <class Element>
-class DeviceBuffer {
-public:
-    explicit DeviceBuffer(std::size_t count) : count_(count) {
-        check_cuda(cudaMalloc(reinterpret_cast<void**>(&data_), bytes()), "Allocate test buffer");
-    }
-    ~DeviceBuffer() { cudaFree(data_); }
-    DeviceBuffer(const DeviceBuffer&) = delete;
-    DeviceBuffer& operator=(const DeviceBuffer&) = delete;
-
-    Element* get() const { return data_; }
-
-    void upload(const Element* source, cudaStream_t stream) const {
-        check_cuda(cudaMemcpyAsync(data_, source, bytes(), cudaMemcpyHostToDevice, stream),
-                   "Upload test buffer");
-    }
-
-    void fill(Byte sentinel, cudaStream_t stream) const {
-        check_cuda(cudaMemsetAsync(data_, sentinel, bytes(), stream), "Fill test buffer");
-    }
-
-    std::vector<Element> download(cudaStream_t stream) const {
-        std::vector<Element> result(count_);
-        check_cuda(cudaMemcpyAsync(result.data(), data_, bytes(), cudaMemcpyDeviceToHost, stream),
-                   "Download test buffer");
-        check_cuda(cudaStreamSynchronize(stream), "Complete test stream");
-        return result;
-    }
-
-private:
-    std::size_t bytes() const { return count_ * sizeof(Element); }
-
-    std::size_t count_;
-    Element* data_ = nullptr;
-};
-
-class Graph {
-public:
-    Graph() = default;
-    Graph(const Graph&) = delete;
-    Graph& operator=(const Graph&) = delete;
-
-    ~Graph() {
-        if (executable_) {
-            cudaGraphExecDestroy(executable_);
-        }
-        if (graph_) {
-            cudaGraphDestroy(graph_);
-        }
-    }
-
-    template <class Submit>
-    void capture(cudaStream_t stream, Submit submit) {
-        check_cuda(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal),
-                   "Begin attention capture");
-        const auto launch_status = submit();
-        const auto capture_status = cudaStreamEndCapture(stream, &graph_);
-        check_cuda(launch_status, "Submit captured attention");
-        check_cuda(capture_status, "End attention capture");
-        check_cuda(cudaGraphInstantiate(&executable_, graph_, 0), "Instantiate attention graph");
-    }
-
-    void replay(cudaStream_t stream) const {
-        check_cuda(cudaGraphLaunch(executable_, stream), "Replay attention graph");
-    }
-
-private:
-    cudaGraph_t graph_ = nullptr;
-    cudaGraphExec_t executable_ = nullptr;
-};
-
-struct Pages {
-    const std::vector<std::int32_t> mapping;
-    DeviceBuffer<std::int32_t> device{mapping.size()};
-
-    sglang::Mxfp8PageTable view() const {
-        return {device.get(), static_cast<int>(mapping.size())};
-    }
 };
 
 struct KvSequence {
@@ -498,7 +460,6 @@ void check_attention(const char* phase, const TestCache& cache, const Pages& pag
 constexpr int query_elements = query_heads * head_width;
 constexpr int long_position = 2048;
 constexpr int score_capacity = physical_pages * page_tokens;
-constexpr Byte attention_sentinel = 0xff;
 
 void compare_decode(const char* phase, int position, const std::vector<BFloat>& actual,
                     const std::vector<BFloat>& direct) {
@@ -587,11 +548,10 @@ void check_exact_decode(cudaStream_t stream) {
     }
     check_score_tail(scores, -1, stream);
 
-    Graph graph;
-    graph.capture(stream, [&] {
-        return sglang::decoder::exact_decode_gqa_attention(view, table, position.get(),
-            device_queries.get(), output.get() + 1, workspace, stream);
-    });
+    Graph graph(stream);
+    graph.finish(stream, sglang::decoder::exact_decode_gqa_attention(
+                             view, table, position.get(), device_queries.get(), output.get() + 1,
+                             workspace, stream));
 
     for (const int last : {0, 31, 32, 127, 128, long_position, 1024, 1}) {
         check_cuda(sglang::mxfp8_gqa_attention(view, table, last + 1, last, 1,
@@ -674,8 +634,7 @@ void check_bound_cache(cudaStream_t stream) {
     const Pages forward{{3, 1}}, reverse{{6, 2}};
     forward.device.upload(forward.mapping.data(), stream);
     reverse.device.upload(reverse.mapping.data(), stream);
-    Graph graph;
-    graph.capture(stream, [&] {
+    const auto submit = [&] {
         const auto append = sglang::decoder::decode_kv_append(
             binding.get(), table.get(), position.get(), keys.get(), values.get(), stream);
         if (append != cudaSuccess) {
@@ -684,7 +643,9 @@ void check_bound_cache(cudaStream_t stream) {
         return sglang::decoder::exact_decode_gqa_attention(
             binding.get(), table.get(), position.get(), queries.get(), output.get() + 1,
             workspace, stream);
-    });
+    };
+    Graph graph(stream);
+    graph.finish(stream, submit());
     for (int trial = 0; trial < 4; ++trial) {
         const int last = trial < 2 ? page_tokens - 1 + trial : 1 + trial;
         auto& cache = trial % 2 ? second : first;
@@ -724,15 +685,6 @@ void check_bound_cache(cudaStream_t stream) {
         inactive.values.verify("inactive values", stream);
     }
     std::puts("Rebound cache, page table and position on four device graph replays");
-}
-
-template <class Element>
-void require_same(const std::vector<Element>& actual, const std::vector<Element>& expected,
-                  const char* message) {
-    if (actual.size() != expected.size() ||
-        std::memcmp(actual.data(), expected.data(), expected.size() * sizeof(Element)) != 0) {
-        throw std::runtime_error(message);
-    }
 }
 
 constexpr int finite_range_tokens = 1536;
@@ -811,9 +763,10 @@ void check_finite_range_decode(cudaStream_t stream) {
             throw std::runtime_error("Finite-range fixture did not produce a split page partial");
         }
     };
-    Graph ordered, split;
-    ordered.capture(stream, [&] { return submit(position.get(), 0); });
-    split.capture(stream, [&] { return submit(position.get(), workspace_bytes); });
+    Graph ordered(stream);
+    ordered.finish(stream, submit(position.get(), 0));
+    Graph split(stream);
+    split.finish(stream, submit(position.get(), workspace_bytes));
     constexpr int last = finite_range_tokens - 1;
     check_cuda(sglang::decoder::set_decode_position(position.get(), last, stream),
                "Set finite-range position");
@@ -854,19 +807,6 @@ KvSequence::KvSequence(std::vector<BFloat> input_keys, std::vector<BFloat> input
       values(std::move(input_values)),
       encoded_keys(encode_rows(keys)),
       encoded_values(encode_rows(values)) {}
-
-constexpr int prefill_guard = 8;
-std::vector<BFloat> download_prefill(const DeviceBuffer<BFloat>& output, cudaStream_t stream) {
-    const auto actual = output.download(stream);
-    for (const auto* guard : {actual.data(), actual.data() + actual.size() - prefill_guard}) {
-        const auto* bytes = reinterpret_cast<const Byte*>(guard);
-        if (!std::all_of(bytes, bytes + prefill_guard * sizeof(BFloat),
-                         [](Byte byte) { return byte == attention_sentinel; })) {
-            throw std::runtime_error("Multirow prefill overwrote an output guard");
-        }
-    }
-    return {actual.begin() + prefill_guard, actual.end() - prefill_guard};
-}
 
 void check_ordered_multirow_prefill(cudaStream_t stream) {
     constexpr int first = page_tokens - 1;
@@ -914,8 +854,8 @@ void check_ordered_multirow_prefill(cudaStream_t stream) {
     check_cuda(submit(), "Launch ordered multirow prefill");
     const auto original = verify("ordered multirow prefill", original_kv);
 
-    Graph graph;
-    graph.capture(stream, submit);
+    Graph graph(stream);
+    graph.finish(stream, submit());
     std::fill_n(values.begin() + changed_offset, group_width, __float2bfloat16_rn(8.0f));
     const KvSequence future(original_kv.keys, std::move(values));
     check_append("ordered future KV", cache, pages, future, changed_token, 1, stream);

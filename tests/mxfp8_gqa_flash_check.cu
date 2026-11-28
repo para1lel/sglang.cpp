@@ -20,8 +20,6 @@
 
 namespace gqa_test {
 
-double decode_value(std::uint8_t code, std::uint8_t scale);
-
 namespace {
 
 using namespace sglang;
@@ -37,44 +35,6 @@ constexpr int first_scale = 116;
 constexpr int scale_count = 12;
 constexpr unsigned head_blocks = mxfp8_query_heads / 2;
 constexpr std::size_t output_elements = static_cast<std::size_t>(rows) * row_width;
-
-void check_cuda(cudaError_t status, const char* action) {
-    if (status != cudaSuccess) {
-        throw std::runtime_error(std::string(action) + ": " + cudaGetErrorString(status));
-    }
-}
-
-template <class Element>
-class DeviceBuffer {
-public:
-    explicit DeviceBuffer(std::size_t count) : count_(count) {
-        check_cuda(cudaMalloc(&data_, count * sizeof(Element)), "Allocate Flash check buffer");
-    }
-
-    ~DeviceBuffer() { cudaFree(data_); }
-    DeviceBuffer(const DeviceBuffer&) = delete;
-    DeviceBuffer& operator=(const DeviceBuffer&) = delete;
-
-    Element* get() const { return data_; }
-
-    void upload(const std::vector<Element>& source, cudaStream_t stream, int offset = 0) const {
-        check_cuda(cudaMemcpyAsync(data_ + offset, source.data(),
-                                   source.size() * sizeof(Element), cudaMemcpyHostToDevice, stream),
-                   "Upload Flash check input");
-    }
-
-    std::vector<Element> download(cudaStream_t stream) const {
-        std::vector<Element> result(count_);
-        check_cuda(cudaMemcpyAsync(result.data(), data_, count_ * sizeof(Element),
-                                   cudaMemcpyDeviceToHost, stream), "Download Flash check output");
-        check_cuda(cudaStreamSynchronize(stream), "Complete Flash check");
-        return result;
-    }
-
-private:
-    std::size_t count_;
-    Element* data_ = nullptr;
-};
 
 struct Input {
     const int physical_pages;
@@ -249,20 +209,6 @@ constexpr Dispatch ordered_dispatch(int count) {
     return {"multirow_prefill_attention", static_cast<unsigned>(count / 4 + count % 4)};
 }
 
-struct Graph {
-    cudaGraph_t graph = nullptr;
-    cudaGraphExec_t executable = nullptr;
-
-    ~Graph() {
-        if (executable) {
-            cudaGraphExecDestroy(executable);
-        }
-        if (graph) {
-            cudaGraphDestroy(graph);
-        }
-    }
-};
-
 void check_dispatch_errors(cudaStream_t stream) {
     struct Case {
         const char* label;
@@ -289,9 +235,9 @@ void check_dispatch_errors(cudaStream_t stream) {
         statuses[index] = decoder::tensor_core_multirow_prefill_gqa(
             {}, {}, request.position, request.count, nullptr, nullptr, stream);
     }
-    check_cuda(cudaStreamEndCapture(stream, &graph.graph), "End invalid prefill capture");
+    check_cuda(graph.end_capture(stream), "End invalid prefill capture");
     std::size_t count = 0;
-    check_cuda(cudaGraphGetNodes(graph.graph, nullptr, &count), "Count invalid prefill launches");
+    check_cuda(cudaGraphGetNodes(graph.get(), nullptr, &count), "Count invalid prefill launches");
     if (count != 0) {
         throw std::runtime_error("Empty or invalid prefill dispatched a kernel");
     }
@@ -348,15 +294,11 @@ void check_dispatch(const char* label, cudaGraph_t graph, Dispatch expected) {
 
 void check_guards(const char* label, const std::vector<BFloat>& output, int count) {
     const auto elements = static_cast<std::size_t>(count) * row_width;
-    for (int index = 0; index < guard; ++index) {
-        if (__bfloat16_as_ushort(output[index]) != 0xffff) {
-            throw std::runtime_error(std::string(label) + ": prefix output guard overwritten");
-        }
+    if (!poisoned(output, 0, guard)) {
+        throw std::runtime_error(std::string(label) + ": prefix output guard overwritten");
     }
-    for (std::size_t index = guard + elements; index < output.size(); ++index) {
-        if (__bfloat16_as_ushort(output[index]) != 0xffff) {
-            throw std::runtime_error(std::string(label) + ": inactive output overwritten");
-        }
+    if (!poisoned(output, guard + elements, output.size())) {
+        throw std::runtime_error(std::string(label) + ": inactive output overwritten");
     }
 }
 
@@ -434,9 +376,9 @@ struct DeviceInput {
                        "Begin missing tail page capture");
             const auto status = decoder::tensor_core_multirow_prefill_gqa(
                 cache, table, position, rows, queries.get(), output.get() + guard, stream);
-            check_cuda(cudaStreamEndCapture(stream, &graph.graph), "End missing tail page capture");
+            check_cuda(graph.end_capture(stream), "End missing tail page capture");
             std::size_t count = 0;
-            check_cuda(cudaGraphGetNodes(graph.graph, nullptr, &count), "Count missing page nodes");
+            check_cuda(cudaGraphGetNodes(graph.get(), nullptr, &count), "Count missing page nodes");
             if (status != cudaErrorInvalidValue || count) {
                 throw std::runtime_error("Short page count admitted an unaligned paired tile");
             }
@@ -453,9 +395,7 @@ struct DeviceInput {
         value_scales.upload(input.value_scales, stream, options.value_scale_offset);
         pages.upload(input.pages, stream);
         queries.upload(input.queries, stream);
-        constexpr auto output_bytes = (output_elements + 2 * guard) * sizeof(BFloat);
-        check_cuda(cudaMemsetAsync(output.get(), 0xff, output_bytes, stream),
-                   "Poison Flash check output");
+        output.fill(attention_sentinel, stream);
         const Mxfp8KvCache cache{keys.get() + options.key_offset,
                                  values.get() + options.value_offset,
                                  key_scales.get() + options.key_scale_offset,
@@ -471,24 +411,19 @@ struct DeviceInput {
             : decoder::tensor_core_multirow_prefill_gqa(
                   cache, page_table, position, options.count, queries.get(),
                   output.get() + guard, stream);
-        const auto capture = cudaStreamEndCapture(stream, &graph.graph);
+        const auto capture = graph.end_capture(stream);
         check_cuda(dispatch, "Dispatch captured prefill");
         check_cuda(capture, "End Flash check capture");
-        check_dispatch(label, graph.graph, expected);
-        check_cuda(cudaGraphInstantiate(&graph.executable, graph.graph, 0),
-                   "Instantiate Flash check graph");
-        check_cuda(cudaGraphLaunch(graph.executable, stream), "Replay Flash check graph");
+        check_dispatch(label, graph.get(), expected);
+        graph.instantiate();
+        graph.replay(stream);
         auto result = output.download(stream);
         if (options.repeat_graph) {
-            check_cuda(cudaMemsetAsync(output.get(), 0xff, output_bytes, stream),
-                       "Poison output before second TMEM graph replay");
-            check_cuda(cudaGraphLaunch(graph.executable, stream), "Replay the TMEM graph again");
-            const auto repeated = output.download(stream);
-            if (std::memcmp(result.data(), repeated.data(), output_bytes) != 0) {
-                throw std::runtime_error("TMEM graph reuse changed its output");
-            }
-            std::printf("MXFP8 prefill %s repeated graph matched %zu output bytes\n",
-                        label, output_bytes);
+            output.fill(attention_sentinel, stream);
+            graph.replay(stream);
+            require_same(output.download(stream), result, "TMEM graph reuse changed its output");
+            std::cout << "MXFP8 prefill " << label << " repeated graph matched "
+                      << (result.size() * sizeof(BFloat)) << " output bytes\n";
         }
         if (samples.empty()) {
             check_guards(label, result, options.count);
@@ -525,13 +460,9 @@ struct DeviceInput {
         };
         for (const auto mode : {std::string_view("fit"), std::string_view("short"),
                                 std::string_view("capture")}) {
-            check_cuda(cudaMemsetAsync(key_scratch.get(), poison, key_bytes + 2 * scratch_guard,
-                                      stream), "Poison decoded keys");
-            check_cuda(cudaMemsetAsync(value_scratch.get(), poison,
-                                      value_bytes + 2 * scratch_guard, stream),
-                       "Poison decoded values");
-            check_cuda(cudaMemsetAsync(output.get(), 0xff, raw.size() * sizeof(BFloat), stream),
-                       "Poison staged attention output");
+            key_scratch.fill(poison, stream);
+            value_scratch.fill(poison, stream);
+            output.fill(attention_sentinel, stream);
             const decoder::PairedPrefillScratch scratch{
                 reinterpret_cast<std::byte*>(key_scratch.get() + scratch_guard), key_bytes,
                 reinterpret_cast<std::byte*>(value_scratch.get() + scratch_guard),
@@ -546,20 +477,15 @@ struct DeviceInput {
                            stream, scratch),
                        "Dispatch paired attention with scratch");
             if (mode == "capture") {
-                check_cuda(cudaStreamEndCapture(stream, &graph.graph),
-                           "End paired capture with scratch");
+                check_cuda(graph.end_capture(stream), "End paired capture with scratch");
                 check_dispatch(position % mxfp8_page_size == 0 ? "early tile capture with scratch"
                                                                : "staged tile capture with scratch",
-                               graph.graph, raw_capture);
-                check_cuda(cudaGraphInstantiate(&graph.executable, graph.graph, 0),
-                           "Instantiate paired capture with scratch");
-                check_cuda(cudaGraphLaunch(graph.executable, stream),
-                           "Replay paired capture with scratch");
+                               graph.get(), raw_capture);
+                graph.instantiate();
+                graph.replay(stream);
             }
-            const auto result = output.download(stream);
-            if (std::memcmp(result.data(), raw.data(), raw.size() * sizeof(BFloat))) {
-                throw std::runtime_error("Paired workspace changed the raw attention output");
-            }
+            require_same(output.download(stream), raw,
+                         "Paired workspace changed the raw attention output");
             check_scratch(key_scratch, key_bytes, mode == "fit");
             check_scratch(value_scratch, value_bytes, mode == "fit");
         }
@@ -653,10 +579,8 @@ void check_paired_prefill(cudaStream_t stream) {
     const auto unaligned_partial = device.run("paired partial tile with unaligned value scales",
                                               input, position, synchronous_partial, partial_samples,
                                               stream, {.count = partial, .value_scale_offset = 1});
-    if (std::memcmp(aligned_partial.data(), unaligned_partial.data(),
-                    aligned_partial.size() * sizeof(BFloat))) {
-        throw std::runtime_error("Unaligned scales changed the partial Flash output");
-    }
+    require_same(aligned_partial, unaligned_partial,
+                 "Unaligned scales changed the partial Flash output");
     check_future_values("paired final page causality", input, device, position,
                         rows - mxfp8_page_size / 2, baseline, tmem_paired, stream);
 }
@@ -670,10 +594,8 @@ std::vector<BFloat> check_paired_tail_matches_wide(const char* label, const Inpu
     const auto control = std::string(label) + " scale-alignment fallback";
     const auto wide = device.run(control.c_str(), input, position, flash, {}, stream,
                                  {.value_scale_offset = 8});
-    if (std::memcmp(paired.data(), wide.data(), paired.size() * sizeof(BFloat))) {
-        throw std::runtime_error(std::string(label) +
-                                 ": unaligned paired output differs from wide");
-    }
+    const auto mismatch = std::string(label) + ": unaligned paired output differs from wide";
+    require_same(paired, wide, mismatch.c_str());
     return paired;
 }
 
@@ -771,9 +693,8 @@ void check_long_flash(cudaStream_t stream) {
             const auto scale_label = label + " with unaligned key scales";
             const auto unaligned = device.run(scale_label.c_str(), input, position,
                                               sync, samples, stream, {.key_scale_offset = 1});
-            if (std::memcmp(unaligned.data(), baseline.data(), baseline.size() * sizeof(BFloat))) {
-                throw std::runtime_error("Unaligned Flash scales changed the wide tile output");
-            }
+            require_same(unaligned, baseline,
+                         "Unaligned Flash scales changed the wide tile output");
             device.run("32769 unaligned key", input, position, protected_rows, samples, stream,
                        {.key_offset = 1});
             device.run("32769 unaligned value", input, position, protected_rows, samples, stream,
@@ -840,11 +761,8 @@ void check_partial_boundaries(cudaStream_t stream) {
             const auto value = device.run("193 rows unaligned value scales", input, position,
                                           sync, samples, stream,
                                           {.count = count, .value_scale_offset = 1});
-            const auto bytes = baseline.size() * sizeof(BFloat);
-            if (std::memcmp(key.data(), baseline.data(), bytes) != 0 ||
-                std::memcmp(value.data(), baseline.data(), bytes) != 0) {
-                throw std::runtime_error("Unaligned Flash scales changed the output");
-            }
+            require_same(key, baseline, "Unaligned Flash scales changed the output");
+            require_same(value, baseline, "Unaligned Flash scales changed the output");
         }
     }
 }

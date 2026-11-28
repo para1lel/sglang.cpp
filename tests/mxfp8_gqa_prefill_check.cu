@@ -1,3 +1,4 @@
+#include "mxfp8_gqa_checks.h"
 #include "sglang/decoder_cuda.cuh"
 #include "sglang/mxfp8_gqa.h"
 #include "sglang/text/gdn/replay_ssm.h"
@@ -15,21 +16,11 @@
 #include <utility>
 #include <vector>
 
-namespace gqa_test {
-std::vector<__nv_bfloat16> make_queries(int start_token, int count);
-double decode_value(std::uint8_t code, std::uint8_t scale);
-void verify_ordered_prefill(const char* phase, sglang::Mxfp8KvCache cache,
-                            sglang::Mxfp8PageTable pages, int first, int rows,
-                            const __nv_bfloat16* queries, const std::vector<__nv_bfloat16>& actual,
-                            cudaStream_t stream);
-}
-
 namespace {
+using namespace gqa_test;
+
 using BFloat = __nv_bfloat16;
 using Byte = std::uint8_t;
-using gqa_test::decode_value;
-using gqa_test::make_queries;
-using gqa_test::verify_ordered_prefill;
 
 constexpr int head_width = 256;
 constexpr int kv_heads = 4;
@@ -40,115 +31,25 @@ constexpr int query_elements = query_heads * head_width;
 constexpr std::size_t kv_elements_per_token = kv_heads * head_width;
 constexpr std::size_t payload_bytes = physical_pages * sglang::mxfp8_payload_bytes_per_page;
 constexpr std::size_t scale_bytes = physical_pages * sglang::mxfp8_scale_bytes_per_page;
-constexpr Byte attention_sentinel = 0xff;
 
-std::size_t row_index(int token, int head, int heads) {
-    return static_cast<std::size_t>(token) * heads + head;
+unsigned check_grid(const Graph& graph, int visible, unsigned width) {
+    std::size_t count = 0;
+    check_cuda(cudaGraphGetNodes(graph.get(), nullptr, &count), "Count attention graph nodes");
+    if (count != 1) {
+        throw std::runtime_error("Expected one attention graph kernel");
+    }
+    cudaGraphNode_t node = nullptr;
+    check_cuda(cudaGraphGetNodes(graph.get(), &node, &count), "Get attention graph node");
+    cudaKernelNodeParams kernel{};
+    check_cuda(cudaGraphKernelNodeGetParams(node, &kernel), "Get attention graph grid");
+    if (kernel.gridDim.x != width || kernel.gridDim.y != query_heads / 2) {
+        throw std::runtime_error("Unexpected prefill dispatch grid at " + std::to_string(visible) +
+                                 " visible tokens: " + std::to_string(kernel.gridDim.x) + "x" +
+                                 std::to_string(kernel.gridDim.y) + ", expected " +
+                                 std::to_string(width) + "x" + std::to_string(query_heads / 2));
+    }
+    return kernel.gridDim.x;
 }
-
-void check_cuda(cudaError_t status, const char* operation) {
-    if (status != cudaSuccess) {
-        throw std::runtime_error(std::string(operation) + " failed with " +
-                                 cudaGetErrorString(status));
-    }
-}
-
-template <class Element>
-class DeviceBuffer {
-public:
-    explicit DeviceBuffer(std::size_t count) : count_(count) {
-        check_cuda(cudaMalloc(reinterpret_cast<void**>(&data_), bytes()), "Allocate test buffer");
-    }
-    ~DeviceBuffer() { cudaFree(data_); }
-    DeviceBuffer(const DeviceBuffer&) = delete;
-    DeviceBuffer& operator=(const DeviceBuffer&) = delete;
-
-    Element* get() const { return data_; }
-
-    void upload(const Element* source, cudaStream_t stream) const {
-        check_cuda(cudaMemcpyAsync(data_, source, bytes(), cudaMemcpyHostToDevice, stream),
-                   "Upload test buffer");
-    }
-
-    void fill(Byte sentinel, cudaStream_t stream) const {
-        check_cuda(cudaMemsetAsync(data_, sentinel, bytes(), stream), "Fill test buffer");
-    }
-
-    std::vector<Element> download(cudaStream_t stream) const {
-        std::vector<Element> result(count_);
-        check_cuda(cudaMemcpyAsync(result.data(), data_, bytes(), cudaMemcpyDeviceToHost, stream),
-                   "Download test buffer");
-        check_cuda(cudaStreamSynchronize(stream), "Complete test stream");
-        return result;
-    }
-private:
-    std::size_t bytes() const { return count_ * sizeof(Element); }
-
-    std::size_t count_;
-    Element* data_ = nullptr;
-};
-
-class Graph {
-public:
-    Graph() = default;
-    Graph(const Graph&) = delete;
-    Graph& operator=(const Graph&) = delete;
-
-    ~Graph() {
-        if (executable_) {
-            cudaGraphExecDestroy(executable_);
-        }
-        if (graph_) {
-            cudaGraphDestroy(graph_);
-        }
-    }
-
-    template <class Submit>
-    void capture(cudaStream_t stream, Submit submit) {
-        check_cuda(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal),
-                   "Begin attention capture");
-        const auto launch_status = submit();
-        const auto capture_status = cudaStreamEndCapture(stream, &graph_);
-        check_cuda(launch_status, "Submit captured attention");
-        check_cuda(capture_status, "End attention capture");
-        check_cuda(cudaGraphInstantiate(&executable_, graph_, 0), "Instantiate attention graph");
-    }
-
-    void replay(cudaStream_t stream) const {
-        check_cuda(cudaGraphLaunch(executable_, stream), "Replay attention graph");
-    }
-
-    unsigned check_grid(int visible, unsigned width) const {
-        std::size_t count = 0;
-        check_cuda(cudaGraphGetNodes(graph_, nullptr, &count), "Count attention graph nodes");
-        if (count != 1) {
-            throw std::runtime_error("Expected one attention graph kernel");
-        }
-        cudaGraphNode_t node = nullptr;
-        check_cuda(cudaGraphGetNodes(graph_, &node, &count), "Get attention graph node");
-        cudaKernelNodeParams kernel{};
-        check_cuda(cudaGraphKernelNodeGetParams(node, &kernel), "Get attention graph grid");
-        if (kernel.gridDim.x != width || kernel.gridDim.y != query_heads / 2) {
-            throw std::runtime_error("Unexpected prefill dispatch grid at "
-                + std::to_string(visible) + " visible tokens: "
-                + std::to_string(kernel.gridDim.x) + "x" + std::to_string(kernel.gridDim.y)
-                + ", expected " + std::to_string(width) + "x" + std::to_string(query_heads / 2));
-        }
-        return kernel.gridDim.x;
-    }
-private:
-    cudaGraph_t graph_ = nullptr;
-    cudaGraphExec_t executable_ = nullptr;
-};
-
-struct Pages {
-    const std::vector<std::int32_t> mapping;
-    DeviceBuffer<std::int32_t> device{mapping.size()};
-
-    sglang::Mxfp8PageTable view() const {
-        return {device.get(), static_cast<int>(mapping.size())};
-    }
-};
 
 struct RawCache {
     DeviceBuffer<Byte> keys{payload_bytes};
@@ -349,22 +250,6 @@ struct GdnBuffers {
     }
 };
 
-template <class Element>
-void require_same(const std::vector<Element>& actual, const std::vector<Element>& expected,
-                  const char* message) {
-    if (actual.size() != expected.size() ||
-        std::memcmp(actual.data(), expected.data(), expected.size() * sizeof(Element)) != 0) {
-        throw std::runtime_error(message);
-    }
-}
-
-template <class Element>
-bool poisoned(const std::vector<Element>& data, std::size_t first, std::size_t end) {
-    const auto* bytes = reinterpret_cast<const Byte*>(data.data());
-    return std::all_of(bytes + first * sizeof(Element), bytes + end * sizeof(Element),
-                       [](Byte byte) { return byte == attention_sentinel; });
-}
-
 std::vector<double> paged_reference(const PagedBank& bank, int position) {
     std::vector<double> expected(query_elements), scores(position + 1);
     for (int head = 0; head < query_heads; ++head) {
@@ -504,8 +389,7 @@ void check_paged_eager(const PagedSlot& slot, PagedBinding binding,
 void check_paged_replay(cudaStream_t stream) {
     std::array<PagedSlot, paged_lanes * paged_layers> slots;
     std::array<PagedBank, paged_lanes * paged_layers> banks;
-    Graph graph;
-    graph.capture(stream, [&] {
+    const auto submit = [&] {
         for (int layer = 0; layer < paged_layers; ++layer) {
             std::array<BoundPagedDecodeLane, paged_lanes> lanes{};
             for (int lane = 0; lane < paged_lanes; ++lane) {
@@ -522,7 +406,9 @@ void check_paged_replay(cudaStream_t stream) {
             }
         }
         return cudaSuccess;
-    });
+    };
+    Graph graph(stream);
+    graph.finish(stream, submit());
     constexpr int positions[][paged_lanes] = {
         {8190, 8191, 16383, 16384}, {8192, 8190, 16384, 16383}, {8319, 8320, 127, 128},
     };
@@ -599,8 +485,8 @@ void check_paged_finite_range(cudaStream_t stream) {
         slots[index].device_binding.upload(&active, stream);
         lanes[index] = slots[index].lane();
     }
-    Graph graph;
-    graph.capture(stream, [&] { return paged_decode_gqa(lanes.data(), paged_lanes, stream); });
+    Graph graph(stream);
+    graph.finish(stream, paged_decode_gqa(lanes.data(), paged_lanes, stream));
     const DeviceBuffer<BFloat> input_keys(elements), input_values(elements);
     const DeviceBuffer<BFloat> ordered(query_elements);
     const auto bf16 = [](float value) { return __float2bfloat16_rn(value); };
@@ -675,21 +561,6 @@ void check_paged_finite_range(cudaStream_t stream) {
         }
     }
     std::puts("Paged decode recovered from finite-input overflow and value cancellation");
-}
-
-constexpr int prefill_guard = 8;
-
-std::vector<BFloat> download_prefill(const DeviceBuffer<BFloat>& output, cudaStream_t stream,
-                                     int guard_elements = prefill_guard) {
-    const auto actual = output.download(stream);
-    for (const auto* guard : {actual.data(), actual.data() + actual.size() - guard_elements}) {
-        const auto* bytes = reinterpret_cast<const Byte*>(guard);
-        if (!std::all_of(bytes, bytes + guard_elements * sizeof(BFloat),
-                         [](Byte byte) { return byte == attention_sentinel; })) {
-            throw std::runtime_error("Multirow prefill overwrote an output guard");
-        }
-    }
-    return {actual.begin() + guard_elements, actual.end() - guard_elements};
 }
 
 void check_ordered_prefill_geometry(cudaStream_t stream) {
@@ -861,9 +732,9 @@ void check_ordered_prefill_score_overflow(cudaStream_t stream) {
                 cache, pages.view(), first, rows, queries.get(), output.get() + prefill_guard,
                 stream);
         };
-        Graph graph;
-        graph.capture(stream, [&] { return launch(view); });
-        const auto width = graph.check_grid(visible, expected_width);
+        Graph graph(stream);
+        graph.finish(stream, launch(view));
+        const auto width = check_grid(graph, visible, expected_width);
         output.fill(attention_sentinel, stream);
         graph.replay(stream);
         const auto actual = download_prefill(output, stream);
@@ -924,9 +795,8 @@ void check_bound_gdn(cudaStream_t stream) {
         output.get(), 1,
         true,
     };
-    Graph graph;
-    graph.capture(stream,
-                  [&] { return replay::launch(false, bound, weights, stream, binding.get()); });
+    Graph graph(stream);
+    graph.finish(stream, replay::launch(false, bound, weights, stream, binding.get()));
     for (int trial = 0; trial < 6; ++trial) {
         const int lane = trial % 2;
         std::vector<BFloat> input(text_gdn_qkv_width);
@@ -996,4 +866,90 @@ void check_raw_attention(cudaStream_t stream) {
     check_paged_replay(stream);
     check_paged_finite_range(stream);
 }
+
+template <class Element> DeviceBuffer<Element>::DeviceBuffer(std::size_t count) : count_(count) {
+    check_cuda(cudaMalloc(&data_, bytes()), "Allocate test buffer");
+}
+
+template <class Element> DeviceBuffer<Element>::~DeviceBuffer() {
+    cudaFree(data_);
+}
+
+template <class Element> Element* DeviceBuffer<Element>::get() const {
+    return data_;
+}
+
+template <class Element>
+void DeviceBuffer<Element>::upload(const Element* source, cudaStream_t stream) const {
+    upload(source, count_, stream, 0);
+}
+
+template <class Element>
+void DeviceBuffer<Element>::upload(const std::vector<Element>& source, cudaStream_t stream,
+                                   int offset) const {
+    upload(source.data(), source.size(), stream, offset);
+}
+
+template <class Element>
+void DeviceBuffer<Element>::fill(std::uint8_t sentinel, cudaStream_t stream) const {
+    check_cuda(cudaMemsetAsync(data_, sentinel, bytes(), stream), "Fill test buffer");
+}
+
+template <class Element>
+std::vector<Element> DeviceBuffer<Element>::download(cudaStream_t stream) const {
+    std::vector<Element> result(count_);
+    check_cuda(cudaMemcpyAsync(result.data(), data_, bytes(), cudaMemcpyDeviceToHost, stream),
+               "Download test buffer");
+    check_cuda(cudaStreamSynchronize(stream), "Complete test stream");
+    return result;
+}
+
+template <class Element> std::size_t DeviceBuffer<Element>::bytes() const {
+    return count_ * sizeof(Element);
+}
+
+template <class Element>
+void DeviceBuffer<Element>::upload(const Element* source, std::size_t count, cudaStream_t stream,
+                                   int offset) const {
+    check_cuda(cudaMemcpyAsync(data_ + offset, source, count * sizeof(Element),
+                               cudaMemcpyHostToDevice, stream),
+               "Upload test buffer");
+}
+
+template class DeviceBuffer<Byte>;
+template class DeviceBuffer<BFloat>;
+template class DeviceBuffer<std::byte>;
+template class DeviceBuffer<std::int32_t>;
+template class DeviceBuffer<float>;
+template class DeviceBuffer<sglang::Mxfp8KvCache>;
+template class DeviceBuffer<sglang::Mxfp8PageTable>;
+template class DeviceBuffer<PagedBinding>;
+template class DeviceBuffer<replay::Cursor>;
+template class DeviceBuffer<replay::State>;
+
+template <class Element>
+void require_same(const std::vector<Element>& actual, const std::vector<Element>& expected,
+                  const char* message) {
+    if (actual.size() != expected.size() ||
+        std::memcmp(actual.data(), expected.data(), expected.size() * sizeof(Element)) != 0) {
+        throw std::runtime_error(message);
+    }
+}
+
+template void require_same(const std::vector<Byte>&, const std::vector<Byte>&, const char*);
+template void require_same(const std::vector<BFloat>&, const std::vector<BFloat>&, const char*);
+template void require_same(const std::vector<float>&, const std::vector<float>&, const char*);
+template void require_same(const std::vector<std::int32_t>&, const std::vector<std::int32_t>&,
+                           const char*);
+
+template <class Element>
+bool poisoned(const std::vector<Element>& data, std::size_t first, std::size_t end) {
+    const auto* bytes = reinterpret_cast<const std::uint8_t*>(data.data());
+    return std::all_of(bytes + (first * sizeof(Element)), bytes + (end * sizeof(Element)),
+                       [](std::uint8_t byte) { return byte == attention_sentinel; });
+}
+
+template bool poisoned(const std::vector<Byte>&, std::size_t, std::size_t);
+template bool poisoned(const std::vector<BFloat>&, std::size_t, std::size_t);
+template bool poisoned(const std::vector<float>&, std::size_t, std::size_t);
 }

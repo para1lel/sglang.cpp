@@ -376,7 +376,7 @@ void check_mtp_w3(Setup setup_lane, Expect expect, decoder::Request& first,
     setup_lane(0, 10236);
     expect(full, 0, 0);
     setup_lane(0, gqa_decode::long_min_position - 1);
-    expect(full, 1, full - steps + 1);
+    expect(full, 1, full - steps + 1, gqa_decode::long_single_rank_splits);
 }
 
 template <bool W4>

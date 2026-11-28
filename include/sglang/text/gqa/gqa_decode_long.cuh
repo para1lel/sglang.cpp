@@ -8,10 +8,13 @@ namespace sglang::gqa_decode {
 inline constexpr int long_rows = text_gdn_max_verify_rows;
 inline constexpr int long_requests = decoder::max_wide_mtp_lanes;
 inline constexpr int long_min_position = 32768;
+inline constexpr int long_single_rank_splits = 32;
 inline constexpr int long_rank_wide_requests = 2 * decoder::wide_mtp_lanes;
 inline constexpr int long_rank_wide_splits = 18;
 inline constexpr int long_rank_wide_end = long_min_position + 4096;
 static_assert(sizeof(Partial) * long_rank_wide_splits * gqa_rank_geometry.query_heads <=
+              decoder::paged_decode_scratch_bytes);
+static_assert(sizeof(Partial) * long_single_rank_splits * gqa_rank_geometry.query_heads <=
               decoder::paged_decode_scratch_bytes);
 
 struct LongRequest {

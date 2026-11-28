@@ -1,6 +1,6 @@
 # Wide long paged decode
 
-This guide covers wide TP2 projections and draft repair. [Current target attention](singleton-gqa-decode.md#split-kv-target-attention)
+This guide covers wide TP2 projections and draft repair. [Target attention dispatch](singleton-gqa-decode.md#split-kv-target-attention) · [TP2 single-request split probe](singleton-gqa-decode.md#tp2-single-request-split-probe)
 
 ## Responsibilities and sources of truth
 
@@ -86,4 +86,4 @@ Record prefill overlays as separate experiments. Use identical prefill code on b
 
 Historical packed runs diverged above width one. Fixed-input probes implicated FP8 projection reduction order and BF16 softmax-weight rounding. [Frozen drift details](https://github.com/para1lel/sglang.cpp/blob/6debe50edccdeda34ff307235ed38e74b6b8f2ee/docs/long-paged-decode.md#packed-route-drift-evidence)
 
-The graph requirement is compare complete BF16 score rows bitwise across every eligible width and both low/high slot masks. Warmup must not consume a required mask. Full serving performance qualification remains open.
+Compare complete BF16 score rows bitwise across eligible graph widths and both low/high slot masks. Warmup must leave the required masks for measurement.

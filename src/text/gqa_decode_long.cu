@@ -692,9 +692,17 @@ std::optional<cudaError_t> launch_long_decode(const LongBatch& batch, int reques
     const auto encoded = encode_maps(batch, requests, maps);
     if (const auto pending = cudaPeekAtLastError(); pending != cudaSuccess) return pending;
     if (!encoded || *encoded != cudaSuccess) return encoded;
-    const int splits = rank_wide ? long_rank_wide_splits : max_splits;
-    const auto kernel = rank_wide ? decode_long<long_rank_wide_splits, true>
-        : deep_rank ? decode_long<max_splits, true> : decode_long<max_splits>;
+    int splits = max_splits;
+    auto* kernel = deep_rank ? decode_long<max_splits, true> : decode_long<max_splits>;
+    const auto& first = batch.requests[0];
+    if (rank_wide) {
+        splits = long_rank_wide_splits;
+        kernel = decode_long<long_rank_wide_splits, true>;
+    } else if (requests == 1 && first.cache.kv_heads == gqa_rank_geometry.kv_heads &&
+               first.first >= long_min_position) {
+        splits = long_single_rank_splits;
+        kernel = decode_long<long_single_rank_splits>;
+    }
     status = long_decode_status(cudaFuncSetAttribute(
         kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, sizeof(Shared)));
     if (status != cudaSuccess) return status;

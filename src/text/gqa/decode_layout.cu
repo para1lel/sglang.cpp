@@ -60,6 +60,6 @@ __device__ __inline_hint__ decoder::PagedDecodeLane resolve(const LongBatch& bat
 
 template SGLANG_GQA_HOST_DEVICE Partial* partials<max_splits>(void*, int);
 template SGLANG_GQA_HOST_DEVICE Partial* partials<long_rank_wide_splits>(void*, int);
-
+template SGLANG_GQA_HOST_DEVICE Partial* partials<long_single_rank_splits>(void*, int);
 }
 #endif

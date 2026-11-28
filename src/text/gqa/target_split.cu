@@ -218,9 +218,12 @@ cudaError_t gqa_decode::combine_long_decode(const LongBatch& batch, int requests
                                             cudaStream_t stream) {
     static_assert(long_min_position >= (max_splits - 1) * min_split_chunks * split_chunk_tokens);
     void* arguments[] = {const_cast<LongBatch*>(&batch)};
-    const auto kernel = splits == long_rank_wide_splits
-        ? target_split_combine<LongBatch, long_rank_wide_splits>
-        : target_split_combine<LongBatch, max_splits>;
+    auto* kernel = target_split_combine<LongBatch, max_splits>;
+    if (splits == long_single_rank_splits) {
+        kernel = target_split_combine<LongBatch, long_single_rank_splits>;
+    } else if (splits == long_rank_wide_splits) {
+        kernel = target_split_combine<LongBatch, long_rank_wide_splits>;
+    }
     return cudaLaunchKernel(kernel, dim3(gqa_query_heads(batch.requests[0].cache.kv_heads),
                                         1, requests * long_rows),
                             mxfp8_head_dim, arguments, 0, stream);

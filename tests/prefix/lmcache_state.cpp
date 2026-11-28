@@ -3,6 +3,7 @@
 #include "sglang/decoder_prefill.h"
 #include "sglang/decoder_prefix_cache.h"
 #include "sglang/decoder_verify.h"
+#include "sglang/runtime/cache/lmcache_group.h"
 #include "sglang/runtime/server/batch_cache.h"
 #include "sglang/text/decoder_logprobs.h"
 #include "sglang/testing/prefix_fixture.h"
@@ -15,6 +16,7 @@
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <iostream>
 #include <limits>
 #include <mutex>
 #include <tuple>
@@ -244,12 +246,12 @@ void check_history_gap(const LmCacheClient& cache, const std::vector<int>& promp
     store(cache, keys, first);
     auto later = export_prefix_view(cold.request, 768, 0, imported, stream, &cold.draft);
     store(cache, keys, later);
-    const auto matched = cache.lookup_prefix(keys, prompt_end, true);
-    require(matched.gqa == 512 && matched.matched_gdn == imported &&
-            matched.gdn == 0 && matched.draft == 0, "Daemon crossed a GQA history gap");
+    const auto read = LmCacheGroup(cache).lookup_prefix({&keys}, prompt_end, true);
+    require(read.usable_gqa == 512 && read.matched_gdn == imported &&
+                read.matched_gdn_endpoints == std::vector<int>{imported} && read.usable_gdn == 0 &&
+                read.usable_draft == 0,
+            "Daemon crossed a GQA history gap");
     Lane gap(model, stream, imported);
-    const PrefixCacheRead read{matched.gqa, matched.matched_gdn, matched.gqa,
-                               matched.gdn, matched.draft};
     require(restore(cache, keys, gap.request, read, stream, &gap.draft) == 0 &&
             gap.request.cached_gqa_tokens == 512 && gap.draft.valid_prefix() == 0,
             "GDN was exposed across a historical GQA hole");
@@ -258,7 +260,7 @@ void check_history_gap(const LmCacheClient& cache, const std::vector<int>& promp
     require(before == prefix_fixture::target_digest(gap.request, 512),
             "Growth lost imported rows with zero coherent checkpoint");
     std::printf("hole usable_gqa 512 matched_gdn %d coherent_gdn 0 draft_rows 0\n",
-                matched.matched_gdn);
+                read.matched_gdn);
 }
 
 class GuardedMxfp8 {
@@ -280,7 +282,7 @@ public:
     }
 
     PrefixDeviceMxfp8 view(int family, int begin, int end) const {
-        PrefixDeviceMxfp8 result{begin, end, layers(family * 4), pages_, {}};
+        PrefixDeviceMxfp8 result{begin, end, layers(family * 4), pages_, mxfp8_kv_heads, {}};
         for (int plane = 0; plane < 4; ++plane) {
             result.planes[plane] = {0, offsets_[family * 4 + plane]};
         }
@@ -583,7 +585,8 @@ constexpr std::size_t old_slab_bytes = 1280ULL * 33792;
 void check_detached_growth(Lane& lane, RequestBlockCache& retired, const LmCacheClient& cache,
                            const PrefixCacheKeys& keys, PrefixDeviceTransfer alias,
                            cudaStream_t stream) {
-    require(cache.lookup_prefix(keys, prompt_end, true).gqa == 0,
+    const auto before = cache.lookup_prefix(keys, true);
+    require(before.gqa == 0 && before.endpoints.empty(),
             "Unsubmitted detached checkpoint was already visible");
     lane.request.grow_kv(capacity, checkpoint, stream);
     require(retired.unavailable_bytes() == old_slab_bytes,
@@ -595,7 +598,8 @@ void check_detached_growth(Lane& lane, RequestBlockCache& retired, const LmCache
     } catch (const std::runtime_error&) {
         failed = true;
     }
-    require(failed && cache.lookup_prefix(keys, prompt_end, true).gqa == 0,
+    const auto after = cache.lookup_prefix(keys, true);
+    require(failed && after.gqa == 0 && after.endpoints.empty(),
             "Invalid device STORE was published");
     alias = {};
     require(retired.unavailable_bytes() == old_slab_bytes,
@@ -633,10 +637,11 @@ void check_terminal_detach(const DecoderModel& model, cudaStream_t stream,
     synchronize_cuda(stream, "Initialize independent request over retired cache pool");
     store(cache, terminal_keys, terminal);
     terminal = {};
-    const auto hit = cache.lookup_prefix(terminal_keys, prompt_end, true);
-    const PrefixCacheRead terminal_read{hit.gqa, hit.matched_gdn, hit.gqa, hit.gdn, hit.draft};
+    const auto terminal_read =
+        LmCacheGroup(cache).lookup_prefix({&terminal_keys}, prompt_end, true);
     require(restore(cache, terminal_keys, successor.request, terminal_read, stream,
-                    &successor.draft) == prompt_end && hit.draft == prompt_end - 1,
+                    &successor.draft) == prompt_end &&
+                terminal_read.usable_draft == prompt_end - 1,
             "Terminal object retirement lost a stored cache family");
     require(prefix_fixture::target_digest(successor.request, prompt_end) == target &&
             prefix_fixture::recurrent_digest(successor.request, successor.request.work) == gdn,
@@ -715,16 +720,16 @@ std::array<const void*, 4> checkpoint_sources(const Request& request) {
             request.work.hidden, request.work.residual};
 }
 
-void check_delayed_periodic(const DecoderModel& model, const LmCacheClient& cache,
-                            const PrefixCacheKeys& keys, const PrefixCacheKeys& saved_keys,
-                            cudaStream_t stream, const PrefixCacheRead& read) {
+static void check_delayed_checkpoint(const DecoderModel& model, const LmCacheClient& cache,
+                                     const PrefixCacheKeys& keys, const PrefixCacheKeys& saved_keys,
+                                     cudaStream_t stream, const PrefixCacheRead& read) {
     RequestBlockCache retired(0, true);
     Allocations peer_execution(0);
     peer_execution.open_stream();
     const auto peer_stream = peer_execution.stream();
     auto source = std::make_unique<Lane>(model, stream, capacity, &retired);
     require(restore(cache, keys, source->request, read, stream, &source->draft) == checkpoint,
-            "Missing source for delayed periodic checkpoint");
+            "Missing source for delayed checkpoint");
     const auto target = prefix_fixture::target_digest(source->request, checkpoint);
     const auto gdn = prefix_fixture::recurrent_digest(source->request, source->request.work);
     const auto operands = checkpoint_sources(source->request);
@@ -755,16 +760,16 @@ void check_delayed_periodic(const DecoderModel& model, const LmCacheClient& cach
     gate.expect_released();
     store(cache, saved_keys, pending);
     pending = {};
-    const auto match = cache.lookup_prefix(saved_keys, prompt_end, true);
-    const PrefixCacheRead saved{match.gqa, match.matched_gdn, match.gqa, match.gdn, match.draft};
+    const auto saved = LmCacheGroup(cache).lookup_prefix({&saved_keys}, prompt_end, true);
     require(restore(cache, saved_keys, reused.request, saved, peer_stream, &reused.draft) ==
-                checkpoint && match.draft == checkpoint - 1,
-            "Delayed periodic STORE did not restore each state family");
+                    checkpoint &&
+                saved.usable_draft == checkpoint - 1,
+            "Delayed STORE did not restore each state family");
     require(prefix_fixture::target_digest(reused.request, checkpoint) == target &&
             prefix_fixture::recurrent_digest(reused.request, reused.request.work) == gdn,
             "Delayed producer read a successor's state after cancellation");
     retired.clear();
-    require(retired.unavailable_bytes() == 0, "Delayed periodic STORE left detached bytes");
+    require(retired.unavailable_bytes() == 0, "Delayed STORE left detached bytes");
     std::puts("held CUDA D2D through source cancellation and physical reuse; restored exact state");
 }
 
@@ -786,7 +791,8 @@ void check_checkpoint_faults(const Lane& lane, const LmCacheClient& cache,
                     checkpoint_copies == test.submitted && cudaPeekAtLastError() == cudaSuccess,
                 "A checkpoint CUDA submission error was lost or left stale state");
     }
-    require(cache.lookup_prefix(keys, prompt_end, true).gqa == 0,
+    const auto unmatched = cache.lookup_prefix(keys, true);
+    require(unmatched.gqa == 0 && unmatched.endpoints.empty(),
             "Failed checkpoint unexpectedly reached LMCache");
     auto version = export_prefix_view(lane.request, 0, 0, prompt_end, stream, &lane.draft);
     auto* const data = last_allocation;
@@ -798,7 +804,7 @@ void check_checkpoint_faults(const Lane& lane, const LmCacheClient& cache,
     require(data && synchronous_free.exchange(nullptr) == data,
             "Unsupported asynchronous free leaked the checkpoint state version");
     require(attempted_free.exchange(nullptr) == data, "Checkpoint free missed injected pointer");
-    require(cache.lookup_prefix(keys, prompt_end, true).gdn == prompt_end,
+    require(LmCacheGroup(cache).lookup_prefix({&keys}, prompt_end, true).usable_gdn == prompt_end,
             "Same-thread publication failed after recoverable CUDA errors");
     std::puts("actual checkpoint allocation, second-copy and event failures drain; retry succeeds");
 }
@@ -891,7 +897,7 @@ void check_model_state(const DecoderModel& model) {
     checkpoint_copy_bytes = 0;
     auto prime = export_prefix_view(cold.request, 0, 0, checkpoint, stream, &cold.draft);
     require(std::exchange(checkpoint_copy_bytes, std::nullopt) == 153964544,
-            "Periodic snapshot copied outside the four mutable state planes");
+            "Prefill snapshot copied outside the four mutable state planes");
     auto alias = export_prefix_view(cold.request, 0, 0, checkpoint, stream, &cold.draft);
     const auto prime_target = prefix_fixture::target_digest(cold.request, checkpoint);
     const auto prime_gdn = prefix_fixture::recurrent_digest(cold.request, cold.request.work);
@@ -914,23 +920,21 @@ void check_model_state(const DecoderModel& model) {
     check_detached_growth(cold, retired, cache, keys, std::move(alias), stream);
     extend(cold, false);
     require(prime_gdn != prefix_fixture::recurrent_digest(cold.request, cold.request.work),
-            "Continuation did not overwrite periodic checkpoint source");
+            "Continuation did not overwrite the checkpoint source");
     store(cache, keys, prime);
     prime = {};
     retired.clear();
     require(retired.unavailable_bytes() == 0, "Acknowledged STORE left detached bytes charged");
-    std::printf("periodic D2D 153964544 target retained %zu across two views and failed STORE\n",
-                old_slab_bytes);
+    std::cout << "prefill D2D 153964544 target retained " << old_slab_bytes
+              << " across two views and failed STORE\n";
     auto available = export_prefix_view(cold.request, 0, imported - 1, imported, stream,
                                         &cold.draft);
     available.layout.gdn = {};
     store(cache, keys, available);
-    const auto matched = cache.lookup_prefix(keys, prompt_end, true);
-    require(matched.gqa == imported && matched.matched_gdn == checkpoint &&
-            matched.gdn == checkpoint && matched.draft == checkpoint - 1,
+    const auto read = LmCacheGroup(cache).lookup_prefix({&keys}, prompt_end, true);
+    require(read.usable_gqa == imported && read.matched_gdn == checkpoint &&
+                read.usable_gdn == checkpoint && read.usable_draft == checkpoint - 1,
             "Unexpected split-family daemon lookup");
-    const PrefixCacheRead read{matched.gqa, matched.matched_gdn, matched.gqa,
-                               matched.gdn, matched.draft};
     Lane warm(model, stream);
     require(restore(cache, keys, warm.request, read, stream, &warm.draft) == checkpoint,
             "Mixed family coherent endpoint differs");
@@ -948,14 +952,16 @@ void check_model_state(const DecoderModel& model) {
     check_terminal_detach(model, stream, cache, keys,
         PrefixCacheKeys(prompt, prefix_fixture::run_salt("oracle-detached-terminal")), read,
         cold, retired, extend);
-    check_delayed_periodic(model, cache, keys,
-        PrefixCacheKeys(prompt, prefix_fixture::run_salt("oracle-delayed-periodic")), stream, read);
+    const PrefixCacheKeys delayed_keys(prompt,
+                                       prefix_fixture::run_salt("oracle-delayed-checkpoint"));
+    check_delayed_checkpoint(model, cache, keys, delayed_keys, stream, read);
     check_checkpoint_faults(cold, cache,
         PrefixCacheKeys(prompt, prefix_fixture::run_salt("oracle-copy-faults")), stream);
     check_worker_release(cold, cache,
         PrefixCacheKeys(prompt, prefix_fixture::run_salt("oracle-worker-release")), stream);
     check_history_gap(cache, prompt, model, stream, cold);
-    std::printf("split gqa %d gdn %d draft %d\n", matched.gqa, matched.gdn, checkpoint - 1);
+    std::cout << "split gqa " << read.usable_gqa << " gdn " << read.usable_gdn << " draft "
+              << read.usable_draft << '\n';
 
     compare_generation(generate(model, cold, prompt_end, stream),
                        generate(model, warm, prompt_end, stream));

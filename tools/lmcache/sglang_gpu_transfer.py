@@ -1,6 +1,10 @@
+from __future__ import annotations
+
+import os
+import re
 from contextlib import ExitStack
 from dataclasses import dataclass
-import os
+from typing import TYPE_CHECKING, Protocol
 
 import torch
 from cuda.bindings import driver, runtime
@@ -11,14 +15,32 @@ from lmcache.v1.memory_allocators.lazy_memory_allocator import LazyMemoryAllocat
 from lmcache.v1.platform.base.event_ipc import get_event_ipc_backend
 from lmcache.v1.platform.devices.cuda.utils import cuda_ipc_handle_from_bytes
 
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from lmcache.v1.distributed.api import ObjectKey
+
+    RecordKey = Callable[[int, bytes, int], ObjectKey]
+
 
 MAX_RECORD = 1 << 30
 MAX_ALLOCATION = 1 << 40
 MAX_TOKENS = 1 << 18
 PREFIX_CHUNK = 256
 DIGEST_BYTES = 64
+DRAFT_FAMILY = 3
+RETENTION_LIMIT = 12
+LOWER_DIGEST = re.compile(rb"[0-9a-f]{64}")
 GDN_END = "sglang_gdn_end"
 LOG = init_logger(__name__)
+
+
+class TransferReader(Protocol):
+    def read(self, size: int) -> bytes: ...
+
+    def number(self, width: int) -> int: ...
+
+    def end(self) -> None: ...
 
 
 @dataclass(frozen=True)
@@ -34,10 +56,14 @@ class Region:
 
 @dataclass(frozen=True)
 class GdnRecord:
-    key: object
+    key: ObjectKey
     size: int
     regions: tuple
     tokens: int = 0
+
+    @property
+    def prefix_end(self) -> int:
+        return self.key.extra_attributes[GDN_END]
 
     @classmethod
     def parse(cls, request, allocations, key):
@@ -69,15 +95,25 @@ class NativeMxfp8:
     kv_heads: int
 
     @classmethod
-    def parse_records(cls, request, allocations, family, key, legacy=True):
+    def parse_records(
+        cls,
+        request: TransferReader,
+        allocations: list[tuple[bytes, int]],
+        family: int,
+        key: RecordKey,
+    ) -> list[NativeRecord]:
         begin, end = request.number(4), request.number(4)
         if begin == end == 0:
             return []
-        kv_heads = 4 if legacy else request.number(4)
+        kv_heads = request.number(4)
         pages = request.number(4)
         planes = tuple((request.number(4), request.number(8)) for _ in range(4))
         layers = 16 if family == 1 else 1
-        if not begin < end <= MAX_TOKENS or begin % PREFIX_CHUNK or not end <= pages * 128:
+        if (
+            not begin < end <= MAX_TOKENS - (family == DRAFT_FAMILY)
+            or begin % PREFIX_CHUNK
+            or end > pages * 128
+        ):
             raise ValueError("invalid native MXFP8 extent")
         if not 0 < pages <= MAX_TOKENS // 128 or not 0 < kv_heads <= 128:
             raise ValueError("invalid native MXFP8 geometry")
@@ -87,9 +123,15 @@ class NativeMxfp8:
                     offset + layers * pages * 128 * plane_bytes > allocations[allocation][1]:
                 raise ValueError("native MXFP8 plane exceeds allocation")
         view = cls(layers, pages, planes, kv_heads)
-        return [NativeRecord(key(family, request.read(DIGEST_BYTES)),
-                             min(PREFIX_CHUNK, end - start), start, view)
-                for start in range(begin, end, PREFIX_CHUNK)]
+        return [
+            NativeRecord(
+                key(family, request.read(DIGEST_BYTES), 0),
+                min(PREFIX_CHUNK, end - start),
+                start,
+                view,
+            )
+            for start in range(begin, end, PREFIX_CHUNK)
+        ]
 
     def regions(self, begin, rows):
         offset = 0
@@ -121,10 +163,14 @@ class NativeMxfp8:
 
 @dataclass(frozen=True)
 class NativeRecord:
-    key: object
+    key: ObjectKey
     tokens: int
     begin: int
     view: NativeMxfp8
+
+    @property
+    def prefix_end(self) -> int:
+        return self.begin + self.tokens + (self.key.object_group_id == DRAFT_FAMILY)
 
     @property
     def size(self):
@@ -136,14 +182,85 @@ class NativeRecord:
 
 
 @dataclass(frozen=True)
+class Retention:
+    anchors: list[tuple[int, ObjectKey, ObjectKey, ObjectKey | None]]
+    gqa_chunks: list[ObjectKey]
+    draft_chunks: list[ObjectKey]
+
+    @classmethod
+    def parse(
+        cls,
+        request: TransferReader,
+        key: RecordKey,
+        current: list[NativeRecord | GdnRecord],
+        gdn: GdnRecord | None,
+    ) -> Retention | None:
+        count, draft = request.number(1), request.number(1)
+        if count > RETENTION_LIMIT or draft > 1 or (draft and not count):
+            raise ValueError("invalid native retention header")
+        if not count:
+            return None
+        if gdn is None:
+            raise ValueError("native retention requires a current GDN endpoint")
+
+        current_keys = {
+            (record.key.object_group_id, record.prefix_end): record.key
+            for record in current
+            if record.tokens
+        }
+        anchors = []
+        last = 0
+        for _ in range(count):
+            end = request.number(4)
+            if not last < end < gdn.prefix_end:
+                raise ValueError("invalid native retention endpoint")
+            identity = retention_digest(request)
+            target = key(1, identity, 0)
+            shifted = key(DRAFT_FAMILY, identity, 0) if draft and end > 1 else None
+            anchors.append((end, target, key(2, identity, end), shifted))
+            last = end
+        check_retention_anchors(anchors, current_keys)
+
+        def chunks(family: int, shift: int) -> list[ObjectKey]:
+            result = []
+            for end in range(PREFIX_CHUNK + shift, last, PREFIX_CHUNK):
+                record = current_keys.get((family, end))
+                result.append(
+                    record if record is not None else key(family, retention_digest(request), 0)
+                )
+            return result
+
+        return cls(anchors, chunks(1, 0), chunks(DRAFT_FAMILY, 1) if draft else [])
+
+
+def retention_digest(request: TransferReader) -> bytes:
+    identity = request.read(DIGEST_BYTES)
+    if LOWER_DIGEST.fullmatch(identity) is None:
+        raise ValueError("invalid native retention digest")
+    return identity
+
+
+def check_retention_anchors(
+    anchors: list[tuple[int, ObjectKey, ObjectKey, ObjectKey | None]],
+    current: dict[tuple[int, int], ObjectKey],
+) -> None:
+    for end, target, _, shifted in anchors:
+        if current.get((1, end), target) != target or (
+            shifted is not None and current.get((DRAFT_FAMILY, end), shifted) != shifted
+        ):
+            raise ValueError("native retention digest disagrees with transfer")
+
+
+@dataclass(frozen=True)
 class Transfer:
     device: bytes
     event: bytes
-    allocations: list
-    records: list
+    allocations: list[tuple[bytes, int]]
+    records: list[NativeRecord | GdnRecord]
+    retention: Retention | None = None
 
     @classmethod
-    def parse(cls, request, key, legacy=True):
+    def parse(cls, request: TransferReader, key: RecordKey, *, store: bool = False) -> Transfer:
         device = bytes(request.read(16))
         event = bytes(request.read(64))
         count = request.number(4)
@@ -154,15 +271,17 @@ class Transfer:
             raise ValueError("invalid CUDA IPC allocation size")
         if len({handle for handle, _ in allocations}) != count:
             raise ValueError("duplicate CUDA IPC allocation")
-        records = NativeMxfp8.parse_records(request, allocations, 1, key, legacy)
-        records += NativeMxfp8.parse_records(request, allocations, 3, key, legacy)
+        records: list[NativeRecord | GdnRecord] = []
+        records.extend(NativeMxfp8.parse_records(request, allocations, 1, key))
+        records.extend(NativeMxfp8.parse_records(request, allocations, DRAFT_FAMILY, key))
         gdn = GdnRecord.parse(request, allocations, key)
         if gdn:
             records.append(gdn)
+        retention = Retention.parse(request, key, records, gdn) if store else None
         request.end()
         if not records or len({record.key for record in records}) != len(records):
             raise ValueError("empty or duplicate native GPU records")
-        return cls(device, event, allocations, records)
+        return cls(device, event, allocations, records, retention)
 
 
 def cuda_check(result, operation):

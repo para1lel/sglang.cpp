@@ -7,8 +7,11 @@
 #include "sglang/runtime/cache/prefix_cache_layout.h"
 
 #include <algorithm>
+#include <condition_variable>
+#include <mutex>
 #include <cstdio>
 #include <cstring>
+#include <iostream>
 #include <stdexcept>
 #include <utility>
 
@@ -200,6 +203,17 @@ public:
         }
         return result;
     }
+    PrefixDeviceGdn gdn(const std::shared_ptr<PrefixPrefillSnapshot>& snapshot, int end) {
+        owners_->blocks.push_back(snapshot);
+        auto address = allocation(snapshot->data(), snapshot->bytes());
+        PrefixDeviceGdn result{end, {}};
+        for (std::size_t index = 0; index < state_bytes_.size(); ++index) {
+            result.planes[index] = {address, state_bytes_[index]};
+            address.offset += state_bytes_[index];
+        }
+        view_.prefill_checkpoint = true;
+        return result;
+    }
 
     std::size_t version_bytes() const {
         return state_bytes_[0] + state_bytes_[1] + state_bytes_[2] + state_bytes_[3];
@@ -251,6 +265,113 @@ int capacity(const Request& request) { return request.pages.page_count * mxfp8_p
 
 }
 
+PrefixPrefillSnapshot::PrefixPrefillSnapshot(const PrefixCacheLayout* layout)
+    : sizes_(gdn_state_bytes(layout)) {
+    check(cudaGetDevice(&device_), "Identify prefill checkpoint device");
+    void* data = nullptr;
+    check_prefix_cuda(cudaMalloc(&data, bytes()), "Allocate prefill checkpoint state");
+    data_ = static_cast<std::byte*>(data);
+}
+
+PrefixPrefillSnapshot::~PrefixPrefillSnapshot() {
+    try {
+        const DeviceScope device(device_);
+        const auto status = release_cuda_block(data_, cudaStreamPerThread, true);
+        if (status != cudaSuccess) {
+            std::cerr << "sglang decoder: Release prefill checkpoint state: "
+                      << cudaGetErrorString(status) << '\n';
+        }
+    } catch (const CudaError& error) {
+        std::cerr << "sglang decoder: " << error.what() << '\n';
+    }
+}
+
+TextGdnState PrefixPrefillSnapshot::state(int bank) const {
+    return {
+        reinterpret_cast<Bf16*>(data_ + (bank * sizes_[0] / gdn_layers)),
+        reinterpret_cast<float*>(data_ + sizes_[0] + (bank * sizes_[1] / gdn_layers)),
+    };
+}
+
+void PrefixPrefillSnapshot::capture_row(const void* hidden, const void* residual,
+                                        cudaStream_t stream) const {
+    auto* destination = data_ + sizes_[0] + sizes_[1];
+    check_prefix_cuda(
+        cudaMemcpyAsync(destination, hidden, sizes_[2], cudaMemcpyDeviceToDevice, stream),
+        "Capture prefill checkpoint hidden row");
+    check_prefix_cuda(cudaMemcpyAsync(destination + sizes_[2], residual, sizes_[3],
+                                      cudaMemcpyDeviceToDevice, stream),
+                      "Capture prefill checkpoint residual row");
+}
+
+void PrefixPrefillSnapshot::capture_state(TextGdnState state, cudaStream_t stream) const {
+    check_prefix_cuda(
+        cudaMemcpyAsync(data_, state.history, sizes_[0], cudaMemcpyDeviceToDevice, stream),
+        "Capture prefill checkpoint convolution");
+    check_prefix_cuda(cudaMemcpyAsync(data_ + sizes_[0], state.recurrent, sizes_[1],
+                                      cudaMemcpyDeviceToDevice, stream),
+                      "Capture prefill checkpoint recurrent state");
+}
+
+std::byte* PrefixPrefillSnapshot::data() const {
+    return data_;
+}
+
+std::size_t PrefixPrefillSnapshot::bytes() const {
+    return sizes_[0] + sizes_[1] + sizes_[2] + sizes_[3];
+}
+
+struct PrefixPrefillPool::Release {
+    std::mutex mutex;
+    std::condition_variable completed;
+};
+
+PrefixPrefillPool::PrefixPrefillPool() : release_(std::make_shared<Release>()) {
+}
+
+std::size_t PrefixPrefillPool::available(std::size_t capacity) const {
+    const auto existing = std::min(capacity, slots_.size());
+    return capacity - existing +
+           std::count_if(slots_.begin(), slots_.begin() + static_cast<std::ptrdiff_t>(existing),
+                         [](const auto& slot) { return slot.use_count() == 1; });
+}
+
+void PrefixPrefillPool::wait_available(std::size_t capacity, std::size_t count) const {
+    std::unique_lock lock(release_->mutex);
+    release_->completed.wait(lock, [&] { return available(capacity) >= count; });
+}
+
+std::shared_ptr<PrefixPrefillSnapshot> PrefixPrefillPool::acquire(std::size_t capacity,
+                                                                  const PrefixCacheLayout* layout) {
+    const auto lease = [this](std::shared_ptr<PrefixPrefillSnapshot> owner) {
+        auto* address = owner.get();
+        return std::shared_ptr<PrefixPrefillSnapshot>(
+            address,
+            [owner = std::move(owner), release = release_](PrefixPrefillSnapshot*) mutable {
+                const std::scoped_lock lock(release->mutex);
+                owner.reset();
+                release->completed.notify_one();
+            });
+    };
+    for (std::size_t index = 0; index < std::min(capacity, slots_.size()); ++index) {
+        if (slots_[index].use_count() == 1)
+            return lease(slots_[index]);
+    }
+    if (slots_.size() >= capacity)
+        return {};
+    const auto sizes = gdn_state_bytes(layout);
+    const auto bytes = sizes[0] + sizes[1] + sizes[2] + sizes[3];
+    if (available_device_bytes() < decoder_shared_reserve + bytes)
+        return {};
+    try {
+        return lease(slots_.emplace_back(std::make_shared<PrefixPrefillSnapshot>(layout)));
+    } catch (const CudaError& error) {
+        if (error.status != cudaErrorMemoryAllocation)
+            throw;
+        return {};
+    }
+}
+
 PrefixDeviceTransfer restore_prefix_view(Request& request, const PrefixCacheRead& read,
                                          cudaStream_t initialized, MtpDraftRequest* draft,
                                          const PrefixCacheLayout* layout) {
@@ -280,13 +401,17 @@ PrefixDeviceTransfer restore_prefix_view(Request& request, const PrefixCacheRead
                                    draft_rows, mxfp8_kv_heads);
     }
     if (coherent) payload.gdn = view.gdn(request.states.front(), request.work, coherent);
-    return view.finish(payload, initialized);
+    auto transfer = view.finish(payload, initialized);
+    if (coherent > 0)
+        transfer.attention_only_restore = std::make_shared<bool>(false);
+    return transfer;
 }
 
 PrefixDeviceTransfer export_prefix_view(const Request& request, int gqa_begin, int draft_begin,
                                         int end, cudaStream_t source_ready,
                                         const MtpDraftRequest* draft, const Workspace* row,
-                                        bool terminal, const PrefixCacheLayout* layout) {
+                                        bool terminal, const PrefixCacheLayout* layout,
+                                        const std::shared_ptr<PrefixPrefillSnapshot>& snapshot) {
     if (draft && layout && !layout->draft_lane) {
         throw std::logic_error("Export a draft decoder prefix from a non-draft lane");
     }
@@ -303,16 +428,19 @@ PrefixDeviceTransfer export_prefix_view(const Request& request, int gqa_begin, i
         payload.draft = view.mxfp8(draft->prefix_cache_view(end - 1, true), 1, draft_begin,
                                    end - 1, mxfp8_kv_heads, &draft->prefix_cache_memory());
     }
-    payload.gdn = view.gdn(request.states.front(), row ? *row : request.work, end,
-                           &request.memory, terminal);
+    payload.gdn = snapshot ? view.gdn(snapshot, end)
+                           : view.gdn(request.states.front(), row != nullptr ? *row : request.work,
+                                      end, &request.memory, terminal);
     return view.finish(payload, source_ready);
 }
 
 int commit_restored_prefix(Request& request, const PrefixDeviceTransfer& view,
                            MtpDraftRequest* draft) {
-    if (draft) draft->commit_restored_prefix(view.layout.draft.end);
+    const bool attention_only = view.attention_only_restore && *view.attention_only_restore;
+    if (draft != nullptr)
+        draft->commit_restored_prefix(attention_only ? 0 : view.layout.draft.end);
     request.cached_gqa_tokens = view.layout.gqa.end;
-    return view.layout.gdn.end;
+    return attention_only ? 0 : view.layout.gdn.end;
 }
 
 }

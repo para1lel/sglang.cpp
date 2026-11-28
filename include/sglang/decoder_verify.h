@@ -1,7 +1,6 @@
 #pragma once
 
 #include "sglang/decoder_internal.h"
-#include "sglang/text/gdn/gdn_replay_batch.h"
 
 namespace sglang::decoder {
 
@@ -10,7 +9,6 @@ struct MtpDraftInput;
 struct SamplingParameters;
 struct VerificationGraphBinding;
 struct VerificationWorkspace;
-struct GdnVerificationLane;
 
 inline constexpr int target_verify_max_rows = decoder_max_mtp_steps + 1;
 static_assert(target_verify_max_rows <= text_fp8_max_batch);
@@ -49,39 +47,32 @@ void project_verification_bf16(Bf16Weight weight, const VerificationRow* rows, i
                                Bf16* Workspace::*output, cudaStream_t stream);
 
 struct VerificationWorkspace {
-    VerificationWorkspace(Allocations& memory, int rows);
-    void bind_gdn(int layer, int rows);
+    VerificationWorkspace(Allocations& memory, int rows, bool rank_local = false);
 
-    struct ReplayLayer {
-        TextGdnReplayRows inputs;
-        TextGdnWeights weights;
-    };
-
-    std::array<ReplayLayer, gdn_layers> replay;
+    TextGdnReplayRows gdn{};
     std::vector<Workspace> work;
-Bf16* observable;
-TextLogitCandidate* winners;
+    Bf16* observable;
+    TextLogitCandidate* winners;
     Bf16* bf16_head_packed = nullptr;
     Bf16* bf16_head_packed_logits = nullptr;
 };
 
 struct VerificationGraphBinding {
-    std::array<TextLogitCandidate, k1_verification_rows> inputs;
-    std::array<int, k1_verification_rows> positions;
-    std::array<int, k1_verification_rows> rotary_positions;
-    std::array<ExactGqaWorkspace, k1_verification_rows> scores;
+    std::array<TextLogitCandidate, target_verify_max_rows> inputs;
+    std::array<int, target_verify_max_rows> positions;
+    std::array<int, target_verify_max_rows> rotary_positions;
+    std::array<ExactGqaWorkspace, target_verify_max_rows> scores;
     Mxfp8PageTable pages;
     std::array<Mxfp8KvCache, full_attention_layers> caches;
-    GdnBank initial;
-    GdnBank tail;
-    std::array<TextModelStateRow, k1_verification_rows> final_states;
+    GdnReplayBank gdn_replay;
+    std::array<TextModelStateRow, target_verify_max_rows> final_states;
 };
 
 template <>
 VerificationGraphBinding* Allocations::allocate<VerificationGraphBinding>(std::size_t count);
 
 struct VerificationGraphScratch {
-    explicit VerificationGraphScratch(int device);
+    VerificationGraphScratch(const DecoderModel& model, int rows);
     void upload(const VerificationSequence& sequence, cudaStream_t stream);
 
     Allocations memory;
@@ -94,8 +85,8 @@ struct VerificationGraph {
     explicit VerificationGraph(Allocations& owner);
 
     Allocations& execution;
-    std::unique_ptr<VerificationGraphScratch> scratch;
-    bool warmed = false;
+    std::array<std::unique_ptr<VerificationGraphScratch>, target_verify_max_rows + 1> scratch;
+    std::array<bool, target_verify_max_rows + 1> warmed{};
 };
 
 class MtpConstraintRound {
@@ -149,9 +140,8 @@ struct MtpRound {
     static void propose_depth(MtpRound* rounds, int count, const DraftDepthScratch& scratch,
                               cudaStream_t stream);
     int text_stop_after(const DecoderOptions& options, const RequestProgress& progress) const;
-    bool commit(const Emit& emit, cudaStream_t stream, const Cancel& cancel,
-                MtpDraftInput* repair, const Workspace** committed_row = nullptr,
-                TextGdnReplayBatch* gdn_batch = nullptr);
+    bool commit(const Emit& emit, cudaStream_t stream, const Cancel& cancel, MtpDraftInput* repair,
+                const Workspace** committed_row = nullptr);
 };
 
 class TargetVerification {
@@ -168,16 +158,14 @@ public:
     bool graph_eligible(const VerificationSequence& sequence) const;
     void bind_graph(VerificationGraphBinding& binding) const;
     void use_graph_workspace(VerificationWorkspace& workspace);
-    void bind_gdn(int layer);
-    GdnVerificationLane gdn_lane(int layer, TextGdnWeights weights);
-    void advance_gdn(int layer, TextGdnWeights weights);
+    gdn_replay_ssm::Lane gdn_lane(int layer);
     void sample(const SamplingParameters& parameters, int first_output, void* scratch);
     void constrain(const MtpConstraintRound& constraint, const ConstraintWorkspace& scratch,
                    const SamplingParameters* sampling, int first_output, void* sampling_scratch);
     void enqueue_generated_logprobs(void* scratch);
     void read();
     static void read_all(TargetVerification* const* verifiers, int count, cudaStream_t stream);
-    void commit(int count, TextGdnReplayBatch* gdn_batch = nullptr);
+    void commit(int count);
 
     int winner(int index, bool sampled = false, bool constrained = false) const;
     bool needs_logits() const;
@@ -200,7 +188,6 @@ private:
     int valid_prefix_;
     int pending_rows_ = 0;
     bool ready_ = false;
-    GdnBank tail_;
     std::optional<VerificationWorkspace> eager_workspace_;
     VerificationWorkspace* active_workspace_ = nullptr;
     TextLogitCandidate* host_winners_;

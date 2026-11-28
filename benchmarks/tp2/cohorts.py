@@ -29,7 +29,16 @@ def binding(run):
 def handle(run, fixtures, endpoint=None, *, probe=False):
     row = "W1" if probe else run.parent.name
     lanes = load_lanes(fixtures, row)
-    engine = "vllm" if run.name == "vllm-k4" else cold_cache.LMCACHE_DRAIN
+    identity = load(run.parent.parent / "identity.json")
+    engines = {
+        "tp2-paired-v3": cold_cache.LMCACHE_DRAIN_ALIGNED,
+        "tp2-paired-v4": cold_cache.LMCACHE_DRAIN_SUFFIX,
+    }
+    engine = (
+        "vllm"
+        if run.name == "vllm-k4"
+        else engines.get(identity.get("protocol"), cold_cache.LMCACHE_DRAIN)
+    )
     require(run.name in ("vllm-k4", "native-k4", "native-k4-trace"), "Unknown TP2 arm")
     server_log = run / "server.log"
     require(server_log.is_file(), f"{run.name}: missing server log")
@@ -39,7 +48,6 @@ def handle(run, fixtures, endpoint=None, *, probe=False):
     previous = prior_ranks = None
     tags = ["trace"] if run.name == "native-k4-trace" else ["warmup-01", "measured-01"]
     if probe:
-        identity = load(run.parent.parent / "identity.json")
         require(run.name == "native-k4" and identity["mode"] == "qualify",
                 "Functional probes require a separate native qualification arm")
         lanes = lanes[:1]
@@ -74,7 +82,7 @@ def handle(run, fixtures, endpoint=None, *, probe=False):
         else:
             measured[tag] = validate_cohort(raw, lanes, policy)
         previous = cold_cache.replay(raw, engine, previous)
-        if engine == cold_cache.LMCACHE_DRAIN:
+        if engine in cold_cache.LMCACHE_DRAIN_ENGINES:
             prior_ranks = cache_activity.replay(raw["cold_cache"], previous, prior_ranks)
             if probe:
                 before = cold_cache.parse_metrics(raw["cold_cache"]["cleared"], prior_ranks)

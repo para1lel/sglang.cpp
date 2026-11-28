@@ -4,7 +4,7 @@
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| Native generation | Assign one request ID per generated item and track its owner. | [ID input](../apps/server/native_generate.cpp#L520)<!-- prefix: "std::vector\u003c" --> · [Registration](../apps/server/native_generate.cpp#L586)<!-- prefix: "NativeGenera" --> |
+| Native generation | Assign one request ID per generated item and track its owner. | [ID input](../apps/server/native_generate.cpp#L520)<!-- prefix: "std::vector\u003c" --> · [Registration](../apps/server/native_generate.cpp#L575)<!-- prefix: "NativeGenera" --> |
 | HTTP control | Dispatch `POST /abort_request` on the reader and release fully aborted queue entries. | [Control route](../apps/server/prefix_controls.cpp#L496)<!-- prefix: "if (abort_ &" --> · [Queue cleanup](../apps/server/prefix_controls.cpp#L820)<!-- prefix: "void Connect" --> |
 | Decoder service | Skip waiting items, retire running items, and apply abort delivery according to the job's overlap history. | [ID state](../include/sglang/server/batch_service.h#L48)<!-- prefix: "class BatchR" --> · [Retirement](../apps/server/batch_service.cpp#L207)<!-- prefix: "if (cancelle" --> · [Waiting items](../apps/server/batch_service.cpp#L547)<!-- prefix: "bool BatchSe" --> · [Abort delivery](../apps/server/detail/batch_state.cpp#L166)<!-- prefix: "bool Job::ha" --> |
 | Native response | Report each item's terminal abort on its original generation connection. | [Finish metadata](../apps/server/native_generate.cpp#L153)<!-- prefix: "if (terminal" --> · [Pre-admission response](../apps/server/native_generate.cpp#L363)<!-- prefix: "void complet" --> |
@@ -39,7 +39,7 @@ HTTP 200 has an empty body. It acknowledges receipt of the control request. Use 
 - An item aborted before decoder submission produces empty `output_ids` and a finish reason of `{"type":"abort","message":"Abort in waiting queue"}`.
 - An item aborted after submission returns `{"type":"abort","message":"Aborted","status_code":null,"err_type":null}` as its finish reason. Its output IDs follow the delivery rules below.
 
-The scheduler observes the abort at its next cancellation check. Work already in flight can finish its current step. A normal terminal result, including a [native text stop](native-generate.md#text-stops), stays final if it wins the state transition. [Matching](../apps/server/native_generate.cpp#L718)<!-- prefix: "bool changed" --> · [Publish](../apps/server/batch_service.cpp#L262)<!-- prefix: "bool BatchSe" -->
+The scheduler observes the abort at its next cancellation check. Work already in flight can finish its current step. A normal terminal result, including a [native text stop](native-generate.md#text-stops), stays final if it wins the state transition. [Matching](../apps/server/native_generate.cpp#L707)<!-- prefix: "bool changed" --> · [Publish](../apps/server/batch_service.cpp#L262)<!-- prefix: "bool BatchSe" -->
 
 If a job has never published a step while another is pending, an abort still delivers any single already-published step before the terminal result. Once a job has published overlapping steps through [bounded decode output](http-server.md#bounded-decode-output), an abort winner discards every unclaimed step, even after ordinary scheduling resumes. A callback already claimed can finish. The abort terminal includes the IDs accepted by the writer. [Overlap history](../apps/server/batch_service.cpp#L281)<!-- prefix: "job.output_o" --> · [Single-item delivery](../apps/server/detail/batch_state.cpp#L166)<!-- prefix: "bool Job::ha" --> · [Batch delivery](../apps/server/batch_service.cpp#L590)<!-- prefix: "const bool h" -->
 
@@ -53,7 +53,7 @@ Duplicate effective IDs within a batch or against live items return HTTP 400. A 
 
 For `n > 1`, the server validates caller-supplied IDs before assigning UUIDs. A string is checked as `rid_0` through `rid_<expanded_count - 1>`. An array supplies one ID per original prompt. Duplicate IDs in the array or IDs that match live items return HTTP 400. A terminal child's ID can pass this check while its original siblings are still running. The new request registers fresh child UUIDs, so the same base can serve independent parallel requests.
 
-If a request disconnects or fails, reuse its IDs after the associated work and queue entry have been cleaned up. A late named abort targets whichever live item currently owns that ID. Use distinct caller IDs when late control requests can overlap a replacement. [Cleanup](../apps/server/native_generate.cpp#L568)<!-- prefix: "~Registratio" --> · [Terminal state](../apps/server/detail/batch_state.cpp#L46)<!-- prefix: "bool BatchRe" -->
+If a request disconnects or fails, reuse its IDs after the associated work and queue entry have been cleaned up. A late named abort targets whichever live item currently owns that ID. Use distinct caller IDs when late control requests can overlap a replacement. [Cleanup](../apps/server/native_generate.cpp#L557)<!-- prefix: "~Registratio" --> · [Terminal state](../apps/server/detail/batch_state.cpp#L46)<!-- prefix: "bool BatchRe" -->
 
 ### Capacity
 
@@ -69,7 +69,7 @@ One additional CPU worker removes a fully aborted pending request from the compl
 - Send a JSON object. `rid` accepts a string or null. `abort_all` accepts a boolean and defaults to `false` when omitted. A null `abort_all` or invalid field type returns HTTP 400.
 - An empty, missing, null, unknown, or finished `rid` with `abort_all: false` returns HTTP 200 without changing any item. An empty scalar generation ID therefore requires `abort_all` or disconnect for cancellation.
 - The control uses the shared header and body size limits. Send `Content-Length` for the JSON body. The route accepts `Content-Type: application/json` and has no media-type requirement of its own.
-- The control works with prefix reuse enabled or disabled. Abort can abandon a lookup or discard a periodic store waiting for capacity. An armed GET holds its destination slot until lease release. A submitted STORE keeps its source allocations through release and can publish after the abort. Ready peers can advance. [Cache lease rules](prefix-cache.md#constraints-and-failure-behavior)
+- The control works with prefix reuse enabled or disabled. Abort can abandon a lookup or discard a nonterminal store waiting for capacity. An armed GET holds its destination slot until lease release. A submitted STORE keeps its source allocations through release and can publish after the abort. Ready peers can advance. [Cache lease rules](prefix-cache.md#constraints-and-failure-behavior)
 - Benchmark generation, OpenAI text and chat completions, and tokenization are outside the abort scope. Upstream IPC fields, `abort_message`, and `finished_reason` have no effect on this route.
 
 ### Pinned SGLang reference

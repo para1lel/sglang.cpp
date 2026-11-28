@@ -1,6 +1,7 @@
 #include "sglang/decoder_internal.h"
 
 #include "sglang/text/decoder_logprobs.h"
+#include "sglang/text/gdn_local.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -51,6 +52,31 @@ void copy_kv_plane(std::uint8_t* destination, const std::uint8_t* source, std::s
                     "Copy MXFP8 cache during growth");
 }
 
+template <typename Shape> struct ReplayStorage {
+    static constexpr std::size_t keys = gdn_replay_ssm::capacity * Shape::qk_width;
+    static constexpr std::size_t updates = gdn_replay_ssm::capacity * Shape::value_width;
+    static constexpr std::size_t decay = gdn_replay_ssm::capacity * Shape::value_heads;
+    static constexpr std::size_t raw = gdn_replay_ssm::capacity * Shape::qkv_width;
+    static constexpr std::size_t floats = keys + updates + decay;
+    static constexpr std::size_t bytes =
+        gdn_layers *
+        ((floats * sizeof(float)) + (raw * sizeof(Bf16)) + sizeof(gdn_replay_ssm::Cursor));
+
+    static void allocate(Request& request) {
+        auto* history = request.memory.allocate<float>(gdn_layers * floats);
+        auto* raw_rows = request.memory.allocate<Bf16>(gdn_layers * raw);
+        auto* cursors = static_cast<gdn_replay_ssm::Cursor*>(
+            request.memory.allocate_elements(gdn_layers, sizeof(gdn_replay_ssm::Cursor)));
+        for (std::size_t layer = 0; layer < gdn_layers; ++layer) {
+            auto* layer_history = history + (layer * floats);
+            request.gdn_replay[layer] = {
+                request.states[layer],    layer_history,
+                layer_history + keys,     layer_history + keys + updates,
+                raw_rows + (layer * raw), cursors + layer,
+            };
+        }
+    }
+};
 }
 
 void validate_batch_options(const DecoderBatchOptions& options) {
@@ -75,12 +101,11 @@ std::size_t request_resident_bytes(int capacity, int verification_rows, bool dra
         (gdn_history_elements * sizeof(Bf16) + gdn_state_elements * sizeof(float));
     constexpr std::size_t workspace_allowance = 16 * 1024 * 1024;
     const int pages = pages_for(capacity);
-    const auto target = kv_bytes(pages, mxfp8_kv_heads) + pages * sizeof(std::int32_t) +
-                        gdn_bytes;
+    const auto target = kv_bytes(pages, mxfp8_kv_heads) + (pages * sizeof(std::int32_t)) +
+                        gdn_bytes + ReplayStorage<GdnFull>::bytes;
     const auto draft_kv = kv_bytes(pages, mxfp8_kv_heads) / full_attention_layers +
                           pages * sizeof(std::int32_t);
-    const auto verifier = verification_rows ? gdn_bytes + verification_rows * workspace_allowance
-                                            : 0;
+    const auto verifier = verification_rows * workspace_allowance;
     return target + workspace_allowance + (draft ? draft_kv + workspace_allowance : 0) + verifier;
 }
 
@@ -269,18 +294,24 @@ void Request::initialize(int capacity, cudaStream_t stream, int maximum_kv, int 
     const bool rank_local = kv_heads != mxfp8_kv_heads;
     gdn_history_stride = rank_local ? gdn_local_history_elements : gdn_history_elements;
     gdn_state_stride = rank_local ? gdn_local_state_elements : gdn_state_elements;
-     const int page_count = pages_for(capacity);
-     const int table_pages = std::max(page_count, pages_for(maximum_kv));
-     auto* table = memory.allocate<std::int32_t>(table_pages);
-     auto& logical_pages = memory.transfers().logical_pages;
-     logical_pages.resize(table_pages);
-     std::iota(logical_pages.begin(), logical_pages.end(), 0);
-     copy_cuda_async(table, logical_pages.data(), table_pages * sizeof(std::int32_t),
-                     cudaMemcpyHostToDevice, stream, "Upload MXFP8 page table");
-     pages = {table, page_count};
+    const int page_count = pages_for(capacity);
+    const int table_pages = std::max(page_count, pages_for(maximum_kv));
+    auto* table = memory.allocate<std::int32_t>(table_pages);
+    auto& logical_pages = memory.transfers().logical_pages;
+    logical_pages.resize(table_pages);
+    std::iota(logical_pages.begin(), logical_pages.end(), 0);
+    copy_cuda_async(table, logical_pages.data(), table_pages * sizeof(std::int32_t),
+                    cudaMemcpyHostToDevice, stream, "Upload MXFP8 page table");
+    pages = {table, page_count};
     caches = allocate_kv(memory, page_count, cache_kv_heads);
     allocate_gdn(memory, states, gdn_history_stride, gdn_state_stride);
- }
+    if (rank_local) {
+        ReplayStorage<GdnLocal>::allocate(*this);
+    } else {
+        ReplayStorage<GdnFull>::allocate(*this);
+    }
+    reset_gdn_replay(stream);
+}
 
 void Request::grow_kv(int positions, int written, cudaStream_t stream) {
     written = std::max(written, cached_gqa_tokens);
@@ -321,12 +352,24 @@ void Request::grow_kv(int positions, int written, cudaStream_t stream) {
 void Request::reset(cudaStream_t stream) {
     zero(states.front().history, gdn_layers * gdn_history_stride, stream);
     zero(states.front().recurrent, gdn_layers * gdn_state_stride, stream);
+    reset_gdn_replay(stream);
 }
 
 void Request::reset() {
     reset(memory.stream());
 }
 
+void Request::reset_gdn_replay(cudaStream_t stream) {
+    zero(gdn_replay.front().cursor, gdn_layers, stream);
+}
+
+void Request::materialize_gdn(cudaStream_t stream) {
+    const bool rank_local = cache_kv_heads != mxfp8_kv_heads;
+    for (const auto& state : gdn_replay) {
+        check(gdn_replay_ssm::materialize(rank_local, state, state.checkpoint, stream),
+              "Materialize committed GDN state");
+    }
+}
 }
 
 namespace sglang::decoder {

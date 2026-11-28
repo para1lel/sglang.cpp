@@ -41,7 +41,7 @@ User messages can include an `input_image` part with an `image_url` such as
 codec-enabled build uses the [native chat media limits](../chat-serving.md) and reports
 expanded prompt tokens in `usage.input_tokens`. Blocking, SSE, and stored follow-ups use
 the same media path. External URLs, file IDs, video and image detail or resizing overrides
-return HTTP 400. [Image translation](../../apps/server/responses.cpp#L109)<!-- prefix: "Value messag" -->
+return HTTP 400. [Image translation](../../apps/server/responses.cpp#L108)<!-- prefix: "Value messag" -->
 
 ## Output logprobs
 

@@ -1,5 +1,5 @@
 #include "sglang/decoder_cuda.cuh"
-#include "sglang/decoder_internal.h"
+#include "sglang/decoder_verify.h"
 #include "sglang/text/decode_proj.h"
 #include "sglang/text_ops.h"
 
@@ -407,8 +407,7 @@ __global__ void bf16_gdn_decode_shared(const __nv_bfloat16* weight_b,
     }
 }
 
-constexpr int wide_gdn_gate_rows = decoder::GdnVerificationBatch::lanes *
-                                    decoder::GdnVerificationBatch::rows;
+constexpr int wide_gdn_gate_rows = decoder::verification_packet_rows;
 
 template <int capacity>
 struct VerifyGdnGateArguments {
@@ -609,40 +608,6 @@ std::optional<cudaError_t> try_verify_bf16_gdn_gates_impl(
                                        : launch(VerifyGdnGateArguments<text_fp8_max_batch>{});
 }
 
-template <int Channels>
-std::optional<cudaError_t> try_verify_bf16_gdn_gates_compact_impl(
-    const __nv_bfloat16* weight_b, const __nv_bfloat16* weight_a,
-    const decoder::VerifyGdnGateRow* rows, int count, cudaStream_t stream) {
-    constexpr int capacity =
-        decoder::CompactGdnVerificationBatch::lanes * decoder::CompactGdnVerificationBatch::rows;
-    const auto pending = cudaGetLastError();
-    if (pending != cudaSuccess) {
-        return pending;
-    }
-    if ((count != capacity / 2 && count != capacity) || !rows || !weight_b || !weight_a ||
-        !aligned(weight_b, 16) || !aligned(weight_a, 16)) {
-        return std::nullopt;
-    }
-    VerifyGdnGateArguments<capacity> arguments;
-    for (int index = 0; index < count; ++index) {
-        const auto& row = rows[index];
-        if (!row.input || !row.output_b || !row.output_a || !aligned(row.input, 16)) {
-            return std::nullopt;
-        }
-        arguments.rows[index] = row;
-    }
-    void* args[] = {&weight_b, &weight_a, &arguments};
-    const dim3 grid(2 * Channels, count / wide_gdn_gate_rows);
-    const auto direct = cudaLaunchKernel(bf16_gdn_verify_gates<capacity, Channels>, grid,
-                                         wide_gdn_gate_rows * warp_width, args, 0, stream);
-    const auto recorded = cudaGetLastError();
-    if (direct == cudaSuccess ||
-        (!decoder::CudaError::terminal(direct) && decoder::CudaError::terminal(recorded))) {
-        return recorded;
-    }
-    return direct;
-}
-
 }
 
 std::optional<cudaError_t> try_text_bf16_decode_gates(
@@ -728,20 +693,6 @@ std::optional<cudaError_t> decoder::try_verify_bf16_gdn_gates_local(
     const __nv_bfloat16* weight_b, const __nv_bfloat16* weight_a,
     const VerifyGdnGateRow* rows, int count, cudaStream_t stream) {
     return try_verify_bf16_gdn_gates_impl<local_gdn_gate_channels>(
-        weight_b, weight_a, rows, count, stream);
-}
-
-std::optional<cudaError_t> decoder::try_verify_bf16_gdn_gates_compact(
-    const __nv_bfloat16* weight_b, const __nv_bfloat16* weight_a,
-    const VerifyGdnGateRow* rows, int count, cudaStream_t stream) {
-    return try_verify_bf16_gdn_gates_compact_impl<text_gdn_value_heads>(
-        weight_b, weight_a, rows, count, stream);
-}
-
-std::optional<cudaError_t> decoder::try_verify_bf16_gdn_gates_compact_local(
-    const __nv_bfloat16* weight_b, const __nv_bfloat16* weight_a,
-    const VerifyGdnGateRow* rows, int count, cudaStream_t stream) {
-    return try_verify_bf16_gdn_gates_compact_impl<local_gdn_gate_channels>(
         weight_b, weight_a, rows, count, stream);
 }
 

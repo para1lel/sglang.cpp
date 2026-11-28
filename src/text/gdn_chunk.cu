@@ -1,5 +1,6 @@
 #include "sglang/text/gdn/gdn_chunk.cuh"
 
+#include <algorithm>
 #include <mma.h>
 #include <type_traits>
 
@@ -183,9 +184,7 @@ __global__ void prepare_segments(Segments) {
 }
 #endif
 
-}
-
-namespace sglang::gdn_chunk::warp_mma {
+namespace warp_mma {
 
 constexpr int columns = 8;
 constexpr int block_warps = 8;
@@ -532,11 +531,61 @@ __device__ __forceinline__ void advance_state(const Bf16* scaled_keys, const Bf1
     }
 }
 
+static __device__ __forceinline__ void store_carry(float* target, int lane,
+                                                   const Result (&accumulator)[key_tiles]) {
+    #pragma unroll
+    for (int key = 0; key < key_tiles; ++key) {
+    #pragma unroll
+        for (int element = 0; element < 4; ++element) {
+            target[(result_column(lane, element) * dimension) + (key * tile) +
+                   result_row(lane, element)] = accumulator[key].fragments[element];
+        }
+    }
+}
+
+static __device__ __forceinline__ void
+store_checkpoints(const gdn_prefill::Checkpoints& checkpoints, int& next, int last, int feature,
+                  int lane, const Result (&accumulator)[key_tiles]) {
+    while (next < checkpoints.count && checkpoints.values[next].rows <= last) {
+        store_carry(checkpoints.values[next].state.recurrent +
+                        (static_cast<std::size_t>(feature) * dimension),
+                    lane, accumulator);
+        ++next;
+    }
+}
+
+template <typename S, bool Grouped, int BlockWarps, typename Frame>
+static __device__ __forceinline__ void
+wait_and_prefetch(Frame* frames, Bf16* scaled_keys, int first, int count, int head, int feature,
+                  const Bf16* convolved, const Matrices* matrices) {
+    asm volatile("cp.async.wait_group 0;" ::: "memory");
+    __syncthreads();
+    const int chunk = first / rows;
+    if (first + rows < count) {
+        prefetch<S, BlockWarps>(
+            frames[(chunk + 1) % 2], matrices[(chunk + 1) * S::value_heads + head], convolved,
+            first + rows, min(count - first - rows, rows), head, feature, threadIdx.x);
+    }
+    scale_keys<Grouped, BlockWarps>(frames[chunk % 2], scaled_keys, threadIdx.x);
+}
+
+static __device__ __forceinline__ void
+store_state_tiles(Bf16* state, int lane, const Result (&accumulator)[key_tiles], bool next_tile) {
+    if (!next_tile) {
+        return;
+    }
+    #pragma unroll
+    for (int key = 0; key < key_tiles; ++key) {
+        store_bf16(state + (static_cast<std::size_t>(key) * tile * columns), accumulator[key],
+                   lane);
+    }
+}
+
 template <typename S, bool Grouped, int BlockWarps = block_warps, typename Frame = Stage,
-          int PipelineSlots = 0>
-__device__ __forceinline__ void recur_segment(int count, const Bf16* convolved,
-                                              const Matrices* matrices, float* recurrent,
-                                              Bf16* observable) {
+          int PipelineSlots = 0, bool Snapshot = false>
+static __device__ __forceinline__ void
+recur_segment(int count, const Bf16* convolved, const Matrices* matrices, float* recurrent,
+              Bf16* observable, const gdn_prefill::Checkpoints* checkpoints = nullptr) {
     alignas(32) extern __shared__ unsigned char dynamic_frames[];
     auto* frames = reinterpret_cast<Frame*>(dynamic_frames);
     __shared__ alignas(32) Bf16 scaled_keys[rows * key_stride];
@@ -562,6 +611,7 @@ __device__ __forceinline__ void recur_segment(int count, const Bf16* convolved,
     auto* state = states[warp];
     auto* work = workspace[warp];
     Result accumulator[key_tiles];
+    int next_checkpoint = 0;
     #pragma unroll
     for (int key = 0; key < key_tiles; ++key) {
         #pragma unroll
@@ -580,14 +630,8 @@ __device__ __forceinline__ void recur_segment(int count, const Bf16* convolved,
         if constexpr (pipelined) {
             asm volatile("bar.sync 2;" ::: "memory");
         } else {
-            asm volatile("cp.async.wait_group 0;" ::: "memory");
-            __syncthreads();
-            if (first + rows < count) {
-                prefetch<S, BlockWarps>(frames[(chunk + 1) % 2],
-                    matrices[(chunk + 1) * S::value_heads + head], convolved, first + rows,
-                    min(count - first - rows, rows), head, first_feature, threadIdx.x);
-            }
-            scale_keys<Grouped, BlockWarps>(stage, scaled_keys, threadIdx.x);
+            wait_and_prefetch<S, Grouped, BlockWarps>(frames, scaled_keys, first, count, head,
+                                                      first_feature, convolved, matrices);
         }
 
         Result projection[2 * time_tiles];
@@ -603,29 +647,27 @@ __device__ __forceinline__ void recur_segment(int count, const Bf16* convolved,
         }
         __syncwarp();
 
-        write_observable<S, Grouped>(stage, work, projection, first, valid, feature, lane,
-                                     observable);
+        if (!Snapshot || observable) {
+            write_observable<S, Grouped>(stage, work, projection, first, valid, feature, lane,
+                                         observable);
+        }
+        if constexpr (Snapshot) {
+            store_checkpoints(*checkpoints, next_checkpoint, first + valid - 1, feature, lane,
+                              accumulator);
+        }
         if constexpr (pipelined) {
             advance_state(stage.scaled, work, stage.initial[rows - 1], lane, accumulator);
         } else {
             __syncthreads();
             advance_state(scaled_keys, work, stage.initial[rows - 1], lane, accumulator);
         }
-        if (first + rows < count) {
-            #pragma unroll
-            for (int key = 0; key < key_tiles; ++key) {
-                store_bf16(state + key * tile * columns, accumulator[key], lane);
-            }
+        if constexpr (Snapshot) {
+            store_checkpoints(*checkpoints, next_checkpoint, first + valid, feature, lane,
+                              accumulator);
         }
+        store_state_tiles(state, lane, accumulator, first + rows < count);
     }
-    #pragma unroll
-    for (int key = 0; key < key_tiles; ++key) {
-        #pragma unroll
-        for (int element = 0; element < 4; ++element) {
-            carry[result_column(lane, element) * dimension + key * tile +
-                  result_row(lane, element)] = accumulator[key].fragments[element];
-        }
-    }
+    store_carry(carry, lane, accumulator);
 }
 
 template <typename S = GdnFull, int BlockWarps = block_warps, bool Vector = false,
@@ -638,12 +680,31 @@ __global__ void recur_warp(int count, const Bf16* convolved, const Matrices* mat
                                                                recurrent, observable);
 }
 
+template <typename S, int BlockWarps, bool Vector, bool StageValues, int PipelineSlots>
+static __global__ void
+recur_warp_checkpoints(int count, const Bf16* convolved, const Matrices* matrices, float* recurrent,
+                       Bf16* observable, const __grid_constant__ gdn_prefill::Checkpoints points) {
+    using Frame = std::conditional_t<PipelineSlots != 0, PipelinedStage,
+                                     std::conditional_t<StageValues, ValueStage, Stage>>;
+    recur_segment<S, Vector, BlockWarps, Frame, PipelineSlots, true>(
+        count, convolved, matrices, recurrent, observable, &points);
+}
+
 template <typename S = GdnFull>
 __global__ __launch_bounds__(block_threads, 3)
 void recur_segments(const __grid_constant__ Segments segments) {
     const auto& segment = segments.values[blockIdx.z];
     recur_segment<S, true>(segment.count, segment.convolved, segment.matrices,
                           segment.recurrent, segment.observable);
+}
+
+template <typename S>
+static __global__ __launch_bounds__(block_threads, 3) void recur_segment_checkpoints(
+    const __grid_constant__ Segments segments, const __grid_constant__ SegmentCheckpoints points) {
+    const auto& segment = segments.values[blockIdx.z];
+    recur_segment<S, true, block_warps, Stage, 0, true>(
+        segment.count, segment.convolved, segment.matrices, segment.recurrent, segment.observable,
+        &points.values[blockIdx.z]);
 }
 #else
 constexpr int dynamic_bytes = 0;
@@ -660,15 +721,22 @@ template <typename S = GdnFull, int BlockWarps = block_warps, bool Vector = fals
 __global__ void recur_warp(int, const Bf16*, const Matrices*, float*, Bf16*) {
     __trap();
 }
+template <typename S, int BlockWarps, bool Vector, bool StageValues, int PipelineSlots>
+static __global__ void recur_warp_checkpoints(int, const Bf16*, const Matrices*, float*, Bf16*,
+                                              gdn_prefill::Checkpoints) {
+    __trap();
+}
 template <typename S = GdnFull>
 __global__ void recur_segments(Segments) {
+    __trap();
+}
+template <typename S>
+static __global__ void recur_segment_checkpoints(Segments, SegmentCheckpoints) {
     __trap();
 }
 #endif
 
 }
-
-namespace sglang::gdn_chunk {
 
 template <typename S = GdnFull>
 inline std::size_t scratch_bytes(int count) {
@@ -686,11 +754,24 @@ template <typename S>
 constexpr int recurrence_warps = std::is_same_v<S, GdnLocal> ? 4 : warp_mma::block_warps;
 
 template <typename S, bool StageValues = false, int PipelineSlots = 0>
-constexpr auto recurrence_kernel =
-    warp_mma::recur_warp<S, recurrence_warps<S>, std::is_same_v<S, GdnLocal>, StageValues,
-                         PipelineSlots>;
+static const void* recurrence_kernel(bool checkpoints) {
+    constexpr int warps = recurrence_warps<S>;
+    constexpr bool local = std::is_same_v<S, GdnLocal>;
+    return checkpoints
+               ? reinterpret_cast<const void*>(
+                     warp_mma::recur_warp_checkpoints<S, warps, local, StageValues, PipelineSlots>)
+               : reinterpret_cast<const void*>(
+                     warp_mma::recur_warp<S, warps, local, StageValues, PipelineSlots>);
+}
 
-static cudaError_t configure_local(bool& enabled, int device, Recurrence& recurrence) {
+template <typename S, bool StageValues = false, int PipelineSlots = 0>
+static cudaError_t configure_kernel(bool checkpoints, int bytes) {
+    return cudaFuncSetAttribute(recurrence_kernel<S, StageValues, PipelineSlots>(checkpoints),
+                                cudaFuncAttributeMaxDynamicSharedMemorySize, bytes);
+}
+
+static cudaError_t configure_local(bool& enabled, int device, Recurrence& recurrence,
+                                   bool checkpoints) {
     int shared_limit = 0;
     const auto status =
         cudaDeviceGetAttribute(&shared_limit, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
@@ -703,29 +784,22 @@ static cudaError_t configure_local(bool& enabled, int device, Recurrence& recurr
     }
     if (recurrence == Recurrence::unstaged || shared_limit < warp_mma::value_shared_bytes) {
         recurrence = Recurrence::unstaged;
-        return cudaFuncSetAttribute(recurrence_kernel<GdnLocal>,
-                                    cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                    warp_mma::dynamic_bytes);
+        return configure_kernel<GdnLocal>(checkpoints, warp_mma::dynamic_bytes);
     }
     if (shared_limit >= warp_mma::three_frame_shared_bytes) {
         recurrence = Recurrence::three_frames;
-        return cudaFuncSetAttribute(recurrence_kernel<GdnLocal, true, 3>,
-                                    cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                    warp_mma::three_frame_bytes);
+        return configure_kernel<GdnLocal, true, 3>(checkpoints, warp_mma::three_frame_bytes);
     }
     if (shared_limit >= warp_mma::two_frame_shared_bytes) {
         recurrence = Recurrence::two_frames;
-        return cudaFuncSetAttribute(recurrence_kernel<GdnLocal, true, 2>,
-                                    cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                    warp_mma::two_frame_bytes);
+        return configure_kernel<GdnLocal, true, 2>(checkpoints, warp_mma::two_frame_bytes);
     }
     recurrence = Recurrence::staged;
-    return cudaFuncSetAttribute(recurrence_kernel<GdnLocal, true>,
-                                cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                warp_mma::value_dynamic_bytes);
+    return configure_kernel<GdnLocal, true>(checkpoints, warp_mma::value_dynamic_bytes);
 }
 
-template <typename S> cudaError_t configure(bool& enabled, bool grouped, Recurrence* recurrence) {
+template <typename S>
+cudaError_t configure(bool& enabled, bool grouped, Recurrence* recurrence, bool checkpoints) {
     int device = 0, major = 0, minor = 0;
     auto status = cudaGetDevice(&device);
     if (status == cudaSuccess) {
@@ -742,25 +816,31 @@ template <typename S> cudaError_t configure(bool& enabled, bool grouped, Recurre
         return cudaSuccess;
     }
     if (grouped) {
-        return cudaFuncSetAttribute(warp_mma::recur_segments<S>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, warp_mma::dynamic_bytes);
+        const void* kernel =
+            checkpoints ? reinterpret_cast<const void*>(warp_mma::recur_segment_checkpoints<S>)
+                        : reinterpret_cast<const void*>(warp_mma::recur_segments<S>);
+        return cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                    warp_mma::dynamic_bytes);
     }
     if constexpr (std::is_same_v<S, GdnLocal>) {
         if (recurrence) {
-            return configure_local(enabled, device, *recurrence);
+            return configure_local(enabled, device, *recurrence, checkpoints);
         }
     }
-    return cudaFuncSetAttribute(recurrence_kernel<S>,
-                                cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                warp_mma::dynamic_bytes);
+    return configure_kernel<S>(checkpoints, warp_mma::dynamic_bytes);
 }
 
 template <typename S, bool StageValues, int PipelineSlots = 0>
-static cudaError_t launch_chunk(int count, const Bf16* convolved, const float2* gates,
-                                void* scratch, float* recurrent, Bf16* observable,
-                                cudaStream_t stream) {
+static cudaError_t enqueue_chunk(int count, const Bf16* convolved, const float2* gates,
+                                 void* scratch, float* recurrent, Bf16* observable,
+                                 cudaStream_t stream, gdn_prefill::Checkpoints* points) {
     auto* matrices = static_cast<Matrices*>(scratch);
-    void* prepare_args[] = {&count, &convolved, &gates, &matrices};
+    void* prepare_args[] = {
+        &count,
+        static_cast<void*>(&convolved),
+        static_cast<void*>(&gates),
+        static_cast<void*>(&matrices),
+    };
     constexpr int shared_heads = StageValues ? S::heads_per_qk : 1;
     const auto status = cudaLaunchKernel(
         prepare<S, shared_heads>, dim3(S::value_heads / shared_heads, (count + rows - 1) / rows),
@@ -768,76 +848,152 @@ static cudaError_t launch_chunk(int count, const Bf16* convolved, const float2* 
     if (status != cudaSuccess) {
         return status;
     }
-    void* recur_args[] = {&count, &convolved, &matrices, &recurrent, &observable};
     constexpr int recurrence_threads = recurrence_warps<S> * (PipelineSlots != 0 ? 64 : 32);
-    constexpr int shared = [] {
-        if constexpr (PipelineSlots == 3) {
-            return warp_mma::three_frame_bytes;
-        } else if constexpr (PipelineSlots == 2) {
-            return warp_mma::two_frame_bytes;
-        } else {
-            return StageValues ? warp_mma::value_dynamic_bytes : warp_mma::dynamic_bytes;
-        }
-    }();
+    constexpr int frame_bytes[] = {0, 0, warp_mma::two_frame_bytes, warp_mma::three_frame_bytes};
+    constexpr int ordinary_bytes =
+        StageValues ? warp_mma::value_dynamic_bytes : warp_mma::dynamic_bytes;
+    constexpr int shared = PipelineSlots != 0 ? frame_bytes[PipelineSlots] : ordinary_bytes;
+    void* recur_args[] = {
+        &count,
+        static_cast<void*>(&convolved),
+        static_cast<void*>(&matrices),
+        static_cast<void*>(&recurrent),
+        static_cast<void*>(&observable),
+        points,
+    };
+    const auto kernel = recurrence_kernel<S, StageValues, PipelineSlots>(points != nullptr);
     return cudaLaunchKernel(
-        recurrence_kernel<S, StageValues, PipelineSlots>,
-        dim3(S::value_heads, dimension / (warp_mma::columns * recurrence_warps<S>)),
+        kernel, dim3(S::value_heads, dimension / (warp_mma::columns * recurrence_warps<S>)),
         dim3(recurrence_threads), recur_args, shared, stream);
+}
+
+static int interior_chunk_start(int count, int endpoint) {
+    return endpoint < count && endpoint % rows != 0 ? endpoint / rows * rows : -1;
+}
+
+template <typename S, bool StageValues, int PipelineSlots = 0>
+static cudaError_t launch_chunk(int count, const Bf16* convolved, const float2* gates,
+                                void* scratch, float* recurrent, Bf16* observable,
+                                cudaStream_t stream, gdn_prefill::Checkpoints* points) {
+    auto status = enqueue_chunk<S, StageValues, PipelineSlots>(
+        count, convolved, gates, scratch, recurrent, observable, stream, points);
+    if (status != cudaSuccess || !points) {
+        return status;
+    }
+    gdn_prefill::Checkpoints empty{};
+    for (int index = 0; index < points->count; ++index) {
+        const auto& point = points->values[index];
+        const int first = interior_chunk_start(count, point.rows);
+        if (first >= 0) {
+            status = enqueue_chunk<S, StageValues, PipelineSlots>(
+                point.rows - first, convolved + static_cast<std::size_t>(first) * S::qkv_width,
+                gates + first * S::value_heads, scratch, point.state.recurrent, nullptr, stream,
+                &empty);
+            if (status != cudaSuccess) {
+                return status;
+            }
+        }
+    }
+    return cudaSuccess;
 }
 
 template <typename S>
 cudaError_t launch(int count, const Bf16* convolved, const float2* gates, void* scratch,
-                   float* recurrent, Bf16* observable, cudaStream_t stream, Recurrence recurrence) {
+                   float* recurrent, Bf16* observable, cudaStream_t stream, Recurrence recurrence,
+                   gdn_prefill::Checkpoints* checkpoints) {
     if constexpr (std::is_same_v<S, GdnLocal>) {
         if (recurrence == Recurrence::three_frames) {
             return launch_chunk<S, true, 3>(count, convolved, gates, scratch, recurrent, observable,
-                                            stream);
+                                            stream, checkpoints);
         }
         if (recurrence == Recurrence::two_frames) {
             return launch_chunk<S, true, 2>(count, convolved, gates, scratch, recurrent, observable,
-                                            stream);
+                                            stream, checkpoints);
         }
         if (recurrence == Recurrence::staged) {
             return launch_chunk<S, true>(count, convolved, gates, scratch, recurrent, observable,
-                                         stream);
+                                         stream, checkpoints);
         }
     }
-    return launch_chunk<S, false>(count, convolved, gates, scratch, recurrent, observable, stream);
+    return launch_chunk<S, false>(count, convolved, gates, scratch, recurrent, observable, stream,
+                                  checkpoints);
 }
 
 template <typename S>
-cudaError_t launch_segments(Segments segments, int count, int max_rows,
-                                   cudaStream_t stream) {
-    void* args[] = {&segments};
-    const auto chunks = (max_rows + rows - 1) / rows;
-    const auto status = cudaLaunchKernel(prepare_segments<S>,
-                                         dim3(S::qk_heads, chunks, count),
-                                         dim3(threads * S::heads_per_qk), args, 0, stream);
+static cudaError_t enqueue_segments(Segments& segments, gdn_prefill::SegmentExtent extent,
+                                    cudaStream_t stream, SegmentCheckpoints* points) {
+    void* args[] = {&segments, points};
+    const auto chunks = (extent.max_rows + rows - 1) / rows;
+    const auto status =
+        cudaLaunchKernel(prepare_segments<S>, dim3(S::qk_heads, chunks, extent.count),
+                         dim3(threads * S::heads_per_qk), args, 0, stream);
     if (status != cudaSuccess) {
         return status;
     }
-    return cudaLaunchKernel(warp_mma::recur_segments<S>,
-                            dim3(S::value_heads, warp_mma::warp_value_tiles, count),
-                            dim3(warp_mma::block_threads), args, warp_mma::dynamic_bytes,
-                            stream);
+    const void* kernel = points != nullptr
+                             ? reinterpret_cast<const void*>(warp_mma::recur_segment_checkpoints<S>)
+                             : reinterpret_cast<const void*>(warp_mma::recur_segments<S>);
+    return cudaLaunchKernel(kernel, dim3(S::value_heads, warp_mma::warp_value_tiles, extent.count),
+                            dim3(warp_mma::block_threads), args, warp_mma::dynamic_bytes, stream);
+}
+
+template <typename S>
+cudaError_t launch_segments(Segments segments, int count, int max_rows, cudaStream_t stream,
+                            SegmentCheckpoints* checkpoints) {
+    auto status = enqueue_segments<S>(segments, {count, max_rows}, stream, checkpoints);
+    if (status != cudaSuccess || !checkpoints) {
+        return status;
+    }
+    SegmentCheckpoints empty{};
+    for (int index = 0; index < text_gdn_max_prefill_checkpoints; ++index) {
+        Segments prefixes{};
+        int pending = 0;
+        int longest = 0;
+        for (int lane = 0; lane < count; ++lane) {
+            const auto& points = checkpoints->values[lane];
+            if (index >= points.count) {
+                continue;
+            }
+            const auto& point = points.values[index];
+            const auto& segment = segments.values[lane];
+            const int first = interior_chunk_start(segment.count, point.rows);
+            if (first >= 0) {
+                const int prefix = point.rows - first;
+                prefixes.values[pending++] = {
+                    prefix,
+                    segment.convolved + static_cast<std::size_t>(first) * S::qkv_width,
+                    segment.gates + first * S::value_heads,
+                    segment.matrices,
+                    point.state.recurrent,
+                    nullptr,
+                };
+                longest = std::max(longest, prefix);
+            }
+        }
+        if (pending != 0) {
+            status = enqueue_segments<S>(prefixes, {pending, longest}, stream, &empty);
+            if (status != cudaSuccess) {
+                return status;
+            }
+        }
+    }
+    return cudaSuccess;
 }
 
 template bool eligible<GdnFull>(int, const void*, std::size_t);
 template bool eligible<GdnLocal>(int, const void*, std::size_t);
-template cudaError_t configure<GdnFull>(bool&, bool, Recurrence*);
-template cudaError_t configure<GdnLocal>(bool&, bool, Recurrence*);
+template cudaError_t configure<GdnFull>(bool&, bool, Recurrence*, bool);
+template cudaError_t configure<GdnLocal>(bool&, bool, Recurrence*, bool);
 template cudaError_t launch<GdnFull>(int, const Bf16*, const float2*, void*, float*, Bf16*,
-                                     cudaStream_t, Recurrence);
+                                     cudaStream_t, Recurrence, gdn_prefill::Checkpoints*);
 template cudaError_t launch<GdnLocal>(int, const Bf16*, const float2*, void*, float*, Bf16*,
-                                      cudaStream_t, Recurrence);
-template cudaError_t launch_segments<GdnFull>(Segments, int, int, cudaStream_t);
-template cudaError_t launch_segments<GdnLocal>(Segments, int, int, cudaStream_t);
+                                      cudaStream_t, Recurrence, gdn_prefill::Checkpoints*);
+template cudaError_t launch_segments<GdnFull>(Segments, int, int, cudaStream_t,
+                                              SegmentCheckpoints*);
+template cudaError_t launch_segments<GdnLocal>(Segments, int, int, cudaStream_t,
+                                               SegmentCheckpoints*);
 }
 
-namespace sglang {
-
-std::size_t text_gdn_local_chunk_scratch_bytes(int rows) {
+std::size_t sglang::text_gdn_local_chunk_scratch_bytes(int rows) {
     return gdn_chunk::scratch_bytes<GdnLocal>(rows);
-}
-
 }

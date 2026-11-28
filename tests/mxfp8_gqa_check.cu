@@ -18,7 +18,6 @@ namespace gqa_test {
 std::vector<__nv_bfloat16> make_queries(int start_token, int count);
 double decode_value(std::uint8_t code, std::uint8_t scale);
 void check_bound_gdn(cudaStream_t stream);
-void check_tiled_prefill_scales(cudaStream_t stream);
 void check_raw_attention(cudaStream_t stream);
 void verify_ordered_prefill(const char* phase, sglang::Mxfp8KvCache cache,
                             sglang::Mxfp8PageTable pages, int first, int rows,

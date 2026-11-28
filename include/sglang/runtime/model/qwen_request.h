@@ -7,6 +7,7 @@
 #include "sglang/decoder_sampling.h"
 #include "sglang/runtime/backend/cuda_resources.h"
 #include "sglang/runtime/model/qwen_layers.h"
+#include "sglang/text/gdn/replay_ssm.h"
 
 #include <array>
 #include <cstdint>
@@ -58,6 +59,7 @@ struct Workspace {
 };
 
 using GdnBank = std::array<TextGdnState, gdn_layers>;
+using GdnReplayBank = std::array<gdn_replay_ssm::State, gdn_layers>;
 void allocate_gdn(Allocations& memory, GdnBank& states,
                   std::size_t history_elements = gdn_history_elements,
                   std::size_t state_elements = gdn_state_elements);
@@ -102,6 +104,8 @@ struct Request {
     void grow_kv(int positions, int written, cudaStream_t stream);
     void reset(cudaStream_t stream);
     void reset();
+    void reset_gdn_replay(cudaStream_t stream);
+    void materialize_gdn(cudaStream_t stream);
     void prepare_minimum_stops(const DecoderOptions& options, cudaStream_t stream);
     void prepare_logit_adjustments(const DecoderOptions& options, cudaStream_t stream);
     ExactGqaWorkspace batch_graph_scores();
@@ -119,6 +123,7 @@ struct Request {
     int cached_gqa_tokens = 0;
     bool prefix_checkpoint_outputs = false;
     GdnBank states;
+    GdnReplayBank gdn_replay{};
     std::optional<ExactGqaWorkspace> long_graph_scores;
     std::byte* sampling_workspace = nullptr;
     ConstraintWorkspace constraint_workspace;

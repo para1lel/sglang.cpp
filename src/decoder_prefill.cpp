@@ -205,6 +205,8 @@ void finish_prefill_group(const DecoderModel& model, const Chunk& chunk,
         }
         capture_prefill_scores(model, grant, &buffers, offset, stream);
         stage_prefill_row(*grant.request, buffers, offset + grant.rows - 1, stream);
+        capture_prefill_checkpoints(grant, &buffers, offset, stream);
+        publish_prefill_checkpoints(grant);
         offset += grant.rows;
     }
 }
@@ -383,10 +385,13 @@ void finish_prefill_group_tp(const DecoderModel& model, const Chunk& chunk,
         }
         capture_prefill_scores(model, grant, &chunk.work, offset, stream);
         stage_prefill_row(*grant.request, chunk.work, offset + grant.rows - 1, stream);
+        capture_prefill_checkpoints(grant, &chunk.work, offset, stream);
         on_device(peer_device, [&] {
             stage_prefill_row(*peer_grant.request, peer_chunk.work,
                               offset + grant.rows - 1, peer_stream);
+            capture_prefill_checkpoints(peer_grant, &peer_chunk.work, offset, peer_stream);
         });
+        publish_prefill_checkpoints(grant);
         offset += grant.rows;
     }
 }
@@ -571,12 +576,16 @@ bool decoder::try_prefill_projection_groups(
 void Decoder::Model::prefill_chunk(Request& request, const int* tokens, int rows, int position,
                                    PrefillWorkspace& workspace, MtpDraftRequest* draft,
                                    int prompt_remaining, const MediaPrefill* media,
-                                   const PromptLogprobCapture* scores,
-                                   int logical_capacity) const {
+                                   const PromptLogprobCapture* scores, int logical_capacity,
+                                   const PrefillGrant* checkpoint_grant) const {
     const auto stream = workspace.stream();
     const int capacity = logical_capacity ? logical_capacity : workspace.capacity();
-    const PrefillGrant grant{&request, tokens, position, rows, rows, prompt_remaining,
-                             draft, media, scores};
+    PrefillGrant grant{&request, tokens, position, rows, rows, prompt_remaining, draft, media};
+    grant.scores = scores;
+    if (checkpoint_grant != nullptr) {
+        grant.checkpoints = checkpoint_grant->checkpoints;
+        grant.checkpoint = checkpoint_grant->checkpoint;
+    }
     validate_prefill_tile(grant, workspace, capacity);
     if (rows == 1 || !workspace.data()) {
         if (!std::all_of(tokens, tokens + rows,
@@ -586,6 +595,7 @@ void Decoder::Model::prefill_chunk(Request& request, const int* tokens, int rows
         int pending = 0;
         const int first = scores ? scores->start : position;
         const int end = scores ? scores->score_end(position, rows) : position;
+        auto checkpoints = prefill_checkpoints(grant);
         for (int row = 0; row < rows; ++row) {
             const int token_position = position + row;
             ForwardLane lane{
@@ -601,6 +611,16 @@ void Decoder::Model::prefill_chunk(Request& request, const int* tokens, int rows
             }
             if (draft && row + 1 < prompt_remaining) {
                 seed_draft(request.work, *draft, token_position, tokens[row + 1], stream, media);
+            }
+            if (checkpoints.size != 0 && checkpoints.data[0].end == token_position + 1) {
+                auto current = grant;
+                current.position = token_position;
+                current.rows = 1;
+                current.checkpoints = {checkpoints.data, 1};
+                capture_prefill_checkpoints(current, nullptr, 0, stream);
+                publish_prefill_checkpoints(current);
+                ++checkpoints.data;
+                --checkpoints.size;
             }
         }
         if (scores) scores->collect(pending, stream);
@@ -621,19 +641,20 @@ void Decoder::Model::prefill_chunk(Request& request, const int* tokens, int rows
         const auto [branch, residual] = residuals(work);
         chunk.normalize(branch, residual, weight);
     };
-    run_layers(layers, normalize,
-                   [&](const GqaLayer& layer, int bank) {
-                       chunk.gqa_input(layer);
-                       chunk.gqa_attention(layer, request.caches[bank], request.pages,
-                                           work.gqa_scratch());
-                       chunk.project(layer.output, chunk.quantize(work.attention, dims.q_width),
-                                     work.projected_attention);
-                   },
-                   [&](const GdnLayer& layer, int bank) {
-                       chunk.gdn_input(layer);
-                       chunk.gdn_attention(layer, request.states[bank], bank);
-                   },
-                   [&](const Layer& layer) { chunk.mlp(layer); });
+    run_layers(
+        layers, normalize,
+        [&](const GqaLayer& layer, int bank) {
+            chunk.gqa_input(layer);
+            chunk.gqa_attention(layer, request.caches[bank], request.pages, work.gqa_scratch());
+            chunk.project(layer.output, chunk.quantize(work.attention, dims.q_width),
+                          work.projected_attention);
+        },
+        [&](const GdnLayer& layer, int bank) {
+            chunk.gdn_input(layer);
+            const GdnPrefillCheckpoints checkpoints(grant, bank);
+            chunk.gdn_attention(layer, request.states[bank], bank, checkpoints.view());
+        },
+        [&](const Layer& layer) { chunk.mlp(layer); });
     if (draft && prompt_remaining > 1) {
         const bool wmma = tensor_core && backend.draft.wmma_seed_fc &&
                           position + prompt_remaining >= wmma_seed_min_prompt_tokens;
@@ -642,6 +663,8 @@ void Decoder::Model::prefill_chunk(Request& request, const int* tokens, int rows
     }
     capture_prefill_scores(*this, grant, &work, 0, stream);
     stage_prefill_row(request, work, rows - 1, stream);
+    capture_prefill_checkpoints(grant, &work, 0, stream);
+    publish_prefill_checkpoints(grant);
 }
 
 namespace {
@@ -713,9 +736,12 @@ void prefill_chunk_tp(const DecoderModel& model, const DecoderModel& peer,
             } else {
                 chunk.gdn_input(layer);
                 on_device(peer.device, [&] { peer_chunk.gdn_input(peer_layer); });
-                chunk.gdn_attention(layer, request.states[bank], bank);
+                const GdnPrefillCheckpoints checkpoints(grant, bank);
+                chunk.gdn_attention(layer, request.states[bank], bank, checkpoints.view());
                 on_device(peer.device, [&] {
-                    peer_chunk.gdn_attention(peer_layer, peer_request.states[bank], bank);
+                    const GdnPrefillCheckpoints peer_checkpoints(peer_grant, bank);
+                    peer_chunk.gdn_attention(peer_layer, peer_request.states[bank], bank,
+                                             peer_checkpoints.view());
                 });
             }
             reduce(work.projected_attention, peer_work.projected_attention);
@@ -725,26 +751,15 @@ void prefill_chunk_tp(const DecoderModel& model, const DecoderModel& peer,
             on_device(peer.device, [&] { peer_chunk.mlp(peer_layer); });
             reduce(work.hidden, peer_work.hidden);
         });
-    if (grant.draft && grant.prompt_remaining > 1) {
-        const bool wmma = tensor_core && model.backend.draft.wmma_seed_fc &&
-                          grant.position + grant.prompt_remaining >= wmma_seed_min_prompt_tokens;
-        const int seed_rows = std::min(rows, grant.prompt_remaining - 1);
-        const int concat_rows = std::min(seed_rows, prefill_chunk_rows);
-        const std::size_t available = workspace.layout_bytes() - layout.bytes;
-        if (seed_scratch_bytes(concat_rows, seed_rows) > available) {
-            throw std::runtime_error("Prefill workspace too small for the MTP draft seed scratch");
-        }
-        const auto scratch = make_seed_scratch(
-            layout.take_bf16(seed_scratch_bytes(concat_rows, seed_rows) / sizeof(Bf16)),
-            concat_rows, seed_rows);
-        chunk.seed_draft(*grant.draft, grant.tokens + 1, seed_rows, model.final_norm, wmma,
-                         nullptr, &scratch);
-    }
+    seed_ranked_prefill_draft(model, grant, chunk, layout, workspace.layout_bytes());
     capture_prefill_scores(model, grant, &work, 0, stream);
     stage_prefill_row(request, work, rows - 1, stream);
+    capture_prefill_checkpoints(grant, &work, 0, stream);
     on_device(peer.device, [&] {
         stage_prefill_row(peer_request, peer_work, rows - 1, peer_stream);
+        capture_prefill_checkpoints(peer_grant, &peer_work, 0, peer_stream);
     });
+    publish_prefill_checkpoints(grant);
 }
 void enqueue_native_prefill_grants(const DecoderModel& model, const PrefillGrant* grants,
                                    int count, PrefillWorkspace& workspace, int capacity,
@@ -758,13 +773,15 @@ void enqueue_native_prefill_grants(const DecoderModel& model, const PrefillGrant
                                  grant.tokens[1], stream, grant.media);
             }
             capture_prefill_scores(model, grant, nullptr, 0, stream);
+            capture_prefill_checkpoints(grant, nullptr, 0, stream);
+            publish_prefill_checkpoints(grant);
         } else {
             for (int offset = first_offset; offset < grant.rows;) {
                 const int rows = std::min({grant.tile_rows, capacity, grant.rows - offset});
                 model.prefill_chunk(*grant.request, grant.tokens + offset, rows,
                                     grant.position + offset, workspace, grant.draft,
                                     grant.prompt_remaining - offset, grant.media, grant.scores,
-                                    capacity);
+                                    capacity, &grant);
                 offset += rows;
             }
         }
@@ -787,6 +804,13 @@ void enqueue_native_prefill_grants_tp(const DecoderModel& model, const DecoderMo
                                  grant.tokens[1], stream, grant.media);
             }
             capture_prefill_scores(model, grant, nullptr, 0, stream);
+            capture_prefill_checkpoints(grant, nullptr, 0, stream);
+            if (peer_grant.checkpoints.size != 0) {
+                on_device(peer.device, [&] {
+                    capture_prefill_checkpoints(peer_grant, nullptr, 0, peer_stream);
+                });
+            }
+            publish_prefill_checkpoints(grant);
         } else {
 
             for (int offset = first_offset; offset < grant.rows;) {
@@ -918,24 +942,7 @@ void Decoder::Model::prefill_grants_tp(const Model& peer, const PrefillGrant* gr
                                        DecoderBatchStepStats& stats) const {
     const DeviceScope local_scope(device);
     if (count == 0) return;
-    for (int index = 0; index < count; ++index) {
-        const auto& grant = grants[index];
-        const auto& mirror = peer_grants[index];
-        if (grant.tokens != mirror.tokens || grant.position != mirror.position ||
-            grant.rows != mirror.rows || grant.tile_rows != mirror.tile_rows ||
-            grant.prompt_remaining != mirror.prompt_remaining ||
-            grant.request->cached_gqa_tokens != mirror.request->cached_gqa_tokens) {
-            throw std::invalid_argument("Mismatched prefill grants across tensor-parallel ranks");
-        }
-        if (mirror.draft || mirror.scores || mirror.media) {
-            throw std::invalid_argument(
-                "Peer prefill grants must not carry draft, media, or score captures");
-        }
-        if (grant.media) {
-            throw std::invalid_argument(
-                "Multimodal prefill is unsupported under tensor parallelism");
-        }
-    }
+    validate_ranked_prefill_grants({grants, peer_grants}, count);
     if (try_prefill_projection_groups_tp(*this, peer, grants, peer_grants, count, stream,
                                          peer_stream, group, stats)) {
         return;

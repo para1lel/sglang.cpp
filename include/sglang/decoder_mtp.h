@@ -9,6 +9,7 @@ struct DraftDepthScratch;
 struct PrefillProjections;
 struct PrefixCacheRead;
 struct PrefixCacheLayout;
+class PrefixPrefillSnapshot;
 struct PrefixDeviceTransfer;
 
 inline constexpr int draft_projection_rows = 16;
@@ -97,7 +98,8 @@ private:
                                                     const PrefixCacheLayout*);
     friend PrefixDeviceTransfer export_prefix_view(const Request&, int, int, int, cudaStream_t,
                                                    const MtpDraftRequest*, const Workspace*, bool,
-                                                   const PrefixCacheLayout*);
+                                                   const PrefixCacheLayout*,
+                                                   const std::shared_ptr<PrefixPrefillSnapshot>&);
     friend int commit_restored_prefix(Request&, const PrefixDeviceTransfer&, MtpDraftRequest*);
     Mxfp8KvCache prefix_cache_view(int rows, bool storing) const;
     const Allocations& prefix_cache_memory() const;

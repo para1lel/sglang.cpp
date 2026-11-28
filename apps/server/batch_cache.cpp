@@ -1,5 +1,6 @@
 #include "sglang/runtime/server/batch_cache.h"
 #include "sglang/runtime/cache/lmcache_group.h"
+#include "sglang/decoder_batch.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -185,6 +186,7 @@ struct StoreCheckpoint {
     std::vector<std::shared_ptr<void>> reservations;
     std::vector<std::function<void()>> dones;
     std::shared_ptr<std::atomic_uint64_t> stores;
+    bool prefill_checkpoint = false;
 };
 
 struct BatchStorePairing::State {
@@ -271,10 +273,16 @@ void run_joint_store(CacheState* state,
     if (failure) {
         ++state->errors;
         state->available = false;
+        if (checkpoint->prefill_checkpoint)
+            ++state->prefill_checkpoint_failures;
     } else if (logical) {
         state->record(LmCacheStatus::complete, joint, false);
+        if (checkpoint->prefill_checkpoint)
+            ++state->prefill_checkpoint_stores;
     } else {
         state->record(first_incomplete, joint, false);
+        if (checkpoint->prefill_checkpoint)
+            ++state->prefill_checkpoint_failures;
     }
     state->write_ns += elapsed(start);
     for (auto& lane_view : checkpoint->views) lane_view = {};
@@ -369,11 +377,66 @@ struct BatchCache::State {
     std::array<std::atomic_uint64_t, 3> read_bytes{}, written_bytes{};
     std::atomic_bool available{false};
     std::atomic_uint64_t misses{0}, errors{0}, stores{0}, declined{0}, gqa_written{0};
+    std::atomic_uint64_t prefill_checkpoint_stores{0}, prefill_checkpoint_failures{0};
     std::atomic_uint64_t lookup_ns{0}, write_ns{0}, restore_ns{0};
     std::shared_ptr<StoreReservations> reservations;
     RestoreStop restore_stop;
     Tasks readers, restores, stores_queue;
 };
+
+namespace {
+template <typename CacheState, typename JoinState>
+LmCacheStatus retry_attention_restore(CacheState& state, const JoinState& join,
+                                      const std::vector<const PrefixCacheKeys*>& keys,
+                                      LmCacheReceipt& receipt,
+                                      std::vector<LmCacheReceipt>& rank_receipts) {
+    std::vector<PrefixDeviceTransfer> views;
+    std::vector<const PrefixDeviceTransfer*> commands;
+    views.reserve(join.views.size());
+    commands.reserve(join.views.size());
+    for (const auto* view : join.views) {
+        auto& attention = views.emplace_back(*view);
+        attention.layout.gdn = {};
+        attention.layout.draft = {};
+        commands.push_back(&attention);
+    }
+    const auto status =
+        state.group->retrieve(keys, commands, &receipt, &rank_receipts, state.restore_stop.fd);
+    if (status == LmCacheStatus::complete) {
+        for (const auto* view : join.views) {
+            if (view->attention_only_restore)
+                *view->attention_only_restore = true;
+        }
+    }
+    return status;
+}
+
+template <typename CacheState, typename JoinState>
+bool read_ranked_checkpoint(CacheState& state, const JoinState& join) {
+    LmCacheReceipt receipt;
+    std::vector<LmCacheReceipt> ranks;
+    std::vector<const PrefixCacheKeys*> keys;
+    keys.reserve(join.keys.size());
+    for (const auto& key : join.keys)
+        keys.push_back(key.get());
+    auto status = state.group->retrieve(keys, join.views, &receipt, &ranks, state.restore_stop.fd);
+    const auto& layout = join.views.front()->layout;
+    if (status == LmCacheStatus::miss && layout.gdn.end && layout.gqa.end) {
+        status = retry_attention_restore(state, join, keys, receipt, ranks);
+    }
+    const bool success = state.record(status, receipt, true);
+    if (success && state.rank_restores.size() == join.views.size() &&
+        state.rank_read_bytes.size() == join.views.size()) {
+        for (std::size_t rank = 0; rank < ranks.size(); ++rank) {
+            ++state.rank_restores[rank];
+            for (int family = 0; family < 3; ++family) {
+                state.rank_read_bytes[rank][family] += ranks[rank].bytes[family];
+            }
+        }
+    }
+    return success;
+}
+}
 
 BatchCache::BatchCache(std::unique_ptr<LmCacheClient> client, std::string identity, int lanes)
     : state_(std::make_unique<State>(std::move(client), std::move(identity), lanes)) {}
@@ -477,26 +540,7 @@ std::shared_future<bool> BatchCache::restore(
                 const auto start = Clock::now();
                 bool success = false;
                 try {
-                    LmCacheReceipt receipt;
-                    std::vector<LmCacheReceipt> rank_receipts;
-                    std::vector<const PrefixCacheKeys*> key_ptrs;
-                    key_ptrs.reserve(join->keys.size());
-                    for (const auto& key : join->keys) key_ptrs.push_back(key.get());
-                    const auto status = state->group->retrieve(key_ptrs, join->views, &receipt,
-                                                               &rank_receipts,
-                                                               state->restore_stop.fd);
-                    success = state->record(status, receipt, true);
-                    if (success && state->rank_restores.size() == join->views.size() &&
-                        state->rank_read_bytes.size() == join->views.size()) {
-                        for (std::size_t lane = 0; lane < join->views.size(); ++lane) {
-                            if (!join->views[lane]) continue;
-                            ++state->rank_restores[lane];
-                            for (int family = 0; family < 3; ++family) {
-                                state->rank_read_bytes[lane][family] +=
-                                    rank_receipts[lane].bytes[family];
-                            }
-                        }
-                    }
+                    success = read_ranked_checkpoint(*state, *join);
                 } catch (const std::exception&) {
                     ++state->errors;
                     state->available = false;
@@ -568,6 +612,10 @@ void BatchCache::store(const std::shared_ptr<BatchStorePairing>& pairing,
         if (!checkpoint) {
             checkpoint = std::make_shared<StoreCheckpoint>(static_cast<int>(world));
             pairing->state_->pending.push_back(checkpoint);
+            checkpoint->prefill_checkpoint = view.prefill_checkpoint;
+            if (view.prefill_checkpoint) {
+                reservation = std::make_shared<StoreReservation>(state->reservations);
+            }
         }
         checkpoint->attached[lane] = true;
         checkpoint->metadata[lane] = std::move(metadata);
@@ -616,6 +664,8 @@ LmCacheMetrics BatchCache::metrics() const {
     metrics.lookup_misses = state.misses;
     metrics.io_errors = state.errors;
     metrics.stores = state.stores;
+    metrics.prefill_checkpoint_stores = state.prefill_checkpoint_stores;
+    metrics.prefill_checkpoint_failures = state.prefill_checkpoint_failures;
     metrics.declined_stores = state.declined;
     metrics.pending_stores = pending;
     metrics.gqa_written_tokens = state.gqa_written;

@@ -324,12 +324,6 @@ __global__ void draft_argmax_finish(const __grid_constant__ decoder::DraftArgmax
 
 }
 
-__host__ __device__ __inline_hint__ int decoder::compact_gdn_row(int lane, int row) {
-    constexpr int packet_lanes = GdnVerificationBatch::lanes;
-    constexpr int packet_rows = packet_lanes * GdnVerificationBatch::rows;
-    return (lane / packet_lanes) * packet_rows + row * packet_lanes + lane % packet_lanes;
-}
-
 cudaError_t text_embedding(const __nv_bfloat16* weight, int vocab_size, int width, int token_id,
                            __nv_bfloat16* output, cudaStream_t stream) {
     if (weight == nullptr || output == nullptr || width <= 0 ||

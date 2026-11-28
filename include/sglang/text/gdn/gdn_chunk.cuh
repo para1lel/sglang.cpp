@@ -1,6 +1,7 @@
 #pragma once
 
 #include "sglang/text/gdn_local.h"
+#include "sglang/text/gdn/gdn_prefill_kernels.cuh"
 
 namespace sglang::gdn_chunk {
 
@@ -29,19 +30,23 @@ struct Segments {
     Segment values[decoder::max_gdn_prefill_segments];
 };
 
+using gdn_prefill::SegmentCheckpoints;
+
 enum class Recurrence { unstaged, staged, two_frames, three_frames };
 
 template <typename S = GdnFull>
 bool eligible(int count, const void* scratch, std::size_t bytes);
 
 template <typename S = GdnFull>
-cudaError_t configure(bool& enabled, bool grouped = false, Recurrence* recurrence = nullptr);
+cudaError_t configure(bool& enabled, bool grouped = false, Recurrence* recurrence = nullptr,
+                      bool checkpoints = false);
 
 template <typename S = GdnFull>
 cudaError_t launch(int count, const Bf16* convolved, const float2* gates, void* scratch,
-                   float* recurrent, Bf16* observable, cudaStream_t stream, Recurrence recurrence);
+                   float* recurrent, Bf16* observable, cudaStream_t stream, Recurrence recurrence,
+                   gdn_prefill::Checkpoints* checkpoints = nullptr);
 
 template <typename S = GdnFull>
-cudaError_t launch_segments(Segments segments, int count, int max_rows, cudaStream_t stream);
-
+cudaError_t launch_segments(Segments segments, int count, int max_rows, cudaStream_t stream,
+                            SegmentCheckpoints* checkpoints = nullptr);
 }

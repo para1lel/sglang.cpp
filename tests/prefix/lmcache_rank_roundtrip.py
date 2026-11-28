@@ -1,9 +1,11 @@
 """Run the real Unix daemon handler and native rank client with CPU-backed record inventories."""
 
 import os
+import struct
 import subprocess
 import sys
 import unittest
+from collections.abc import Callable
 from contextlib import ExitStack, contextmanager
 from importlib import import_module
 from pathlib import Path
@@ -12,12 +14,27 @@ from threading import Thread
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, call, patch
 
-from lmcache_relay import DRAFT, PREFIX_DETAIL, RANK_GET, RANK_PUT, READY, RECEIPT, Relay, control
+from lmcache_relay import (
+    DRAFT,
+    GDN,
+    PREFIX_DETAIL,
+    RANK_GET,
+    RANK_PUT,
+    READY,
+    RECEIPT,
+    WIRE_VERSION,
+    Relay,
+    control,
+)
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tools/lmcache"))
 gpu_transfer = import_module("sglang_gpu_transfer")
 NativeMxfp8 = gpu_transfer.NativeMxfp8
 lmcache = import_module("sglang_lmcache")
+
+RankCall = Callable[..., str]
+REJECTED = 2
+RANK0_ANCHOR, RANK_SHARED_ANCHOR = 65, 193
 
 
 class DeviceStartupTest(unittest.TestCase):
@@ -62,7 +79,7 @@ class DeviceStartupTest(unittest.TestCase):
             worker.start()
             stack.callback(worker.join)
             stack.callback(server.close)
-            success = (0, b"0.5.8+native-v3")
+            success = (0, WIRE_VERSION)
             first, second = self.uuids
             for payload in (b"", first, second, first + second, second + first):
                 with self.subTest(payload=payload.hex()):
@@ -92,7 +109,9 @@ class DeviceStartupTest(unittest.TestCase):
 
     def test_second_device_failure_prevents_listener(self) -> None:
         self.cuda.Stream.side_effect = [Mock(), RuntimeError("second CUDA device failed")]
-        manager = Mock(spec=lmcache.DramL1Manager, _registered_listeners=[])
+        manager = Mock(
+            spec=lmcache.DramL1Manager, _registered_listeners=[], _objects={}, _lock=ExitStack()
+        )
         storage = Mock(l1_managers=Mock(return_value=[manager]), l2_adapters=Mock(return_value=[]))
         with (
             patch.object(
@@ -109,6 +128,8 @@ class DeviceStartupTest(unittest.TestCase):
 
 class HostRecords:
     """Keep the parsed record descriptors in place of a CUDA-backed DRAM L1."""
+
+    lookup = lmcache.Records.lookup
 
     def __init__(self, world: int) -> None:
         self.world = world
@@ -184,12 +205,133 @@ def check_scales():
                 assert sum(r.rows * r.width for r in regions) == len(expected)
 
 
-def exercise(binary, runtime, world):
-    def call(op, end=225, rank=0, draft=True, swap=False):
-        args = [binary, op, world, rank, end, int(draft), int(swap)]
+def reject_old_put(path: Path, uuid: bytes) -> None:
+    payload = (
+        uuid
+        + bytes(64)
+        + struct.pack("!I64sQ", 1, bytes(64), 4)
+        + bytes(16)
+        + struct.pack("!I64s", 65, b"a" * 64)
+        + b"".join(struct.pack("!IQQ", 0, offset, 1) for offset in range(4))
+    )
+    status, reply = control(path, "sglang", RANK_PUT, payload)
+    assert status == REJECTED, (status, reply)
+    assert reply
+
+
+def check_tp2_inventory(call: RankCall, relay: Relay, records: HostRecords) -> None:
+    before_lookup = len(relay.since())
+    assert call("lookup", 160) == "193 211 193 65 64 65 193 211"
+    inventory = [event for event in relay.since(before_lookup) if event["opcode"] == PREFIX_DETAIL]
+    assert [event["coverage_query"]["count"] for event in inventory] == [225, 225]
+    assert [event["coverage_query"]["draft"] for event in inventory] == [1, 0]
+    assert [event["coverage"] for event in inventory] == [
+        {"gqa": 193, "checkpoints": [(211, 0), (193, 1), (65, 1)]},
+        {"gqa": 225, "checkpoints": [(225, 0), (211, 0), (193, 0), (161, 0), (65, 0)]},
+    ]
+    assert call("draft-inventory", 160) == "65 193"
+    (key,) = (
+        k
+        for k, device in records.owners.items()
+        if device == records.devices[1]
+        and k.extra_attributes.get("sglang_gdn_end") == RANK_SHARED_ANCHOR
+    )
+    del records.records[key]
+    del records.owners[key]
+    records.gdn_endpoints.on_l1_keys_deleted_by_manager([key])
+    assert call("get", 193) == "miss"
+    assert call("lookup") == "193 211 193 65 64 65 211"
+    assert call("draft-inventory") == "65"
+
+
+def check_tp2(call: RankCall, relay: Relay, records: HostRecords, gdn_bytes: int) -> None:
+    assert call("get", 65) == "miss"
+    call("store", 161, rank=1)
+    assert call("lookup") == "0 0 0 0 0"
+    call("store", 65, rank=1)
+    call("store", 193, draft=False)
+    call("store", 225, rank=1)
+    assert call("lookup") == "65 65 65 65 64 65"
+    assert call("lookup", swap=True) == "0 0 0 0 0"
+    assert call("get", 65, swap=True) == "miss"
+    assert call("get", 65) == f"{65 * 33792} {gdn_bytes} {64 * 2112} 65"
+    call("store", 193, rank=1)
+    assert call("lookup", draft=False) == "193 193 193 193 0 65 193"
+    assert call("lookup") == "193 193 193 65 64 65 193"
+    assert call("draft-inventory") == "65"
+    call("store", 193)
+    assert call("lookup") == "193 193 193 193 192 65 193"
+    call("store-gdn", 211)
+    assert call("lookup") == "193 193 193 193 192 65 193"
+    call("store-gdn", 211, rank=1)
+    check_tp2_inventory(call, relay, records)
+    for rank in range(records.world):
+        call("store", 1, rank=rank, draft=False)
+    assert call("lookup", 1) == "193 211 193 1 0 1 65 211"
+    assert call("get", 1) == f"33792 {gdn_bytes} 0 1"
+    assert call("lookup", 0) == "193 211 193 0 0 1 65 211"
+
+
+def check_retention(relay: Relay, call: RankCall, records: HostRecords) -> None:
+    for rank in range(records.world):
+        call("store", 193, rank=rank, draft=rank == 0)
+    prior_puts = [event for event in relay.since() if event["opcode"] == RANK_PUT]
+    assert prior_puts
+    assert all(
+        event["prior_gdn"] == {"draft_required": False, "anchors": []} for event in prior_puts
+    )
+    offset = len(relay.since())
+    for rank in range(records.world):
+        call("store-retaining", 225, rank=rank, draft=rank == 0)
+    hinted = relay.since(offset)
+    assert len(hinted) == records.world
+    for rank, event in enumerate(hinted):
+        device = records.devices[rank].hex()
+        assert event["opcode"] == RANK_PUT
+        assert event["device"] == device
+        expected = []
+        for end in (RANK0_ANCHOR, RANK_SHARED_ANCHOR):
+            (key,) = {
+                key
+                for put in prior_puts
+                if put["device"] == device
+                for (family, key), record in zip(put["keys"], put["records"], strict=True)
+                if family == GDN and record["endpoint"] == end
+            }
+            expected.append((end, key))
+        assert event["prior_gdn"] == {"draft_required": rank == 0, "anchors": expected}
+
+
+def check_transfers(relay: Relay, records: HostRecords, gdn_bytes: int) -> None:
+    assert not relay.errors
+    trace = relay.since()
+    assert all(event["namespace"] == "sglang" for event in trace)
+    assert sum(event["opcode"] == PREFIX_DETAIL for event in trace) > 1
+    gdn_gets = [
+        event
+        for event in trace
+        if event["opcode"] == RANK_GET
+        and event["keys"]
+        and all(family == GDN for family, _ in event["keys"])
+    ]
+    assert len(gdn_gets) == records.world
+    assert all(event["receipt"] == (0, gdn_bytes // records.world, 0, 0) for event in gdn_gets)
+    for rank, device in enumerate(records.devices):
+        transfers = [event for event in trace if event.get("device") == device.hex()]
+        assert {RANK_GET, RANK_PUT} <= {event["opcode"] for event in transfers}
+        if rank == 1:
+            assert not any(family == DRAFT for event in transfers for family, _ in event["keys"])
+
+
+def exercise(binary: str, runtime: Path, world: int) -> None:
+    def call(
+        op: str, end: int = 225, *, rank: int = 0, draft: bool = True, swap: bool = False
+    ) -> str:
+        operation, expected = ("ready", REJECTED) if op == "old-ready" else (op, 0)
+        args = [binary, operation, world, rank, end, int(draft), int(swap)]
         result = subprocess.run(list(map(str, args)), capture_output=True, text=True, timeout=8,
                                 env={**os.environ, "XDG_RUNTIME_DIR": str(runtime)})
-        assert result.returncode == 0, (args, result.stderr)
+        assert result.returncode == expected, (result.args, result.stderr)
         return result.stdout.strip()
 
     records = HostRecords(world)
@@ -211,56 +353,30 @@ def exercise(binary, runtime, world):
         assert readiness["devices"] == (
             [device.hex() for device in records.devices] if world > 1 else []
         )
+        old_version = "0.5.8+native-v3"
+        with patch.object(lmcache, "WIRE_VERSION", old_version):
+            devices = b"" if world == 1 else b"".join(records.devices)
+            assert control(upstream, "sglang", READY, devices) == (0, old_version.encode())
+            call("old-ready")
+        call("ready")
+        for obsolete in (3, 4, 7):
+            assert control(upstream, "sglang", obsolete) == (2, b"unknown LMCache operation")
+        reject_old_put(upstream, records.devices[0])
         assert call("lookup") == "0 0 0 0 0"
         call("store", 65)
+        gdn_bytes = 153964544 if world == 1 else 2 * 76992512
         if world == 1:
-            assert call("lookup") == "65 65 65 65 64"
-            assert call("get", 65) == f"{65 * 33792} 153964544 {64 * 2112} 65"
-            return
-        assert call("lookup") == "0 0 0 0 0"
-        assert call("get", 65) == "miss"
-        call("store", 161, rank=1)
-        assert call("lookup") == "65 65 65 0 0"
-        call("store", 65, rank=1)
-        call("store", 193, draft=False)
-        call("store", 225, rank=1)
-        assert call("lookup") == "193 193 193 65 64"
-        assert call("lookup", swap=True) == "0 0 0 0 0"
-        assert call("get", 65, swap=True) == "miss"
-        assert call("get", 65) == f"{65 * 33792} {2 * 76992512} {64 * 2112} 65"
-        call("store", 193, rank=1)
-        assert call("lookup", draft=False) == "193 193 193 193 0"
-        assert call("lookup") == "193 193 193 65 64"
-        terminal = 193
-        call("store", terminal)
-        assert call("lookup") == "193 193 193 193 192"
-        assert call("lookup", 160) == "193 193 193 65 64"
-        (key,) = (
-            k
-            for k, device in records.owners.items()
-            if device == records.devices[1] and k.extra_attributes.get("sglang_gdn_end") == terminal
-        )
-        del records.records[key]
-        del records.owners[key]
-        records.gdn_endpoints.on_l1_keys_deleted_by_manager([key])
-        assert call("get", 193) == "miss"
-        assert call("lookup") == "193 193 193 65 64"
-        for rank in range(world):
-            call("store", 1, rank=rank, draft=False)
-        assert call("lookup", 1) == "193 193 193 1 0"
-        assert call("get", 1) == f"33792 {2 * 76992512} 0 1"
-        assert call("lookup", 0) == "193 193 193 0 0"
-        assert not relay.errors
-        trace = relay.since()
-        assert all(event["namespace"] == "sglang" for event in trace)
-        assert sum(event["opcode"] == PREFIX_DETAIL for event in trace) > 1
-        for rank, device in enumerate(records.devices):
-            transfers = [event for event in trace if event.get("device") == device.hex()]
-            assert {RANK_GET, RANK_PUT} <= {event["opcode"] for event in transfers}
-            if rank == 1:
-                assert not any(
-                    family == DRAFT for event in transfers for family, _ in event["keys"]
-                )
+            assert call("lookup") == "65 65 65 65 64 65"
+            assert call("get", 65) == f"{65 * 33792} {gdn_bytes} {64 * 2112} 65"
+            call("store-gdn", 161)
+            assert call("lookup", 65) == "65 161 65 65 64 65 161"
+            gdn_end = 161
+        else:
+            check_tp2(call, relay, records, gdn_bytes)
+            gdn_end = 211
+        assert call("get-gdn", gdn_end) == f"0 {gdn_bytes} 0 0"
+        check_retention(relay, call, records)
+        check_transfers(relay, records, gdn_bytes)
 
 
 if __name__ == "__main__":

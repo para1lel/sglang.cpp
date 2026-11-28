@@ -1,4 +1,5 @@
 #include "sglang/runtime/execution/decoder_prefill_tiles.h"
+#include "sglang/decoder_prefix_cache.h"
 #include "sglang/decoder_media_internal.h"
 #include "sglang/decoder_mtp.h"
 #include "sglang/text/decoder_logprobs.h"
@@ -208,7 +209,7 @@ void Chunk::gdn_input(const GdnLayer& layer) const {
 }
 
 void Chunk::gdn_recur(const GdnLayer& layer, TextGdnState state, int bank,
-               TextFp8Activation quantized) const {
+                      TextFp8Activation quantized, TextGdnPrefillCheckpoints checkpoints) const {
     const auto& dims = work.dims;
     if (std::size_t(dims.kv_width) * sizeof(Bf16) <
         std::size_t(dims.gdn_heads) * sizeof(float2)) {
@@ -220,42 +221,46 @@ void Chunk::gdn_recur(const GdnLayer& layer, TextGdnState state, int bank,
     const auto scratch_bytes = rows * dims.intermediate * sizeof(Bf16);
     const bool local = dims.is_local_gdn();
     if (quantized.values) {
-        const auto status = local
-            ? tensor_core_prefill_gdn_local(rows, work.gdn_qkv, work.gdn_z, work.gdn_b,
-                                            work.gdn_a, layer.recurrent, state,
-                                            work.gdn_scratch, gates, quantized, stream,
-                                            scratch, scratch_bytes)
-            : tensor_core_prefill_gdn(rows, work.gdn_qkv, work.gdn_z, work.gdn_b, work.gdn_a,
-                                      layer.recurrent, state, work.gdn_scratch, gates,
-                                      quantized, stream, scratch, scratch_bytes);
+        const auto status =
+            local ? tensor_core_prefill_gdn_local(rows, work.gdn_qkv, work.gdn_z, work.gdn_b,
+                                                  work.gdn_a, layer.recurrent, state,
+                                                  work.gdn_scratch, gates, quantized, stream,
+                                                  scratch, scratch_bytes, checkpoints)
+                  : tensor_core_prefill_gdn(rows, work.gdn_qkv, work.gdn_z, work.gdn_b, work.gdn_a,
+                                            layer.recurrent, state, work.gdn_scratch, gates,
+                                            quantized, stream, scratch, scratch_bytes, checkpoints);
         check(status, "Advance and quantize prefill Gated DeltaNet");
         return;
     }
-    const auto status = tensor_core_fp8
-        ? (local
-               ? tensor_core_prefill_gdn_local(rows, work.gdn_qkv, work.gdn_z, work.gdn_b,
-                                               work.gdn_a, layer.recurrent, state,
-                                               work.gdn_scratch, gates, work.attention,
-                                               stream, scratch, scratch_bytes)
-               : tensor_core_prefill_gdn(rows, work.gdn_qkv, work.gdn_z, work.gdn_b,
-                                         work.gdn_a, layer.recurrent, state, work.gdn_scratch,
-                                         gates, work.attention, stream, scratch,
-                                         scratch_bytes))
-        : (local
-               ? text_gdn_forward_local(rows, TextGdnMode::prefill, work.gdn_qkv, work.gdn_z,
-                                        work.gdn_b, work.gdn_a, layer.recurrent, state,
-                                        work.gdn_scratch, text_gdn_local_workspace_bytes(rows),
-                                        work.attention, stream)
-               : text_gdn_forward(rows, TextGdnMode::prefill, work.gdn_qkv, work.gdn_z,
-                                  work.gdn_b, work.gdn_a, layer.recurrent, state,
-                                  work.gdn_scratch, text_gdn_workspace_bytes(rows),
-                                  work.attention, stream));
+    if (tensor_core_fp8) {
+        const auto status =
+            local ? tensor_core_prefill_gdn_local(rows, work.gdn_qkv, work.gdn_z, work.gdn_b,
+                                                  work.gdn_a, layer.recurrent, state,
+                                                  work.gdn_scratch, gates, work.attention, stream,
+                                                  scratch, scratch_bytes, checkpoints)
+                  : tensor_core_prefill_gdn(rows, work.gdn_qkv, work.gdn_z, work.gdn_b, work.gdn_a,
+                                            layer.recurrent, state, work.gdn_scratch, gates,
+                                            work.attention, stream, scratch, scratch_bytes,
+                                            checkpoints);
+        check(status, "Advance prefill Gated DeltaNet state");
+        return;
+    }
+    const auto status =
+        local
+            ? text_gdn_forward_local(rows, TextGdnMode::prefill, work.gdn_qkv, work.gdn_z,
+                                     work.gdn_b, work.gdn_a, layer.recurrent, state,
+                                     work.gdn_scratch, text_gdn_local_workspace_bytes(rows),
+                                     work.attention, stream, checkpoints)
+            : text_gdn_forward(rows, TextGdnMode::prefill, work.gdn_qkv, work.gdn_z, work.gdn_b,
+                               work.gdn_a, layer.recurrent, state, work.gdn_scratch,
+                               text_gdn_workspace_bytes(rows), work.attention, stream, checkpoints);
     check(status, "Advance prefill Gated DeltaNet state");
 }
 
-void Chunk::gdn_attention(const GdnLayer& layer, TextGdnState state, int bank) const {
+void Chunk::gdn_attention(const GdnLayer& layer, TextGdnState state, int bank,
+                          TextGdnPrefillCheckpoints checkpoints) const {
     const bool quantized = tensor_core_fp8;
-    gdn_recur(layer, state, bank, quantized ? activation : TextFp8Activation{});
+    gdn_recur(layer, state, bank, quantized ? activation : TextFp8Activation{}, checkpoints);
     const auto input = quantized
         ? TextFp8ActivationView{activation.values, activation.scales}
         : quantize(work.attention, work.dims.gdn_value_width);
@@ -416,6 +421,75 @@ void stage_prefill_row(Request& request, const TileBuffers& work, int row,
                     cudaMemcpyDeviceToDevice, stream, "Stage final prefill hidden row");
     copy_cuda_async(request.work.residual, work.residual + offset, bytes,
                     cudaMemcpyDeviceToDevice, stream, "Stage final prefill residual row");
+}
+
+PrefillCheckpoints prefill_checkpoints(const PrefillGrant& grant) {
+    auto points = grant.checkpoints;
+    while (points.size != 0 && points.data[0].end <= grant.position) {
+        ++points.data;
+        --points.size;
+    }
+    while (points.size != 0 && points.data[points.size - 1].end > grant.position + grant.rows) {
+        --points.size;
+    }
+    return points;
+}
+
+void seed_ranked_prefill_draft(const DecoderModel& model, const PrefillGrant& grant,
+                               const Chunk& chunk, ScratchLayout& layout,
+                               std::size_t layout_bytes) {
+    if (grant.draft == nullptr || grant.prompt_remaining <= 1)
+        return;
+    const bool wmma = chunk.tensor_core_fp8 && model.backend.draft.wmma_seed_fc &&
+                      grant.position + grant.prompt_remaining >= wmma_seed_min_prompt_tokens;
+    const int rows = std::min(grant.rows, grant.prompt_remaining - 1);
+    const int concat_rows = std::min(rows, prefill_chunk_rows);
+    const auto bytes = seed_scratch_bytes(concat_rows, rows);
+    if (bytes > layout_bytes - layout.bytes) {
+        throw std::runtime_error("Prefill workspace too small for the MTP draft seed scratch");
+    }
+    const auto scratch =
+        make_seed_scratch(layout.take_bf16(bytes / sizeof(Bf16)), concat_rows, rows);
+    chunk.seed_draft(*grant.draft, grant.tokens + 1, rows, model.final_norm, wmma, nullptr,
+                     &scratch);
+}
+
+GdnPrefillCheckpoints::GdnPrefillCheckpoints() = default;
+
+GdnPrefillCheckpoints::GdnPrefillCheckpoints(const PrefillGrant& grant, int bank) {
+    const auto points = prefill_checkpoints(grant);
+    for (int index = 0; index < points.size; ++index) {
+        const auto& point = points.data[index];
+        items[count++] = {point.end - grant.position, point.snapshot->state(bank)};
+    }
+}
+
+TextGdnPrefillCheckpoints GdnPrefillCheckpoints::view() const {
+    return {items.data(), count};
+}
+
+void capture_prefill_checkpoints(const PrefillGrant& grant, const TileBuffers* work, int offset,
+                                 cudaStream_t stream) {
+    const auto points = prefill_checkpoints(grant);
+    for (int index = 0; index < points.size; ++index) {
+        const auto& point = points.data[index];
+        if (work != nullptr) {
+            const int row = (offset + point.end - grant.position - 1) * hidden_size;
+            point.snapshot->capture_row(work->hidden + row, work->residual + row, stream);
+        } else {
+            const auto& request = *grant.request;
+            point.snapshot->capture_state(request.states.front(), stream);
+            point.snapshot->capture_row(request.work.hidden, request.work.residual, stream);
+        }
+    }
+}
+
+void publish_prefill_checkpoints(const PrefillGrant& grant) {
+    if (grant.checkpoint == nullptr)
+        return;
+    const auto points = prefill_checkpoints(grant);
+    for (int index = 0; index < points.size; ++index)
+        (*grant.checkpoint)(points.data[index].end);
 }
 
 void capture_prefill_scores(const DecoderModel& model, const PrefillGrant& grant,

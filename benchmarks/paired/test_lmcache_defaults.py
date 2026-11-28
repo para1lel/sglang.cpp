@@ -85,7 +85,6 @@ def drain_metric_text(**changes):
 
 
 def drain_receipt(**changes):
-    # The first final cursor lands on a periodic checkpoint. The other needs two stores.
     requests = [{"submit_ns": 40 + lane, "done_ns": 48 + lane, "eof_ns": 50 + lane,
                  "usage": {"prompt_tokens": 8192, "completion_tokens": completion}}
                 for lane, completion in enumerate((1, 4))]
@@ -199,14 +198,17 @@ def test_lmcache_evidence_binds_native_environment_and_own_daemon(tmp_path):
         lmcache_evidence.verify(run, environment, identity)
 
 
-@pytest.mark.parametrize(("wire", "magic", "payload", "matches"), [
-    ("SLC2", b"SLC2", b"0.5.8", True),
-    ("SLC2", b"SLC1", b"0.5.8", False),
-    ("SLC2", b"SLC3", b"0.5.8+native-v3", False),
-    ("SLC3", b"SLC3", b"0.5.8+native-v3", True),
-    ("SLC3", b"SLC2", b"0.5.8", False),
-    ("SLC3", b"SLC3", b"0.5.8", False),
-])
+@pytest.mark.parametrize(
+    ("wire", "magic", "payload", "matches"),
+    [
+        ("SLC2", b"SLC2", b"0.5.8", True),
+        ("SLC2", b"SLC1", b"0.5.8", False),
+        ("SLC2", b"SLC3", b"0.5.8+native-v4", False),
+        ("SLC3", b"SLC3", b"0.5.8+native-v4", True),
+        ("SLC3", b"SLC2", b"0.5.8", False),
+        ("SLC3", b"SLC3", b"0.5.8", False),
+    ],
+)
 def test_direct_ready_checks_an_actual_socket_frame(tmp_path, wire, magic, payload, matches):
     endpoint = tmp_path / "daemon.sock"
     frame = lmcache_evidence.FRAME

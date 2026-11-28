@@ -4,6 +4,7 @@
 #include "sglang/text/prefill_attn_sm100.h"
 
 #include <array>
+#include <functional>
 #include <memory>
 
 namespace sglang::decoder {
@@ -32,6 +33,20 @@ struct PromptLogprobCapture {
 void finish_prompt_logprobs(const DecoderOptions& options, DecoderPromptLogprobs& scores,
                             DecoderBatchStep& result);
 
+class PrefixPrefillSnapshot;
+
+struct PrefillCheckpoint {
+    int end = 0;
+    std::shared_ptr<PrefixPrefillSnapshot> snapshot;
+};
+
+using PrefillCheckpointList = std::array<PrefillCheckpoint, text_gdn_max_prefill_checkpoints>;
+
+struct PrefillCheckpoints {
+    const PrefillCheckpoint* data = nullptr;
+    int size = 0;
+};
+
 struct PrefillGrant {
     Request* request;
     const int* tokens;
@@ -42,6 +57,8 @@ struct PrefillGrant {
     MtpDraftRequest* draft;
     const MediaPrefill* media;
     const PromptLogprobCapture* scores = nullptr;
+    const std::function<void(int)>* checkpoint = nullptr;
+    PrefillCheckpoints checkpoints{};
 };
 
 struct PrefillProjections {

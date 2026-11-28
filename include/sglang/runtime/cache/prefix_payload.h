@@ -18,6 +18,7 @@ namespace sglang::decoder {
 
 struct PrefixCacheLayout;
 inline constexpr int prefix_gqa_chunk_tokens = 256;
+inline constexpr int prefix_prefill_retention_limit = 12;
 enum class PrefixPayloadKind { gqa, gdn, draft };
 
 struct PrefixCacheRead {
@@ -26,6 +27,8 @@ struct PrefixCacheRead {
     int usable_gqa = 0;
     int usable_gdn = 0;
     int usable_draft = 0;
+    std::vector<int> matched_gdn_endpoints;
+    std::vector<int> draft_ready_gdn_endpoints;
 };
 
 struct PrefixDeviceAddress {
@@ -63,6 +66,11 @@ struct PrefixDeviceTransfer {
     PrefixDeviceLayout layout;
     std::shared_ptr<void> ready;
     std::shared_ptr<const void> store_owner;
+    bool prefill_checkpoint = false;
+    std::shared_ptr<bool> attention_only_restore;
+    std::array<int, prefix_prefill_retention_limit> retention_endpoints{};
+    int retention_endpoint_count = 0;
+    bool retention_requires_draft = false;
 };
 
 std::size_t prefix_payload_bytes(PrefixPayloadKind kind, int begin, int end);

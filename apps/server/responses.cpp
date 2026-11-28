@@ -8,7 +8,6 @@
 #include <algorithm>
 #include <ctime>
 #include <iostream>
-#include <random>
 
 namespace sglang::server {
 namespace {
@@ -198,23 +197,6 @@ Array messages(const Array& input, const Value& instructions) {
 
 Value count(std::size_t value) {
     return static_cast<std::uint64_t>(value);
-}
-
-std::string responses_id(std::string_view prefix) {
-    constexpr std::string_view hex = "0123456789abcdef";
-    std::random_device random;
-    std::string id(prefix);
-    for (int part = 0; part < 4; ++part) {
-        auto value = static_cast<std::uint32_t>(random());
-        for (int digit = 0; digit < 8; ++digit) {
-            id += hex[value & 15];
-            value >>= 4;
-        }
-    }
-    id[prefix.size() + 12] = '4';
-    const auto variant = prefix.size() + 16;
-    id[variant] = hex[8 + (hex.find(id[variant]) & 3)];
-    return id;
 }
 
 bool pending(const OrderedObject& envelope) {
@@ -638,9 +620,10 @@ void complete_responses(const Socket& connection, BatchService& service, int slo
 ResponsesOutput::ResponsesOutput(const Socket& connection, EventStream& stream,
                                  const ResponsesRequest& request, const TextRequest& text)
     : connection_(connection), stream_(stream), request_(request), text_(text),
-      id_(request.id ? *request.id : responses_id("resp_")),
+      id_(request.id ? *request.id : random_request_id("resp_")),
       created_(static_cast<std::int64_t>(std::time(nullptr))),
-      reasoning_(text.chat_output.separate_reasoning && text.chat_output.prompt_has_open_think) {}
+      reasoning_(text.chat_output.separate_reasoning && text.chat_output.prompt_has_open_think) {
+}
 
 OrderedObject ResponsesOutput::envelope(const char* status, Value usage, Value error) const {
     OrderedObject output{{"id", id_}, {"object", "response"}, {"created_at", created_},
@@ -726,7 +709,7 @@ OrderedObject ResponsesOutput::part_fields() const {
 
 bool ResponsesOutput::open_item(bool reasoning) {
     if (!close_item()) return false;
-    item_.emplace(Item{responses_id(reasoning ? "rs_" : "msg_"), {}, reasoning});
+    item_.emplace(Item{random_request_id(reasoning ? "rs_" : "msg_"), {}, reasoning});
     if (!text_.stream) return true;
     auto fields = part_fields();
     fields.emplace_back("part", part(*item_, reasoning && request_.summary));
@@ -760,10 +743,16 @@ bool ResponsesOutput::close_item() {
 
 bool ResponsesOutput::accept_tool(const ChatOutputEvent& delta) {
     if (!close_item()) return false;
-    const auto id = responses_id("fc_");
+    const auto id = random_request_id("fc_");
     const auto index = count(output_.size());
-    OrderedObject item{{"id", id}, {"type", "function_call"}, {"status", "in_progress"},
-        {"call_id", responses_id("call_")}, {"name", std::string(delta.name)}, {"arguments", ""}};
+    OrderedObject item{
+        {"id", id},
+        {"type", "function_call"},
+        {"status", "in_progress"},
+        {"call_id", random_request_id("call_")},
+        {"name", std::string(delta.name)},
+        {"arguments", ""},
+    };
     if (text_.stream &&
         (!event("response.output_item.added", {{"output_index", index}, {"item", item}}) ||
          !event("response.function_call_arguments.delta",

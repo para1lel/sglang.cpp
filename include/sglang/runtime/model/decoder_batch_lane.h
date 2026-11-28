@@ -13,6 +13,11 @@ struct Lane {
     DecoderOptions options;
     int prompt_size = static_cast<int>(prompt.size());
     int checkpoint = 0;
+    std::array<int, text_gdn_max_prefill_checkpoints> prefill_endpoints{};
+    int prefill_endpoint_count = -1;
+    std::array<int, prefix_prefill_retention_limit> prefill_captures{};
+    int prefill_capture_count = 0;
+    std::shared_ptr<const PrefixCacheRead> prefill_lookup;
     RequestProgress progress{};
     std::unique_ptr<MtpDraftRequest> draft = nullptr;
     std::unique_ptr<TargetVerification> verification = nullptr;
@@ -34,18 +39,16 @@ struct Lane {
     int remaining_prompt() const;
     int remaining_output() const;
     int capacity() const;
-    int checkpoint_room() const;
-    int prefill_rows(bool checkpoints) const;
-    int proposals(bool checkpoints = false) const;
+    int prefill_rows() const;
+    int proposals() const;
 
     ForwardLane input() const;
 
     void record_decode_input(cudaStream_t stream);
 
     void finish_round(MtpRound& round, DecoderBatchStep& result, cudaStream_t stream,
-                      SerialOutput* output, const MtpRound::Cancel& cancel,
-                      MtpDraftInput* repair, const Workspace** committed_row,
-                      TextGdnReplayBatch* gdn_batch = nullptr);
+                      SerialOutput* output, const MtpRound::Cancel& cancel, MtpDraftInput* repair,
+                      const Workspace** committed_row);
 };
 
 }

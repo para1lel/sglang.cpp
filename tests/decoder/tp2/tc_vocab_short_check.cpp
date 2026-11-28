@@ -6,8 +6,8 @@
 
 #include <algorithm>
 #include <array>
-#include <bit>
 #include <chrono>
+#include <cstdint>
 #include <cstring>
 #include <fstream>
 #include <iomanip>
@@ -145,8 +145,12 @@ public:
         for (int row = 0; row < rows; ++row) {
             const auto a = reference.data[row];
             const auto b = observed.data[row];
-            if (a.token_id != b.token_id || std::bit_cast<unsigned>(a.score) !=
-                                            std::bit_cast<unsigned>(b.score)) {
+            std::uint32_t expected_bits = 0;
+            std::uint32_t observed_bits = 0;
+            static_assert(sizeof(expected_bits) == sizeof(a.score));
+            std::memcpy(&expected_bits, &a.score, sizeof(expected_bits));
+            std::memcpy(&observed_bits, &b.score, sizeof(observed_bits));
+            if (a.token_id != b.token_id || expected_bits != observed_bits) {
                 std::cerr << name << " winner " << row << " expected " << a.token_id << ' '
                           << a.score << " observed " << b.token_id << ' ' << b.score << '\n';
                 throw std::runtime_error("Packed BF16 winner mismatch");

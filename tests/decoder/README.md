@@ -17,7 +17,7 @@ operator_lib=(-Wl,--wrap=cudaLaunchKernel -lsglang_cuda -lsglang_cuda_support -l
 
 ## Batched target GDN
 
-Set `out` to the Release build directory containing the decoder archives. Supply four distinct token ID files of at least 145 whitespace-separated IDs each. Match scores, normalized rows, and committed KV and GDN state against scalar decode at cuts 0–5 and on replacement. Check two-row graph replay with the selected operators.
+Set `out` to the Release build directory containing the decoder archives. Supply four distinct token ID files of at least 145 whitespace-separated IDs each. Match scores, normalized rows, and committed KV and GDN state against scalar decode at cuts 0–5 and on replacement. The single-lane five-row probe uses eager warmup, graph capture, and graph reuse with cuts of 5, 2, and 0.
 
 ```bash
 "$CXX" -std=c++20 -O3 -pthread -Iinclude -isystem "$toolkit/include" \

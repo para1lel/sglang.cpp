@@ -58,7 +58,7 @@ def daemon(args: argparse.Namespace, work: Path) -> Generator[tuple[Path, int]]:
             while monotonic() < deadline and proc.poll() is None:
                 try:
                     reply = lmcache.control(socket_path, "sglang", lmcache.READY)
-                    if reply == (0, b"0.5.8+native-v3"):
+                    if reply == (0, lmcache.WIRE_VERSION):
                         break
                 except (FileNotFoundError, ConnectionRefusedError):
                     pass

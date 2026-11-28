@@ -400,8 +400,8 @@ bool decoder::short_verify_supported(const PagedDecodeLane* lanes, int count) {
             !gqa_decode::valid_buffers(lane.buffers)) {
             return false;
         }
-        position_bound = max(position_bound, lane.position + 1);
-        kv_heads = max(kv_heads, lane.cache.kv_heads);
+        position_bound = std::max<int>(position_bound, lane.position + 1);
+        kv_heads = std::max<int>(kv_heads, lane.cache.kv_heads);
     }
     const auto score_bytes = static_cast<std::size_t>(position_bound)
         * gqa_query_heads(kv_heads) * sizeof(float);
@@ -416,8 +416,8 @@ cudaError_t decoder::short_verify_gqa(const PagedDecodeLane* lanes, int count,
     int position_bound = 0;
     int kv_heads = 0;
     for (int index = 0; index < count; ++index) {
-        position_bound = max(position_bound, lanes[index].position + 1);
-        kv_heads = max(kv_heads, lanes[index].cache.kv_heads);
+        position_bound = std::max<int>(position_bound, lanes[index].position + 1);
+        kv_heads = std::max<int>(kv_heads, lanes[index].cache.kv_heads);
     }
     const GqaGeometry geometry{gqa_query_heads(kv_heads), kv_heads};
     gqa_decode::EagerTargetBatch batch{};
@@ -428,7 +428,8 @@ cudaError_t decoder::short_verify_gqa(const PagedDecodeLane* lanes, int count,
     batch.position_bound = position_bound;
     constexpr int score_threads = score_warps * mxfp8_group_size;
     void* args[] = {&batch};
-    const int blocks = min(32, (position_bound + score_warps) / score_warps);
+    const int score_blocks = (position_bound + score_warps) / score_warps;
+    const int blocks = 32 < score_blocks ? 32 : score_blocks;
     auto status = cudaLaunchKernel(verify_scores_kernel,
         dim3(blocks, geometry.query_heads, count), score_threads, args, 0, stream);
     if (status == cudaSuccess) {

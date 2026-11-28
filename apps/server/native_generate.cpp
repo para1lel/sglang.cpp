@@ -549,18 +549,7 @@ std::vector<std::optional<std::string>> generate_ids(const GenerateInput& input)
 }
 
 std::string NativeGenerate::random_id(std::random_device& random) {
-    constexpr std::string_view hex = "0123456789abcdef";
-    std::string id(32, '0');
-    for (std::size_t offset = 0; offset < id.size(); offset += 8) {
-        auto bits = static_cast<std::uint32_t>(random());
-        for (std::size_t digit = 0; digit < 8; ++digit) {
-            id[offset + digit] = hex[bits & 15];
-            bits >>= 4;
-        }
-    }
-    id[12] = '4';
-    id[16] = hex[8 + (hex.find(id[16]) & 3)];
-    return id;
+    return random_request_id({}, random);
 }
 
 struct NativeGenerate::Registration {

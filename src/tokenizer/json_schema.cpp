@@ -242,21 +242,31 @@ struct Member {
     bool required;
 };
 
-void optional_member(std::string& pattern, const Member& member, bool before_first_required) {
+enum class MemberSyntax { json, xml };
+
+enum class MemberComma { none, before, after };
+
+void optional_member(std::string& pattern, const Member& member, MemberComma comma) {
     append_pattern(pattern, "(?:");
-    if (!before_first_required) append_pattern(pattern, ",");
+    if (comma == MemberComma::before)
+        append_pattern(pattern, ",");
     append_pattern(pattern, member.pattern);
-    if (before_first_required) append_pattern(pattern, ",");
+    if (comma == MemberComma::after)
+        append_pattern(pattern, ",");
     append_pattern(pattern, ")?");
 }
 
-void members_without_required(std::string& pattern, const std::vector<Member>& members) {
+void members_without_required(std::string& pattern, const std::vector<Member>& members,
+                              MemberSyntax syntax) {
     append_pattern(pattern, "(?:");
+    if (syntax == MemberSyntax::xml)
+        append_pattern(pattern, "\n");
+    const auto comma = syntax == MemberSyntax::json ? MemberComma::before : MemberComma::none;
     for (auto first = members.begin(); first != members.end(); ++first) {
         append_pattern(pattern, "|");
         append_pattern(pattern, first->pattern);
         for (auto next = std::next(first); next != members.end(); ++next) {
-            optional_member(pattern, *next, false);
+            optional_member(pattern, *next, comma);
         }
     }
     append_pattern(pattern, ")");
@@ -267,7 +277,7 @@ std::string member_sequence(const std::vector<Member>& members) {
     if (std::none_of(members.begin(), members.end(), [](Member const& member) {
             return member.required;
         })) {
-        members_without_required(pattern, members);
+        members_without_required(pattern, members, MemberSyntax::json);
     } else {
         bool started = false;
         for (const auto& member : members) {
@@ -276,7 +286,8 @@ std::string member_sequence(const std::vector<Member>& members) {
                 append_pattern(pattern, member.pattern);
                 started = true;
             } else {
-                optional_member(pattern, member, !started);
+                optional_member(pattern, member,
+                                started ? MemberComma::before : MemberComma::after);
             }
         }
     }
@@ -406,22 +417,17 @@ std::string Compiler::xml_parameters(const json::Value& value) {
     if (!required.empty()) invalid("required contains a name outside properties");
     const bool has_required = std::any_of(members.begin(), members.end(),
                                          [](const auto& member) { return member.required; });
-    std::string pattern = has_required ? "" : "(?:\n";
+    std::string pattern;
     if (has_required) {
         for (const auto& member : members) {
-            if (!member.required) append_pattern(pattern, "(?:");
-            append_pattern(pattern, member.pattern);
-            if (!member.required) append_pattern(pattern, ")?");
-        }
-    } else {
-        for (auto first = members.begin(); first != members.end(); ++first) {
-            append_pattern(pattern, "|");
-            append_pattern(pattern, first->pattern);
-            for (auto next = std::next(first); next != members.end(); ++next) {
-                append_pattern(pattern, "(?:" + next->pattern + ")?");
+            if (member.required) {
+                append_pattern(pattern, member.pattern);
+            } else {
+                optional_member(pattern, member, MemberComma::none);
             }
         }
-        append_pattern(pattern, ")");
+    } else {
+        members_without_required(pattern, members, MemberSyntax::xml);
     }
     return pattern;
 }

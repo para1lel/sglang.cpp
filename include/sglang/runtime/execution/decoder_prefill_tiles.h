@@ -109,10 +109,11 @@ struct Chunk : PrefillProjections {
 
     void gdn_input(const GdnLayer& layer) const;
 
-    void gdn_recur(const GdnLayer& layer, TextGdnState state, int bank,
-                   TextFp8Activation quantized) const;
+    void gdn_recur(const GdnLayer& layer, TextGdnState state, int bank, TextFp8Activation quantized,
+                   TextGdnPrefillCheckpoints checkpoints = TextGdnPrefillCheckpoints()) const;
 
-    void gdn_attention(const GdnLayer& layer, TextGdnState state, int bank) const;
+    void gdn_attention(const GdnLayer& layer, TextGdnState state, int bank,
+                       TextGdnPrefillCheckpoints checkpoints = TextGdnPrefillCheckpoints()) const;
 
     void gqa_input(const GqaLayer& layer, bool reuse_all = false) const;
 
@@ -141,6 +142,22 @@ void gather_embeddings(const Bf16* embedding, const int* tokens, int rows, Bf16*
                        cudaStream_t stream);
 
 void stage_prefill_row(Request& request, const TileBuffers& work, int row, cudaStream_t stream);
+
+void seed_ranked_prefill_draft(const DecoderModel& model, const PrefillGrant& grant,
+                               const Chunk& chunk, ScratchLayout& layout, std::size_t layout_bytes);
+
+struct GdnPrefillCheckpoints {
+    GdnPrefillCheckpoints();
+    GdnPrefillCheckpoints(const PrefillGrant& grant, int bank);
+    TextGdnPrefillCheckpoints view() const;
+    std::array<TextGdnPrefillCheckpoint, text_gdn_max_prefill_checkpoints> items{};
+    int count = 0;
+};
+
+PrefillCheckpoints prefill_checkpoints(const PrefillGrant& grant);
+void capture_prefill_checkpoints(const PrefillGrant& grant, const TileBuffers* work, int offset,
+                                 cudaStream_t stream);
+void publish_prefill_checkpoints(const PrefillGrant& grant);
 
 void capture_prefill_scores(const DecoderModel& model, const PrefillGrant& grant,
                             const TileBuffers* buffers, int offset, cudaStream_t stream);

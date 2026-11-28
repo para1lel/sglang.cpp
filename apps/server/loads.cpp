@@ -295,8 +295,22 @@ std::string format_metrics(const BatchMetrics& metrics, int running, std::size_t
     emit("sglang_cpp:lmcache_lookup_misses_total", metrics.lmcache.lookup_misses);
     emit("sglang_cpp:lmcache_io_errors_total", metrics.lmcache.io_errors);
     emit("sglang_cpp:lmcache_stores_total", metrics.lmcache.stores);
+    emit("sglang_cpp:lmcache_prefill_checkpoint_stores_total",
+         metrics.lmcache.prefill_checkpoint_stores);
+    emit("sglang_cpp:lmcache_prefill_checkpoint_failures_total",
+         metrics.lmcache.prefill_checkpoint_failures);
+    emit("sglang_cpp:lmcache_prefill_checkpoints_planned_total",
+         metrics.cache.prefill_checkpoints_planned);
+    emit("sglang_cpp:lmcache_prefill_checkpoints_resident_total",
+         metrics.cache.prefill_checkpoints_resident);
+    emit("sglang_cpp:lmcache_prefill_checkpoints_published_total",
+         metrics.cache.prefill_checkpoints_published);
+    emit("sglang_cpp:lmcache_prefill_checkpoints_declined_total",
+         metrics.cache.prefill_checkpoints_declined);
     emit("sglang_cpp:lmcache_declined_stores_total", metrics.lmcache.declined_stores);
     emit("sglang_cpp:lmcache_pending_stores", metrics.lmcache.pending_stores);
+    emit("sglang_cpp:lmcache_gqa_matched_tokens_total", metrics.cache.gqa_matched_tokens);
+    emit("sglang_cpp:lmcache_gdn_matched_tokens_total", metrics.cache.gdn_matched_tokens);
     emit("sglang_cpp:lmcache_gqa_restored_tokens_total", metrics.cache.gqa_restored_tokens);
     emit("sglang_cpp:lmcache_gqa_read_only_tokens_total", metrics.cache.gqa_read_only_tokens);
     emit("sglang_cpp:lmcache_gqa_computed_tokens_total", metrics.cache.gqa_computed_tokens);

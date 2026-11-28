@@ -22,24 +22,35 @@ from lmcache.v1.distributed.internal_api import L1ManagerListener
 from lmcache.v1.distributed.l1_manager.dram import DramL1Manager
 from lmcache.v1.distributed.storage_manager import _L1_WRITE_TAG, l1_owners_of
 from lmcache.v1.multiprocess.engine_module import DiscoverableModule
-from sglang_gpu_transfer import DIGEST_BYTES, GDN_END, PREFIX_CHUNK, DeviceCopies, Transfer
+from sglang_gpu_transfer import (
+    DIGEST_BYTES,
+    DRAFT_FAMILY,
+    GDN_END,
+    MAX_TOKENS,
+    PREFIX_CHUNK,
+    DeviceCopies,
+    Transfer,
+)
 from sglang_socket import OwnedUnixStreamServer
 
 if TYPE_CHECKING:
-    from collections.abc import Generator
+    from collections.abc import Generator, Mapping
 
     from lmcache.v1.distributed.storage_manager import StorageManager
     from lmcache.v1.multiprocess.engine_context import MPCacheServerContext
+    from sglang_gpu_transfer import Retention
 
 
 VERSION = "0.5.8"
-WIRE_VERSION = VERSION + "+native-v3"
+WIRE_VERSION = VERSION + "+native-v4"
 MAGIC = b"SLC3"
 HEADER = struct.Struct("!4sIQ")
 MAX_METADATA = 64 << 20
 MAX_KEYS = 1 << 20
 LOOKUP_BATCH = 4096
-MAX_DETAIL = 4096
+LOOKUP_PREFIX_OP = 9
+RETRIEVE_OP = 10
+STORE_OP = 11
 WORKERS = 16
 REQUEST_TIMEOUT = 10
 LOG = init_logger(__name__)
@@ -59,16 +70,18 @@ class GdnEndpoints(L1ManagerListener):
         self.by_key = {}
         self.counts = Counter()
 
-    def snapshot(self, limit):
+    def positions(self) -> set[int]:
         with self.lock:
-            ends = tuple(self.counts)
-        return sorted((end for end in ends if end <= limit), reverse=True)
+            return set(self.counts)
+
+    def snapshot(self, limit: int) -> list[int]:
+        return sorted((end for end in self.positions() if end <= limit), reverse=True)
 
     def on_l1_keys_write_finished(self, keys):
         with self.lock:
             for key in keys:
                 end = key.extra_attributes.get(GDN_END)
-                if end is not None and key not in self.by_key:
+                if end is not None and 0 < end <= MAX_TOKENS and key not in self.by_key:
                     self.by_key[key] = end
                     self.counts[end] += 1
 
@@ -118,10 +131,12 @@ class TransferMetadata:
 class PrefixLookup:
     def __init__(self, request, namespace, records):
         self.count = request.number(4)
-        self.limit = request.number(4)
         self.draft = request.number(1)
-        if self.count > MAX_KEYS or self.limit > self.count or self.draft > 1 or \
-                self.count * DIGEST_BYTES != request.remaining:
+        if (
+            self.count > MAX_TOKENS
+            or self.draft > 1
+            or self.count * DIGEST_BYTES != request.remaining
+        ):
             raise ValueError("invalid prefix lookup size")
         self.digests = request.read(request.remaining)
         self.namespace = namespace
@@ -129,16 +144,16 @@ class PrefixLookup:
         self.request = request
 
     def key(self, family, end):
-        index = (end - 1 + (family == 3)) * DIGEST_BYTES
-        return object_key(self.namespace, family, bytes(self.digests[index:index + DIGEST_BYTES]))
+        index = (end - 1 + (family == DRAFT_FAMILY)) * DIGEST_BYTES
+        return object_key(self.namespace, family, bytes(self.digests[index : index + DIGEST_BYTES]))
 
     def present(self, family, ends):
-        self.request.time_left()
-        if not ends:
-            return []
-        keys = [self.key(family, end) for end in ends]
-        with self.records.read(keys) as resident:
-            return [key in resident for key in keys]
+        for start in range(0, len(ends), LOOKUP_BATCH):
+            self.request.time_left()
+            keys = [self.key(family, end) for end in ends[start : start + LOOKUP_BATCH]]
+            with self.records.read(keys) as resident:
+                found = [key in resident for key in keys]
+            yield from found
 
     def full_coverage(self, family, limit):
         ends = range(PREFIX_CHUNK, limit + 1, PREFIX_CHUNK)
@@ -147,36 +162,34 @@ class PrefixLookup:
                 return end - PREFIX_CHUNK
         return limit // PREFIX_CHUNK * PREFIX_CHUNK
 
-    def resolve(self):
-        gqa, matched, eligible = self.coverage()
-        if not self.draft:
-            end = eligible[0][0] if eligible else 0
-            return gqa, end, 0, matched
-        end = next((candidate for candidate, draft_ok in eligible if draft_ok), 0)
-        return gqa, end, end - 1 if end else 0, matched
-
-    def detail(self):
-        gqa, matched, eligible = self.coverage()
-        return gqa, matched, len(eligible), eligible[:MAX_DETAIL]
-
     def coverage(self):
         full = self.full_coverage(1, self.count)
         tail = range(min(self.count, full + PREFIX_CHUNK - 1), full, -1)
         gqa = next((end for end, found in zip(tail, self.present(1, tail)) if found), full)
         ends = self.records.gdn_endpoints.snapshot(self.count)
         states = [end for end, found in zip(ends, self.present(2, ends)) if found]
-        matched = states[0] if states else 0
-        maximum = min(self.limit, gqa)
-        if self.draft:
-            draft_full = self.full_coverage(3, maximum - 1)
-            states = [end for end in states if end <= draft_full + PREFIX_CHUNK]
-            tails = [end - 1 for end in states if (end - 1) % PREFIX_CHUNK]
-            usable = {end for end, found in zip(tails, self.present(3, tails)) if found}
-            eligible = [(end, (end - 1) % PREFIX_CHUNK == 0 or end - 1 in usable)
-                        for end in states]
-        else:
-            eligible = [(end, False) for end in states]
-        return gqa, matched, [(end, draft_ok) for end, draft_ok in eligible if end <= maximum]
+        if not self.draft or not states:
+            return gqa, [(end, False) for end in states]
+
+        draft_full = self.full_coverage(DRAFT_FAMILY, states[0] - 1)
+        tails = [
+            end - 1
+            for end in states
+            if end <= draft_full + PREFIX_CHUNK and (end - 1) % PREFIX_CHUNK
+        ]
+        resident_tails = {
+            end
+            for end, found in zip(tails, self.present(DRAFT_FAMILY, tails), strict=True)
+            if found
+        }
+        return gqa, [
+            (
+                end,
+                end <= draft_full + PREFIX_CHUNK
+                and ((end - 1) % PREFIX_CHUNK == 0 or end - 1 in resident_tails),
+            )
+            for end in states
+        ]
 
 
 class Request:
@@ -281,7 +294,14 @@ class DmaLock:
 class DmaReservations(L1ManagerListener):
     """Keep eviction and reservation under the pinned manager's own mutex."""
 
-    def __init__(self, manager):
+    def __init__(self, manager: DramL1Manager) -> None:
+        match manager:
+            case DramL1Manager(_lock=lock, _objects=objects, _registered_listeners=listeners):
+                self.lock = lock
+                self.objects = objects
+                self.listeners = listeners
+            case _:
+                raise RuntimeError("Incompatible LMCache 0.5.8 DRAM manager state")
         self.manager = manager
         self.finishing = threading.local()
         self.writing = threading.local()
@@ -291,8 +311,8 @@ class DmaReservations(L1ManagerListener):
         self.delete_l1 = manager.delete
         manager.clear = self.clear
         manager.delete = self.delete
-        with manager._lock:
-            manager._registered_listeners.insert(0, self)
+        with self.lock:
+            self.listeners.insert(0, self)
 
     @contextlib.contextmanager
     def activity(self):
@@ -335,9 +355,9 @@ class DmaReservations(L1ManagerListener):
     def read_pinned(self, keys):
         entries = {}
         try:
-            with self.manager._lock:
+            with self.lock:
                 for key in dict.fromkeys(keys):
-                    entry = self.manager._objects.get(key)
+                    entry = self.objects.get(key)
                     if entry is not None:
                         entries[key] = (entry, self.pin(entry, "read_lock"))
                 self.manager._report_read_reserved(list(entries))
@@ -347,9 +367,12 @@ class DmaReservations(L1ManagerListener):
                 self.finish_read(entries)
 
     def finish_read(self, entries):
-        with self.manager._lock:
-            pending = {key: lock for key, (entry, lock) in entries.items()
-                       if self.manager._objects.get(key) is entry and entry.read_lock is lock}
+        with self.lock:
+            pending = {
+                key: lock
+                for key, (entry, lock) in entries.items()
+                if self.objects.get(key) is entry and entry.read_lock is lock
+            }
         self.finishing.locks = set(pending.values())
         try:
             if pending:
@@ -357,7 +380,7 @@ class DmaReservations(L1ManagerListener):
         finally:
             unconsumed = self.finishing.locks
             del self.finishing.locks
-            with self.manager._lock:
+            with self.lock:
                 for key, (entry, lock) in entries.items():
                     if key not in pending or lock in unconsumed:
                         lock.pins -= 1
@@ -380,13 +403,13 @@ class DmaReservations(L1ManagerListener):
         finally:
             entries = self.writing.entries
             try:
-                with self.manager._lock:
+                with self.lock:
                     aborted = {key: obj for key, obj in reserved.items()
                                if self.manager._get_staging(key, _L1_WRITE_TAG) is entries[key][0]}
                 if aborted:
                     storage.abort_write(list(aborted), l1_owners_of(aborted))
             finally:
-                with self.manager._lock:
+                with self.lock:
                     for entry, lock in entries.values():
                         if entry.write_lock is lock:
                             entry.write_lock = lock.ttl
@@ -394,7 +417,7 @@ class DmaReservations(L1ManagerListener):
                 del self.writing.reserved
 
     def reserve_write(self, storage, key, layout, reserved):
-        with self.manager._lock:
+        with self.lock:
             if self.manager._get_staging(key, _L1_WRITE_TAG) is not None:
                 return False
         self.writing.key = key
@@ -419,7 +442,7 @@ class DmaReservations(L1ManagerListener):
     def on_l1_keys_write_finished(self, keys):
         entries = getattr(self.writing, "entries", {})
         for key in keys:
-            if key in entries and self.manager._objects.get(key) is entries[key][0]:
+            if key in entries and self.objects.get(key) is entries[key][0]:
                 self.writing.published.add(key)
 
     def on_l1_keys_reserved_read(self, keys):
@@ -449,7 +472,9 @@ class Records:
         self.writing_keys = set()
         self.dma = DmaReservations(self.l1)
         self.gdn_endpoints = GdnEndpoints()
-        self.l1.register_listener(self.gdn_endpoints)
+        with self.dma.lock:
+            self.gdn_endpoints.on_l1_keys_write_finished(self.dma.objects)
+            self.dma.listeners.append(self.gdn_endpoints)
 
     @contextlib.contextmanager
     def read(self, keys):
@@ -484,6 +509,47 @@ class Records:
                 self.writing_keys.difference_update(keys)
                 self.writes.notify_all()
 
+    def touch_prefix(self, transfer: Transfer, *, stored: bool = False) -> None:
+        ordered = [(record.prefix_end, record.key) for record in transfer.records]
+        with self.dma.lock:
+            if stored and transfer.retention is not None:
+                ordered.extend(self.resident_anchors(transfer.retention, self.dma.objects))
+            ordered.sort(key=lambda item: item[0])
+            self.l1.touch_keys(
+                list(dict.fromkeys(key for _, key in ordered if key in self.dma.objects))
+            )
+
+    @staticmethod
+    def resident_anchors(
+        retention: Retention, objects: Mapping[ObjectKey, object]
+    ) -> Generator[tuple[int, ObjectKey], None, None]:
+        def consecutive(keys: list[ObjectKey]) -> int:
+            return next((index for index, key in enumerate(keys) if key not in objects), len(keys))
+
+        target_ready = consecutive(retention.gqa_chunks)
+        draft_ready = consecutive(retention.draft_chunks)
+        target_needed = draft_needed = 0
+        for end, target, anchor, shifted in retention.anchors:
+            target_chunks = (end - 1) // PREFIX_CHUNK
+            draft_chunks = (end - 2) // PREFIX_CHUNK if shifted is not None else 0
+            if (
+                target_chunks <= target_ready
+                and draft_chunks <= draft_ready
+                and target in objects
+                and anchor in objects
+                and (shifted is None or shifted in objects)
+            ):
+                yield end, target
+                yield end, anchor
+                if shifted is not None:
+                    yield end, shifted
+                target_needed = target_chunks
+                draft_needed = draft_chunks
+        for index in range(target_needed):
+            yield (index + 1) * PREFIX_CHUNK, retention.gqa_chunks[index]
+        for index in range(draft_needed):
+            yield (index + 1) * PREFIX_CHUNK + 1, retention.draft_chunks[index]
+
     def retrieve(self, request, transfer):
         keys = [record.key for record in transfer.records]
         with self.read(keys) as resident:
@@ -491,7 +557,7 @@ class Records:
                 return 1, b""
             request.check_mutation()
             self.device.run(transfer, transfer.records, resident, store=False)
-            self.l1.touch_keys(keys)
+            self.touch_prefix(transfer)
             return self.receipt(transfer.records, store=False)
 
     def store(self, request, transfer):
@@ -503,7 +569,7 @@ class Records:
                 return 3, b""
             result = self.write(request, transfer, pending)
             if result[0] == 0:
-                self.l1.touch_keys(keys)
+                self.touch_prefix(transfer, stored=True)
             return result
 
     def write(self, request, transfer, pending):
@@ -687,19 +753,22 @@ class Handler(socketserver.BaseRequestHandler):
         records = self.server.records
         if request.op == 2:
             records.lookup(request, namespace)
-        elif request.op in (3, 4, 10, 11):
+        elif request.op in (RETRIEVE_OP, STORE_OP):
             if not self.server.gpu_slots.acquire(blocking=False):
                 request.reply(3)
                 return
             try:
                 metadata = TransferMetadata(request)
-                legacy = request.op in (3, 4)
-                transfer = Transfer.parse(metadata, lambda family, identity, endpoint=0:
-                                          object_key(namespace, family, identity, endpoint),
-                                          legacy)
+                transfer = Transfer.parse(
+                    metadata,
+                    lambda family, identity, endpoint: object_key(
+                        namespace, family, identity, endpoint
+                    ),
+                    store=request.op == STORE_OP,
+                )
                 if self.server.device_copies is not None:
                     self.server.device_copies.device_for(transfer.device)
-                operation = records.retrieve if request.op in (3, 10) else records.store
+                operation = records.retrieve if request.op == RETRIEVE_OP else records.store
                 with self.server.lease(request):
                     result = operation(request, transfer)
                 request.release_reply(*result)
@@ -716,15 +785,13 @@ class Handler(socketserver.BaseRequestHandler):
             request.check_mutation()
             _, skipped = records.storage.delete_l1_keys([key])
             request.reply(1 if skipped else 0)
-        elif request.op in (7, 9):
-            query = PrefixLookup(request, namespace, records)
-            if request.op == 7:
-                request.reply(0, struct.pack("!IIII", *query.resolve()))
-            else:
-                gqa, matched, total, entries = query.detail()
-                request.reply(0, struct.pack("!IIII", gqa, matched, total, len(entries)) +
-                              b"".join(struct.pack("!IB", end, draft_ok)
-                                       for end, draft_ok in entries))
+        elif request.op == LOOKUP_PREFIX_OP:
+            gqa, entries = PrefixLookup(request, namespace, records).coverage()
+            request.reply(
+                0,
+                struct.pack("!II", gqa, len(entries))
+                + b"".join(struct.pack("!IB", end, draft_ok) for end, draft_ok in entries),
+            )
         else:
             raise ValueError("unknown LMCache operation")
 
@@ -766,9 +833,6 @@ class SglangSnapshotModule(DiscoverableModule):
             ",".join(uuid.hex() for uuid in devices),
             records.l1.get_capacity_bytes(),
         )
-
-    def get_handlers(self):
-        return {}
 
     def report_status(self):
         return {"capacity_bytes": self.server.records.l1.get_capacity_bytes()}

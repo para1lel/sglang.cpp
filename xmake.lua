@@ -152,7 +152,7 @@ target("sglang_cuda")
     add_files("src/text/target_fp8.cu")
     add_files("src/runtime/execution/verification_row_copy.cu")
     add_files("src/text_decode_bandwidth.cu")
-    add_files("src/text/text_gdn_batched_replay.cu", "src/text/gdn_chunk.cu")
+    add_files("src/text/gdn_chunk.cu", "src/text/gdn_replay_ssm.cu")
     add_files("src/decoder_sampling.cu", "src/decoder_constraint.cu",
               "src/text/decoder_logprobs.cu")
     add_cuda_device_lto("100", {
@@ -164,7 +164,6 @@ target("sglang_cuda")
         "src/text_ops.cu",
         "src/text/fp8_projection.cu",
         "src/text/gdn_prefill.cu",
-        "src/text/gdn_verify.cu",
         "src/text/rms_quantize.cu",
         "src/text/text_cuda_primitives.cu",
         "src/text/gqa/draft_attention.cu",
@@ -278,7 +277,6 @@ target("sglang_decoder")
               "src/runtime/execution/decoder_prefill_plan.cpp",
               "src/runtime/execution/decoder_prefill_staged_gqa.cpp",
               "src/runtime/execution/decoder_prefill_tiles.cpp",
-              "src/runtime/execution/decoder_verify_replay.cpp",
               "src/runtime/execution/decoder_verify_workspace.cpp",
               "src/text/decoder_batch_plan.cpp", "src/text/draft_projection.cpp",
               "src/text/gqa/verify_batch.cpp", "src/text/label_logprobs.cpp",

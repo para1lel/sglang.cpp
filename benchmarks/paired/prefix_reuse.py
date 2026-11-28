@@ -16,7 +16,7 @@ from benchmarks.streaming.client import json_bytes, request_body
 
 COMMON_PREFIX = 8192
 BRANCH_SUFFIX = 1792
-DRAFT_CACHED_ROWS = "sglang_cpp:prefix_cache_draft_cached_rows_total"
+DRAFT_CACHED_ROWS = "sglang_cpp:lmcache_draft_restored_rows_total"
 
 
 def workload(root):
@@ -26,7 +26,6 @@ def workload(root):
     branch_tokens = {prompt[0] for prompt in prompts}
     k4.require(len(prefix) == COMMON_PREFIX and len(branch_tokens) == len(prompts),
                "W3 fixture lacks a complete common prefix or distinct branch tokens")
-    off_branch = next(token for token in prompts[0] if token not in branch_tokens)
     branches = [prefix + prompt[:BRANCH_SUFFIX] for prompt in prompts]
 
     def request(lane, ids, count):
@@ -34,14 +33,20 @@ def workload(root):
         body = json_bytes(request_body(case))
         return {"lane": lane, "request_sha256": digest(body)}, body, case
 
-    return (original, [request(0, prefix + [off_branch], 1)],
-            [request(lane["lane"], ids, case["output_tokens"])
-             for (lane, _, case), ids in zip(original, branches, strict=True)])
+    return (
+        original,
+        [request(0, prefix, 1)],
+        [
+            request(lane["lane"], ids, case["output_tokens"])
+            for (lane, _, case), ids in zip(original, branches, strict=True)
+        ],
+    )
 
 
 def capture(url, engine, label, directory, lanes, policy, *, reset, lower=0, upper=0, trace=None):
-    receipt = cold_cache.before_cohort(url, engine) if reset else None
-    before = receipt["cleared"] if receipt else cold_cache.idle_metrics(url, engine)
+    cache_engine = cold_cache.LMCACHE_DRAIN_SUFFIX if engine == "native" else engine
+    receipt = cold_cache.before_cohort(url, cache_engine) if reset else None
+    before = receipt["cleared"] if receipt else cold_cache.idle_metrics(url, cache_engine)
     for lane, body, _ in lanes:
         (directory / f'{label}-{lane["lane"]:02d}.request.json').write_bytes(body)
     if trace is not None:
@@ -52,10 +57,10 @@ def capture(url, engine, label, directory, lanes, policy, *, reset, lower=0, upp
     try:
         if receipt is not None:
             raw["cold_cache"] = receipt
-            cold_cache.after_cohort(url, engine, receipt)
+            cold_cache.after_cohort(url, cache_engine, receipt)
             after = receipt["after"]
         else:
-            after = cold_cache.idle_metrics(url, engine)
+            after = cold_cache.idle_metrics(url, cache_engine)
         raw.update(metrics_before=before, metrics_after=after)
     finally:
         with gzip.open(directory / f"{label}.json.gz", "wt", compresslevel=3) as stream:
@@ -63,8 +68,8 @@ def capture(url, engine, label, directory, lanes, policy, *, reset, lower=0, upp
     report, records = client.replay_cohort(raw, cases, policy)
     report["requests"] = records
     if receipt is not None:
-        cold_cache.replay(raw, engine)
-    metrics = [cold_cache.metrics(snapshot, engine) for snapshot in (before, after)]
+        cold_cache.replay(raw, cache_engine)
+    metrics = [cold_cache.metrics(snapshot, cache_engine) for snapshot in (before, after)]
     if engine == "vllm" and lower:
         for moment, snapshot in (("before", before), ("after", after)):
             (directory / f"metrics-{moment}.txt").write_text(snapshot)
@@ -106,10 +111,15 @@ def run(engine, endpoint, root, directory, *, native_trace=None):
     control = capture(url, engine, "prime-after-reset", directory, prime, policy, reset=True)
     k4.require(first["requests"][0]["output_ids"] == control["requests"][0]["output_ids"],
                "Prime changed output after clearing prefix state")
-    summary = {"protocol": "matched-k4-prefix-reuse-v2", "engine": engine,
-               "common_prefix_tokens": COMMON_PREFIX,
-               "cold-W3": cold, "prime": first, "warm-W3-branches": warm,
-               "prime-after-reset": control}
+    summary = {
+        "protocol": "matched-k4-prefix-reuse-v3",
+        "engine": engine,
+        "common_prefix_tokens": COMMON_PREFIX,
+        "cold-W3": cold,
+        "prime": first,
+        "warm-W3-branches": warm,
+        "prime-after-reset": control,
+    }
     k4.save(directory / "summary.json", summary)
     return summary
 

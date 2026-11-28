@@ -30,13 +30,6 @@ struct LmCacheGpuTransfer {
 class PrefixCacheKeys;
 struct PrefixDeviceTransfer;
 
-struct LmCachePrefix {
-    int gqa = 0;
-    int gdn = 0;
-    int draft = 0;
-    int matched_gdn = 0;
-};
-
 struct LmCacheEndpointCoverage {
     int end = 0;
     bool draft = false;
@@ -44,7 +37,6 @@ struct LmCacheEndpointCoverage {
 
 struct LmCachePrefixDetail {
     int gqa = 0;
-    int matched_gdn = 0;
     std::vector<LmCacheEndpointCoverage> endpoints;
 };
 
@@ -59,7 +51,6 @@ struct LmCacheConfig {
     std::string endpoint = default_lmcache_endpoint();
     std::string name_space = "sglang";
     int timeout_ms = 1000;
-    bool native_v4 = false;
 };
 
 class LmCacheClient {
@@ -70,9 +61,7 @@ public:
     bool ready() const;
     bool ready(const std::vector<std::array<std::uint8_t, 16>>& devices) const;
     std::vector<bool> lookup(const std::vector<LmCacheKey>& keys) const;
-    LmCachePrefix lookup_prefix(const PrefixCacheKeys& keys, int max_restore, bool draft) const;
-    LmCachePrefixDetail lookup_prefix_detail(const PrefixCacheKeys& keys, int max_restore,
-                                             bool draft) const;
+    LmCachePrefixDetail lookup_prefix(const PrefixCacheKeys& keys, bool draft) const;
 
     std::string prepare_store(const PrefixCacheKeys& keys,
                               const PrefixDeviceTransfer& transfer) const;
@@ -86,10 +75,8 @@ public:
     void reset() const;
 
 private:
-    LmCachePrefix lookup_prefix(std::string_view digests, int max_restore, bool draft) const;
-    LmCachePrefixDetail lookup_prefix_detail(std::string_view digests, int max_restore,
-                                             bool draft) const;
-    LmCacheConfig config_;
+  LmCachePrefixDetail lookup_prefix(std::string_view digests, bool draft) const;
+  LmCacheConfig config_;
 };
 
 }

@@ -280,6 +280,10 @@ def native_info(run, identity, *, opt_in):
 def cache_engine(identity, arm):
     if arm == "vllm-k4":
         return "vllm"
+    if identity.get("protocol") == workload_suite.LMCACHE_DRAIN_SUFFIX_PROTOCOL:
+        return cold_cache.LMCACHE_DRAIN_SUFFIX
+    if identity.get("protocol") == workload_suite.LMCACHE_DRAIN_ALIGNED_PROTOCOL:
+        return cold_cache.LMCACHE_DRAIN_ALIGNED
     if identity.get("protocol") == workload_suite.LMCACHE_DRAIN_PROTOCOL:
         return cold_cache.LMCACHE_DRAIN
     if identity.get("protocol") in workload_suite.LMCACHE_PROTOCOLS:

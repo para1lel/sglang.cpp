@@ -74,11 +74,11 @@ checker="${BUILD_WORK_DIR:?set the printed build directory}/build/bin/mxfp8-gqa-
 
 Expect `compute_capability=10.0`, `MXFP8 GQA check passed`, and exit zero. The
 [Flash checks](flash-prefill.md#verification) cover automatic dispatch,
-regular Flash, split graph nodes, and ordered replay. The [verifier](../tests/mxfp8_gqa_check.cu#L639)<!-- prefix: "void run_che" --> covers append, attention, and page reuse with packed KV and BF16.
+regular Flash, split graph nodes, and ordered replay. The [verifier](../tests/mxfp8_gqa_check.cu#L638)<!-- prefix: "void run_che" --> covers append, attention, and page reuse with packed KV and BF16.
 
-The [ordered decode check](../tests/mxfp8_gqa_check.cu#L541)<!-- prefix: "void check_e" --> covers BF16 parity, tile and page boundaries, graph and eager execution, input preservation, and validation.
+The [ordered decode check](../tests/mxfp8_gqa_check.cu#L540)<!-- prefix: "void check_e" --> covers BF16 parity, tile and page boundaries, graph and eager execution, input preservation, and validation.
 
-Check [exponents 0 and 255](../tests/mxfp8_gqa_prefill_check.cu#L932)<!-- prefix: "void check_t" -->, [remaps and graphs](../tests/mxfp8_gqa_check.cu#L872)<!-- prefix: "void check_o" -->, [chunk edges and tails](../tests/mxfp8_gqa_prefill_check.cu#L697)<!-- prefix: "void check_o" -->, [rounding](../tests/mxfp8_gqa_prefill_check.cu#L745)<!-- prefix: "void check_o" -->, and [masked-score recovery](../tests/mxfp8_gqa_check.cu#L935)<!-- prefix: "void check_o" -->.
+Check [exponents 0 and 255](../tests/mxfp8_gqa_prefill_check.cu#L768)<!-- prefix: "void check_o" -->, [remaps and graphs](../tests/mxfp8_gqa_check.cu#L871)<!-- prefix: "void check_o" -->, [chunk edges and tails](../tests/mxfp8_gqa_prefill_check.cu#L720)<!-- prefix: "void check_o" -->, [rounding](../tests/mxfp8_gqa_prefill_check.cu#L768)<!-- prefix: "void check_o" -->, and [masked-score recovery](../tests/mxfp8_gqa_check.cu#L934)<!-- prefix: "void check_o" -->.
 
 Use the [ordered prefill replay checks](ordered-gqa-prefill.md#verification) for staged tails and overflow controls.
 
@@ -88,9 +88,9 @@ The [checkpoint loader](../include/sglang/checkpoint.h#L24)<!-- prefix: "class C
 
 ### Runtime path
 
-The shared layer loop uses the model layout to select each layer's KV or GDN bank. Tile and row adapters supply buffers and operator dispatch. The outer paths own embedding, draft seeding, and scoring. [Layer mapping](../src/runtime/model/qwen_text_model.cpp#L13)<!-- prefix: "QwenTextMode" --> · [Execution bank selection](../src/decoder_prefill.cpp#L32)<!-- prefix: "const auto r" --> · [Tile adapter](../src/decoder_prefill.cpp#L624)<!-- prefix: "run_layers(l" --> · [Row adapter](../src/decoder_forward.cpp#L75)<!-- prefix: "void Decoder" -->
+The shared layer loop uses the model layout to select each layer's KV or GDN bank. Tile and row adapters supply buffers and operator dispatch. The outer paths own embedding, draft seeding, and scoring. [Layer mapping](../src/runtime/model/qwen_text_model.cpp#L13)<!-- prefix: "QwenTextMode" --> · [Execution bank selection](../src/decoder_prefill.cpp#L32)<!-- prefix: "const auto r" --> · [Tile adapter](../src/decoder_prefill.cpp#L644)<!-- prefix: "run_layers(" --> · [Row adapter](../src/decoder_forward.cpp#L75)<!-- prefix: "void Decoder" -->
 
-Serial K0 reuses its stream and grows storage on demand. Prefill rebuilds [MXFP8 pages](#p2-gqa-cache-contract) with an identity page table. Reset clears BF16 convolution history and FP32 recurrent state across the GDN layers. The final prompt row supplies the initial logits. Overlapping calls use private eager storage. [Generation loop](../src/decoder.cpp#L721)<!-- prefix: "void Decoder" --> · [State reset](../src/runtime/model/qwen_request.cpp#L321)<!-- prefix: "void Request" -->
+Serial K0 reuses its stream and grows storage on demand. Prefill rebuilds [MXFP8 pages](#p2-gqa-cache-contract) with an identity page table. Reset clears BF16 convolution history and FP32 recurrent state across the GDN layers. The final prompt row supplies the initial logits. Overlapping calls use private eager storage. [Generation loop](../src/decoder.cpp#L721)<!-- prefix: "void Decoder" --> · [State reset](../src/runtime/model/qwen_request.cpp#L352)<!-- prefix: "void Request" -->
 
 Use the feature contracts for dispatch and numerical details.
 
@@ -98,14 +98,14 @@ Use the feature contracts for dispatch and numerical details.
 | --- | --- |
 | Text prefill | [Serial tiles](text-serving.md#serial-prefill), [batch tiles and workspace](native-prefill-workspace.md), [FP8 projections and activation rounding](fp8-prefill-projections.md), [GDN recurrence](gdn-prefill.md), and [GQA dispatch](flash-prefill.md#runtime-path) |
 | Decode | [Singleton GQA and exact/direct fallback](singleton-gqa-decode.md), [batch and graph selection](batch-graphs.md#runtime-path), and [GDN state updates](gdn-decode.md) |
-| Speculation and reuse | [MTP seeding, verification, and rollback](mtp.md#runtime-path), [periodic and request-end checkpoints](prefix-cache.md#checkpoint-boundaries), and [prefix restoration](prefix-cache.md#checkpoint-compatibility-and-resume) |
+| Speculation and reuse | [MTP seeding, verification, and rollback](mtp.md#runtime-path) and [prefix restoration](prefix-cache.md#checkpoint-compatibility-and-resume) |
 | Media and scoring | [Multimodal decoder](multimodal-decoder.md) and [pointwise scoring](serving/pointwise-score.md) |
 
 ### Constraints and failure behavior
 
 Use the [generator contract](native-generate.md) for token validation, budgets, sampling, stops, and exit status. The checkpoint has 248,320 vocabulary IDs and a 262,144-token context.
 
-The decoder retains CUDA resources and transfer buffers while completion is uncertain. Model and request setup retry cleanup on the same device. Persistent errors block setup. Terminal errors and ambiguous frees quarantine resources until exit. [Deferred cleanup](../src/runtime/backend/cuda_resources.cpp#L129)<!-- prefix: "static void " --> · [Destructor diagnostics](../src/runtime/backend/cuda_resources.cpp#L468)<!-- prefix: "Allocations:" -->
+The decoder retains CUDA resources and transfer buffers while completion is uncertain. Model and request setup retry cleanup on the same device. Persistent errors block setup. Terminal errors and ambiguous frees quarantine resources until exit. [Deferred cleanup](../src/runtime/backend/cuda_resources.cpp#L130)<!-- prefix: "static void " --> · [Destructor diagnostics](../src/runtime/backend/cuda_resources.cpp#L469)<!-- prefix: "Allocations:" -->
 
 Workspace sizing, row-wise fallback, and pool retention are documented with the prefill allocation contract. [Prefill workspace](native-prefill-workspace.md#constraints-and-failure-behavior)
 

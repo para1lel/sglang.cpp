@@ -2,6 +2,7 @@
 
 #include "sglang/decoder_internal.h"
 #include "sglang/decoder_prefix_cache.h"
+#include "sglang/runtime/cache/lmcache_group.h"
 #include "sglang/tokenizer/tokenizer.h"
 
 #include <chrono>
@@ -83,12 +84,13 @@ std::shared_ptr<sglang::decoder::PrefixCacheRead> read_checkpoint(
         const sglang::decoder::LmCacheClient& cache, const std::vector<int>& prompt,
         std::string_view salt, int endpoint, bool draft) {
     using namespace sglang::decoder;
-    const auto match = cache.lookup_prefix(PrefixCacheKeys(prompt, salt), endpoint, draft);
-    if (match.gqa < endpoint || match.gdn != endpoint || (draft && match.draft != endpoint - 1)) {
+    const PrefixCacheKeys keys(prompt, salt);
+    auto match = LmCacheGroup(cache).lookup_prefix({&keys}, endpoint, draft);
+    if (match.usable_gqa < endpoint || match.usable_gdn != endpoint ||
+        (draft && match.usable_draft != endpoint - 1)) {
         throw std::runtime_error("Missing test checkpoint at expected position");
     }
-    return std::make_shared<PrefixCacheRead>(PrefixCacheRead{
-        match.gqa, match.matched_gdn, match.gqa, match.gdn, match.draft});
+    return std::make_shared<PrefixCacheRead>(std::move(match));
 }
 
 namespace {

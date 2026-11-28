@@ -32,6 +32,18 @@ struct TextGdnState {
     float* recurrent;
 };
 
+inline constexpr int text_gdn_max_prefill_checkpoints = 12;
+
+struct TextGdnPrefillCheckpoint {
+    int rows;
+    TextGdnState state;
+};
+
+struct TextGdnPrefillCheckpoints {
+    const TextGdnPrefillCheckpoint* data = nullptr;
+    int size = 0;
+};
+
 inline constexpr int text_gdn_max_verify_rows = 5;
 
 struct TextGdnReplayRows {
@@ -44,19 +56,11 @@ struct TextGdnReplayRows {
 std::size_t text_gdn_workspace_bytes(int token_count);
 
 cudaError_t text_gdn_forward(int token_count, TextGdnMode mode, const __nv_bfloat16* qkv,
-                             const __nv_bfloat16* z, const __nv_bfloat16* b,
-                             const __nv_bfloat16* a, TextGdnWeights weights,
-                             TextGdnState state, __nv_bfloat16* workspace,
+                             const __nv_bfloat16* z, const __nv_bfloat16* b, const __nv_bfloat16* a,
+                             TextGdnWeights weights, TextGdnState state, __nv_bfloat16* workspace,
                              std::size_t workspace_bytes, __nv_bfloat16* output,
-                             cudaStream_t stream);
-
-cudaError_t text_gdn_verify_tail(int token_count, TextGdnReplayRows rows,
-                                const __nv_bfloat16* z, TextGdnWeights weights,
-                                TextGdnState initial, TextGdnState tail,
-                                __nv_bfloat16* observable, __nv_bfloat16* output,
-                                cudaStream_t stream);
-cudaError_t text_gdn_replay_prefix(int token_count, TextGdnReplayRows rows, TextGdnWeights weights,
-                                  TextGdnState initial, TextGdnState result, cudaStream_t stream);
+                             cudaStream_t stream,
+                             TextGdnPrefillCheckpoints checkpoints = TextGdnPrefillCheckpoints{});
 
 cudaError_t text_gqa_preprocess(int first_position, int token_count,
                                 const __nv_bfloat16* q_gate, const __nv_bfloat16* keys,

@@ -155,7 +155,7 @@ struct BatchDecodeBinding {
     ExactGqaWorkspace scores;
     Mxfp8PageTable pages;
     std::array<Mxfp8KvCache, full_attention_layers> caches;
-    std::array<TextGdnState, gdn_layers> states;
+    GdnReplayBank gdn_replay;
     TextModelStateRow final_state;
 };
 
@@ -244,7 +244,8 @@ struct Decoder::Model {
                        decoder::MtpDraftRequest* draft = nullptr, int prompt_remaining = 0,
                        const decoder::MediaPrefill* media = nullptr,
                        const decoder::PromptLogprobCapture* scores = nullptr,
-                       int logical_capacity = 0) const;
+                       int logical_capacity = 0,
+                       const decoder::PrefillGrant* checkpoint_grant = nullptr) const;
     void prefill_grants(const decoder::PrefillGrant* grants, int count, cudaStream_t stream,
                         DecoderBatchStepStats& stats) const;
     

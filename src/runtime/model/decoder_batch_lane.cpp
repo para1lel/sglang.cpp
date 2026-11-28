@@ -15,19 +15,15 @@ int Lane::remaining_output() const { return progress.remaining_output(options); 
 
 int Lane::capacity() const { return RequestProgress::capacity(prompt_size, options); }
 
-int Lane::checkpoint_room() const {
-    constexpr int interval = decoder_batch_prefix_checkpoint_interval;
-    return interval - progress.position % interval;
+int Lane::prefill_rows() const {
+    if (!checkpoints())
+        return remaining_prompt();
+    constexpr int grant_rows = 8192;
+    return std::min(remaining_prompt(), grant_rows - (progress.position % grant_rows));
 }
 
-int Lane::prefill_rows(bool checkpoints) const {
-    return checkpoints ? std::min(remaining_prompt(), checkpoint_room()) : remaining_prompt();
-}
-
-int Lane::proposals(bool checkpoints) const {
-    const int available = checkpoints ? std::min(remaining_output(), checkpoint_room())
-                                      : remaining_output();
-    return std::min(options.mtp_steps, available - 1);
+int Lane::proposals() const {
+    return std::min(options.mtp_steps, remaining_output() - 1);
 }
 
 ForwardLane Lane::input() const {
@@ -54,48 +50,50 @@ void Lane::record_decode_input(cudaStream_t stream) {
 }
 
 void Lane::finish_round(MtpRound& round, DecoderBatchStep& result, cudaStream_t stream,
-                  SerialOutput* output, const MtpRound::Cancel& cancel,
-                  MtpDraftInput* repair, const Workspace** committed_row,
-                  TextGdnReplayBatch* gdn_batch) {
+                        SerialOutput* output, const MtpRound::Cancel& cancel, MtpDraftInput* repair,
+                        const Workspace** committed_row) {
     result.mtp_drafted_tokens = round.drafted;
     result.mtp_verified_rows = round.rows();
     try {
         const bool scored = round.target->needs_generated_logprobs();
         const int stop = options.text_stop && (!cancel || !cancel())
             ? round.text_stop_after(options, progress) : 0;
-        const bool completed = round.commit([&](int token, const Bf16* logits, bool accepted,
-                                                int row) {
-            if (!result.token) {
-                result.token = token;
-                if (scored) result.generated_logprobs = round.target->generated_logprobs(row);
-            } else {
-                const int index = result.extra_token_count++;
-                result.extra_tokens[index] = token;
-                if (scored) {
-                    result.extra_generated_logprobs[index] =
-                        round.target->generated_logprobs(row);
+        const bool completed = round.commit(
+            [&](int token, const Bf16* logits, bool accepted, int row) {
+                if (!result.token) {
+                    result.token = token;
+                    if (scored)
+                        result.generated_logprobs = round.target->generated_logprobs(row);
+                } else {
+                    const int index = result.extra_token_count++;
+                    result.extra_tokens[index] = token;
+                    if (scored) {
+                        result.extra_generated_logprobs[index] =
+                            round.target->generated_logprobs(row);
+                    }
                 }
-            }
-            result.mtp_accepted_tokens += accepted;
-            result.finish_reason = progress.commit(options, token, logits, output);
-            if (row + 1 == stop && result.finish_reason != DecoderFinishReason::cancelled)
-                result.finish_reason = DecoderFinishReason::stop;
-            return !result.finish_reason;
-        }, stream, cancel, repair, committed_row, gdn_batch);
+                result.mtp_accepted_tokens += accepted;
+                result.finish_reason = progress.commit(options, token, logits, output);
+                if (row + 1 == stop && result.finish_reason != DecoderFinishReason::cancelled)
+                    result.finish_reason = DecoderFinishReason::stop;
+                return !result.finish_reason;
+            },
+            stream, cancel, repair, committed_row);
         if (!completed) {
             result.finish_reason = DecoderFinishReason::cancelled;
         }
     } catch (const DecoderSamplingError&) {
+        round.target->commit(round.consumed);
         result.sampling_failed = true;
         return;
     } catch (const DecoderConstraintError&) {
+        round.target->commit(round.consumed);
         result.constraint_failed = true;
         return;
     }
     if (result.extra_token_count != 0) {
         result.extra_token = result.extra_tokens.front();
     }
-    result.mtp_replayed_rows = round.consumed < round.rows() ? round.consumed : 0;
     progress.advance(round.consumed);
     if (committed_row) {
         prompt.insert(prompt.end(), round.tokens.begin(),

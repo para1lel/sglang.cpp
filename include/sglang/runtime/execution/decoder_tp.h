@@ -6,7 +6,6 @@
 #include "sglang/decoder_mtp.h"
 #include "sglang/decoder_prefill.h"
 #include "sglang/runtime/cache/prefix_cache_layout.h"
-#include "sglang/text/gdn/gdn_replay_batch.h"
 #include "sglang/runtime/model/decoder_batch_checkpoint.h"
 #include "sglang/runtime/model/decoder_batch_lane.h"
 
@@ -55,19 +54,10 @@ struct DecoderBatch::TpDriver {
                 const decoder::TcVocabScratch* vocabulary, bool capture,
                 bool allow_peer_repair) const;
     void commit_peer_round(decoder::Lane& lane, const decoder::MtpRound& round,
-                           const decoder::Workspace* const* saved,
-                           TextGdnReplayBatch* gdn_batch = nullptr) const;
-    TextGdnReplayBatch* prepare_peer_gdn_replays() const;
-    void finish_peer_gdn_replays() const;
-
-    void store_peer_checkpoint(decoder::Lane& lane, int end, int generated, int count,
-                               bool terminal, const std::shared_ptr<void>& reservation,
-                               const std::shared_ptr<std::atomic_uint64_t>& acknowledged) const;
+                           const decoder::Workspace* const* saved) const;
 
     const Decoder::Model& model;
     Decoder::TpRuntime& tp;
-    mutable TextGdnReplayBatch peer_replays;
-    mutable bool peer_replays_broken = false;
     std::unique_ptr<decoder::PeerDraftRepair> peer_repair;
     bool peer_repair_prepared = false;
 };

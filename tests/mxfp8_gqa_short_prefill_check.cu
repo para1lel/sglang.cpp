@@ -5,10 +5,13 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstddef>
 #include <cstdio>
 #include <cstdint>
+#include <cstring>
 #include <stdexcept>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -171,6 +174,62 @@ void check_mixed_staged_heads(cudaStream_t stream) {
 }
 
 namespace gqa_test {
+
+std::vector<Bf16> make_queries(int start_token, int count);
+
+void check_tiled_prefill_scales(cudaStream_t stream) {
+    constexpr int rows = 2;
+    constexpr int first = mxfp8_page_size - 1;
+    constexpr int physical_pages = 18;
+    constexpr auto page_payload = mxfp8_payload_bytes_per_page;
+    constexpr auto page_scales = mxfp8_scale_bytes_per_page;
+    constexpr auto elements = std::size_t{rows} * channels;
+    const DeviceBuffer<std::int32_t> mapping(2);
+    constexpr std::array<std::int32_t, 2> host_mapping{1, 0};
+    check(cudaMemcpyAsync(mapping.data, host_mapping.data(), sizeof(host_mapping),
+                          cudaMemcpyHostToDevice, stream));
+    const DeviceBuffer<std::uint8_t> keys(physical_pages * page_payload);
+    const DeviceBuffer<std::uint8_t> values(physical_pages * page_payload);
+    const DeviceBuffer<std::uint8_t> key_scales(physical_pages * page_scales);
+    const DeviceBuffer<std::uint8_t> value_scales(physical_pages * page_scales);
+    const Mxfp8KvCache cache{
+        keys.data, values.data, key_scales.data, value_scales.data, physical_pages,
+    };
+    const Mxfp8PageTable pages{mapping.data, 2};
+    const DeviceBuffer<Bf16> queries(elements);
+    const DeviceBuffer<Bf16> direct(elements);
+    const DeviceBuffer<Bf16> tiled(elements);
+    const auto host_queries = make_queries(first, rows);
+    check(cudaMemcpyAsync(queries.data, host_queries.data(), elements * sizeof(Bf16),
+                          cudaMemcpyHostToDevice, stream));
+    check(cudaMemsetAsync(keys.data, 0, 2 * page_payload, stream));
+    check(cudaMemsetAsync(key_scales.data, 127, 2 * page_scales, stream));
+    std::vector<Bf16> expected(elements);
+    std::vector<Bf16> actual(elements);
+    for (const auto [exponent, payload] : {std::pair{0, 0x38U}, std::pair{255, 0x01U}}) {
+        check(
+            cudaMemsetAsync(values.data, static_cast<int>(payload | 0x80U), page_payload, stream));
+        check(cudaMemsetAsync(values.data + page_payload, static_cast<int>(payload), page_payload,
+                              stream));
+        check(cudaMemsetAsync(value_scales.data, exponent, 2 * page_scales, stream));
+        check(mxfp8_gqa_attention(cache, pages, first + rows, first, rows, queries.data,
+                                  direct.data, stream));
+        check(decoder::tensor_core_prefill_gqa(cache, pages, first, rows, queries.data, tiled.data,
+                                               stream));
+        check(cudaMemcpyAsync(expected.data(), direct.data, elements * sizeof(Bf16),
+                              cudaMemcpyDeviceToHost, stream));
+        check(cudaMemcpyAsync(actual.data(), tiled.data, elements * sizeof(Bf16),
+                              cudaMemcpyDeviceToHost, stream));
+        check(cudaStreamSynchronize(stream));
+        const float first_value = __bfloat162float(expected.front());
+        if (!std::isfinite(first_value) || first_value <= 0.0F ||
+            std::memcmp(actual.data(), expected.data(), elements * sizeof(Bf16)) != 0) {
+            throw std::runtime_error("Tiled prefill scale mismatch at exponent " +
+                                     std::to_string(exponent));
+        }
+    }
+    std::puts("Tiled prefill scales match across a remapped page boundary");
+}
 
 void check_short_prefill_replay(cudaStream_t stream) {
     DeviceBuffer<std::uint8_t> keys(payload_bytes), values(payload_bytes);

@@ -32,9 +32,9 @@ StepPlan plan_step(const BatchStorage& storage, const Selection& selected, int l
     for (int slot = 0; slot < lanes; ++slot) {
         const auto& lane = storage.slots[slot];
         if (!selected[slot] || !lane || !lane->request || lane->restored_prompt) continue;
-        work[slot] = lane->remaining_prompt()
-            ? BudgetLane{chunked ? lane->prefill_rows(lane->checkpoints()) : 1}
-            : BudgetLane{0, std::max(0, lane->proposals(lane->checkpoints())), true};
+        const bool prefill = lane->remaining_prompt() != 0;
+        work[slot] = prefill ? BudgetLane{chunked ? lane->prefill_rows() : 1}
+                             : BudgetLane{0, std::max(0, lane->proposals()), true};
         if (wide && work[slot].decode && lane->draft && lane->remaining_output() > 1) {
             const auto bit = std::uint32_t{1} << slot;
             wide->speculative |= bit;
@@ -141,21 +141,6 @@ void DecoderBatch::State::disable() noexcept {
     storage->slots = {};
     storage->decode_graphs = {};
     storage->verification_graph.reset();
-}
-
-TextGdnReplayBatch* DecoderBatch::State::prepare_gdn_replays() {
-    static const bool batch_disabled =
-        std::getenv("SGLANG_DISABLE_GDN_REPLAY_BATCH") != nullptr;
-    if (batch_disabled || gdn_replays_broken) return nullptr;
-    if (gdn_replays.capacity() == 0) {
-        DeviceScope device(model.device);
-        if (!gdn_replays.reserve(decoder::gdn_layers * decoder::max_wide_mtp_lanes)) {
-            gdn_replays_broken = true;
-            return nullptr;
-        }
-    }
-    gdn_replays.reset();
-    return &gdn_replays;
 }
 
 const MtpRound::Cancel& DecoderBatch::State::cancel_probe() const {

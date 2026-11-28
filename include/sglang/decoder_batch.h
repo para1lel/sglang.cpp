@@ -16,7 +16,6 @@ inline constexpr int decoder_batch_max_step_tokens = 32768;
 inline constexpr int decoder_batch_max_graph_lanes = 4;
 inline constexpr int decoder_batch_max_mtp_lanes = 4;
 inline constexpr int decoder_batch_max_mtp_steps = decoder_max_mtp_steps;
-inline constexpr int decoder_batch_prefix_checkpoint_interval = 8192;
 inline constexpr int decoder_batch_prefix_max_tokens =
     decoder::QwenTextModel::max_position_embeddings;
 
@@ -87,6 +86,12 @@ struct DecoderPrefixCacheStats {
     std::uint64_t gqa_restored_tokens = 0;
     std::uint64_t gqa_read_only_tokens = 0;
     std::uint64_t gqa_computed_tokens = 0;
+    std::uint64_t gqa_matched_tokens = 0;
+    std::uint64_t gdn_matched_tokens = 0;
+    std::uint64_t prefill_checkpoints_planned = 0;
+    std::uint64_t prefill_checkpoints_resident = 0;
+    std::uint64_t prefill_checkpoints_published = 0;
+    std::uint64_t prefill_checkpoints_declined = 0;
 };
 
 class DecoderBatch {

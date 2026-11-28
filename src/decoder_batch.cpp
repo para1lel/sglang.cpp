@@ -93,6 +93,11 @@ void DecoderBatch::State::initialize(Lane& lane, int slot) {
         tp_driver->initialize_peer(lane, request_capacity, resident_limit);
     }
     auto read = std::exchange(lane.options.prefix_cache_read, {});
+    lane.prefill_lookup = read;
+    if (read) {
+        prefix_stats.gqa_matched_tokens += read->matched_gqa;
+        prefix_stats.gdn_matched_tokens += read->matched_gdn;
+    }
     if (lane.resident_bytes) {
         if (const int rows = reserved_verification_rows(opts.max_new_tokens, opts.mtp_steps)) {
             const auto& winners = storage->verification_winners;
@@ -280,10 +285,15 @@ void DecoderBatch::State::submit(const Selection& selected, const PrefillRows& d
                                  CheckpointRows* checkpoint_rows,
                                  const WideMtpGroups& wide_groups) {
     StepLanes lanes;
-    const int max_rows =
-        *std::max_element(stats.prefill_rows.begin(), stats.prefill_rows.end());
+    const auto checkpoints = prepare_prefill_checkpoints(stats.prefill_rows);
+    const int max_rows = *std::max_element(stats.prefill_rows.begin(), stats.prefill_rows.end());
+    if (max_rows == 0 && checkpoints.blocked_pool != nullptr &&
+        std::none_of(decode.begin(), decode.end(), [](int rows) { return rows != 0; })) {
+        checkpoints.blocked_pool->wait_available(checkpoints.blocked_capacity,
+                                                 checkpoints.blocked_count);
+    }
     collect_step_lanes(selected, stats.prefill_rows, decode, results, checkpoint_rows, lanes);
-    dispatch_step_lanes(lanes, max_rows, results, stats, checkpoint_rows, wide_groups);
+    dispatch_step_lanes(lanes, max_rows, results, stats, checkpoint_rows, wide_groups, checkpoints);
     contains_mtp = lanes.contains_mtp;
 }
 
@@ -303,8 +313,9 @@ void DecoderBatch::State::collect_step_lanes(const Selection& selected, const Pr
             continue;
         }
         const int remaining = lane.remaining_prompt();
-        const int decode_rows = options.max_num_batched_tokens || remaining
-            ? decode[slot] : lane.proposals(lane.checkpoints()) + 1;
+        const int decode_rows = options.max_num_batched_tokens != 0 || remaining != 0
+                                    ? decode[slot]
+                                    : lane.proposals() + 1;
         if (rows[slot] == 0 && decode_rows == 0) {
             continue;
         }
@@ -358,7 +369,8 @@ void DecoderBatch::State::collect_step_lanes(const Selection& selected, const Pr
 void DecoderBatch::State::dispatch_step_lanes(StepLanes& lanes, int max_rows, Steps& results,
                                               DecoderBatchStepStats& stats,
                                               CheckpointRows* checkpoint_rows,
-                                              const WideMtpGroups& wide_groups) {
+                                              const WideMtpGroups& wide_groups,
+                                              const PrefillCheckpointBatch& checkpoints) {
     const auto stream = execution.stream();
     auto& slots = storage->slots;
     const auto& policy = model.execution;
@@ -377,7 +389,8 @@ void DecoderBatch::State::dispatch_step_lanes(StepLanes& lanes, int max_rows, St
         if (lanes.single_count)
             model.forward(lanes.single_prefill.data(), lanes.single_count, stream);
     }
-    if (max_rows) prefill(stats.prefill_rows, stats);
+    if (max_rows != 0)
+        prefill(stats.prefill_rows, stats, checkpoints);
     bool submitted = lanes.count != 0 || max_rows != 0;
     for (int slot = 0; slot < decoder_batch_max_lanes; ++slot) {
         if (auto* request = lanes.scoring[slot]) {
@@ -408,12 +421,14 @@ void DecoderBatch::State::dispatch_step_lanes(StepLanes& lanes, int max_rows, St
     collect_scores(lanes.scoring, results);
 }
 
-void DecoderBatch::State::prefill(const PrefillRows& rows, DecoderBatchStepStats& stats) {
+void DecoderBatch::State::prefill(const PrefillRows& rows, DecoderBatchStepStats& stats,
+                                  const PrefillCheckpointBatch& checkpoints) {
     const auto stream = execution.stream();
     const int limit = model.execution.prefill_limit();
     std::array<PrefillGrant, decoder_batch_max_lanes> grants;
     std::array<PrefillGrant, decoder_batch_max_lanes> peer_grants;
     std::array<PromptLogprobCapture, decoder_batch_max_lanes> captures;
+    std::array<std::function<void(int)>, decoder_batch_max_lanes> publish;
     int count = 0;
     for (int slot = 0; slot < decoder_batch_max_lanes; ++slot) {
         if (rows[slot] == 0) continue;
@@ -429,10 +444,21 @@ void DecoderBatch::State::prefill(const PrefillRows& rows, DecoderBatchStepStats
                          tile_rows, lane.remaining_prompt(), lane.draft.get(),
                          lane.media ? &lane.media_prefill : nullptr,
                          lane.options.score_prompt ? &captures[count] : nullptr};
+        if (const int endpoints = checkpoints.counts[slot]) {
+            publish[count] = [this, &lane, &checkpoints, slot](int end) {
+                publish_prefill_checkpoint_at(lane, checkpoints, slot, end);
+            };
+            grants[count].checkpoint = &publish[count];
+            grants[count].checkpoints = {checkpoints.local[slot].data(), endpoints};
+        }
         if (tp_driver) {
             peer_grants[count] = {lane.peer_request.get(), lane.prompt.data() + position,
                                   position, rows[slot], tile_rows, lane.remaining_prompt(),
                                   nullptr, nullptr, nullptr};
+            peer_grants[count].checkpoints = {
+                checkpoints.peer[slot].data(),
+                checkpoints.counts[slot],
+            };
         }
         ++count;
     }
@@ -664,9 +690,6 @@ void DecoderBatch::State::speculate_group(const PrefillRows& verification_rows, 
         std::array<DraftRepairs, draft_projection_rows> packet_repairs;
         auto* repairs = deferred ? deferred : packet_repairs.data();
         if (!deferred) std::fill_n(repairs, size, DraftRepairs{});
-        TextGdnReplayBatch* gdn_batch = prepare_gdn_replays();
-        TextGdnReplayBatch* peer_gdn_batch =
-            tp_driver ? tp_driver->prepare_peer_gdn_replays() : nullptr;
         for (int index = 0; index < size; ++index) {
             auto& round = rounds[first + index];
             const int slot = slots[first + index];
@@ -675,15 +698,11 @@ void DecoderBatch::State::speculate_group(const PrefillRows& verification_rows, 
             auto& lane = *storage->slots[slot];
             const auto saved = checkpoint_rows && lane.checkpoints() ? &(*checkpoint_rows)[slot]
                                                                      : nullptr;
-            lane.finish_round(round, results[slot], stream, output, cancel, repair, saved,
-                              gdn_batch);
-            if (tp_driver) tp_driver->commit_peer_round(lane, round, saved, peer_gdn_batch);
+            lane.finish_round(round, results[slot], stream, output, cancel, repair, saved);
+            if (tp_driver)
+                tp_driver->commit_peer_round(lane, round, saved);
         }
         if (!deferred) repair_verification_group(repairs, size, stream);
-        if (gdn_batch) {
-            check(gdn_batch->launch(tp != nullptr, stream), "Batched GDN prefix replay");
-        }
-        if (tp_driver) tp_driver->finish_peer_gdn_replays();
         stats.verification_lanes += size;
     };
     const bool full = count > packet &&
@@ -723,8 +742,11 @@ Steps DecoderBatch::State::advance(const Selection& requested, bool chunked,
         auto& slots = storage->slots;
         auto selected = requested;
         for (int slot = 0; slot < options.max_lanes; ++slot) {
-            const auto& lane = slots[slot];
+            auto& lane = slots[slot];
             if (lane && (lane->prefix || lane->prefix_store)) selected[slot] = false;
+            if (selected[slot] && lane && lane->remaining_prompt() != 0 && lane->checkpoints() &&
+                lane->prefill_endpoint_count < 0)
+                plan_prefill_checkpoints(*lane);
         }
         CheckpointRows checkpoint_rows{};
         Steps results{};

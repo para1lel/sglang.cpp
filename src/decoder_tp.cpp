@@ -7,7 +7,6 @@
 #include "sglang/runtime/backend/tensor_parallel.h"
 
 #include <utility>
-#include <cstdlib>
 
 namespace sglang {
 namespace decoder {
@@ -99,6 +98,9 @@ void DecoderBatch::TpDriver::register_prefix_restore(
 void DecoderBatch::TpDriver::finish_peer_restore(decoder::Lane& lane) const {
     if (!lane.peer_prefix) return;
     decoder::DeviceScope peer(tp.peer_device);
+    if (lane.peer_prefix->command.attention_only_restore &&
+        *lane.peer_prefix->command.attention_only_restore)
+        lane.peer_request->reset(tp.peer_stream);
     decoder::commit_restored_prefix(*lane.peer_request, lane.peer_prefix->command, nullptr);
 }
 
@@ -192,60 +194,14 @@ void DecoderBatch::TpDriver::verify(decoder::MtpRound* rounds, decoder::MtpRound
                               peer_packed, logprob_workspace, capture, repair);
 }
 
-TextGdnReplayBatch* DecoderBatch::TpDriver::prepare_peer_gdn_replays() const {
-    
-    
-    
-    
-    static const bool batch_disabled =
-        std::getenv("SGLANG_DISABLE_GDN_REPLAY_BATCH") != nullptr;
-    if (batch_disabled || peer_replays_broken) return nullptr;
-    if (peer_replays.capacity() == 0) {
-        decoder::DeviceScope peer(tp.peer_device);
-        if (!peer_replays.reserve(decoder::gdn_layers * decoder::max_wide_mtp_lanes)) {
-            peer_replays_broken = true;
-            return nullptr;
-        }
-    }
-    peer_replays.reset();
-    return &peer_replays;
-}
-
-void DecoderBatch::TpDriver::finish_peer_gdn_replays() const {
-    if (peer_replays_broken || peer_replays.size() == 0) return;
+void DecoderBatch::TpDriver::commit_peer_round(decoder::Lane& lane, const decoder::MtpRound& round,
+                                               const decoder::Workspace* const* saved) const {
+    if (!lane.peer_verification)
+        return;
     decoder::DeviceScope peer(tp.peer_device);
-    decoder::check(peer_replays.launch(true, tp.peer_stream), "Batched peer GDN prefix replay");
-}
-
-void DecoderBatch::TpDriver::commit_peer_round(decoder::Lane& lane,
-                                               const decoder::MtpRound& round,
-                                               const decoder::Workspace* const* saved,
-                                               TextGdnReplayBatch* gdn_batch) const {
-    if (!lane.peer_verification) return;
-    decoder::DeviceScope peer(tp.peer_device);
-    lane.peer_verification->commit(round.consumed, gdn_batch);
-    if (saved && *saved != &lane.request->work) {
-        
-        
+    lane.peer_verification->commit(round.consumed);
+    if (saved != nullptr && *saved != nullptr && *saved != &lane.request->work) {
         lane.peer_checkpoint_row = lane.peer_verification->checkpoint_row(round.consumed - 1);
     }
 }
-
-void DecoderBatch::TpDriver::store_peer_checkpoint(
-    decoder::Lane& lane, int end, int generated, int count, bool terminal,
-    const std::shared_ptr<void>& reservation,
-    const std::shared_ptr<std::atomic_uint64_t>& acknowledged) const {
-    if (!lane.peer_request) return;
-    
-    
-    decoder::DeviceScope peer(tp.peer_device);
-    auto peer_view =
-        decoder::export_prefix_view(*lane.peer_request, 0, 0, end, tp.peer_stream, nullptr,
-                                    lane.peer_checkpoint_row, terminal,
-                                    &decoder::tp2_prefix_layouts()[1]);
-    lane.options.store_prefix(std::move(peer_view),
-                              count ? lane.prompt.data() + generated : nullptr, count,
-                              reservation, acknowledged);
-}
-
 }

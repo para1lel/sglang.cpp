@@ -20,7 +20,7 @@ for name in state graph; do
         wrap=(-Wl,--wrap="$append" -Wl,--wrap=cudaMemcpyAsync -Wl,--wrap=cudaFreeAsync
               -Wl,--wrap=cudaFree -Wl,--wrap=cudaMalloc -Wl,--wrap=cudaEventRecord
               -Wl,--wrap=cudaStreamSynchronize -Wl,--wrap=cudaGetErrorString)
-        extra_sources=(apps/server/batch_cache.cpp src/runtime/cache/lmcache_group.cpp
+        extra_sources=(apps/server/batch_cache.cpp
                        src/runtime/server/{batch_restore_join,cache_identity}.cpp)
     else
         extra_sources=(apps/server/detail/batch_state.cpp)
@@ -28,7 +28,7 @@ for name in state graph; do
     "${CXX:-c++}" -std=c++17 -O3 -pthread -ffunction-sections -fdata-sections \
         -Iinclude -I"$toolkit/include" \
         "tests/prefix/lmcache_$name.cpp" tests/prefix/prefix_fixture.cpp \
-        src/runtime/cache/{lmcache_client,lmcache_prefix}.cpp "${extra_sources[@]}" \
+        src/runtime/cache/{lmcache_client,lmcache_group,lmcache_prefix}.cpp "${extra_sources[@]}" \
         -L"$build/lib" -L"$toolkit/lib" -L"$toolkit/lib/stubs" -L"$prefix/lib64" \
         -Wl,-rpath,"$prefix/lib" -Wl,-rpath,"$toolkit/lib" -Wl,-rpath,"$prefix/lib64" \
         "${wrap[@]}" -Wl,--start-group -lsglang_decoder -lsglang_checkpoint -lsglang_cuda \

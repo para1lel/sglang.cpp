@@ -9,6 +9,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdio>
+#include <iostream>
 #include <mutex>
 #include <optional>
 #include <utility>
@@ -193,7 +194,7 @@ struct Allocations::State {
     cudaStream_t stream = nullptr;
     cudaGraph_t capture = nullptr;
     cudaGraphExec_t graph = nullptr;
-    std::array<BatchGraph, decoder_batch_max_graph_lanes + 1> batch_graphs{};
+    std::array<BatchGraph, decoder_batch_max_graph_lanes + text_gdn_max_verify_rows> batch_graphs{};
     bool verification_graph_incomplete = false;
     bool uncertain_stream = false;
     bool uncertain_graph = false;
@@ -542,7 +543,7 @@ void Allocations::capture_graph(const std::function<void()>& enqueue) {
 bool Allocations::replay_batch_graph(int width, const std::function<void()>& prepare,
                                      const std::function<void()>& capture_nodes,
                                      const std::function<bool()>& bind, bool target_verify) {
-    const int index = target_verify ? decoder_batch_max_graph_lanes : width - 1;
+    const int index = (target_verify ? decoder_batch_max_graph_lanes : 0) + width - 1;
     return replay_graph_slot(index, width, prepare, capture_nodes, bind, target_verify);
 }
 
@@ -571,9 +572,9 @@ bool Allocations::replay_graph_slot(int index, int width, const std::function<vo
         if (target_verify) {
             state_->verification_graph_incomplete = false;
         }
-        std::fprintf(stderr, "sglang decoder: %s at width %d: %s, using eager %s\n",
-                     operation, width, cudaGetErrorString(rejected),
-                     target_verify ? "K1 target verification" : "batch decode");
+        std::cerr << "sglang decoder: " << operation << " at width " << width << ": "
+                  << cudaGetErrorString(rejected) << ", using eager "
+                  << (target_verify ? "target verification" : "batch decode") << '\n';
         return false;
     };
     if (!batch.executable) {

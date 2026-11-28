@@ -178,6 +178,7 @@ void prefill_group_gdn(const Chunk& chunk, const GdnLayer& layer, int bank,
     const auto& buffers = chunk.work;
     const auto& dims = buffers.dims;
     GdnPrefillSegment segments[max_gdn_prefill_segments]{};
+    std::array<GdnPrefillCheckpoints, max_gdn_prefill_segments> captures;
     bool grouped_recurrence = count > 1;
     int index = 0;
     for (int lane = 0, row = offset; lane < count; row += grants[lane++].rows) {
@@ -189,16 +190,25 @@ void prefill_group_gdn(const Chunk& chunk, const GdnLayer& layer, int bank,
         };
         grouped_recurrence = grouped_recurrence &&
             grant.rows % layerwise_row_alignment == 0 && (grant.position != 0 || bank != 0);
-        segments[index++] = {
-            grant.rows, segment.gdn_qkv, segment.gdn_z, segment.gdn_b, segment.gdn_a,
+        captures[index] = GdnPrefillCheckpoints(grant, bank);
+        const auto scratch_offset = dims.is_local_gdn() ? text_gdn_local_workspace_bytes(row)
+                                                        : text_gdn_workspace_bytes(row);
+        segments[index] = {
+            grant.rows,
+            segment.gdn_qkv,
+            segment.gdn_z,
+            segment.gdn_b,
+            segment.gdn_a,
             grant.request->states[bank],
-            buffers.gdn_scratch +
-                (dims.is_local_gdn() ? text_gdn_local_workspace_bytes(row)
-                                     : text_gdn_workspace_bytes(row)) / sizeof(Bf16),
-            reinterpret_cast<float2*>(segment.keys), fp8,
+            reinterpret_cast<Bf16*>(reinterpret_cast<std::byte*>(buffers.gdn_scratch) +
+                                    scratch_offset),
+            reinterpret_cast<float2*>(segment.keys),
+            fp8,
             buffers.mlp_gate + row * dims.intermediate,
             std::size_t(grant.rows) * dims.intermediate * sizeof(Bf16),
+            captures[index].view(),
         };
+        ++index;
     }
     const auto status = grouped_recurrence
         ? (dims.is_local_gdn()
@@ -217,8 +227,8 @@ void prefill_group_gdn(const Chunk& chunk, const GdnLayer& layer, int bank,
     for (int lane = 0, row = offset; lane < count; row += grants[lane++].rows) {
         const auto& grant = grants[lane];
         const auto& segment = segments[index++];
-        prefill_attention_segment(chunk, grant, row).gdn_recur(
-            layer, segment.state, bank, segment.output);
+        prefill_attention_segment(chunk, grant, row)
+            .gdn_recur(layer, segment.state, bank, segment.output, segment.checkpoints);
     }
 }
 
@@ -268,7 +278,9 @@ void prefill_partial_gdn(const Chunk& chunk, const GdnLayer& layer, int bank,
             const bool ordered_first = bank == 0 && first.position == 0;
             if (ordered_first) {
                 const auto segment = prefill_attention_segment(chunk, first, row);
-                segment.gdn_recur(layer, first.request->states[bank], bank, activation);
+                const GdnPrefillCheckpoints captures(first, bank);
+                segment.gdn_recur(layer, first.request->states[bank], bank, activation,
+                                  captures.view());
             }
             const int start = ordered_first ? 1 : 0;
             const int offset = row + start * batch_prefill_tile_rows;
@@ -279,7 +291,8 @@ void prefill_partial_gdn(const Chunk& chunk, const GdnLayer& layer, int bank,
                 activation.values + std::size_t(offset) * dims.gdn_value_width,
                 activation.scales + std::size_t(offset) * dims.gdn_heads,
             };
-            segment.gdn_recur(layer, first.request->states[bank], bank, quantized);
+            const GdnPrefillCheckpoints captures(combined, bank);
+            segment.gdn_recur(layer, first.request->states[bank], bank, quantized, captures.view());
         } else {
             for (int step = 0; step < run; ++step) {
                 const auto segment =
@@ -288,8 +301,10 @@ void prefill_partial_gdn(const Chunk& chunk, const GdnLayer& layer, int bank,
                     activation.values + std::size_t(row) * dims.gdn_value_width,
                     activation.scales + std::size_t(row) * dims.gdn_heads,
                 };
-                segment.gdn_recur(layer, grants[index + step].request->states[bank], bank,
-                                  quantized);
+                const auto& grant = grants[index + step];
+                const GdnPrefillCheckpoints captures(grant, bank);
+                segment.gdn_recur(layer, grant.request->states[bank], bank, quantized,
+                                  captures.view());
                 row += grants[index + step].rows;
             }
             index += run;

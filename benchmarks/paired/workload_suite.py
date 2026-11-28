@@ -13,7 +13,14 @@ LMCACHE_PROTOCOL = "matched-k4-native-defaults-lmcache-v6"
 LMCACHE_GPU_PROTOCOL = "matched-k4-native-defaults-lmcache-slc2"
 LMCACHE_GPU_SLC3_PROTOCOL = "matched-k4-native-defaults-lmcache-slc3"
 LMCACHE_DRAIN_PROTOCOL = "matched-k4-native-defaults-lmcache-slc3-drain"
-LMCACHE_SLC3_PROTOCOLS = (LMCACHE_GPU_SLC3_PROTOCOL, LMCACHE_DRAIN_PROTOCOL)
+LMCACHE_DRAIN_ALIGNED_PROTOCOL = "matched-k4-native-defaults-lmcache-slc3-drain-aligned"
+LMCACHE_DRAIN_SUFFIX_PROTOCOL = "matched-k4-native-defaults-lmcache-slc3-drain-suffix"
+LMCACHE_SLC3_PROTOCOLS = (
+    LMCACHE_GPU_SLC3_PROTOCOL,
+    LMCACHE_DRAIN_PROTOCOL,
+    LMCACHE_DRAIN_ALIGNED_PROTOCOL,
+    LMCACHE_DRAIN_SUFFIX_PROTOCOL,
+)
 LMCACHE_GPU_PROTOCOLS = (LMCACHE_GPU_PROTOCOL, *LMCACHE_SLC3_PROTOCOLS)
 LMCACHE_PROTOCOLS = (LMCACHE_PROTOCOL, *LMCACHE_GPU_PROTOCOLS)
 WIDE_BUDGET_PROTOCOLS = (PROTOCOL_V4, PROTOCOL_V5, *LMCACHE_PROTOCOLS)
@@ -21,6 +28,7 @@ WORKLOAD_PROTOCOLS = (PROTOCOL, *WIDE_BUDGET_PROTOCOLS)
 V4_TOKEN_BUDGET = 32768
 LMCACHE_VERSION = "0.5.8"
 LMCACHE_SLC3_READY = "0.5.8+native-v3"
+LMCACHE_NATIVE_READY = "0.5.8+native-v4"
 ROWS = {
     "W1": (128, 128, 1),
     "W2": (2048, 512, 1),
@@ -64,9 +72,16 @@ def validate_identity(identity):
                 and identity.get("sampling") == "single-round-v1",
                 "LMCache campaign requires the pinned daemon and single-round sampling")
     if identity["protocol"] in LMCACHE_SLC3_PROTOCOLS:
-        require(identity.get("lmcache_wire") == "SLC3"
-                and identity.get("lmcache_ready_version") == LMCACHE_SLC3_READY,
-                "SLC3 campaign requires the native-v3 readiness identity")
+        expected = (
+            LMCACHE_NATIVE_READY
+            if identity["protocol"] == LMCACHE_DRAIN_SUFFIX_PROTOCOL
+            else LMCACHE_SLC3_READY
+        )
+        require(
+            identity.get("lmcache_wire") == "SLC3"
+            and identity.get("lmcache_ready_version") == expected,
+            "SLC3 campaign requires the matching native readiness identity",
+        )
     if identity["protocol"] in LMCACHE_GPU_PROTOCOLS:
         require(type(identity.get("lmcache_capacity_bytes")) is int
                 and identity["lmcache_capacity_bytes"] == 64 << 30,

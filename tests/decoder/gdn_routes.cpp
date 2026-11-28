@@ -202,7 +202,9 @@ extern "C" cudaError_t __wrap_cudaLaunchKernel(const void* function, dim3 grid, 
             } else if (kernel.find("recur_warp") != kernel.npos) {
                 launches.push_back(Stage::chunked);
             }
-        } else if (kernel.find("gdn_recurILb1E") != kernel.npos) {
+        } else if ((kernel.find("gdn_recurI") != std::string_view::npos &&
+                    kernel.find("ELb1E") != std::string_view::npos) ||
+                   kernel.find("gdn_recur_prefill_checkpointsI") != std::string_view::npos) {
             launches.push_back(Stage::exact);
         }
     }

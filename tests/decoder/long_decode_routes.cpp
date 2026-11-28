@@ -580,25 +580,38 @@ void mtp_mixed(const char* checkpoint, const char* fixture) {
 }
 
 void serial_prefill(const char* checkpoint, const char* fixture) {
-    constexpr int prefix = decoder_batch_prefix_checkpoint_interval;
+    constexpr int seed_rows = 8320;
+    constexpr int prefix = seed_rows - 128;
     const Decoder decoder(checkpoint, 0, false);
     check(decoder.uses_b200_operators(), "Serial prefill route check requires a B200");
     DecoderBatch batch(decoder, {.max_lanes = 1});
     const auto cache = prefix_fixture::client();
     constexpr auto salt = "serial-prefill";
     const auto tokens = read_prompt(fixture);
-    check(tokens.size() >= prefix + 3, "Expected at least 8195 prompt IDs");
-    DecoderOptions options{.max_new_tokens = 2, .generated_top_logprobs = 2,
-                           .ignore_eos = true};
+    check(tokens.size() >= seed_rows, "Expected at least 8320 prompt IDs");
+    DecoderOptions options;
+    options.max_new_tokens = 2;
+    options.generated_top_logprobs = 2;
+    options.ignore_eos = true;
+    options.publish_prefix_checkpoints = false;
     const auto selected = select({0});
     DecoderOptions export_options{.max_new_tokens = 1, .ignore_eos = true};
-    const std::vector<int> cached(tokens.begin(), tokens.begin() + prefix);
+    const std::vector<int> cached(tokens.begin(), tokens.begin() + seed_rows);
     const auto stores = prefix_fixture::attach(export_options, cache, cached, salt);
     check(batch.admit(0, cached, export_options) == 0,
           "Unexpected initial prefix hit");
-    const auto terminal = batch.advance_chunked(selected)[0];
-    check(terminal.finish_reason && !terminal.prefix_pending, "Terminal store blocked completion");
+    for (int remaining = seed_rows; remaining > 0;) {
+        DecoderBatchStepStats stats;
+        const auto step = batch.advance_chunked(selected, &stats)[0];
+        const int rows = stats.prefill_rows[0];
+        check(rows > 0 && rows <= remaining, "Seed prefill did not advance to its endpoint");
+        remaining -= rows;
+        const bool finished = step.finish_reason == DecoderFinishReason::length;
+        check(finished == (remaining == 0) && !step.prefix_pending,
+              "Unexpected completion or deferred store during seed prefill");
+    }
     stores->wait();
+    prefix_fixture::read_checkpoint(cache, cached, salt, seed_rows);
     batch.release_retired_allocations();
     const auto tail = [&](int rows, bool without_arena, int* reads) {
         const std::vector<int> prompt(tokens.begin(), tokens.begin() + prefix + rows);
@@ -607,8 +620,8 @@ void serial_prefill(const char* checkpoint, const char* fixture) {
         prefix_fixture::attach(restore, cache, prompt, salt);
         check(batch.admit(0, prompt, restore) == 0,
               "Restore should complete asynchronously");
-        check(prefix_fixture::wait(batch, 0).restored == prefix,
-              "Missing restored 8192-token prefix");
+        const auto restored = prefix_fixture::wait(batch, 0).restored;
+        check(restored == prefix, "Missing restored interior prefix");
         serial_reads = reads;
         arena_failures = 0;
         reject_prefill_arena = without_arena;

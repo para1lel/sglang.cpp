@@ -1,5 +1,6 @@
 #include "sglang/decoder_cuda.cuh"
 #include "sglang/mxfp8_gqa.h"
+#include "sglang/text/gdn/replay_ssm.h"
 
 #include <algorithm>
 #include <array>
@@ -310,19 +311,41 @@ struct PagedSlot {
     }
 };
 
+namespace replay = sglang::gdn_replay_ssm;
 struct GdnBuffers {
-    DeviceBuffer<BFloat> history{sglang::text_gdn_qkv_width * sglang::text_gdn_history_taps};
-    DeviceBuffer<float> recurrent{sglang::text_gdn_value_width * sglang::text_gdn_head_dim};
-    DeviceBuffer<BFloat> output{sglang::text_gdn_value_width};
+    static constexpr auto history_size =
+        std::size_t{sglang::text_gdn_qkv_width} * sglang::text_gdn_history_taps;
+    static constexpr auto state_size =
+        std::size_t{sglang::text_gdn_value_width} * sglang::text_gdn_head_dim;
+    static constexpr std::size_t capacity = replay::capacity;
+    DeviceBuffer<BFloat> history{history_size}, materialized_history{history_size};
+    DeviceBuffer<float> recurrent{state_size}, materialized_recurrent{state_size};
+    DeviceBuffer<float> keys{capacity * sglang::text_gdn_qk_width};
+    DeviceBuffer<float> updates{capacity * sglang::text_gdn_value_width};
+    DeviceBuffer<float> decay{capacity * sglang::text_gdn_value_heads};
+    DeviceBuffer<BFloat> raw{capacity * sglang::text_gdn_qkv_width};
+    DeviceBuffer<replay::Cursor> cursor{1};
 
-    sglang::TextGdnState state() const {
-        return {history.get(), recurrent.get()};
+    replay::State state() const {
+        return {
+            {history.get(), recurrent.get()},
+            keys.get(),
+            updates.get(),
+            decay.get(),
+            raw.get(),
+            cursor.get(),
+        };
     }
 
     void initialize(cudaStream_t stream) {
         history.fill(0, stream);
         recurrent.fill(0, stream);
-        output.fill(attention_sentinel, stream);
+        cursor.fill(0, stream);
+    }
+    void materialize(cudaStream_t stream) const {
+        const sglang::TextGdnState target{materialized_history.get(), materialized_recurrent.get()};
+        check_cuda(replay::materialize(false, state(), target, stream),
+                   "Materialize rebound GDN state");
     }
 };
 
@@ -870,17 +893,19 @@ void check_ordered_prefill_score_overflow(cudaStream_t stream) {
 namespace gqa_test {
 void check_bound_gdn(cudaStream_t stream) {
     using namespace sglang;
-    const DeviceBuffer<BFloat> convolution(text_gdn_qkv_width * (text_gdn_history_taps + 1));
+    constexpr auto convolution_size = std::size_t{text_gdn_qkv_width} * (text_gdn_history_taps + 1);
+    const DeviceBuffer<BFloat> convolution(convolution_size);
     const DeviceBuffer<BFloat> head_weights(text_gdn_value_heads), norm(text_gdn_head_dim);
     const DeviceBuffer<BFloat> qkv(text_gdn_qkv_width), z(text_gdn_value_width);
     const DeviceBuffer<BFloat> gate(text_gdn_value_heads);
-    const DeviceBuffer<BFloat> scratch(text_gdn_workspace_bytes(1) / sizeof(BFloat));
+    const DeviceBuffer<BFloat> convolved(text_gdn_qkv_width);
+    const DeviceBuffer<BFloat> observable(text_gdn_value_width);
     const DeviceBuffer<BFloat> output(text_gdn_value_width);
-    const DeviceBuffer<TextGdnState> binding(1);
-    const std::vector<BFloat> convolution_values(
-        text_gdn_qkv_width * (text_gdn_history_taps + 1), __float2bfloat16_rn(0.25f));
-    const std::vector<BFloat> norm_values(text_gdn_head_dim, __float2bfloat16_rn(1.0f));
-    const std::vector<BFloat> z_values(text_gdn_value_width, __float2bfloat16_rn(0.5f));
+    const DeviceBuffer<BFloat> eager_output(text_gdn_value_width);
+    const DeviceBuffer<replay::State> binding(1);
+    const std::vector<BFloat> convolution_values(convolution_size, __float2bfloat16_rn(0.25F));
+    const std::vector<BFloat> norm_values(text_gdn_head_dim, __float2bfloat16_rn(1.0F));
+    const std::vector<BFloat> z_values(text_gdn_value_width, __float2bfloat16_rn(0.5F));
     convolution.upload(convolution_values.data(), stream);
     head_weights.fill(0, stream);
     gate.fill(0, stream);
@@ -893,80 +918,54 @@ void check_bound_gdn(cudaStream_t stream) {
         actual[lane].initialize(stream);
         eager[lane].initialize(stream);
     }
+    const replay::Lane bound{
+        {},           {qkv.get(), convolved.get(), gate.get(), gate.get()},
+        z.get(),      observable.get(),
+        output.get(), 1,
+        true,
+    };
     Graph graph;
-    graph.capture(stream, [&] {
-        return decoder::decode_gdn(qkv.get(), z.get(), gate.get(), gate.get(), weights,
-                                   binding.get(), scratch.get(), output.get(), stream);
-    });
+    graph.capture(stream,
+                  [&] { return replay::launch(false, bound, weights, stream, binding.get()); });
     for (int trial = 0; trial < 6; ++trial) {
         const int lane = trial % 2;
         std::vector<BFloat> input(text_gdn_qkv_width);
         for (int index = 0; index < text_gdn_qkv_width; ++index) {
-            input[index] = __float2bfloat16_rn(((index * 7 + trial * 13) % 31 - 15) / 16.0f);
+            const int sample = (((index * 7) + (trial * 13)) % 31) - 15;
+            input[index] = __float2bfloat16_rn(static_cast<float>(sample) / 16.0F);
         }
         const auto state = actual[lane].state();
         qkv.upload(input.data(), stream);
         binding.upload(&state, stream);
         graph.replay(stream);
-        check_cuda(text_gdn_forward(1, TextGdnMode::decode, qkv.get(), z.get(), gate.get(),
-                   gate.get(), weights, eager[lane].state(), scratch.get(),
-                   text_gdn_workspace_bytes(1), eager[lane].output.get(), stream),
-                   "Launch eager GDN oracle");
-        require_same(output.download(stream), eager[lane].output.download(stream),
+        auto job = bound;
+        job.state = eager[lane].state();
+        job.output = eager_output.get();
+        check_cuda(replay::launch(false, job, weights, stream), "Launch eager ReplaySSM");
+        const auto emitted = output.download(stream);
+        require_same(emitted, eager_output.download(stream),
                      "Rebound GDN output differs from eager");
         for (int bank = 0; bank < 2; ++bank) {
-            require_same(actual[bank].history.download(stream),
-                         eager[bank].history.download(stream), "Wrong GDN history bank");
-            require_same(actual[bank].recurrent.download(stream),
-                         eager[bank].recurrent.download(stream), "Wrong GDN recurrent bank");
+            const int committed = (trial + 2 - bank) / 2;
+            const auto cursor = actual[bank].cursor.download(stream).front();
+            if (cursor.first != 0 || cursor.committed != committed || cursor.pending != 0) {
+                throw std::runtime_error("Wrong rebound GDN cursor");
+            }
+            actual[bank].materialize(stream);
+            eager[bank].materialize(stream);
+            const auto history = eager[bank].materialized_history.download(stream);
+            const auto recurrent = eager[bank].materialized_recurrent.download(stream);
+            require_same(actual[bank].materialized_history.download(stream), history,
+                         "Wrong GDN history bank");
+            require_same(actual[bank].materialized_recurrent.download(stream), recurrent,
+                         "Wrong GDN recurrent bank");
         }
-        const auto emitted = output.download(stream);
         if (std::none_of(emitted.begin(), emitted.end(),
-                         [](BFloat value) { return __bfloat162float(value) != 0.0f; })) {
+                         [](BFloat value) { return __bfloat162float(value) != 0.0F; })) {
             throw std::runtime_error("Degenerate GDN output");
         }
     }
-    std::puts("Rebound GDN history and recurrent banks on six device graph replays");
-}
-
-void check_tiled_prefill_scales(cudaStream_t stream) {
-    constexpr int rows = 2;
-    constexpr int first = page_tokens - 1;
-    constexpr auto page_payload = page_tokens * kv_elements_per_token;
-    constexpr auto page_scales = scale_bytes / physical_pages;
-    const Pages pages{{1, 0}};
-    pages.device.upload(pages.mapping.data(), stream);
-    const RawCache cache;
-    const auto view = cache.view();
-    const auto table = pages.view();
-    const DeviceBuffer<BFloat> queries(rows * query_elements);
-    const DeviceBuffer<BFloat> direct(rows * query_elements);
-    const DeviceBuffer<BFloat> tiled(rows * query_elements);
-    const auto host_queries = make_queries(first, rows);
-    queries.upload(host_queries.data(), stream);
-    check_cuda(cudaMemsetAsync(view.key_payload, 0, 2 * page_payload, stream), "Clear keys");
-    check_cuda(cudaMemsetAsync(view.key_scales, 127, 2 * page_scales, stream), "Set key scales");
-    for (const auto [exponent, payload] : {std::pair{0, 0x38}, std::pair{255, 0x01}}) {
-        check_cuda(cudaMemsetAsync(view.value_payload, payload | 0x80, page_payload, stream),
-                   "Set negative FP8 values");
-        check_cuda(cudaMemsetAsync(view.value_payload + page_payload, payload, page_payload,
-                                   stream), "Set positive FP8 values");
-        check_cuda(cudaMemsetAsync(view.value_scales, exponent, 2 * page_scales, stream),
-                   "Set value scales");
-        check_cuda(sglang::mxfp8_gqa_attention(view, table, first + rows, first, rows,
-                   queries.get(), direct.get(), stream), "Launch direct prefill oracle");
-        check_cuda(sglang::decoder::tensor_core_prefill_gqa(view, table, first, rows,
-                   queries.get(), tiled.get(), stream), "Launch tiled prefill");
-        const auto expected = direct.download(stream);
-        const auto actual = tiled.download(stream);
-        const float first_value = __bfloat162float(expected.front());
-        if (!std::isfinite(first_value) || first_value <= 0.0f ||
-            std::memcmp(actual.data(), expected.data(), expected.size() * sizeof(BFloat)) != 0) {
-            throw std::runtime_error("Tiled prefill scale mismatch at exponent " +
-                                     std::to_string(exponent));
-        }
-    }
-    std::puts("Tiled prefill scales match across a remapped page boundary");
+    std::puts("Rebound ReplaySSM cursors and materialized banks on six device graph replays");
 }
 
 void verify_ordered_prefill(const char* phase, sglang::Mxfp8KvCache cache,

@@ -1,25 +1,38 @@
 """Observe and control the real LMCache Unix transport for live prefix tests."""
 
-from io import BytesIO
+from __future__ import annotations
+
 import os
-from pathlib import Path
+import select
 import socket
 import socketserver
 import struct
-from tempfile import mkdtemp
 import threading
+from contextlib import ExitStack
+from ctypes import addressof, create_string_buffer, string_at
+from dataclasses import dataclass
+from hashlib import sha256
+from importlib import import_module
+from io import BytesIO
+from pathlib import Path
+from tempfile import mkdtemp
 from time import monotonic, perf_counter_ns, sleep, time_ns
+from typing import TYPE_CHECKING
 
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 HEADER = struct.Struct("!4sIQ")
 MAGIC = b"SLC3"
-READY, LOOKUP, GET, PUT, RESET, ERASE, PREFIX, LEASE = range(1, 9)
+READY, LOOKUP, RESET, ERASE, LEASE = 1, 2, 5, 6, 8
 PREFIX_DETAIL, RANK_GET, RANK_PUT = range(9, 12)
-TRANSFERS = (GET, PUT, RANK_GET, RANK_PUT)
+TRANSFERS = (RANK_GET, RANK_PUT)
+WIRE_VERSION = b"0.5.8+native-v4"
 ADMISSION = struct.Struct("!16s16sI")
 RECEIPT = struct.Struct("!QQQI")
 GQA, GDN, DRAFT = range(1, 4)
 TIMEOUT = 30
+BLOCK_TOKENS = 256
 
 
 def receive(sock, size):
@@ -67,6 +80,114 @@ def control(path, namespace, opcode, payload=b""):
         return status, receive(sock, size)
 
 
+def _receive_gdn(path: Path, namespace: str, payload: bytes, size: int) -> None:
+    with socket.socket(socket.AF_UNIX) as sock:
+        sock.settimeout(TIMEOUT)
+        sock.connect(str(path))
+        assert send(sock, namespace, RANK_GET, payload) == (4, ADMISSION.size)
+        admission = receive(sock, ADMISSION.size)
+        _, _, pid = ADMISSION.unpack(admission)
+        pidfd = os.pidfd_open(pid)
+        try:
+            sock.sendall(b"\x01")
+            _, status, length = header(sock)
+            assert (status, length) == (0, RECEIPT.size)
+            assert RECEIPT.unpack(receive(sock, length)) == (0, size, 0, 0)
+        finally:
+            sock.close()
+            try:
+                while not select.select([pidfd], [], [], 0.1)[0]:
+                    try:
+                        if control(path, namespace, LEASE, admission[:32]) == (0, b""):
+                            break
+                    except (OSError, EOFError):
+                        continue
+            finally:
+                os.close(pidfd)
+
+
+def restore_gdn(
+    path: Path,
+    namespace: str,
+    device: tuple[int, str],
+    key: tuple[int, bytes],
+    record: dict[str, int | list[int]],
+) -> str:
+    torch = import_module("torch")
+    cuda = import_module("cuda.bindings.runtime")
+    ordinal, uuid = device
+
+    def checked(result: tuple) -> list:
+        status, *values = result
+        if int(status):
+            raise RuntimeError(f"CUDA GDN-only test transfer failed: {status}")
+        return values
+
+    size = record["bytes"]
+    received = []
+    with torch.cuda.device(ordinal), ExitStack() as cleanup:
+        (address,) = checked(cuda.cudaMalloc(size))
+        cleanup.callback(lambda: checked(cuda.cudaFree(address)))
+        (memory,) = checked(cuda.cudaIpcGetMemHandle(address))
+        allocation = struct.pack("!I64sQ", 1, string_at(memory.getPtr(), 64), size)
+        gdn = struct.pack("!I64s", record["endpoint"], key[1])
+        offset = 0
+        for width in record["widths"]:
+            gdn += struct.pack("!IQQ", 0, offset, width)
+            offset += width
+        assert offset == size
+        host = create_string_buffer(size)
+        stream = torch.cuda.current_stream()
+        for fill in (0x2B, 0xAB):
+            checked(cuda.cudaMemsetAsync(address, fill, size, stream.cuda_stream))
+            event = torch.cuda.Event(interprocess=True)
+            event.record(stream)
+            payload = bytes.fromhex(uuid) + event.ipc_handle() + allocation + bytes(16) + gdn
+            _receive_gdn(path, namespace, payload, size)
+            checked(
+                cuda.cudaMemcpy(
+                    addressof(host), address, size, cuda.cudaMemcpyKind.cudaMemcpyDeviceToHost
+                )
+            )
+            received.append(sha256(host).hexdigest())
+        assert received[0] == received[1], "GDN-only DMA did not fully overwrite its destination"
+    return received[0]
+
+
+def _prior_inventory(read: Callable[[int], bytes], records: list[dict[str, int]]) -> dict:
+    count, draft_required = struct.unpack("!BB", read(2))
+    anchors = [struct.unpack("!I64s", read(68)) for _ in range(count)]
+    highest = anchors[-1][0] if anchors else 0
+    complete = {
+        (record["family"], record["end"] + (record["family"] == DRAFT))
+        for record in records
+        if record["tokens"] == BLOCK_TOKENS
+    }
+    prerequisites = [
+        (GQA, end, read(64))
+        for end in range(BLOCK_TOKENS, highest, BLOCK_TOKENS)
+        if (GQA, end) not in complete
+    ]
+    if draft_required:
+        prerequisites.extend(
+            (DRAFT, end, read(64))
+            for end in range(BLOCK_TOKENS + 1, highest, BLOCK_TOKENS)
+            if (DRAFT, end) not in complete
+        )
+    return {
+        "prior_gdn": {"draft_required": bool(draft_required), "anchors": anchors},
+        "prior_prerequisites": prerequisites,
+    }
+
+
+def _prefix_inventory(body: bytes) -> dict:
+    gqa, count = struct.unpack("!II", body[:8])
+    checkpoints = list(struct.iter_unpack("!IB", body[8:]))
+    if len(checkpoints) != count:
+        raise ValueError("Invalid prefix inventory response length")
+    return {"gqa": gqa, "checkpoints": checkpoints}
+
+
 def frame_metadata(opcode, payload):
     view = BytesIO(payload)
 
@@ -96,27 +217,49 @@ def frame_metadata(opcode, payload):
             begin, end = number(4), number(4)
             if begin == end == 0:
                 continue
-            kv_heads = number(4) if opcode in (RANK_GET, RANK_PUT) else 4
+            kv_heads = number(4)
             read(4 + 4 * 12)
-            for start in range(begin, end, 256):
+            for start in range(begin, end, BLOCK_TOKENS):
                 entry["keys"].append((family, read(64)))
-                tokens = min(256, end - start)
-                records.append({"bytes": tokens * layers * kv_heads * 528, "tokens": tokens})
+                tokens = min(BLOCK_TOKENS, end - start)
+                records.append(
+                    {
+                        "bytes": tokens * layers * kv_heads * 528,
+                        "tokens": tokens,
+                        "family": family,
+                        "begin": start,
+                        "end": start + tokens,
+                    }
+                )
         endpoint = number(4)
         if endpoint:
             entry["keys"].append((GDN, read(64)))
-            size = 0
+            widths = []
             for _ in range(4):
                 read(12)
-                size += number(8)
-            records.append({"bytes": size, "tokens": 0, "endpoint": endpoint})
+                widths.append(number(8))
+            records.append(
+                {
+                    "bytes": sum(widths),
+                    "tokens": 0,
+                    "family": GDN,
+                    "endpoint": endpoint,
+                    "widths": widths,
+                }
+            )
         entry["records"] = records
+        if opcode == RANK_PUT:
+            entry.update(_prior_inventory(read, records))
     elif opcode == READY:
         entry["devices"] = [read(16).hex() for _ in range((len(payload) - view.tell()) // 16)]
-    elif opcode in (PREFIX, PREFIX_DETAIL):
-        count, limit, draft = struct.unpack("!IIB", read(9))
-        read(64 * count)
-        entry["coverage_query"] = {"count": count, "limit": limit, "draft": draft}
+    elif opcode == PREFIX_DETAIL:
+        count, draft = struct.unpack("!IB", read(5))
+        digests = read(64 * count)
+        entry["coverage_query"] = {
+            "count": count,
+            "draft": draft,
+            "rank_key": digests[:64].decode("ascii"),
+        }
     elif opcode == LEASE:
         entry["incarnation"], entry["lease"] = read(16).hex(), read(16).hex()
     elif opcode in (LOOKUP, ERASE):
@@ -127,15 +270,28 @@ def frame_metadata(opcode, payload):
     return entry
 
 
+@dataclass(frozen=True)
+class BarrierSelection:
+    skip: int = 0
+    endpoint: int | None = None
+
+
 class Barrier:
     def __init__(
-        self, opcode: int, target: int | str | None, *, phase: str, drop: bool, skip: int
+        self,
+        opcode: int,
+        target: int | str | None,
+        *,
+        phase: str,
+        drop: bool,
+        selection: BarrierSelection,
     ) -> None:
         self.opcode = opcode
         self.family = target if isinstance(target, int) else None
         self.phase = phase
         self.drop = drop
-        self.skip = skip
+        self.skip = selection.skip
+        self.endpoint = selection.endpoint
         self.device = target if isinstance(target, str) else None
         self.entered = threading.Event()
         self.release = threading.Event()
@@ -156,7 +312,8 @@ class Request(socketserver.BaseRequestHandler):
             return raw, status, body
         incarnation, token, pid = ADMISSION.unpack(body)
         peer, _, _ = struct.unpack(
-            "3i", remote.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+            "3i", remote.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
+        )
         if pid != peer:
             raise ValueError("Lease admission does not name the upstream daemon")
         self.request.sendall(raw + body)
@@ -164,8 +321,13 @@ class Request(socketserver.BaseRequestHandler):
         if arm != b"\x01":
             raise ValueError("Invalid native lease arm")
         remote.sendall(arm)
-        entry.update(incarnation=incarnation.hex(), lease=token.hex(), daemon_pid=pid,
-                     status=4, armed_ns=perf_counter_ns())
+        entry.update(
+            incarnation=incarnation.hex(),
+            lease=token.hex(),
+            daemon_pid=pid,
+            status=4,
+            armed_ns=perf_counter_ns(),
+        )
         if not self.deliver(entry, "arm"):
             return None
         raw, status, size = header(remote)
@@ -186,14 +348,19 @@ class Request(socketserver.BaseRequestHandler):
     def handle(self):
         self.request.settimeout(TIMEOUT)
         entry = None
+        phase = "client header"
         try:
             raw, opcode, size = header(self.request)
+            phase = f"opcode {opcode} client payload ({size} bytes)"
             payload = receive(self.request, size)
+            phase = f"opcode {opcode} metadata ({size} bytes)"
             entry = frame_metadata(opcode, payload)
+            phase = f"opcode {opcode} daemon request"
             with socket.socket(socket.AF_UNIX) as remote:
                 remote.settimeout(TIMEOUT)
                 remote.connect(str(self.server.upstream))
                 remote.sendall(raw + payload)
+                phase = f"opcode {opcode} daemon reply"
                 if opcode in TRANSFERS:
                     result = self.forward_arm(remote, entry)
                     if result is None:
@@ -204,26 +371,23 @@ class Request(socketserver.BaseRequestHandler):
                 else:
                     reply, status, length = header(remote)
                     body = receive(remote, length)
-                    if opcode == PREFIX and status == 0:
-                        entry["coverage"] = struct.unpack("!IIII", body)
-                    elif opcode == PREFIX_DETAIL and status == 0:
-                        gqa, matched, total, listed = struct.unpack("!IIII", body[:16])
-                        ends = list(struct.iter_unpack("!IB", body[16:]))
-                        if len(ends) != listed:
-                            raise ValueError("Invalid ranked prefix response length")
-                        entry["coverage"] = (gqa, matched, total, ends)
+                    if opcode == PREFIX_DETAIL and status == 0:
+                        entry["coverage"] = _prefix_inventory(body)
                 entry.update(status=status, response_bytes=len(body), reply_ns=perf_counter_ns())
+                phase = f"opcode {opcode} forwarding reply"
                 if self.deliver(entry, "reply"):
                     self.request.sendall(reply + body)
                     entry["forwarded"] = True
         except (ConnectionError, EOFError, TimeoutError, ValueError, struct.error) as error:
             with self.server.guard:
-                self.server.errors.append(str(error))
+                self.server.errors.append(f"{phase}: {error}")
         finally:
             self.server.completed(entry)
 
 
 class Relay(socketserver.ThreadingUnixStreamServer):
+    request_queue_size = 64
+
     def __init__(self, path, upstream):
         self.upstream = upstream
         self.guard = threading.Lock()
@@ -258,6 +422,13 @@ class Relay(socketserver.ThreadingUnixStreamServer):
                 or entry["status"] != (4 if phase == "arm" else 0)
                 or (barrier.device is not None and entry.get("device") != barrier.device)
                 or (
+                    barrier.endpoint is not None
+                    and not any(
+                        record.get("endpoint") == barrier.endpoint
+                        for record in entry.get("records", ())
+                    )
+                )
+                or (
                     barrier.family is not None
                     and not any(family == barrier.family for family, _ in entry["keys"])
                 )
@@ -284,14 +455,19 @@ class Relay(socketserver.ThreadingUnixStreamServer):
         *,
         phase: str = "reply",
         drop: bool = False,
-        skip: int = 0,
+        **selection: int | None,
     ) -> Barrier:
         with self.guard:
             previous = self.barrier
-            if previous and not previous.finished.is_set() and (
-                    previous.entered.is_set() or not previous.release.is_set()):
+            if (
+                previous
+                and not previous.finished.is_set()
+                and (previous.entered.is_set() or not previous.release.is_set())
+            ):
                 raise ValueError("LMCache relay already has an outstanding barrier")
-            self.barrier = Barrier(opcode, target, phase=phase, drop=drop, skip=skip)
+            self.barrier = Barrier(
+                opcode, target, phase=phase, drop=drop, selection=BarrierSelection(**selection)
+            )
             return self.barrier
 
     def since(self, index=0):

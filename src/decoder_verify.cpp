@@ -4,7 +4,6 @@
 #include "sglang/decoder_sampling.h"
 #include "sglang/decoder_mtp.h"
 #include "sglang/text/gdn_local.h"
-#include "sglang/runtime/execution/decoder_verify_workspace.h"
 #include "sglang/runtime/execution/verification_row_copy.h"
 #include "sglang/text/decoder_logprobs.h"
 #include "sglang/text/mtp/tc_vocab.h"
@@ -12,11 +11,21 @@
 #include "sglang/runtime/execution/tp_verify_graph.h"
 
 #include <algorithm>
-#include <cstdio>
 #include <cstring>
+#include <iostream>
 #include <utility>
 
 namespace sglang::decoder {
+namespace {
+
+void free_pinned(void* results) {
+    const auto status = cudaFreeHost(results);
+    if (status != cudaSuccess) {
+        std::cerr << "sglang decoder: Free verifier pinned storage: " << cudaGetErrorString(status)
+                  << '\n';
+    }
+}
+}
 bool TargetVerification::can_begin(int position, int count, cudaStream_t stream) const {
     return stream == stream_ && pending_rows_ == 0 && position == valid_prefix_ &&
            count >= 1 && count <= static_cast<int>(eager_workspace_->work.size()) &&
@@ -30,12 +39,12 @@ VerificationGraphBinding* Allocations::allocate<VerificationGraphBinding>(std::s
         allocate_elements(count, sizeof(VerificationGraphBinding)));
 }
 
-VerificationGraphScratch::VerificationGraphScratch(int device)
-    : memory(device), workspace(memory, k1_verification_rows),
+VerificationGraphScratch::VerificationGraphScratch(const DecoderModel& model, int rows)
+    : memory(model.device), workspace(memory, rows),
       device_binding(memory.allocate<VerificationGraphBinding>(1)) {
     void* pinned = nullptr;
     check(cudaMallocHost(&pinned, sizeof(VerificationGraphBinding)),
-          "Allocate K1 verifier graph bindings");
+          "Allocate verifier graph bindings");
     host_binding = std::shared_ptr<VerificationGraphBinding>(
         static_cast<VerificationGraphBinding*>(pinned), free_pinned);
 }
@@ -44,14 +53,14 @@ void VerificationGraphScratch::upload(const VerificationSequence& sequence, cuda
     auto& binding = *host_binding;
     sequence.verification->bind_graph(binding);
     const int capacity = binding.pages.page_count * mxfp8_page_size;
-    for (int row = 0; row < k1_verification_rows; ++row) {
+    for (int row = 0; row < sequence.count; ++row) {
         binding.inputs[row] = {0.0f, sequence.tokens[row]};
         binding.positions[row] = sequence.position + row;
         binding.rotary_positions[row] = binding.positions[row] + sequence.rotary_delta;
         binding.scores[row] = workspace.work[row].gqa_scores(capacity);
     }
     copy_cuda_async(device_binding, host_binding.get(), sizeof(binding), cudaMemcpyHostToDevice,
-                    stream, "Upload K1 verifier graph bindings");
+                    stream, "Upload verifier graph bindings");
 }
 
 MtpConstraintRound::MtpConstraintRound(Request& request, const TokenConstraint& constraint,
@@ -282,8 +291,7 @@ int MtpRound::text_stop_after(const DecoderOptions& options,
 }
 
 bool MtpRound::commit(const Emit& emit, cudaStream_t stream, const Cancel& cancel,
-                      MtpDraftInput* repair, const Workspace** committed_row,
-                      TextGdnReplayBatch* gdn_batch) {
+                      MtpDraftInput* repair, const Workspace** committed_row) {
     if (draft->valid_prefix() > position) {
         draft->rewind(position);
     }
@@ -291,7 +299,10 @@ bool MtpRound::commit(const Emit& emit, cudaStream_t stream, const Cancel& cance
     bool continuing = true;
     for (int index = 0; index < count; ++index) {
         if (cancel && cancel()) {
-            target->commit(consumed, gdn_batch);
+            if (consumed > 0 && committed_row != nullptr) {
+                *committed_row = target->checkpoint_row(consumed - 1);
+            }
+            target->commit(consumed);
             return false;
         }
         const int token = target->winner(index, sampling != nullptr, constraint != nullptr);
@@ -310,8 +321,7 @@ bool MtpRound::commit(const Emit& emit, cudaStream_t stream, const Cancel& cance
             repair[index] = input;
         }
     }
-    if (committed_row && (!continuing ||
-        (position + consumed) % decoder_batch_prefix_checkpoint_interval == 0)) {
+    if (committed_row != nullptr && !continuing) {
         *committed_row = target->checkpoint_row(consumed - 1);
     }
     if (continuing) {
@@ -319,7 +329,7 @@ bool MtpRound::commit(const Emit& emit, cudaStream_t stream, const Cancel& cance
         copy_cuda_async(request->work.normalized, hidden, hidden_size * sizeof(Bf16),
                         cudaMemcpyDeviceToDevice, stream, "Carry committed MTP hidden row");
     }
-    target->commit(consumed, gdn_batch);
+    target->commit(consumed);
     return true;
 }
 
@@ -341,11 +351,7 @@ TargetVerification::TargetVerification(Request& request, int capacity, int prefi
         generated_top_logprobs > decoder_max_generated_top_logprobs) {
         throw std::invalid_argument("Invalid target verification storage");
     }
-    allocate_gdn(memory, tail_, request_.gdn_history_stride, request_.gdn_state_stride);
-    eager_workspace_.emplace(memory, rows);
-    if (rank_local_gdn_) {
-        relayout_verification_workspace_local(*eager_workspace_, rows);
-    }
+    eager_workspace_.emplace(memory, rows, rank_local_gdn_);
 
     const bool score = generated_top_logprobs >= 0;
     if (winners && !logits && !score) {
@@ -390,19 +396,18 @@ const Workspace* TargetVerification::checkpoint_row(int index) {
 
 bool TargetVerification::graph_eligible(const VerificationSequence& sequence) const {
     const int capacity = request_.pages.page_count * mxfp8_page_size;
-    return sequence.count == k1_verification_rows &&
-        sequence.position <= eager_workspace_->work.front().gqa_scores(capacity).capacity -
-            k1_verification_rows &&
-        std::all_of(sequence.tokens, sequence.tokens + k1_verification_rows,
-                    [](int token) { return token >= 0 && token < vocab_size; });
+    return sequence.count >= k1_verification_rows && eager_workspace_.has_value() &&
+           sequence.position <=
+               eager_workspace_->work.front().gqa_scores(capacity).capacity - sequence.count &&
+           std::all_of(sequence.tokens, sequence.tokens + sequence.count,
+                       [](int token) { return token >= 0 && token < vocab_size; });
 }
 
 void TargetVerification::bind_graph(VerificationGraphBinding& binding) const {
     binding.pages = request_.pages;
     binding.caches = request_.caches;
-    binding.initial = request_.states;
-    binding.tail = tail_;
-    for (int index = 0; index < k1_verification_rows; ++index) {
+    binding.gdn_replay = request_.gdn_replay;
+    for (int index = 0; index < pending_rows_; ++index) {
         const auto& work = eager_workspace_->work[index];
         binding.final_states[index] = request_.prefix_checkpoint_outputs
             ? TextModelStateRow{work.hidden, work.residual} : TextModelStateRow{};
@@ -413,37 +418,13 @@ void TargetVerification::use_graph_workspace(VerificationWorkspace& graph_worksp
     active_workspace_ = &graph_workspace;
 }
 
-void TargetVerification::bind_gdn(int layer) {
-    if (!rank_local_gdn_) {
-        workspace().bind_gdn(layer, pending_rows_);
-        return;
-    }
-    const auto inputs = workspace().replay[layer].inputs;
-    for (int index = 0; index < pending_rows_; ++index) {
-        auto& work = workspace().work[index];
-        work.gdn_qkv = inputs.qkv + index * GdnLocal::qkv_width;
-        work.gdn_b = inputs.b + index * GdnLocal::value_heads;
-        work.gdn_a = inputs.a + index * GdnLocal::value_heads;
-    }
-}
-
-GdnVerificationLane TargetVerification::gdn_lane(int layer, TextGdnWeights weights) {
+gdn_replay_ssm::Lane TargetVerification::gdn_lane(int layer) {
     auto& scratch = workspace();
-    auto& saved = scratch.replay[layer];
-    saved.weights = weights;
     const auto& work = scratch.work.front();
-    return {saved.inputs, work.gdn_z, request_.states[layer], tail_[layer],
-            scratch.observable, work.attention};
-}
-
-void TargetVerification::advance_gdn(int layer, TextGdnWeights weights) {
-    const auto lane = gdn_lane(layer, weights);
-    const auto status = rank_local_gdn_
-        ? text_gdn_verify_tail_local(pending_rows_, lane.inputs, lane.z, weights, lane.initial,
-                                     lane.tail, lane.observable, lane.output, stream_)
-        : text_gdn_verify_tail(pending_rows_, lane.inputs, lane.z, weights, lane.initial,
-                               lane.tail, lane.observable, lane.output, stream_);
-    check(status, "Advance target GDN and retain its tail");
+    return {
+        request_.gdn_replay[layer], scratch.gdn,    work.gdn_z,
+        scratch.observable,         work.attention, pending_rows_,
+    };
 }
 
 void TargetVerification::sample(const SamplingParameters& parameters, int first_output,
@@ -896,29 +877,36 @@ bool Decoder::Model::forward_verify(const VerificationSequence* sequences, int c
     }
     const auto& first = sequences[0];
     if (graph && count == 1 && !first.constrained && first.verification->graph_eligible(first) &&
-        std::exchange(graph->warmed, true)) {
-        const bool replayed = graph->execution.replay_batch_graph(1, [&] {
-            graph->scratch = std::make_unique<VerificationGraphScratch>(device);
-        }, [&] {
-            auto& scratch = *graph->scratch;
-            auto* binding = scratch.device_binding;
-            std::array<VerificationRow, k1_verification_rows> rows;
-            for (int index = 0; index < k1_verification_rows; ++index) {
-                auto& work = scratch.workspace.work[index];
-                rows[index] = {nullptr, &work, 0, nullptr, index == 0, binding, &scratch.workspace};
-                check(decode_embedding(embedding, vocab_size, hidden_size, &binding->inputs[index],
-                                       work.residual, stream), "Look up bound verification input");
-            }
-            enqueue_verification(rows.data(), k1_verification_rows, stream);
-        }, [&] {
-            graph->scratch->upload(first, stream);
-            return true;
-        }, true);
+        std::exchange(graph->warmed[first.count], true)) {
+        auto& slot = graph->scratch[first.count];
+        const bool replayed = graph->execution.replay_batch_graph(
+            first.count,
+            [&] { slot = std::make_unique<VerificationGraphScratch>(*this, first.count); },
+            [&] {
+                auto& scratch = *slot;
+                auto* binding = scratch.device_binding;
+                std::array<VerificationRow, target_verify_max_rows> rows;
+                for (int index = 0; index < first.count; ++index) {
+                    auto& work = scratch.workspace.work[index];
+                    rows[index] = {
+                        nullptr, &work, 0, nullptr, index == 0, binding, &scratch.workspace,
+                    };
+                    check(decode_embedding(embedding, vocab_size, hidden_size,
+                                           &binding->inputs[index], work.residual, stream),
+                          "Look up bound verification input");
+                }
+                enqueue_verification(rows.data(), first.count, stream);
+            },
+            [&] {
+                slot->upload(first, stream);
+                return true;
+            },
+            true);
         if (replayed) {
-            first.verification->use_graph_workspace(graph->scratch->workspace);
+            first.verification->use_graph_workspace(slot->workspace);
             return true;
         }
-        graph->scratch.reset();
+        slot.reset();
     }
     std::array<VerificationRow, max_wide_mtp_rows> rows;
     int next = 0;

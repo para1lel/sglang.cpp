@@ -8,7 +8,7 @@ See [HTTP queue admission](http-server.md#http-admission-and-shutdown), [request
 
 [Launch the server](../README.md#serve-token-ids-over-http). For history, use [chat](chat-serving.md) or [native sessions](serving/native-sessions.md).
 
-`POST` and `PUT` accept the same request fields, validation, queue admission, and JSON or SSE response behavior. [Native route matcher](../apps/server/http.cpp#L388)<!-- prefix: "GenerateRout" --> · [Pinned Python methods](https://github.com/sgl-project/sglang/blob/f04d886bf79aa3d6237cbb12a3311838eb9f9bd8/python/sglang/srt/entrypoints/http_server.py#L963)<!-- prefix: "@app.api_rou" -->
+`POST` and `PUT` accept the same request fields, validation, queue admission, and JSON or SSE response behavior. [Native route matcher](../apps/server/http.cpp#L411)<!-- prefix: "GenerateRout" --> · [Pinned Python methods](https://github.com/sgl-project/sglang/blob/f04d886bf79aa3d6237cbb12a3311838eb9f9bd8/python/sglang/srt/entrypoints/http_server.py#L963)<!-- prefix: "@app.api_rou" -->
 
 Send a text prompt for a JSON response.
 
@@ -81,7 +81,7 @@ Send one object under [shared JSON validation](text-serving.md#send-a-request). 
 | `sampling_params` | One object or one object per prompt for indexed requests. Omission or top-level null uses the defaults below. |
 | `cache_salt` | One string or one string per prompt for indexed requests. Each is at most 256 UTF-8 bytes. Omission or null uses the empty salt. See [prefix reuse](prefix-cache.md#runtime-path). |
 
-Supply one non-null prompt field. Each array uses one prompt form. Parameter arrays have one entry per original prompt. A prompt array or `n > 1` makes a request indexed. Before admission, the server requires at most 32 expanded items and at most 262,144 total output tokens after multiplication by `n`. [Batch form](../apps/server/text_request.cpp#L806)<!-- prefix: "input.batch " --> · [Parameter arrays](../apps/server/native_generate.cpp#L795)<!-- prefix: "const json::" --> · [Batch budget](../apps/server/text_request.cpp#L838)<!-- prefix: "int remainin" -->
+Supply one non-null prompt field. Each array uses one prompt form. Parameter arrays have one entry per original prompt. A prompt array or `n > 1` makes a request indexed. Before admission, the server requires at most 32 expanded items and at most 262,144 total output tokens after multiplication by `n`. [Batch form](../apps/server/text_request.cpp#L806)<!-- prefix: "input.batch " --> · [Parameter arrays](../apps/server/native_generate.cpp#L784)<!-- prefix: "const json::" --> · [Batch budget](../apps/server/text_request.cpp#L838)<!-- prefix: "int remainin" -->
 
 | Sampling field | Accepted values and default |
 | --- | --- |
@@ -108,7 +108,7 @@ Compatibility fields accept `return_routed_experts: false` or null and `lora_pat
 
 Use the [shared status and SSE rules](http-server.md#completion-streams). A pre-header failure substitutes JSON with `error.message` for the entire result. A tokenizer load failure returns 500. A post-header failure attempts one stream-wide error with no index, `error.message: "Native decoder failed"`, `error.type: "server_error"`, `error.code: 500`, and `error.retryable: false`. Already sent events remain visible. Generation failure, disconnect, or write failure drops unsubmitted items and cancels owned jobs through retirement. Acknowledged cache checkpoints can survive. The [reset exclusion](prefix-cache.md#native-http-controls) covers the complete HTTP claim. [Batch cancellation](../apps/server/batch_service.cpp#L463)<!-- prefix: "void BatchSe" --> · [HTTP error mapping](../apps/server/prefix_controls.cpp#L178)<!-- prefix: "void handle_" --> · [SSE error writer](../apps/server/native_generate.cpp#L240)<!-- prefix: "void write_s" -->
 
-The route matches the decoded `/generate` path and ignores its query. `/generate/` follows the [shared redirect rules](http-server.md#request-targets-and-redirects). After HTTP parsing, methods other than `POST` and `PUT` return HTTP 405 with `Allow: POST, PUT` and `{"detail":"Method Not Allowed"}`. For `HEAD`, the server sends only the headers. [Native route matcher](../apps/server/http.cpp#L388)<!-- prefix: "GenerateRout" --> · [Method response](../apps/server/http.cpp#L562)<!-- prefix: "void write_m" -->
+The route matches the decoded `/generate` path and ignores its query. `/generate/` follows the [shared redirect rules](http-server.md#request-targets-and-redirects). After HTTP parsing, methods other than `POST` and `PUT` return HTTP 405 with `Allow: POST, PUT` and `{"detail":"Method Not Allowed"}`. For `HEAD`, the server sends only the headers. [Native route matcher](../apps/server/http.cpp#L411)<!-- prefix: "GenerateRout" --> · [Method response](../apps/server/http.cpp#L585)<!-- prefix: "void write_m" -->
 
 Cancel queued or active work with a disconnect or [`POST /abort_request`](native-abort.md) from a second connection.
 

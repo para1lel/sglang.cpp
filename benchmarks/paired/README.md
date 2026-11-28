@@ -51,9 +51,9 @@ bash benchmarks/paired/run_k4.sh /path/to/sglang-server 2 artifacts/paired-k4-11
 
 W4 can start a fresh campaign. W5 requires W4 to pass in that campaign. Start fresh servers for each row, with vLLM first on W1, W3 and W5. Follow the [campaign order, matching controls and SSE timing](../../docs/performance.md#measurement). The driver defaults to loopback port 17424 and holds the campaign, port and GPU coordination locks.
 
-The TP1 launcher selects one physical B200 with `GPU_INDEX`. The default `PAIRED_K4_NATIVE_PROFILE=server-defaults` uses private 64 GiB LMCache 0.5.8 over SLC3. The campaign records `matched-k4-native-defaults-lmcache-slc3-drain` and `sampling: single-round-v1`. Pinned vLLM uses local prefix caching without KV offload. Set `PAIRED_LMCACHE_PYTHON` and `PAIRED_LMCACHE_WHEEL` to the interpreter and official wheel. `PAIRED_LMCACHE_PYTHONPATH` is optional. The daemon uses a separate loopback port selected by `PAIRED_LMCACHE_PORT` (17524 for TP1). [LMCache inputs](run_k4.sh#L114-L122)<!-- prefix: "lmcache_pyth" --> · [Protocol identity](run_k4.sh#L213-L217)<!-- prefix: "| if $lmcach" -->
+The TP1 launcher selects one physical B200 with `GPU_INDEX`. The default `PAIRED_K4_NATIVE_PROFILE=server-defaults` uses private 64 GiB LMCache 0.5.8 over SLC3. The campaign records `matched-k4-native-defaults-lmcache-slc3-drain-suffix` and `sampling: single-round-v1`. Pinned vLLM uses local prefix caching without KV offload. Set `PAIRED_LMCACHE_PYTHON` and `PAIRED_LMCACHE_WHEEL` to the interpreter and official wheel. `PAIRED_LMCACHE_PYTHONPATH` is optional. The daemon uses a separate loopback port selected by `PAIRED_LMCACHE_PORT` (17524 for TP1). [LMCache inputs](run_k4.sh#L114-L122)<!-- prefix: "lmcache_pyth" --> · [Protocol identity](run_k4.sh#L213-L217)<!-- prefix: "| if $lmcach" -->
 
-For TP2, use [`benchmarks/tp2/run.sh` and its acceptance checks](../../docs/serving/tp2.md#acceptance-target). Use a fresh `tp2-paired-v2` root. Set `PAIRED_LMCACHE_PORT` to override its loopback daemon port (17655). The campaign records `daemon_port` and `lmcache_capacity_bytes`. Readiness and completion record one `daemon_pid` and both ranks. The `daemon/` receipts bind both UUIDs, the socket peer and process configuration. Replay `tp2-paired-v1` at its pinned revision with the original evidence. [Campaign identity](../../benchmarks/tp2/run.sh#L75)<!-- prefix: "'{protocol:\"" --> · [Daemon receipts](../../benchmarks/tp2/native.py#L88)<!-- prefix: "def verify_d" --> · [Historical two-daemon protocol](https://github.com/para1lel/sglang.cpp/blob/57ac5fbbdf20a5a80c5bc079b49073a44c06680f/benchmarks/tp2/run.sh#L73)
+For TP2, use [`benchmarks/tp2/run.sh` and its acceptance checks](../../docs/serving/tp2.md#acceptance-target). Use a fresh `tp2-paired-v4` root. Set `PAIRED_LMCACHE_PORT` to override its loopback daemon port (17655). The campaign identity records `daemon_port`, `lmcache_capacity_bytes` and the SLC3 `0.5.8+native-v4` handshake. Readiness and completion record one `daemon_pid` and both ranks. The `daemon/` receipts bind both UUIDs, the socket peer and process configuration. Replay `tp2-paired-v1` at its pinned revision with the original evidence. [Campaign identity](../../benchmarks/tp2/run.sh#L75)<!-- prefix: "'{protocol:\"" --> · [Daemon receipts](../../benchmarks/tp2/native.py#L88)<!-- prefix: "def verify_d" --> · [Historical two-daemon protocol](https://github.com/para1lel/sglang.cpp/blob/57ac5fbbdf20a5a80c5bc079b49073a44c06680f/benchmarks/tp2/run.sh#L73)
 
 Use the [named workloads](../../docs/performance.md#named-workloads). For TP1 W4/W5, point `PAIRED_FIXTURES` at the original corpus with its archived directory names. The driver checks request digests.
 
@@ -66,6 +66,8 @@ Replay a saved row from the repository root with `PYTHONPATH=.` and
 process arguments, vLLM activity counters, and client exit status. The saved
 identity selects the profile and cohort schedule. Captures without the sampling
 field retain their original sample counts, controls, and verdicts.
+
+TP1 `drain-suffix` and TP2 `tp2-paired-v4` receipts require every planned prefill checkpoint and each distinct terminal checkpoint to be acknowledged. The saved identity selects its original receipt checks for prior campaign versions. [Cold cache controls](../../docs/performance.md#measurement)
 
 ### Driver health
 
@@ -80,7 +82,7 @@ Use the archived recipes with their matching Release and saved evidence. They co
 Run this separately against each verified cache-enabled K4 endpoint on the same
 B200 and NUMA placement. Use the frozen W3 fixtures and a fresh evidence
 directory for each endpoint. Start a dedicated native server with
-`--port 17424 --trace-batches` and capture its standard error in `NATIVE_LOG`.
+`--port 17424 --trace-batches --lmcache-socket SOCKET`. Use the [native daemon setup](../../docs/serving/lmcache.md#start-the-daemon). Capture server standard error in `NATIVE_LOG`.
 
 ```sh
 PYTHONPATH="$PWD" python3 -B benchmarks/paired/prefix_reuse.py native http://127.0.0.1:17424 FIXTURES NATIVE_EVIDENCE --native-trace NATIVE_LOG
@@ -88,15 +90,16 @@ PYTHONPATH="$PWD" python3 -B benchmarks/paired/prefix_reuse.py vllm   http://127
 ```
 
 The diagnostic resets and captures cold W3. It resets again and sends an
-8,193-token prime. The four 9,984-token branch prompts share its first 8,192
+8,192-token prime. The four 9,984-token branch prompts share those 8,192
 IDs and each diverges at the next token. Each branch returns 1,024 output IDs.
 The diagnostic saves SSE, per-lane cached token counts, prefix-counter deltas,
 and warm-only depth-four verification evidence from each engine. It requires
 exactly 8,192 cached prompt tokens on each native lane and a positive native
 draft restore count. Pinned vLLM must report positive reuse on every lane, up
 to the common prefix. Its block geometry determines how much it can reuse.
-The last reset must make the identical prime cold again. Use the diagnostic
-as untimed support evidence for `matched-k4-prefix-reuse-v2`.
+The last reset must make the identical prime cold again and preserve its output.
+The native cold captures include suffix-checkpoint drain receipts. Use the diagnostic
+as untimed support evidence for `matched-k4-prefix-reuse-v3`.
 
 The historical [W3 prefix and K1 recipe](https://github.com/para1lel/sglang.cpp/blob/a5974ba4eb99bd8e8f890c2e7262a27dbc3aace1/benchmarks/variants/README.md)
 replays the archived 6,400-token prefix and one-draft-position captures. Use that

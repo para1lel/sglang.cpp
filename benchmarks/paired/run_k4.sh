@@ -210,9 +210,10 @@ if [[ $native_profile != exact ]]; then
                  participating_gpus:[.gpu_uuid],max_running_requests:$max_seqs} else . end
              | if $wide_budget then . + {protocol:"matched-k4-native-defaults-cache-on-v5",
                  max_num_batched_tokens:$token_budget} else . end
-             | if $lmcache then . + {protocol:"matched-k4-native-defaults-lmcache-slc3-drain",
+             | if $lmcache then . + {
+                 protocol:"matched-k4-native-defaults-lmcache-slc3-drain-suffix",
                  lmcache_version:"0.5.8",lmcache_wire:"SLC3",
-                 lmcache_ready_version:"0.5.8+native-v3",lmcache_port:($lmcache_port | tonumber),
+                 lmcache_ready_version:"0.5.8+native-v4",lmcache_port:($lmcache_port | tonumber),
                  lmcache_capacity_bytes:68719476736,lmcache_python:$lmcache_python,
                  lmcache_uid:$lmcache_uid,lmcache_pythonpath:$lmcache_pythonpath} else . end' \
             <<<"$identity")

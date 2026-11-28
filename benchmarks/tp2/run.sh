@@ -31,8 +31,8 @@ exec {campaign_lock}<"$base"
 flock -n -E 75 "$campaign_lock"
 session=$base
 if [[ -e $base/identity.json ]]; then
-    if [[ $(jq -er .protocol "$base/identity.json") != tp2-paired-v2 ]]; then
-        echo 'Use a new campaign root for the single-daemon protocol.' >&2
+    if [[ $(jq -er .protocol "$base/identity.json") != tp2-paired-v4 ]]; then
+        echo 'Use a new campaign root for the exact prompt checkpoint policy.' >&2
         exit 1
     fi
     [[ $mode == measure && $4 != all && ! -e $base/$4 ]]
@@ -72,7 +72,7 @@ jq -n --arg mode "$mode" --arg id "$campaign_id" --arg rev "$native_source" \
     --argjson capacity "$((lmcache_memory_gib << 30))" \
     --slurpfile lm "$session/lmcache-wheel.json" \
     --slurpfile ref "$project/benchmarks/concurrent/gpu2-reference.json" \
-    '{protocol:"tp2-paired-v2",protocol_sha256:$protocol,corpus_sha256:$wire,
+    '{protocol:"tp2-paired-v4",protocol_sha256:$protocol,corpus_sha256:$wire,
       campaign_id:$id,mode:$mode,
       native_source:$rev,binary:$binary,binary_sha256:$sha,checkpoint_path:$model,
       checkpoint_sha256:$ref[0].checkpoint_manifest_sha256,vllm_pin:$ref[0].vllm_pin,
@@ -80,7 +80,7 @@ jq -n --arg mode "$mode" --arg id "$campaign_id" --arg rev "$native_source" \
       client_python:$python,port:$port,
       server_cpus:$server,client_cpus:$client,devices:[$dev0,$dev1],
       daemon_port:$cache_port,lmcache_capacity_bytes:$capacity,lmcache_uid:$uid,
-      lmcache_wire:"SLC3",lmcache_ready_version:"0.5.8+native-v3",lmcache_python:$lm[0].python,
+      lmcache_wire:"SLC3",lmcache_ready_version:"0.5.8+native-v4",lmcache_python:$lm[0].python,
       lmcache_pythonpath:$lm[0].pythonpath}' >"$session/identity.json"
 if [[ $session != "$base" ]]; then
     receipts=(identity.json protocol.sha256 corpus.json lmcache-wheel.json

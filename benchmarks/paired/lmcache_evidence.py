@@ -14,9 +14,13 @@ from zipfile import ZipFile
 
 from saved_evidence import command, compute_owners, digest, hash_manifest, load, require
 from workload_suite import (
-    LMCACHE_GPU_PROTOCOLS, LMCACHE_SLC3_PROTOCOLS, LMCACHE_SLC3_READY, LMCACHE_VERSION,
+    LMCACHE_DRAIN_SUFFIX_PROTOCOL,
+    LMCACHE_GPU_PROTOCOLS,
+    LMCACHE_NATIVE_READY,
+    LMCACHE_SLC3_PROTOCOLS,
+    LMCACHE_SLC3_READY,
+    LMCACHE_VERSION,
 )
-
 
 FRAME = struct.Struct("!4sIQ")
 SOCKET_NAME = "sglang-lmcache.sock"
@@ -27,7 +31,7 @@ WHEEL_SHA256 = "4ec775bda3a8c5f1f5b1ef0bbc441b666db86b57c3c2a7bcba47a4f6550b07cd
 
 def ready(path, pid, wire="SLC2", namespace="sglang"):
     expected_magic = wire.encode()
-    expected = (LMCACHE_SLC3_READY if wire == "SLC3" else LMCACHE_VERSION).encode()
+    expected = (LMCACHE_NATIVE_READY if wire == "SLC3" else LMCACHE_VERSION).encode()
     before = os.lstat(path)
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
         connection.settimeout(1)
@@ -152,10 +156,17 @@ def verify_gpu(run, identity, daemon, argv, launch_log):
     gpu = identity["gpu_uuid"]
     wheel_receipt(run.parent, identity)
     if identity["protocol"] in LMCACHE_SLC3_PROTOCOLS:
-        require(daemon.get("wire") == identity.get("lmcache_wire") == "SLC3"
-                and daemon.get("ready_version") == identity.get("lmcache_ready_version")
-                == LMCACHE_SLC3_READY, "Incorrect SLC3 READY identity")
-        magic, version = b"SLC3", LMCACHE_SLC3_READY.encode()
+        expected = (
+            LMCACHE_NATIVE_READY
+            if identity["protocol"] == LMCACHE_DRAIN_SUFFIX_PROTOCOL
+            else LMCACHE_SLC3_READY
+        )
+        require(
+            daemon.get("wire") == identity.get("lmcache_wire") == "SLC3"
+            and daemon.get("ready_version") == identity.get("lmcache_ready_version") == expected,
+            "Incorrect SLC3 READY identity",
+        )
+        magic, version = b"SLC3", expected.encode()
     else:
         magic, version = b"SLC2", LMCACHE_VERSION.encode()
     frame = FRAME.pack(magic, 0, len(version)) + version

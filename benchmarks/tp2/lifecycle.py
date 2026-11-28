@@ -15,7 +15,7 @@ def campaign(base):
     identity = load(base / "identity.json")
     sources = base / "protocol.sha256"
     require(
-        identity["protocol"] == "tp2-paired-v2"
+        identity["protocol"] in ("tp2-paired-v2", "tp2-paired-v3", "tp2-paired-v4")
         and identity["mode"] == "measure"
         and identity["protocol_sha256"] == digest(sources)
         and identity["corpus_sha256"] == ADDITIONS_SHA256,

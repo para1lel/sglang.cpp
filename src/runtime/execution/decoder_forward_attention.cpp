@@ -1,6 +1,7 @@
 #include "sglang/runtime/execution/decoder_forward_layers.h"
 #include <algorithm>
 #include <type_traits>
+#include <utility>
 
 namespace sglang::decoder::forward_detail {
 
@@ -13,9 +14,7 @@ void each_lane(const LayerBatch<Lane>& batch, Function function) {
     }
 }
 
-constexpr int gdn_packet_rows = GdnVerificationBatch::lanes * GdnVerificationBatch::rows;
-static_assert(GdnVerificationBatch::lanes == decoder_batch_max_mtp_lanes);
-static_assert(GdnVerificationBatch::rows == target_verify_max_rows);
+constexpr int gdn_packet_rows = verification_packet_rows;
 
 void project_gdn_gates(const GdnLayer& layer, const LayerBatch<VerificationRow>& batch,
                               bool batched) {
@@ -73,118 +72,52 @@ void project_gdn_gates(const GdnLayer& layer, const LayerBatch<VerificationRow>&
     }
 }
 
-void run_gdn_packet(const GdnLayer& layer, const LayerBatch<VerificationRow>& packet,
-                           int state_index) {
-    project_gdn_gates(layer, packet, true);
-    GdnVerificationBatch states;
-    for (int lane = 0; lane < GdnVerificationBatch::lanes; ++lane) {
-        states.entries[lane] = packet.lanes[lane].verification->gdn_lane(
-            state_index, layer.recurrent);
+void run_gdn_verification(const GdnLayer& layer, const LayerBatch<VerificationRow>& batch,
+                          int state_index) {
+    const auto& first = batch.lanes[0];
+    if (first.binding != nullptr) {
+        const auto& scratch = *first.graph_workspace;
+        const gdn_replay_ssm::Lane job{
+            {},          scratch.gdn, first.work->gdn_z, scratch.observable, first.work->attention,
+            batch.count,
+        };
+        check(gdn_replay_ssm::launch(batch.tensor_parallel, job, layer.recurrent, batch.stream,
+                                     &first.binding->gdn_replay[state_index]),
+              "Advance bound verification GDN history");
+        return;
     }
-    check(packet.tensor_parallel
-              ? decode_verify_gdn_batch_local(states, layer.recurrent, packet.stream)
-              : decode_verify_gdn_batch(states, layer.recurrent, packet.stream),
-          "Advance batched target verification GDN packet");
-}
+    if (tp_verify_graph::run_gdn(batch.stream, state_index, layer.recurrent))
+        return;
+    if (batch.count == first.verification->pending_rows()) {
+        check(gdn_replay_ssm::launch(batch.tensor_parallel,
+                                     first.verification->gdn_lane(state_index), layer.recurrent,
+                                     batch.stream),
+              "Advance verification GDN history");
+        return;
+    }
 
-bool run_compact_gdn(const GdnLayer& layer, const LayerBatch<VerificationRow>& batch,
-                            int state_index) {
-    constexpr int rows_per_lane = CompactGdnVerificationBatch::rows;
-    constexpr int row_capacity = CompactGdnVerificationBatch::lanes * rows_per_lane;
-    if (!batch.packed_activation || !batch.target_tc ||
-        batch.lanes[0].binding ||
-        (batch.count != row_capacity / 2 && batch.count != row_capacity) ||
-        layer.b.rows != batch.gdn_gate_heads() || layer.a.rows != batch.gdn_gate_heads() ||
-        layer.b.columns != hidden_size || layer.a.columns != hidden_size) {
-        return false;
-    }
-    std::array<VerifyGdnGateRow, row_capacity> gates;
-    for (int index = 0; index < batch.count; ++index) {
-        const auto& work = workspace(batch.lanes[index]);
-        gates[index] = {work.normalized, work.gdn_b, work.gdn_a};
-    }
-    const auto gates_kernel = batch.tensor_parallel ? try_verify_bf16_gdn_gates_compact_local
-                                                    : try_verify_bf16_gdn_gates_compact;
-    const auto status = gates_kernel(layer.b.values, layer.a.values, gates.data(), batch.count,
-                                     batch.stream);
-    if (!status) {
-        return false;
-    }
-    check(*status, "Run compact verification GDN gate projections");
-    CompactGdnVerificationBatch states{};
-    CompactGdnFp8Rows output{batch.packed_activation, {}};
-    const int lanes = batch.count / rows_per_lane;
-    for (int lane = 0; lane < lanes; ++lane) {
-        const int first = compact_gdn_row(lane, 0);
-        states.entries[lane] = batch.lanes[first].verification->gdn_lane(
-            state_index, layer.recurrent);
-        for (int step = 0; step < rows_per_lane; ++step) {
-            const int row = compact_gdn_row(lane, step);
-            output.scales[row] = batch.projection_activation(row, batch.gdn_attention_width())
-                                     .scales;
-        }
-    }
-    check(batch.tensor_parallel
-              ? decode_verify_gdn_compact_local(states, lanes, layer.recurrent, output,
-                                                batch.stream)
-              : decode_verify_gdn_compact(states, lanes, layer.recurrent, output, batch.stream),
-          "Advance and quantize compact verification GDN");
-    return true;
-}
-
-bool run_gdn_packed_local(const GdnLayer& layer,
-                                 const LayerBatch<VerificationRow>& batch, int state_index) {
-    if (!batch.tensor_parallel) {
-        return false;
-    }
-    const VerificationRow* lane_rows[gdn_verify_tail_max_lanes] = {};
-    int row_counts[gdn_verify_tail_max_lanes] = {};
-    int lane_count = 0;
+    gdn_replay_ssm::Lanes jobs{};
+    int count = 0;
+    int rows = 0;
+    const auto submit = [&] {
+        check(gdn_replay_ssm::launch(batch.tensor_parallel, jobs, count, rows, layer.recurrent,
+                                     batch.stream),
+              "Advance packed verification GDN history");
+        count = 0;
+        rows = 0;
+    };
     for (int index = 0; index < batch.count; ++index) {
         const auto& row = batch.lanes[index];
-        if (!row.first) {
+        if (!row.first)
             continue;
-        }
-        if (lane_count == gdn_verify_tail_max_lanes) {
-            return false;
-        }
-        lane_rows[lane_count++] = &row;
+        const auto job = row.verification->gdn_lane(state_index);
+        jobs.lanes[count++] = job;
+        rows = std::max(rows, job.rows);
+        if (count == gdn_replay_ssm::max_packed_lanes)
+            submit();
     }
-    for (int index = 0; index < batch.count; ++index) {
-        const auto& row = batch.lanes[index];
-        int lane = 0;
-        while (lane < lane_count && row.verification != lane_rows[lane]->verification) {
-            ++lane;
-        }
-        if (lane == lane_count) {
-            return false;
-        }
-        ++row_counts[lane];
-    }
-    for (int lane = 1; lane < lane_count; ++lane) {
-        if (row_counts[lane] != row_counts[0]) {
-            return false;
-        }
-    }
-    if (row_counts[0] == 0 || lane_count * row_counts[0] != batch.count) {
-        return false;
-    }
-    for (int lane = 0; lane < lane_count; ++lane) {
-        const TargetVerification* verification = lane_rows[lane]->verification;
-        if (!verification->rank_local_gdn() || verification->pending_rows() != row_counts[lane] ||
-            verification->stream() != batch.stream) {
-            return false;
-        }
-    }
-    if (tp_verify_graph::run_gdn(batch.stream, state_index, layer.recurrent)) return true;
-    GdnVerifyTailLanes jobs;
-    jobs.lane_count = lane_count;
-    for (int lane = 0; lane < lane_count; ++lane) {
-        jobs.lanes[lane] = lane_rows[lane]->verification->gdn_lane(state_index, layer.recurrent);
-    }
-    check(text_gdn_verify_tail_local_lanes(row_counts[0], jobs, layer.recurrent, batch.stream),
-          "Advance packed verification GDN");
-    return true;
+    if (count != 0)
+        submit();
 }
 
 template <typename Position>
@@ -493,29 +426,39 @@ void run_gdn(const GdnLayer& layer, const LayerBatch<Lane>& batch, int state_ind
             project(layer.b, work.normalized, work.gdn_b, stream);
             project(layer.a, work.normalized, work.gdn_a, stream);
         }
-        if constexpr (std::is_same_v<Lane, BatchGraphLane>) {
-            check(batch.tensor_parallel
-                      ? decode_gdn_local(work.gdn_qkv, work.gdn_z, work.gdn_b, work.gdn_a,
-                                         layer.recurrent, &lane.binding->states[state_index],
-                                         work.gdn_scratch, work.attention, stream)
-                      : decode_gdn(work.gdn_qkv, work.gdn_z, work.gdn_b, work.gdn_a,
-                                   layer.recurrent, &lane.binding->states[state_index],
-                                   work.gdn_scratch, work.attention, stream),
-                  "Advance bound Gated DeltaNet state");
-        } else {
-            check(batch.tensor_parallel
-                      ? text_gdn_forward_local(1, lane.mode, work.gdn_qkv, work.gdn_z,
-                                               work.gdn_b, work.gdn_a, layer.recurrent,
-                                               lane.request->states[state_index],
-                                               work.gdn_scratch,
-                                               text_gdn_local_workspace_bytes(1),
-                                               work.attention, stream)
-                      : text_gdn_forward(1, lane.mode, work.gdn_qkv, work.gdn_z, work.gdn_b,
-                                         work.gdn_a, layer.recurrent,
-                                         lane.request->states[state_index], work.gdn_scratch,
-                                         text_gdn_workspace_bytes(1), work.attention, stream),
-                  "Advance Gated DeltaNet state");
+        if constexpr (!std::is_same_v<Lane, BatchGraphLane>) {
+            if (lane.mode == TextGdnMode::prefill) {
+                check(batch.tensor_parallel
+                          ? text_gdn_forward_local(
+                                1, lane.mode, work.gdn_qkv, work.gdn_z, work.gdn_b, work.gdn_a,
+                                layer.recurrent, lane.request->states[state_index],
+                                work.gdn_scratch, text_gdn_local_workspace_bytes(1), work.attention,
+                                stream)
+                          : text_gdn_forward(1, lane.mode, work.gdn_qkv, work.gdn_z, work.gdn_b,
+                                             work.gdn_a, layer.recurrent,
+                                             lane.request->states[state_index], work.gdn_scratch,
+                                             text_gdn_workspace_bytes(1), work.attention, stream),
+                      "Advance Gated DeltaNet state");
+                return;
+            }
         }
+        const int qkv_width = batch.tensor_parallel ? GdnLocal::qkv_width : GdnFull::qkv_width;
+        const auto [state, bound] =
+            [&]() -> std::pair<gdn_replay_ssm::State, const gdn_replay_ssm::State*> {
+            if constexpr (std::is_same_v<Lane, BatchGraphLane>) {
+                return {{}, &lane.binding->gdn_replay[state_index]};
+            } else {
+                return {lane.request->gdn_replay[state_index], nullptr};
+            }
+        }();
+        const gdn_replay_ssm::Lane job{
+            state,          {work.gdn_qkv, work.gdn_scratch, work.gdn_b, work.gdn_a},
+            work.gdn_z,     work.gdn_scratch + qkv_width,
+            work.attention, 1,
+            true,
+        };
+        check(gdn_replay_ssm::launch(batch.tensor_parallel, job, layer.recurrent, stream, bound),
+              "Advance decode GDN history");
     });
     batch.quantize(&Workspace::attention, batch.gdn_attention_width());
     batch.project(layer.output, &Workspace::projected_attention);
@@ -523,57 +466,12 @@ void run_gdn(const GdnLayer& layer, const LayerBatch<Lane>& batch, int state_ind
 
 void run_gdn(const GdnLayer& layer, const LayerBatch<VerificationRow>& batch,
                     int state_index) {
-    const auto& first = batch.lanes[0];
-    if (first.binding) {
-        auto& scratch = *first.graph_workspace;
-        scratch.bind_gdn(state_index, batch.count);
-        scratch.replay[state_index].weights = layer.recurrent;
-    }
-    if (!tp_verify_graph::bind_gdn_inputs(batch.stream, batch.lanes, state_index)) {
-        each_lane(batch, [&](const VerificationRow& row, Workspace&) {
-            if (row.first && !row.binding) row.verification->bind_gdn(state_index);
-        });
-    }
     if (!batch.fuse_verify_activation() && !batch.fuse_wide_verify_norm()) {
         batch.quantize(&Workspace::normalized, hidden_size);
     }
     batch.project_group({{layer.qkv, &Workspace::gdn_qkv}, {layer.z, &Workspace::gdn_z}});
-    if (run_compact_gdn(layer, batch, state_index)) {
-        batch.project(layer.output, &Workspace::projected_attention);
-        return;
-    }
-
-    if (batch.packed_activation && batch.count % gdn_packet_rows == 0) {
-        for (int start = 0; start < batch.count; start += gdn_packet_rows) {
-            run_gdn_packet(layer, batch.verification_packet(start), state_index);
-        }
-    } else if (batch.target_tc && !first.binding && batch.count == gdn_packet_rows) {
-        run_gdn_packet(layer, batch, state_index);
-    } else {
-        project_gdn_gates(layer, batch, false);
-        if (first.binding) {
-            auto& scratch = *first.graph_workspace;
-            check(batch.tensor_parallel
-                      ? decode_verify_gdn_local(batch.count, scratch.replay[state_index].inputs,
-                                                first.work->gdn_z, layer.recurrent,
-                                                &first.binding->initial[state_index],
-                                                &first.binding->tail[state_index],
-                                                scratch.observable, first.work->attention,
-                                                batch.stream)
-                      : decode_verify_gdn(batch.count, scratch.replay[state_index].inputs,
-                                          first.work->gdn_z, layer.recurrent,
-                                          &first.binding->initial[state_index],
-                                          &first.binding->tail[state_index], scratch.observable,
-                                          first.work->attention, batch.stream),
-                  "Advance bound verification GDN");
-        } else if (!run_gdn_packed_local(layer, batch, state_index)) {
-            each_lane(batch, [&](const VerificationRow& row, Workspace&) {
-                if (row.first) {
-                    row.verification->advance_gdn(state_index, layer.recurrent);
-                }
-            });
-        }
-    }
+    project_gdn_gates(layer, batch, batch.packed_activation != nullptr);
+    run_gdn_verification(layer, batch, state_index);
     batch.quantize(&Workspace::attention, batch.gdn_attention_width());
     batch.project(layer.output, &Workspace::projected_attention);
 }

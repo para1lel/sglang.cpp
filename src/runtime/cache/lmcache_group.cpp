@@ -12,12 +12,29 @@ namespace {
 
 constexpr int draft_rank = 0;
 
-LmCacheConfig cache_config(LmCacheConfig config, int world_size) {
-    if (world_size <= 0) {
-        throw std::invalid_argument("Invalid LMCache world size");
+int common_gqa(const LmCacheClient& client, const std::vector<const PrefixCacheKeys*>& keys,
+               const std::vector<LmCachePrefixDetail>& details) {
+    auto [lowest, highest] = std::minmax_element(
+        details.begin(), details.end(),
+        [](const auto& left, const auto& right) { return left.gqa < right.gqa; });
+    const int limit = lowest->gqa;
+    const int tail = limit % prefix_gqa_chunk_tokens;
+    if (tail == 0 || limit == highest->gqa)
+        return limit;
+
+    const int base = limit - tail;
+    std::vector<bool> common(tail, true);
+    std::vector<LmCacheKey> candidates(tail);
+    for (const auto* rank : keys) {
+        for (int index = 0; index < tail; ++index) {
+            candidates[index] = {LmCacheFamily::gqa, rank->key(limit - index)};
+        }
+        const auto present = client.lookup(candidates);
+        for (int index = 0; index < tail; ++index)
+            common[index] = common[index] && present[index];
     }
-    config.native_v4 |= world_size > 1;
-    return config;
+    const auto first = std::find(common.begin(), common.end(), true);
+    return first == common.end() ? base : limit - static_cast<int>(first - common.begin());
 }
 }
 
@@ -25,7 +42,10 @@ LmCacheGroup::LmCacheGroup(LmCacheClient client) : client_(std::move(client)) {
 }
 
 LmCacheGroup::LmCacheGroup(LmCacheConfig config, int world_size)
-    : client_(cache_config(std::move(config), world_size)), world_size_(world_size) {
+    : client_(std::move(config)), world_size_(world_size) {
+    if (world_size_ <= 0) {
+        throw std::invalid_argument("Invalid LMCache world size");
+    }
 }
 
 bool LmCacheGroup::ready() const {
@@ -50,43 +70,36 @@ PrefixCacheRead LmCacheGroup::lookup_prefix(const std::vector<const PrefixCacheK
             return {};
         }
     }
-    if (world == 1) {
-        const auto match = client_.lookup_prefix(*keys.front(), max_restore, draft);
-        return {match.gqa, match.matched_gdn, match.gqa, match.gdn, match.draft};
-    }
     std::vector<LmCachePrefixDetail> details(world);
     for (std::size_t rank = 0; rank < world; ++rank) {
-        details[rank] =
-            client_.lookup_prefix_detail(*keys[rank], max_restore, draft && rank == draft_rank);
+        details[rank] = client_.lookup_prefix(*keys[rank], draft && rank == draft_rank);
     }
     PrefixCacheRead read;
-    read.matched_gqa = details.front().gqa;
-    read.matched_gdn = details.front().matched_gdn;
-    for (std::size_t rank = 1; rank < world; ++rank) {
-        read.matched_gqa = std::min(read.matched_gqa, details[rank].gqa);
-        read.matched_gdn = std::min(read.matched_gdn, details[rank].matched_gdn);
-    }
-    int endpoint = 0;
-    for (const auto& candidate : details[draft_rank].endpoints) {
-        if (draft && !candidate.draft) continue;
-        bool common = true;
-        for (std::size_t rank = 0; rank < world; ++rank) {
-            if (static_cast<int>(rank) == draft_rank) continue;
-            const auto& endpoints = details[rank].endpoints;
-            common = std::any_of(endpoints.begin(), endpoints.end(),
-                                 [end = candidate.end](const LmCacheEndpointCoverage& item) {
-                                     return item.end == end;
-                                 });
-            if (!common) break;
-        }
-        if (common) {
-            endpoint = candidate.end;
-            break;   
-        }
-    }
+    read.matched_gqa = common_gqa(client_, keys, details);
     read.usable_gqa = read.matched_gqa;
-    read.usable_gdn = endpoint;
-    read.usable_draft = draft && endpoint ? endpoint - 1 : 0;
+    const int maximum = std::min(max_restore, read.usable_gqa);
+    for (const auto& candidate : details[draft_rank].endpoints) {
+        const auto contains = [&](const LmCachePrefixDetail& detail) {
+            const auto& endpoints = detail.endpoints;
+            const auto found =
+                std::lower_bound(endpoints.begin(), endpoints.end(), candidate.end,
+                                 [](const auto& item, int end) { return item.end > end; });
+            return found != endpoints.end() && found->end == candidate.end;
+        };
+        if (!std::all_of(details.begin() + 1, details.end(), contains))
+            continue;
+        if (read.matched_gdn == 0)
+            read.matched_gdn = candidate.end;
+        read.matched_gdn_endpoints.push_back(candidate.end);
+        if (candidate.draft)
+            read.draft_ready_gdn_endpoints.push_back(candidate.end);
+        if (read.usable_gdn == 0 && candidate.end <= maximum && (!draft || candidate.draft)) {
+            read.usable_gdn = candidate.end;
+            read.usable_draft = draft ? candidate.end - 1 : 0;
+        }
+    }
+    std::reverse(read.matched_gdn_endpoints.begin(), read.matched_gdn_endpoints.end());
+    std::reverse(read.draft_ready_gdn_endpoints.begin(), read.draft_ready_gdn_endpoints.end());
     return read;
 }
 

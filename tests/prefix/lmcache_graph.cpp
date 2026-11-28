@@ -1,5 +1,6 @@
 #include "sglang/decoder_internal.h"
 #include "sglang/decoder_prefix_cache.h"
+#include "sglang/runtime/cache/lmcache_group.h"
 #include "sglang/testing/prefix_fixture.h"
 #include "sglang/server/batch_service.h"
 
@@ -84,11 +85,13 @@ Capture capture(DecoderBatch& batch, const LmCacheClient& cache, const std::vect
     options.ignore_eos = depth == 0;
     options.mtp_steps = depth;
     if (depth) options.additional_stop_token_ids.insert(198);
-    const auto acknowledged = batch.prefix_cache_stats().stores;
     const auto stores = prefix_fixture::attach(options, cache, prompt, salt, [] { gate.hold(); });
     require(batch.admit(0, prompt, options) == 0, "Unexpected cold checkpoint admission");
     const auto initial = step(batch, 0, depth, false, false);
-    require(!initial.prefix_pending, "Premature checkpoint export");
+    require(!initial.prefix_pending, "Prefill checkpoint blocked the first token");
+    require(stores->receipts.size() == 1, "Exact prompt endpoint did not submit one checkpoint");
+    stores->wait();
+    const auto acknowledged = batch.prefix_cache_stats().stores;
     if (held) gate.arm();
     try {
         const auto last = step(batch, 0, depth, true, true);
@@ -184,8 +187,9 @@ std::vector<Score> generate(DecoderBatch& batch, const LmCacheClient& cache,
 }
 
 void cancelled_boundary(Decoder& model, const LmCacheClient& cache) {
-    DecoderBatch batch(model, {.max_lanes = 1});
-    const std::vector<int> prompt(decoder_batch_prefix_checkpoint_interval, 198);
+    DecoderBatch batch(model, {.max_lanes = 1, .max_num_batched_tokens = 256});
+    constexpr int end = 385;
+    const std::vector<int> prompt(end, 198);
     Selection selected{};
     selected[0] = true;
     for (const bool text_stop : {false, true}) {
@@ -216,15 +220,21 @@ void cancelled_boundary(Decoder& model, const LmCacheClient& cache) {
             rows += stats.prefill_rows[0];
             if (rows == int(prompt.size())) {
                 require(last.finish_reason == DecoderFinishReason::cancelled &&
-                        !last.prefix_pending,
-                        "Lost terminal claim published a periodic or deferred checkpoint");
+                            !last.prefix_pending,
+                        "Lost terminal claim queued a deferred checkpoint");
             }
         }
-        require(claims == 1 && stores->receipts.empty() && !batch.poll_prefix(0).pending,
-                "Cancelled boundary retained a store or claimed completion twice");
-        const auto match = cache.lookup_prefix(PrefixCacheKeys(prompt, salt), rows, false);
-        require(match.gdn == 0 && match.gqa == 0, "Cancelled endpoint reached the daemon");
-        std::cout << salt << " rows " << rows << " claims " << claims << " stores 0\n";
+        require(claims == 1 && !batch.poll_prefix(0).pending,
+                "Cancelled boundary retained a pending store or claimed completion twice");
+        require(stores->receipts.size() == 3, "Incorrect sparse prefill store count");
+        stores->wait();
+        const PrefixCacheKeys keys(prompt, salt);
+        const auto match = LmCacheGroup(cache).lookup_prefix({&keys}, end, false);
+        const std::vector<int> endpoints{129, 257, end};
+        require(match.matched_gqa == end && match.matched_gdn_endpoints == endpoints,
+                "Cancelled completion changed the published prefill endpoints");
+        std::cout << salt << " rows " << rows << " claims " << claims << " prefill stores 129 257 "
+                  << end << '\n';
     }
 }
 
@@ -272,8 +282,9 @@ void synchronous_mtp(const Decoder& model, const LmCacheClient& cache,
                 result.finish_reason == DecoderFinishReason::length && result.mtp_rounds > 0 &&
                 result.output_token_ids == cold.output_token_ids,
                 "Synchronous MTP restore or cold restart changed generation");
-        require(reservations == 3 && stores->receipts.size() == 1,
-                "Synchronous MTP lost the deferred terminal STORE");
+        const std::size_t expected_stores = fail_restore ? 2 : 1;
+        require(reservations == 3 && stores->receipts.size() == expected_stores,
+                "Synchronous MTP lost the deferred terminal or cold restart checkpoint");
         stores->wait();
         auto history = prompt;
         history.insert(history.end(), result.output_token_ids.begin(),

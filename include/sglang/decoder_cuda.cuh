@@ -36,13 +36,7 @@ struct VerifyGdnGateRow {
 std::optional<cudaError_t> try_verify_bf16_gdn_gates(
     const __nv_bfloat16* weight_b, const __nv_bfloat16* weight_a,
     const VerifyGdnGateRow* rows, int count, cudaStream_t stream);
-std::optional<cudaError_t> try_verify_bf16_gdn_gates_compact(
-    const __nv_bfloat16* weight_b, const __nv_bfloat16* weight_a,
-    const VerifyGdnGateRow* rows, int count, cudaStream_t stream);
 std::optional<cudaError_t> try_verify_bf16_gdn_gates_local(
-    const __nv_bfloat16* weight_b, const __nv_bfloat16* weight_a,
-    const VerifyGdnGateRow* rows, int count, cudaStream_t stream);
-std::optional<cudaError_t> try_verify_bf16_gdn_gates_compact_local(
     const __nv_bfloat16* weight_b, const __nv_bfloat16* weight_a,
     const VerifyGdnGateRow* rows, int count, cudaStream_t stream);
 cudaError_t decode_bf16_lm_head(const __nv_bfloat16* weight, const __nv_bfloat16* input,
@@ -139,19 +133,21 @@ std::optional<cudaError_t> try_prefill_bf16_gdn_gates_local(
     const __nv_bfloat16* weight_b, const __nv_bfloat16* weight_a, const __nv_bfloat16* input,
     int rows, __nv_bfloat16* output_b, __nv_bfloat16* output_a, cudaStream_t stream);
 
-cudaError_t tensor_core_prefill_gdn(int rows, const __nv_bfloat16* qkv, const __nv_bfloat16* z,
-                                    const __nv_bfloat16* b, const __nv_bfloat16* a,
-                                    TextGdnWeights weights, TextGdnState state,
-                                    __nv_bfloat16* workspace, float2* gates,
-                                    __nv_bfloat16* output, cudaStream_t stream,
-                                    void* chunk_scratch = nullptr, std::size_t chunk_bytes = 0);
+cudaError_t
+tensor_core_prefill_gdn(int rows, const __nv_bfloat16* qkv, const __nv_bfloat16* z,
+                        const __nv_bfloat16* b, const __nv_bfloat16* a, TextGdnWeights weights,
+                        TextGdnState state, __nv_bfloat16* workspace, float2* gates,
+                        __nv_bfloat16* output, cudaStream_t stream, void* chunk_scratch = nullptr,
+                        std::size_t chunk_bytes = 0,
+                        TextGdnPrefillCheckpoints checkpoints = TextGdnPrefillCheckpoints{});
 
-cudaError_t tensor_core_prefill_gdn(int rows, const __nv_bfloat16* qkv, const __nv_bfloat16* z,
-                                    const __nv_bfloat16* b, const __nv_bfloat16* a,
-                                    TextGdnWeights weights, TextGdnState state,
-                                    __nv_bfloat16* workspace, float2* gates,
-                                    TextFp8Activation output, cudaStream_t stream,
-                                    void* chunk_scratch = nullptr, std::size_t chunk_bytes = 0);
+cudaError_t
+tensor_core_prefill_gdn(int rows, const __nv_bfloat16* qkv, const __nv_bfloat16* z,
+                        const __nv_bfloat16* b, const __nv_bfloat16* a, TextGdnWeights weights,
+                        TextGdnState state, __nv_bfloat16* workspace, float2* gates,
+                        TextFp8Activation output, cudaStream_t stream,
+                        void* chunk_scratch = nullptr, std::size_t chunk_bytes = 0,
+                        TextGdnPrefillCheckpoints checkpoints = TextGdnPrefillCheckpoints{});
 
 inline constexpr int max_gdn_prefill_segments = 4;
 
@@ -167,6 +163,7 @@ struct GdnPrefillSegment {
     TextFp8Activation output;
     void* chunk_scratch;
     std::size_t chunk_bytes;
+    TextGdnPrefillCheckpoints checkpoints{};
 };
 
 std::optional<cudaError_t> tensor_core_prefill_gdn_group(
@@ -335,51 +332,6 @@ cudaError_t target_split_gqa(const PagedDecodeLane* lanes, int count, int end,
 
 cudaError_t paged_decode_gqa(const PagedDecodeLane* lanes, int count, cudaStream_t stream);
 cudaError_t paged_decode_gqa(const BoundPagedDecodeLane* lanes, int count, cudaStream_t stream);
-
-cudaError_t decode_gdn(const __nv_bfloat16* qkv, const __nv_bfloat16* z,
-                       const __nv_bfloat16* b, const __nv_bfloat16* a,
-                       TextGdnWeights weights, const TextGdnState* state,
-                       __nv_bfloat16* workspace, __nv_bfloat16* output, cudaStream_t stream);
-
-cudaError_t decode_verify_gdn(int rows, TextGdnReplayRows inputs, const __nv_bfloat16* z,
-                              TextGdnWeights weights, const TextGdnState* initial,
-                              const TextGdnState* tail, __nv_bfloat16* observable,
-                              __nv_bfloat16* output, cudaStream_t stream);
-
-struct GdnVerificationLane {
-    TextGdnReplayRows inputs;
-    const __nv_bfloat16* z;
-    TextGdnState initial;
-    TextGdnState tail;
-    __nv_bfloat16* observable;
-    __nv_bfloat16* output;
-};
-
-struct GdnVerificationBatch {
-    static constexpr int lanes = 4;
-    static constexpr int rows = text_gdn_max_verify_rows;
-    GdnVerificationLane entries[lanes];
-};
-
-cudaError_t decode_verify_gdn_batch(GdnVerificationBatch batch, TextGdnWeights weights,
-                                    cudaStream_t stream);
-
-struct CompactGdnVerificationBatch {
-    static constexpr int lanes = 32;
-    static constexpr int rows = GdnVerificationBatch::rows;
-    GdnVerificationLane entries[lanes];
-};
-
-__host__ __device__ int compact_gdn_row(int lane, int row);
-
-struct CompactGdnFp8Rows {
-    std::uint8_t* values;
-    float* scales[CompactGdnVerificationBatch::lanes * CompactGdnVerificationBatch::rows];
-};
-
-cudaError_t decode_verify_gdn_compact(CompactGdnVerificationBatch batch, int lanes,
-                                      TextGdnWeights weights, CompactGdnFp8Rows output,
-                                      cudaStream_t stream);
 
 struct DecodeFp8Projection {
     const std::uint8_t* values;

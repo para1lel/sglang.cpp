@@ -2,164 +2,160 @@
 
 import argparse
 import base64
-from contextlib import closing
-from copy import deepcopy
 import hashlib
-from http.client import HTTPConnection
 import json
-from pathlib import Path
-import queue
-import struct
 import sys
-import traceback
+from copy import deepcopy
+from http import HTTPStatus
+from pathlib import Path
 from tempfile import TemporaryDirectory
-from threading import Thread
 from time import monotonic, perf_counter_ns, sleep
 from types import SimpleNamespace
 
-ROOT = Path(__file__).resolve().parents[2]
-sys.path[:0] = [str(ROOT), str(ROOT / "tests"), str(ROOT / "benchmarks" / "paired")]
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "benchmarks" / "paired"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tests"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from cold_cache import LMCACHE_DRAIN, LMCACHE_METRICS, PENDING_STORES, RUNNING, WAITING, metrics
-from media import http_routes as http
-from lmcache_relay import DRAFT, ERASE, GET, GDN, GQA, LEASE, LOOKUP, PREFIX, PUT, READY, RESET
-from lmcache_relay import Relay, arm_device_fence, control, key_body
+from cold_cache import RUNNING, WAITING, metrics
+from lmcache_relay import (
+    DRAFT,
+    ERASE,
+    GDN,
+    GQA,
+    LEASE,
+    PREFIX_DETAIL,
+    RANK_GET,
+    RANK_PUT,
+    READY,
+    WIRE_VERSION,
+    Relay,
+    arm_device_fence,
+    control,
+    key_body,
+)
+from lmcache_route_helpers import (
+    NAMESPACE,
+    Stream,
+    Witness,
+    capture_case,
+    tokens,
+    transfer_records,
+    wait_until,
+)
 from lmcache_send_trace import require_deferred_send, terminal_times, traced_worker
+from lmcache_split_routes import split_only
 
+from benchmarks.concurrent.reference import load_lanes
+from media import http_routes as http
 
 LOW, HIGH, PROMPT = 1279, 1391, 1536
-NAMESPACE = "sglang"
+TERMINAL_OWNER_STORES = 3
 
 
-def fixture(fixtures):
-    from benchmarks.concurrent.reference import load_lanes
-
+def fixture(fixtures: Path) -> list[list[int]]:
     lanes = load_lanes(fixtures, "W3")
     return [case["prompt_token_ids"] for _, _, case in lanes[:2]]
 
 
-class Witness:
-    def __init__(self, port, evidence, daemon, relay):
-        self.port = port
-        self.evidence = evidence
-        self.daemon = daemon
-        self.relay = relay
-
-    def action(self, opcode, payload=b""):
-        return control(self.daemon, NAMESPACE, opcode, payload)
-
-    def get(self, route):
-        status, _, raw = http.exchange(self.port, route)
-        assert status == 200, (route, status, raw)
-        return raw
-
-    def pending_stores(self):
-        return metrics(self.get("/metrics").decode(), LMCACHE_DRAIN)[PENDING_STORES]
-
-    def drain(self):
-        wait_until(lambda: self.pending_stores() == 0, "LMCache stores did not settle")
-
-    def snapshot(self, label):
-        self.drain()
-        raw = self.get("/metrics")
-        (self.evidence / f"{label}.prom").write_bytes(raw)
-        summary = metrics(raw.decode(), "lmcache")
-        return {name.removeprefix("sglang_cpp:lmcache_").removesuffix("_total"): summary[name]
-                for name in LMCACHE_METRICS}
-
-    def reset(self):
-        self.drain()
-        count = len(self.relay.since())
-        status, _, body = http.exchange(self.port, "/reset_prefix_cache", {})
-        assert status == 200 and json.loads(body) == {"success": True}, (status, body)
-        resets = [entry for entry in self.relay.since(count) if entry["opcode"] == RESET]
-        assert len(resets) == 1 and resets[0]["status"] == 0, resets
-
-    def generate(self, label, prompt, *, count=1, **options):
-        body = http.native_text(prompt, count) | options
-        return http.capture(SimpleNamespace(evidence=self.evidence), label, self.port,
-                            http.GENERATE, body)
-
-    def stores(self, label, prompt):
-        begin = len(self.relay.since())
-        response = self.generate(label, prompt)
-        assert len(response["output_ids"]) == 1
-        keys = self.published_keys(begin)
-        assert {family for family, _ in keys} == {GQA, GDN, DRAFT}, (label, keys)
-        return response, keys
-
-    def published_keys(self, begin):
-        self.drain()
-        entries = [entry for entry in self.relay.since(begin) if entry["opcode"] == PUT]
-        assert all(entry["status"] == 0 for entry in entries), entries
-        return {key for entry in entries for key in entry["keys"]}
-
-    def changes(self, label, prompt, cached, expected, *, count=1, **options):
-        before = self.snapshot(f"{label}-before")
-        result = self.generate(label, prompt, count=count, **options)
-        outputs = http.native_result(result, prompt, count, cached)
-        after = self.snapshot(f"{label}-after")
-        delta = {name: after[name] - before[name] for name in before}
-        assert all(amount >= 0 for amount in delta.values()), delta
-        for name, amount in expected.items():
-            assert delta[name] == amount, (label, name, amount, delta)
-        return outputs, delta
-
-    def lookup(self, keys, expected):
-        payload = struct.pack("!I", len(keys)) + b"".join(map(key_body, keys))
-        assert self.action(LOOKUP, payload) == (0, bytes(expected)), (keys, expected)
+def checkpoint_keys(witness: Witness, begin: int, endpoint: int) -> set[tuple[int, bytes]]:
+    return {
+        key
+        for _, key, record in transfer_records(witness.relay.since(begin), RANK_PUT, GDN)
+        if record["endpoint"] == endpoint
+    }
 
 
-def unique(keys, family):
-    key, = (key for key in keys if key[0] == family)
+def terminal_checkpoint(witness: Witness, begin: int, endpoint: int) -> tuple[int, bytes]:
+    (key,) = checkpoint_keys(witness, begin, endpoint)
     return key
-
-
-def tokens(result):
-    ids, text, _ = result
-    return ids, text
 
 
 def selective(witness, source):
     prefix = source[:PROMPT]
     witness.reset()
-    cold, cold_delta = witness.changes("selective-cold", prefix, 0, {
-        "gqa_restored_tokens": 0, "gqa_read_only_tokens": 0, "gdn_restored_tokens": 0,
-        "gqa_computed_tokens": PROMPT, "gqa_written_tokens": PROMPT,
-        "gdn_computed_tokens": PROMPT, "draft_restored_rows": 0, "io_errors": 0,
-    })
+    cold, cold_delta = witness.changes(
+        "selective-cold",
+        prefix,
+        0,
+        {
+            "gqa_restored_tokens": 0,
+            "gqa_read_only_tokens": 0,
+            "gdn_restored_tokens": 0,
+            "gqa_computed_tokens": PROMPT,
+            "gdn_computed_tokens": PROMPT,
+            "draft_restored_rows": 0,
+            "io_errors": 0,
+        },
+    )
+    assert cold_delta["gqa_written_tokens"] >= PROMPT, cold_delta
     witness.reset()
+    offset = len(witness.relay.since())
     _, low_keys = witness.stores("prime-1279", prefix[:LOW])
+    low_gdn = terminal_checkpoint(witness, offset, LOW)
+    offset = len(witness.relay.since())
     _, high_keys = witness.stores("prime-1391", prefix[:HIGH])
-    low_gdn, high_gdn = unique(low_keys, GDN), unique(high_keys, GDN)
+    high_gdn = terminal_checkpoint(witness, offset, HIGH)
     assert low_gdn != high_gdn
-    assert witness.action(ERASE, key_body(high_gdn))[0] == 0
+    records = transfer_records(witness.relay.since(offset), RANK_PUT, GDN)
+    witness.erase({key for _, key, record in records if record["endpoint"] > LOW})
     witness.lookup([low_gdn, high_gdn], (1, 0))
     offset = len(witness.relay.since())
-    ahead, ahead_delta = witness.changes("gqa-ahead", prefix, LOW, {
-        "gqa_restored_tokens": HIGH, "gqa_read_only_tokens": HIGH - LOW,
-        "gqa_computed_tokens": PROMPT - HIGH, "gdn_restored_tokens": LOW,
-        "gdn_computed_tokens": PROMPT - LOW, "draft_restored_rows": LOW - 1, "io_errors": 0,
-    })
+    ahead, ahead_delta = witness.changes(
+        "gqa-ahead",
+        prefix,
+        LOW,
+        {
+            "gqa_restored_tokens": HIGH,
+            "gqa_read_only_tokens": HIGH - LOW,
+            "gqa_computed_tokens": PROMPT - HIGH,
+            "gdn_restored_tokens": LOW,
+            "gdn_computed_tokens": PROMPT - LOW,
+            "draft_restored_rows": LOW - 1,
+            "io_errors": 0,
+        },
+    )
     assert tokens(ahead) == tokens(cold), (ahead, cold)
-    restored = {key for entry in witness.relay.since(offset)
-                if entry["opcode"] == GET and entry["status"] == 0 for key in entry["keys"]}
+    restored = set().union(*(read_keys(witness, offset, family) for family in (GQA, GDN, DRAFT)))
     assert low_gdn in restored and high_gdn not in restored, restored
     assert any(key in restored for key in high_keys - low_keys if key[0] == GQA), restored
     witness.reset()
     offset = len(witness.relay.since())
-    _, common = witness.stores("prime-inverse", prefix[:HIGH])
-    gqa_root = next(key for entry in witness.relay.since(offset)
-                    if entry["opcode"] == PUT for key in entry["keys"] if key[0] == GQA)
-    gdn = unique(common, GDN)
+    witness.stores("prime-inverse", prefix[:HIGH])
+    gqa_root = next(
+        key
+        for entry in witness.relay.since(offset)
+        if entry["opcode"] == RANK_PUT
+        for key in entry["keys"]
+        if key[0] == GQA
+    )
+    gdn = terminal_checkpoint(witness, offset, HIGH)
     assert witness.action(ERASE, key_body(gqa_root))[0] == 0
     witness.lookup([gqa_root, gdn], (0, 1))
     offset = len(witness.relay.since())
-    # Four full 256-row records remain after erasing the first one. The old final partial
-    # record has a distinct endpoint, so the recomputed turn publishes two full records.
-    inverse, inverse_delta = witness.changes("gdn-ahead", prefix, 0, cold_delta | {
-        "gqa_written_tokens": 2 * 256,
-    })
+    inverse, inverse_delta = witness.changes(
+        "gdn-ahead",
+        prefix,
+        0,
+        {
+            key: cold_delta[key]
+            for key in (
+                "gqa_restored_tokens",
+                "gqa_read_only_tokens",
+                "gdn_restored_tokens",
+                "gqa_computed_tokens",
+                "gdn_computed_tokens",
+                "draft_restored_rows",
+                "io_errors",
+            )
+        },
+    )
+    writes = [
+        entry["receipt"][3]
+        for entry in witness.relay.since(offset)
+        if entry["opcode"] == RANK_PUT and entry["status"] == 0 and entry.get("forwarded")
+    ]
+    assert inverse_delta["gqa_written_tokens"] == sum(writes) > 0, (inverse_delta, writes)
+    witness.lookup([gqa_root], (1,))
     assert tokens(inverse) == tokens(cold), (inverse, cold)
     assert gdn not in read_keys(witness, offset, GDN)
     return {"cold": cold_delta, "gqa_ahead": ahead_delta, "gdn_ahead": inverse_delta}
@@ -173,17 +169,31 @@ def natural_prefix(witness, source, unrelated):
     witness.reset()
     cold = http.native_result(witness.generate("natural-prefix-cold", prompt), prompt, 1, 0)
     witness.reset()
-    _, low_keys = witness.stores("natural-prime-1279", stock[:LOW])
-    _, stock_keys = witness.stores("natural-prime-1416", stock)
-    coherent, divergent = unique(low_keys, GDN), unique(stock_keys, GDN)
+    offset = len(witness.relay.since())
+    witness.stores("natural-prime-1279", stock[:LOW])
+    coherent = terminal_checkpoint(witness, offset, LOW)
+    offset = len(witness.relay.since())
+    witness.stores("natural-prime-1416", stock)
+    divergent = terminal_checkpoint(witness, offset, len(stock))
+    records = transfer_records(witness.relay.since(offset), RANK_PUT, GDN)
+    witness.erase({key for _, key, record in records if LOW < record["endpoint"] <= HIGH})
     witness.lookup([coherent, divergent], (1, 1))
     offset = len(witness.relay.since())
-    full_rows = 1280
-    warm, delta = witness.changes("natural-lcp-1391", prompt, LOW, {
-        "gqa_restored_tokens": full_rows, "gqa_read_only_tokens": full_rows - LOW,
-        "gqa_computed_tokens": PROMPT - full_rows, "gdn_restored_tokens": LOW,
-        "gdn_computed_tokens": PROMPT - LOW, "draft_restored_rows": LOW - 1, "io_errors": 0,
-    })
+    attention_rows = len(stock) - 128
+    warm, delta = witness.changes(
+        "natural-lcp-1391",
+        prompt,
+        LOW,
+        {
+            "gqa_restored_tokens": attention_rows,
+            "gqa_read_only_tokens": attention_rows - LOW,
+            "gqa_computed_tokens": PROMPT - attention_rows,
+            "gdn_restored_tokens": LOW,
+            "gdn_computed_tokens": PROMPT - LOW,
+            "draft_restored_rows": LOW - 1,
+            "io_errors": 0,
+        },
+    )
     assert tokens(warm) == tokens(cold)
     assert read_keys(witness, offset, GDN) == {coherent}
     return {"stock_prompt_tokens": len(stock), "common_prompt_tokens": HIGH, "work": delta}
@@ -216,7 +226,8 @@ def public_salt(witness, source):
         cold, keys = controls[salt]
         assert tokens(warm) == tokens(cold)
         reads = set().union(*(read_keys(witness, offset, family) for family in (GQA, GDN, DRAFT)))
-        assert keys == reads, (name, keys, reads)
+        assert reads <= keys, (name, keys, reads)
+        assert {family for family, _ in reads} == {GQA, GDN, DRAFT}, (name, reads)
         report.append({"restored": delta, "keys_read": len(reads)})
     return report
 
@@ -241,7 +252,8 @@ def media_identity(witness):
     offset = len(witness.relay.since())
     primed = generate("media-original-prime", bodies[0])
     original_ids, original_usage = http.received(primed, budget)
-    state = unique(witness.published_keys(offset), GDN)
+    witness.drain()
+    state = terminal_checkpoint(witness, offset, original_usage["prompt_tokens"])
     prompt_tokens = original_usage["prompt_tokens"]
     assert changed_usage["prompt_tokens"] == prompt_tokens
     assert primed["prompt_token_ids"] == changed_cold["prompt_token_ids"]
@@ -254,7 +266,8 @@ def media_identity(witness):
     cached = changed["usage"]["prompt_tokens_details"]["cached_tokens"]
     assert 0 <= cached < prompt_tokens and state not in read_keys(witness, offset, GDN)
     assert http.received(changed, budget, cached)[0] == changed_ids
-    changed_state = unique(witness.published_keys(offset), GDN)
+    witness.drain()
+    changed_state = terminal_checkpoint(witness, offset, prompt_tokens)
     assert changed_state != state
     witness.lookup([state, changed_state], (1, 1))
     offset = len(witness.relay.since())
@@ -288,9 +301,7 @@ def scored_reference(args, witness, source):
 
 
 def read_keys(witness, offset, family):
-    return {key for entry in witness.relay.since(offset)
-            if entry["opcode"] == GET and entry["status"] == 0
-            for key in entry["keys"] if key[0] == family}
+    return {key for _, key, _ in transfer_records(witness.relay.since(offset), RANK_GET, family)}
 
 
 def shifted_draft(witness, source, unrelated, position):
@@ -325,8 +336,9 @@ def shifted_draft(witness, source, unrelated, position):
                                   "parity": tokens(result) == output}
     witness.reset()
     witness.stores(f"draft-{position}-hole-shared", prefix[:-1])
+    offset = len(witness.relay.since())
     _, primed = witness.stores(f"draft-{position}-hole-exact", prefix)
-    gdn = unique(primed, GDN)
+    gdn = terminal_checkpoint(witness, offset, position)
     assert terminal in primed and witness.action(ERASE, key_body(terminal))[0] == 0
     witness.lookup([terminal, gdn], (0, 1))
     offset = len(witness.relay.since())
@@ -340,8 +352,6 @@ def shifted_draft(witness, source, unrelated, position):
     path = witness.evidence / f"draft-{position}.json"
     path.write_text(json.dumps(recorded, indent=2) + "\n")
     assert recorded["neighbor"]["parity"], (position, recorded)
-    # The 1278+2 history can change a near tie relative to ordinary cold prefill.
-    # The separate matched-history probe compares all scores on this same fixture.
     if position == LOW:
         assert (recorded["original"]["restored_ids"] ==
                 recorded["missing_terminal_draft"]["restored_ids"]), recorded
@@ -356,74 +366,6 @@ def event_receipt(relay):
                                for family, identity in entry["keys"]]} for entry in events]
 
 
-class Stream:
-    def __init__(self, witness, label, prompt, count, *, evidence_label=None, **sampling):
-        self.witness = witness
-        self.label = label
-        self.evidence_label = evidence_label or label
-        self.body = http.native_text(prompt, count) | {"rid": label, "stream": True}
-        self.body["sampling_params"].update(sampling)
-        self.events = queue.Queue()
-        self.thread = Thread(target=self.read)
-        self.thread.start()
-
-    def read(self):
-        try:
-            self.capture()
-        except Exception as error:
-            self.events.put(error)
-
-    def capture(self):
-        path = self.witness.evidence / f"{self.evidence_label}.sse"
-        with path.open("wb") as raw, closing(HTTPConnection(
-                "127.0.0.1", self.witness.port, timeout=90)) as session:
-            session.request("POST", http.GENERATE, json.dumps(self.body), http.HEADERS)
-            with session.getresponse() as response:
-                assert response.status == 200, (response.status, response.read())
-                assert response.headers.get_content_type() == "text/event-stream"
-                for line in iter(response.readline, b""):
-                    raw.write(line)
-                    if line.startswith(b"data: "):
-                        body = line[6:].strip()
-                        value = "[DONE]" if body == b"[DONE]" else json.loads(body)
-                        self.events.put((perf_counter_ns(), value))
-        self.events.put(None)
-
-    def event(self, timeout=10):
-        record = self.events.get(timeout=timeout)
-        if isinstance(record, Exception):
-            raise record
-        assert record is not None, (self.label, "unexpected EOF")
-        return record
-
-    def progress(self, after=0):
-        deadline = monotonic() + 5
-        while (remaining := deadline - monotonic()) > 0:
-            instant, frame = self.event(remaining)
-            if frame == "[DONE]":
-                raise AssertionError((self.label, "completed before demonstrating progress"))
-            assert "meta_info" in frame, frame
-            if instant > after and frame["output_ids"] and not frame["meta_info"]["finish_reason"]:
-                return instant, len(frame["output_ids"])
-        raise TimeoutError(f"No stream progress from {self.label}")
-
-    def finish(self, terminal_after=0):
-        deadline = monotonic() + 90
-        while True:
-            instant, frame = self.event(max(0.001, deadline - monotonic()))
-            if frame == "[DONE]" or frame["meta_info"]["finish_reason"]:
-                assert instant > terminal_after, (
-                    self.label, "terminal before the held lease was released")
-            if frame == "[DONE]":
-                break
-        self.thread.join(5)
-        assert not self.thread.is_alive() and self.events.get(timeout=1) is None
-        raw = (self.witness.evidence / f"{self.evidence_label}.sse").read_bytes()
-        frames = http.stream_frames(raw)
-        last = frames[-1]
-        assert all(last["output_ids"][:len(frame["output_ids"])] == frame["output_ids"]
-                   and frame["meta_info"]["finish_reason"] is None for frame in frames[:-1])
-        return last
 
 
 def held_get(witness, source, unrelated):
@@ -432,7 +374,7 @@ def held_get(witness, source, unrelated):
     witness.stores("prime-held", prime)
     peer = Stream(witness, "unrelated-in-progress", unrelated[:128], 512)
     first_ns, first_count = peer.progress()
-    gate = witness.relay.arm(GET, GQA)
+    gate = witness.relay.arm(RANK_GET, GQA)
     subject = Stream(witness, "held-cache-read", prompt, 8)
     try:
         upstream = gate.wait()
@@ -466,7 +408,7 @@ def abort_pending(witness, source):
     witness.reset()
     witness.stores("prime-abort", source[:HIGH])
     offset = len(witness.relay.since())
-    gate = witness.relay.arm(PREFIX)
+    gate = witness.relay.arm(PREFIX_DETAIL)
     waiting = Stream(witness, "cancel-held-lookup", prompt, 8)
     try:
         upstream = gate.wait()
@@ -480,7 +422,8 @@ def abort_pending(witness, source):
         replacement = Stream(witness, waiting.label, prompt, 8, evidence_label="reused-abort-id")
         admitted_ns = expect_load(witness, 1, 0)
         assert upstream["reply_ns"] < admitted_ns and not gate.release.is_set()
-        assert not any(entry["opcode"] in (GET, PUT) for entry in witness.relay.since(offset))
+        entries = witness.relay.since(offset)
+        assert not any(entry["opcode"] in (RANK_GET, RANK_PUT) for entry in entries)
     finally:
         gate.release.set()
     assert gate.finished.wait(10)
@@ -490,25 +433,26 @@ def abort_pending(witness, source):
 
 
 def held_put(witness, source, unrelated):
-    position = http.CHECKPOINT_INTERVAL
-    prompt, peer_prompt = source[:position] + [unrelated[128]], unrelated[:128]
+    position = 129
+    prompt, peer_prompt = source[: position + 128], unrelated[:128]
     budget = 8
-    assert len(prompt) == position + 1 and prompt[0] != peer_prompt[0]
+    assert len(prompt) == position + 128
+    assert prompt[0] != peer_prompt[0]
     witness.reset()
     cold = witness.generate("held-put-cold", prompt, count=budget)
     expected = http.native_result(cold, prompt, budget, 0)
     witness.reset()
     offset = len(witness.relay.since())
-    gate = witness.relay.arm(PUT, GDN)
-    writer = Stream(witness, "held-periodic-put", prompt, budget)
+    gate = witness.relay.arm(RANK_PUT, GDN, endpoint=position)
+    writer = Stream(witness, "held-prefill-put", prompt, budget)
     try:
         upstream = gate.wait()
-        periodic, = (key for key in upstream["keys"] if key[0] == GDN)
-        periodic_bytes = upstream["receipt"][GDN - 1]
-        assert periodic_bytes > 0
+        (anchor,) = (key for key in upstream["keys"] if key[0] == GDN)
+        anchor_bytes = upstream["receipt"][GDN - 1]
+        assert anchor_bytes > 0
         peer = Stream(witness, "peer-before-put-ack", peer_prompt, budget)
         peer_ns, _ = peer.progress(upstream["reply_ns"])
-        witness.lookup([periodic], (1,))
+        witness.lookup([anchor], (1,))
         written = http.native_result(writer.finish(), prompt, budget, 0)
         finished_ns = perf_counter_ns()
         assert not gate.release.is_set() and witness.pending_stores() > 0
@@ -522,27 +466,50 @@ def held_put(witness, source, unrelated):
     http.native_result(peer.finish(), peer_prompt, budget, 0)
     assert tokens(written) == tokens(expected)
     witness.drain()
-    states = [key for entry in witness.relay.since(offset) if entry["opcode"] == PUT
-              for key in entry["keys"] if key[0] == GDN]
-    assert len(states) == len(set(states)) == 3 and states[0] == periodic, states
-    witness.lookup(states, (1, 1, 1))
+    states = {
+        key: record["endpoint"]
+        for _, key, record in transfer_records(witness.relay.since(offset), RANK_PUT, GDN)
+    }
+    expected_states = {
+        1,
+        position,
+        len(prompt),
+        len(prompt) + budget - 1,
+        len(peer_prompt),
+        len(peer_prompt) + budget - 1,
+    }
+    assert anchor in states, states
+    assert set(states.values()) == expected_states, states
+    assert len(states) == len(expected_states), states
+    witness.lookup(list(states), (1,) * len(states))
     terminal_prompt = prompt + written[0][:-1]
     read_offset = len(witness.relay.since())
-    restored, delta = witness.changes("held-put-terminal-restore", terminal_prompt,
-                                     len(terminal_prompt), {
-        "gdn_restored_tokens": len(terminal_prompt),
-        "draft_restored_rows": len(terminal_prompt) - 1, "io_errors": 0,
-    })
-    terminal, = read_keys(witness, read_offset, GDN)
-    assert terminal != periodic and terminal in states
+    restored, delta = witness.changes(
+        "held-put-terminal-restore",
+        terminal_prompt,
+        len(terminal_prompt),
+        {
+            "gdn_restored_tokens": len(terminal_prompt),
+            "draft_restored_rows": len(terminal_prompt) - 1,
+            "io_errors": 0,
+        },
+    )
+    (terminal,) = read_keys(witness, read_offset, GDN)
+    assert terminal != anchor
+    assert terminal in states
     witness.reset()
     replay = witness.generate("held-put-terminal-cold", terminal_prompt)
     assert tokens(restored) == tokens(http.native_result(replay, terminal_prompt, 1, 0))
-    return {"periodic_rows": position, "periodic_gdn_bytes": periodic_bytes,
-            "terminal_rows": len(terminal_prompt), "terminal_restore": delta,
-            "periodic_ack_held_ns": upstream["reply_ns"], "peer_progress_ns": peer_ns,
-            "writer_finished_ns": finished_ns,
-            "periodic_ack_released_ns": released_ns}
+    return {
+        "anchor_rows": position,
+        "anchor_gdn_bytes": anchor_bytes,
+        "terminal_rows": len(terminal_prompt),
+        "terminal_restore": delta,
+        "anchor_ack_held_ns": upstream["reply_ns"],
+        "peer_progress_ns": peer_ns,
+        "writer_finished_ns": finished_ns,
+        "anchor_ack_released_ns": released_ns,
+    }
 
 
 def failed_get(witness, source):
@@ -553,7 +520,7 @@ def failed_get(witness, source):
     witness.reset()
     witness.stores("prime-error", prime)
     before = witness.snapshot("error-before")
-    gate = witness.relay.arm(GET, GQA, drop=True)
+    gate = witness.relay.arm(RANK_GET, GQA, drop=True)
     request = Stream(witness, "dropped-daemon-reply", prompt, 8)
     try:
         gate.wait()
@@ -573,14 +540,6 @@ def failed_get(witness, source):
             "reconnected": reconnect}
 
 
-def wait_until(predicate, message):
-    deadline = monotonic() + 5
-    while monotonic() < deadline:
-        result = predicate()
-        if result:
-            return result
-        sleep(0.01)
-    raise AssertionError(message)
 
 
 def matching_lease(witness, admission, status):
@@ -598,7 +557,7 @@ def abort_armed_get(witness, fence, source, unrelated):
     peer = Stream(witness, "peer-during-armed-abort", peer_prompt, 512)
     _, peer_count = peer.progress()
     fence = arm_device_fence(fence)
-    gate = witness.relay.arm(GET, GQA, phase="arm", drop=True)
+    gate = witness.relay.arm(RANK_GET, GQA, phase="arm", drop=True)
     subject = Stream(witness, "abort-armed-get", prompt, 8)
     try:
         admission = gate.wait()
@@ -646,7 +605,7 @@ def shutdown_armed_get(args, relay, relay_path, source):
         witness.reset()
         witness.stores("prime-armed-shutdown", prefix)
         begin = len(relay.since())
-        gate = relay.arm(GET, GQA, drop=True)
+        gate = relay.arm(RANK_GET, GQA, drop=True)
         fence = arm_device_fence(args.device_fence_dir)
         subject = Stream(witness, "shutdown-armed-get", prompt, 8)
         try:
@@ -662,7 +621,8 @@ def shutdown_armed_get(args, relay, relay_path, source):
                 admission["incarnation"], admission["lease"])
             assert process.wait(timeout=10) == 0
             released = matching_lease(witness, admission, 0)
-            assert released and witness.action(READY) == (0, b"0.5.8+native-v3")
+            assert released
+            assert witness.action(READY) == (0, WIRE_VERSION)
             subject.thread.join(5)
             assert not subject.thread.is_alive()
             return {"active_ns": active["reply_ns"], "released_ns": released["reply_ns"],
@@ -691,14 +651,6 @@ def fresh_worker(args, relay, relay_path, source):
     return delta
 
 
-def capture_case(report, failures, name, check, *args):
-    try:
-        report[name] = check(*args)
-    except Exception:
-        failures[name] = traceback.format_exc()
-        print(failures[name], file=sys.stderr, flush=True)
-
-
 def exercise(args, relay, path, source, unrelated):
     report, failures = {}, {}
     with http.serve(args, "functional", "--lmcache-socket", str(path)) as (port, _):
@@ -706,15 +658,16 @@ def exercise(args, relay, path, source, unrelated):
         info = json.loads(witness.get("/server_info"))
         assert info["lmcache_enabled"] is info["lmcache_available"] is True
         for label, check, inputs in (
-                ("selective", selective, (source,)),
-                ("natural_prefix", natural_prefix, (source, unrelated)),
-                ("cache_salt", public_salt, (source,)),
-                ("media_identity", media_identity, ()),
-                ("unrelated_progress", held_get, (source, unrelated)),
-                ("shifted_draft_1279", shifted_draft, (source, unrelated, LOW)),
-                ("shifted_draft_8192", shifted_draft, (source, unrelated, 8192)),
-                ("injected_get_errors", failed_get, (source,)),
-                ("immutable_periodic_put", held_put, (source, unrelated))):
+            ("selective", selective, (source,)),
+            ("natural_prefix", natural_prefix, (source, unrelated)),
+            ("cache_salt", public_salt, (source,)),
+            ("media_identity", media_identity, ()),
+            ("unrelated_progress", held_get, (source, unrelated)),
+            ("shifted_draft_1279", shifted_draft, (source, unrelated, LOW)),
+            ("shifted_draft_8192", shifted_draft, (source, unrelated, 8192)),
+            ("injected_get_errors", failed_get, (source,)),
+            ("immutable_prefill_put", held_put, (source, unrelated)),
+        ):
             capture_case(report, failures, label, check, witness, *inputs)
         capture_case(report, failures, "scored_same_history", scored_reference,
                      args, witness, source)
@@ -736,88 +689,146 @@ def exercise(args, relay, path, source, unrelated):
     return report | {"failures": failures}
 
 
-def exact_terminal(witness, source, unrelated, trace):
-    endpoint = http.CHECKPOINT_INTERVAL
-    prompt = source[:endpoint]
-    assert len(prompt) == endpoint
+def terminal_send_order(trace: Path, owner: str, claimant: str, opened: int) -> dict[str, int]:
+    _, owner_end = terminal_times(trace, owner)
+    claimant_start, _ = terminal_times(trace, claimant)
+    assert owner_end < opened, (owner, owner_end, opened)
+    require_deferred_send(claimant, claimant_start, opened)
+    return {
+        "owner_send_end_unix_ns": owner_end,
+        "barrier_open_unix_ns": opened,
+        "claimant_send_start_unix_ns": claimant_start,
+    }
+
+
+def exact_terminal(
+    witness: Witness, source: list[int], unrelated: list[int], trace: Path
+) -> dict[str, object]:
+    prompt_rows = 96
+    prompt = source[:prompt_rows]
+    endpoint = prompt_rows + 1
+    owner_prompt = unrelated[:endpoint]
+    assert len(prompt) == prompt_rows
+    assert len(owner_prompt) == endpoint
     witness.reset()
     assert json.loads(witness.get("/server_info"))["max_running_requests"] == 1
-    reference = witness.generate("boundary-length", prompt)
-    ids, text, _ = http.native_result(reference, prompt, 1, 0)
+    reference = witness.generate("boundary-length", prompt, count=2)
+    ids, text, _ = http.native_result(reference, prompt, 2, 0)
     assert text, reference
-    ordering = {}
-    for label in ("length", "stop"):
+
+    def prove_release_order(label: str) -> dict[str, int]:
         witness.reset()
-        gate = witness.relay.arm(PUT, GDN)
+        gate = witness.relay.arm(RANK_PUT, GDN, endpoint=len(owner_prompt) + 1)
         try:
-            first = Stream(witness, f"{label}-held-owner", unrelated[:97], 1)
+            first = Stream(witness, f"{label}-held-owner", owner_prompt, 2, cache_salt="first")
             owner = gate.wait()
-            http.native_result(first.finish(), unrelated[:97], 1, 0)
-            witness.generate(f"{label}-queued-owner", unrelated[:98])
-            assert witness.pending_stores() == 2
+            http.native_result(first.finish(), owner_prompt, 2, 0)
+            queued_prompt = unrelated[:98]
+            queued = witness.generate(
+                f"{label}-queued-owner", queued_prompt, count=2, cache_salt="second"
+            )
+            http.native_result(queued, queued_prompt, 2, 0)
+            held_stores = witness.pending_stores()
+            assert held_stores == TERMINAL_OWNER_STORES, held_stores
             begin = len(witness.relay.since())
-            count, sampling = (1, {}) if label == "length" else (4, {"stop": [text]})
+            count, sampling = (2, {}) if label == "length" else (4, {"stop": [text]})
             request = Stream(witness, f"boundary-{label}-claim", prompt, count, **sampling)
-            wait_until(lambda: witness.pending_stores() == 3, "Terminal checkpoint never deferred")
+            wait_until(
+                lambda held_stores=held_stores: witness.pending_stores() == held_stores + 2,
+                "Terminal checkpoint never deferred behind both owners",
+            )
             status, _, raw = http.exchange(witness.port, "/abort_request", {"rid": request.label})
-            assert status == 200 and not raw
-            assert witness.pending_stores() == 3
+            assert status == HTTPStatus.OK
+            assert not raw
+            assert witness.pending_stores() == held_stores + 2
         finally:
             gate.release.set()
-        assert gate.finished.wait(10) and owner.get("forwarded") is True
+        assert gate.finished.wait(10)
+        assert owner.get("forwarded") is True
         final = request.finish()
-        opened = owner["barrier_open_unix_ns"]
-        _, owner_end = terminal_times(trace, first.label)
-        claimant_start, _ = terminal_times(trace, request.label)
-        assert owner_end < opened, (first.label, owner_end, opened)
-        require_deferred_send(request.label, claimant_start, opened)
-        ordering[label] = {"owner_send_end_unix_ns": owner_end, "barrier_open_unix_ns": opened,
-                           "claimant_send_start_unix_ns": claimant_start}
+        timing = terminal_send_order(
+            trace, first.label, request.label, owner["barrier_open_unix_ns"]
+        )
         if label == "length":
-            assert http.native_result(final, prompt, 1, 0)[0] == ids
+            assert http.native_result(final, prompt, 2, 0)[0] == ids
         else:
             assert final["meta_info"]["finish_reason"] == {"type": "stop", "matched": text}
-            assert final["output_ids"] == ids and final["text"] == "", final
+            assert final["output_ids"] == ids, final
+            assert final["text"] == "", final
         witness.drain()
-        endpoints = [record["endpoint"] for entry in witness.relay.since(begin)
-                     if entry["opcode"] == PUT and entry["status"] == 0
-                     for record in entry["records"] if record.get("endpoint") == endpoint]
+        endpoints = [
+            record["endpoint"]
+            for entry in witness.relay.since(begin)
+            if entry["opcode"] == RANK_PUT and entry["status"] == 0
+            for record in entry["records"]
+            if record.get("endpoint") == endpoint
+        ]
         assert endpoints == [endpoint], (label, endpoints)
         warm = witness.generate(f"boundary-{label}-warm", prompt + ids)
         http.native_result(warm, prompt + ids, 1, endpoint)
-    return {"endpoint": endpoint, "first_id": ids[0], "matched_stop": text, "ordering": ordering}
+        return timing
+
+    ordering = {label: prove_release_order(label) for label in ("length", "stop")}
+    return {"endpoint": endpoint, "output_ids": ids, "matched_stop": text, "ordering": ordering}
 
 
-def periodic_only(args, relay, path, source, unrelated):
-    with http.serve(args, "held-put", "--lmcache-socket", str(path)) as (port, _):
+def checkpoint_only(
+    args: argparse.Namespace, relay: Relay, path: Path, source: list[int], unrelated: list[int]
+) -> dict:
+    report, failures = {}, {}
+    with http.serve(args, "checkpoints", "--lmcache-socket", str(path)) as (port, _):
         witness = Witness(port, args.evidence, args.daemon, relay)
-        return {"immutable_periodic_put": held_put(witness, source, unrelated), "failures": {}}
+        capture_case(report, failures, "natural_prefix", natural_prefix, witness, source, unrelated)
+        capture_case(
+            report, failures, "immutable_prefill_put", held_put, witness, source, unrelated
+        )
+    return report | {"failures": failures}
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("server", type=Path)
     parser.add_argument("checkpoint", type=Path)
     parser.add_argument("fixtures", type=Path)
     parser.add_argument("daemon", type=Path, help="Private LMCache 0.5.8 Unix socket")
     parser.add_argument("evidence", type=Path)
-    parser.add_argument("--periodic-only", action="store_true")
+    parser.add_argument("--checkpoint-only", action="store_true")
+    parser.add_argument("--split-only", action="store_true")
+    parser.add_argument(
+        "--tp",
+        type=int,
+        choices=(1, 2),
+        default=1,
+        help="Tensor parallel width for the focused split cache cases",
+    )
+    parser.add_argument(
+        "--alternate-checkpoint", type=Path, help="Compatible checkpoint with distinct weights"
+    )
     parser.add_argument("--device-fence-dir", type=Path,
                         help="Private directory passed to install_device_fence in the daemon")
     args = parser.parse_args()
+    assert not (args.split_only and args.checkpoint_only)
+    assert args.tp == 1 or args.split_only
+    assert args.split_only or not args.alternate_checkpoint
     args.evidence.mkdir(parents=True)
-    assert control(args.daemon, NAMESPACE, READY) == (0, b"0.5.8+native-v3")
+    assert control(args.daemon, NAMESPACE, READY) == (0, WIRE_VERSION)
     source, unrelated = fixture(args.fixtures)
     with TemporaryDirectory(prefix="sglang-cache-test.", dir="/tmp") as work:
         relay_path = Path(work) / "cache.sock"
         relay = Relay(relay_path, args.daemon)
         try:
             with relay:
-                run = periodic_only if args.periodic_only else exercise
+                run = exercise
+                if args.split_only:
+                    run = split_only
+                elif args.checkpoint_only:
+                    run = checkpoint_only
                 report = run(args, relay, relay_path, source, unrelated)
         finally:
             tape = {"events": event_receipt(relay), "errors": relay.errors}
-            (args.evidence / "relay.json").write_text(json.dumps(tape, indent=2) + "\n")
+            (args.evidence / "relay.json").write_text(
+                json.dumps(tape, default=bytes.hex, indent=2) + "\n"
+            )
         assert not relay.errors, relay.errors
     (args.evidence / "summary.json").write_text(json.dumps(report, indent=2) + "\n")
     assert not report["failures"], sorted(report["failures"])

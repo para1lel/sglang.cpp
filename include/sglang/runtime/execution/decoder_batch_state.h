@@ -1,5 +1,4 @@
 #pragma once
-#include "sglang/text/gdn/gdn_replay_batch.h"
 
 #include "sglang/runtime/execution/decoder_tp.h"
 #include "sglang/decoder_internal.h"
@@ -8,6 +7,7 @@
 #include "sglang/text/label_logprobs.h"
 #include "sglang/decoder_mtp.h"
 #include "sglang/decoder_verify.h"
+#include "sglang/decoder_prefill.h"
 #include "sglang/runtime/model/decoder_batch_lane.h"
 #include "sglang/runtime/model/decoder_batch_checkpoint.h"
 #include "sglang/text/mtp/draft_depth.h"
@@ -58,8 +58,8 @@ struct DecoderBatch::State {
     State(const Decoder::Model& owner, DecoderBatchOptions options,
           Decoder::TpRuntime* parallel = nullptr);
 
-    
-    
+    struct PrefillCheckpointBatch;
+
     struct StepLanes {
         std::array<ForwardLane, decoder_batch_max_lanes> work;
         std::array<ForwardLane, decoder_batch_max_lanes> single_prefill;
@@ -82,12 +82,37 @@ struct DecoderBatch::State {
                             CheckpointRows* checkpoint_rows, StepLanes& lanes);
     void dispatch_step_lanes(StepLanes& lanes, int max_rows, Steps& results,
                              DecoderBatchStepStats& stats, CheckpointRows* checkpoint_rows,
-                             const WideMtpGroups& wide_groups);
-    void prefill(const PrefillRows& rows, DecoderBatchStepStats& stats);
+                             const WideMtpGroups& wide_groups,
+                             const PrefillCheckpointBatch& checkpoints);
+    void prefill(const PrefillRows& rows, DecoderBatchStepStats& stats,
+                 const PrefillCheckpointBatch& checkpoints);
     void publish_checkpoint(Lane& lane, DecoderBatchStep& result, const Workspace* row,
                             bool& publishing);
     static void retire(std::optional<Lane>& lane, const TpDriver* tp_driver = nullptr);
     bool submit_checkpoint(Lane& lane);
+    void store_checkpoint(Lane& lane, int end, const Workspace* row, bool terminal,
+                          std::shared_ptr<void> reservation,
+                          const PrefillCheckpoint* local = nullptr,
+                          const PrefillCheckpoint* peer = nullptr);
+    void plan_prefill_checkpoints(Lane& lane);
+    void publish_prefill_checkpoint(Lane& lane, const PrefillCheckpoint& local,
+                                    const PrefillCheckpoint* peer);
+    void publish_prefill_checkpoint_at(Lane& lane, const PrefillCheckpointBatch& batch, int slot,
+                                       int end);
+    struct PrefillCheckpointBatch {
+        std::array<PrefillCheckpointList, decoder_batch_max_lanes> local;
+        std::array<PrefillCheckpointList, decoder_batch_max_lanes> peer;
+        std::array<int, decoder_batch_max_lanes> counts{};
+        const PrefixPrefillPool* blocked_pool = nullptr;
+        std::size_t blocked_capacity = 0;
+        std::size_t blocked_count = 0;
+        bool require(const PrefixPrefillPool& pool, std::size_t capacity, std::size_t count);
+    };
+    PrefillCheckpointBatch prepare_prefill_checkpoints(PrefillRows& rows);
+    bool prepare_lane_checkpoints(const Lane& lane, int slot, PrefillCheckpointBatch& batch,
+                                  int rows);
+    void acquire_prefill_checkpoint(PrefillCheckpointBatch& batch, int slot, int end,
+                                    std::size_t capacity);
     void finish_restore(Lane& lane, int restored);
     void score(int slot, Lane& lane, Workspace& work, bool logits_ready, bool decode);
     void speculate_group(const PrefillRows& verification_rows, int& next_slot, Steps& results,
@@ -115,16 +140,6 @@ struct DecoderBatch::State {
 
     void disable() noexcept;
 
-    
-    
-    
-    
-    
-    
-    
-    
-    TextGdnReplayBatch* prepare_gdn_replays();
-
     const Decoder::Model& model;
     const DecoderBatchOptions options;
     KvResidencyPolicy residency;
@@ -132,6 +147,8 @@ struct DecoderBatch::State {
     Allocations execution;
     Decoder::TpRuntime* tp = nullptr;
     std::unique_ptr<TpDriver> tp_driver;
+    PrefixPrefillPool prefill_checkpoints;
+    PrefixPrefillPool peer_prefill_checkpoints;
     std::uint8_t* wide_mtp_activation = nullptr;
     DraftDepthScratch draft_depth;
     DecoderPrefixCacheStats prefix_stats;
@@ -143,8 +160,6 @@ struct DecoderBatch::State {
     GeneratedLogprobReadback* logprob_readback = nullptr;
     ConstraintWorkspace constraint_workspace;
     AdjustedLogitsWorkspace adjusted_workspace;
-    TextGdnReplayBatch gdn_replays;
-    bool gdn_replays_broken = false;
     bool failed = false;
     SerialOutput* output = nullptr;
     MtpRound::Cancel no_cancel;

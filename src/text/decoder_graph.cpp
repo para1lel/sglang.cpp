@@ -68,8 +68,10 @@ bool replay_narrow(const DecoderModel& model, Allocations& execution, DecodeGrap
             const TextModelStateRow state = request.prefix_checkpoint_outputs
                 ? TextModelStateRow{request.work.hidden, request.work.residual}
                 : TextModelStateRow{};
-            scratch.bindings[index] = {{0.0f, lane.token_id}, lane.position, rotary, scores,
-                                       request.pages, request.caches, request.states, state};
+            scratch.bindings[index] = {
+                {0.0F, lane.token_id}, lane.position,      rotary, scores, request.pages,
+                request.caches,        request.gdn_replay, state,
+            };
         }
         check(cudaMemcpyAsync(scratch.device_bindings, scratch.bindings.data(),
                               count * sizeof(BatchDecodeBinding), cudaMemcpyHostToDevice,

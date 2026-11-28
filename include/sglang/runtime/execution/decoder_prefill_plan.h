@@ -31,6 +31,7 @@ int long_serial_visible(const PrefillGrant* grants, int count, bool grouped);
 
 void validate_prefill_tile(const PrefillGrant& grant, const PrefillWorkspace& workspace,
                            int capacity);
+void validate_ranked_prefill_grants(std::array<const PrefillGrant*, 2> ranks, int count);
 
 inline constexpr int paired_tile_grant_rows = 2 * batch_prefill_tile_rows;
 inline constexpr PrefillGroup paired_tile_group{4, 2 * paired_tile_grant_rows};

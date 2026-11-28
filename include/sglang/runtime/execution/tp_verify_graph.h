@@ -1,7 +1,7 @@
 #pragma once
 
 #include "sglang/text/gqa_verify_batch.h"
-#include "sglang/text/gdn_local.h"
+#include "sglang/text/gdn/replay_ssm.h"
 
 #include <array>
 #include <memory>
@@ -23,10 +23,6 @@ struct RowExchange {
     Bf16* residual;
 };
 
-struct ReplayExchange {
-    TextGdnReplayRows from;
-    TextGdnReplayRows to;
-};
 class Graph;
 using Input = std::array<const VerificationRow*, 2>;
 struct Forward {
@@ -53,7 +49,6 @@ private:
 };
 void record_fused(cudaStream_t stream);
 struct HostBinding;
-bool bind_gdn_inputs(cudaStream_t stream, const VerificationRow* packet, int layer);
 bool run_gdn(cudaStream_t stream, int layer, TextGdnWeights weights);
 void attend_gqa(HostBinding& live, const GqaLayer& layer, const VerificationRow* packet,
                 int cache_index, GqaGeometry geometry);
@@ -62,17 +57,14 @@ void record_regular(cudaStream_t stream);
 struct DeviceBinding {
     int rotary[rows];
     GqaBinding gqa[full_attention_layers];
-    GdnVerificationLane gdn[gdn_layers][lanes];
+    gdn_replay_ssm::Lane gdn[gdn_layers][lanes];
     RowExchange resident[rows];
     RowExchange request[rows];
-    ReplayExchange replay[gdn_layers][lanes];
 };
 
 struct HostBinding {
     cudaStream_t stream;
     DeviceBinding* device;
-    TextGdnWeights weights[gdn_layers];
-    TextGdnReplayRows (*replay)[lanes];
     int gqa_calls = 0;
     int gdn_calls = 0;
     int fused_calls = 0;
@@ -89,9 +81,7 @@ cudaError_t preprocess(const GqaVerifyRows<GqaVerifyPreprocessRow>& batch, const
 cudaError_t append(const GqaVerifyRows<GqaVerifyAppendRow>& batch, const GqaBinding* live,
                    int kv_heads, cudaStream_t stream);
 cudaError_t read(const GqaBinding* live, int query_heads, cudaStream_t stream);
-cudaError_t gdn(const GdnVerificationLane* live, TextGdnWeights weights, cudaStream_t stream);
 cudaError_t exchange_rows(const DeviceBinding* table, bool output, cudaStream_t stream);
-cudaError_t exchange_replay(const DeviceBinding* table, cudaStream_t stream);
 
 }
 

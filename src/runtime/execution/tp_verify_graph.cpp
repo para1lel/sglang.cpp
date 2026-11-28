@@ -1,5 +1,6 @@
 #include "sglang/runtime/execution/tp_verify_graph.h"
 #include "sglang/runtime/backend/tensor_parallel.h"
+#include "sglang/text/gdn_local.h"
 
 #include <exception>
 #include <stdexcept>
@@ -56,27 +57,40 @@ struct Rank {
         DeviceScope owner(device);
         binding.stream = stream;
         binding.device = memory.allocate<DeviceBinding>(1);
-        binding.replay = replay;
         auto* attention = memory.allocate<Bf16>(rows * GdnLocal::value_width);
         auto* z = memory.allocate<Bf16>(rows * GdnLocal::value_width);
         auto* observed = memory.allocate<Bf16>(rows * GdnLocal::value_width);
         for (int lane = 0; lane < lanes; ++lane) {
-            for (int step = 0; step < depth; ++step) {
-                const int index = step * lanes + lane;
-                const int lane_row = lane * depth + step;
-                work[index] = Workspace(memory, attention + lane_row * GdnLocal::value_width);
-                work[index].gdn_z = z + lane_row * GdnLocal::value_width;
+            constexpr std::size_t qkv = static_cast<std::size_t>(depth) * GdnLocal::qkv_width;
+            constexpr std::size_t gates = static_cast<std::size_t>(depth) * GdnLocal::value_heads;
+            auto* packed = memory.allocate<Bf16>(2 * (qkv + gates));
+            auto* gate_storage = packed + (2 * qkv);
+            const TextGdnReplayRows inputs{
+                packed,
+                packed + qkv,
+                gate_storage,
+                gate_storage + gates,
+            };
+            const auto first_row = static_cast<std::size_t>(lane) * depth;
+            for (std::size_t step = 0; step < depth; ++step) {
+                const auto index = (step * lanes) + lane;
+                const auto lane_row = first_row + step;
+                const auto values = lane_row * GdnLocal::value_width;
+                const auto gate_offset = step * GdnLocal::value_heads;
+                work[index] = Workspace(memory, attention + values);
+                work[index].gdn_z = z + values;
+                work[index].gdn_qkv = inputs.qkv + (step * GdnLocal::qkv_width);
+                work[index].gdn_b = inputs.b + gate_offset;
+                work[index].gdn_a = inputs.a + gate_offset;
             }
-            for (int layer = 0; layer < gdn_layers; ++layer) {
-                constexpr int qkv = depth * GdnLocal::qkv_width;
-                constexpr int gates = depth * GdnLocal::value_heads;
-                auto* packed = memory.allocate<Bf16>(2 * (qkv + gates));
-                replay[layer][lane] = {packed, packed + qkv, packed + 2 * qkv,
-                                       packed + 2 * qkv + gates};
-                gdn[layer][lane] = {replay[layer][lane], work[lane].gdn_z, {}, {},
-                                    observed + lane * depth * GdnLocal::value_width,
-                                    work[lane].attention};
-            }
+            gdn[lane] = {
+                {},
+                inputs,
+                work[lane].gdn_z,
+                observed + (first_row * GdnLocal::value_width),
+                work[lane].attention,
+                depth,
+            };
         }
         try {
             check(cudaMallocHost(&staging, sizeof(*staging)), "Allocate pinned graph binding");
@@ -100,8 +114,7 @@ struct Rank {
     DeviceBinding* staging = nullptr;
     cudaEvent_t edge = nullptr;
     Workspace work[rows];
-    TextGdnReplayRows replay[gdn_layers][lanes];
-    GdnVerificationLane gdn[gdn_layers][lanes];
+    gdn_replay_ssm::Lane gdn[lanes];
 };
 
 bool eligible(const Input& input, const std::array<cudaStream_t, 2>& streams) {
@@ -195,7 +208,6 @@ public:
                 DeviceScope device(rank->device);
                 check(exchange_rows(rank->binding.device, true, rank->stream),
                       "Capture output copy");
-                check(exchange_replay(rank->binding.device, rank->stream), "Capture rollback copy");
             }
         } catch (...) {
             error = std::current_exception();
@@ -252,13 +264,9 @@ public:
             }
             for (int layer = 0; layer < gdn_layers; ++layer) {
                 for (int lane = 0; lane < lanes; ++lane) {
-                    const auto request = input[rank][lane].verification->gdn_lane(
-                        layer, state.binding.weights[layer]);
-                    auto job = state.gdn[layer][lane];
-                    job.initial = request.initial;
-                    job.tail = request.tail;
+                    auto job = state.gdn[lane];
+                    job.state = input[rank][lane].request->gdn_replay[layer];
                     table.gdn[layer][lane] = job;
-                    table.replay[layer][lane] = {job.inputs, request.inputs};
                 }
             }
         }
@@ -337,26 +345,12 @@ Submission::~Submission() {
     else owner->release_binding();
 }
 
-bool bind_gdn_inputs(cudaStream_t stream, const VerificationRow* packet, int layer) {
-    const auto* live = binding(stream);
-    if (!live) return false;
-    for (int index = 0; index < rows; ++index) {
-        const auto& input = live->replay[layer][index % lanes];
-        auto& work = *packet[index].work;
-        const int step = index / lanes;
-        work.gdn_qkv = input.qkv + step * GdnLocal::qkv_width;
-        work.gdn_b = input.b + step * GdnLocal::value_heads;
-        work.gdn_a = input.a + step * GdnLocal::value_heads;
-    }
-    return true;
-}
-
 bool run_gdn(cudaStream_t stream, int layer, TextGdnWeights weights) {
     auto* live = binding(stream);
     if (!live) return false;
-    live->weights[layer] = weights;
     ++live->gdn_calls;
-    check(gdn(live->device->gdn[layer], weights, stream), "Capture bound GDN");
+    check(gdn_replay_ssm::launch(true, live->device->gdn[layer], lanes, depth, weights, stream),
+          "Capture bound GDN history");
     return true;
 }
 

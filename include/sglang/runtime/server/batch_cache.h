@@ -19,6 +19,8 @@ struct LmCacheMetrics {
     std::uint64_t lookup_misses = 0;
     std::uint64_t io_errors = 0;
     std::uint64_t stores = 0;
+    std::uint64_t prefill_checkpoint_stores = 0;
+    std::uint64_t prefill_checkpoint_failures = 0;
     std::uint64_t declined_stores = 0;
     std::uint64_t pending_stores = 0;
     std::uint64_t gqa_written_tokens = 0;

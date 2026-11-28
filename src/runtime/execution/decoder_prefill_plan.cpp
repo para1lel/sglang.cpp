@@ -57,6 +57,27 @@ void validate_prefill_tile(const PrefillGrant& grant, const PrefillWorkspace& wo
     }
 }
 
+void validate_ranked_prefill_grants(std::array<const PrefillGrant*, 2> ranks, int count) {
+    for (int index = 0; index < count; ++index) {
+        const auto& grant = ranks[0][index];
+        const auto& mirror = ranks[1][index];
+        if (grant.tokens != mirror.tokens || grant.position != mirror.position ||
+            grant.rows != mirror.rows || grant.tile_rows != mirror.tile_rows ||
+            grant.prompt_remaining != mirror.prompt_remaining ||
+            grant.request->cached_gqa_tokens != mirror.request->cached_gqa_tokens) {
+            throw std::invalid_argument("Mismatched prefill grants across tensor-parallel ranks");
+        }
+        if (mirror.draft != nullptr || mirror.scores != nullptr || mirror.media != nullptr) {
+            throw std::invalid_argument(
+                "Peer prefill grants must not carry draft, media, or score captures");
+        }
+        if (grant.media != nullptr) {
+            throw std::invalid_argument(
+                "Multimodal prefill is unsupported under tensor parallelism");
+        }
+    }
+}
+
 bool can_pack_paired_tiles(const PrefillGrant* grants, int count) {
     return count == 2 && grants[0].rows == paired_tile_grant_rows &&
         full_tile_prefill_grants(grants, count) && grants[0].request != grants[1].request &&

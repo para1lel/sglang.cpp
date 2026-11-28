@@ -87,6 +87,12 @@ __device__ float fp8x4_dot(unsigned int lhs_bits, unsigned int rhs_bits, float s
     return sum;
 }
 
+__device__ float fp8_pack_dot(uint4 lhs, uint4 rhs) {
+    const float low = fp8x4_dot(lhs.y, rhs.y, fp8x4_dot(lhs.x, rhs.x, 0.0F));
+    const float high = fp8x4_dot(lhs.w, rhs.w, fp8x4_dot(lhs.z, rhs.z, 0.0F));
+    return low + high;
+}
+
 constexpr int fp8_pack_bytes = 16;
 constexpr int fp8_packed_warps = 4;
 constexpr int fp8_groups_per_warp = warp_width * fp8_pack_bytes / text_fp8_group_size;
@@ -125,10 +131,8 @@ __global__ void fp8_gemv_packed_kernel(const std::uint8_t* weight,
         const auto col = static_cast<std::size_t>(group) * text_fp8_group_size + lane_col;
         const uint4 rhs = load_128(input.values + col);
         const uint4 lhs = load_fp8_weight(row_weight + col);
-        const float low = fp8x4_dot(lhs.y, rhs.y, fp8x4_dot(lhs.x, rhs.x, 0.0f));
-        const float high = fp8x4_dot(lhs.w, rhs.w, fp8x4_dot(lhs.z, rhs.z, 0.0f));
         const int scale_index = group + lane_group;
-        const float scaled = (low + high) * input.scales[scale_index];
+        const float scaled = fp8_pack_dot(lhs, rhs) * input.scales[scale_index];
         sum = fmaf(scaled, __bfloat162float(row_scales[scale_index]), sum);
     }
     sum = warp_sum(sum);
@@ -177,10 +181,7 @@ __global__ void fp8_batch_packed_kernel(const std::uint8_t* weight,
             const float input_scale = input.scales[scale_index];
 #pragma unroll
             for (int channel = 0; channel < Channels; ++channel) {
-                const auto left = lhs[channel];
-                const float low = fp8x4_dot(left.y, rhs.y, fp8x4_dot(left.x, rhs.x, 0.0f));
-                const float high = fp8x4_dot(left.w, rhs.w, fp8x4_dot(left.z, rhs.z, 0.0f));
-                const float scaled = (low + high) * input_scale;
+                const float scaled = fp8_pack_dot(lhs[channel], rhs) * input_scale;
                 sums[index][channel] = fmaf(scaled, scale, sums[index][channel]);
             }
         }
@@ -210,12 +211,6 @@ cudaError_t launch_fp8_batch(const std::uint8_t* weight, const __nv_bfloat16* we
     return cudaLaunchKernel(fp8_batch_packed_kernel<Count, Channels>,
                             divide_up(out_width, fp8_packed_warps * Channels),
                             fp8_packed_warps * warp_width, args, 0, stream);
-}
-
-__device__ float fp8_pack_dot(uint4 lhs, uint4 rhs) {
-    const float low = fp8x4_dot(lhs.y, rhs.y, fp8x4_dot(lhs.x, rhs.x, 0.0f));
-    const float high = fp8x4_dot(lhs.w, rhs.w, fp8x4_dot(lhs.z, rhs.z, 0.0f));
-    return low + high;
 }
 
 template <int Rows, int Channels = 1>

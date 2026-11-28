@@ -23,6 +23,11 @@ Compare those sources with the affected implementation.
 Identify required behavior, supported inputs, compatibility constraints, and failure behavior.
 Keep intended changes distinct from existing defects and unrelated refactoring.
 
+For optimization or default-route changes, map the full supported input, workload, and configuration matrix.
+Include limits, feature combinations, and device topologies that affect routing.
+Group cases with equivalent eligibility, dispatch, and resource behavior.
+Identify the route that defaults select for each case.
+
 Trace the public entry through dispatch, implementation, resource ownership, and observable outputs.
 Examine existing solutions and relevant consumers before adding another abstraction.
 Read [implementation standards](references/code-standards.md) before editing.
@@ -41,6 +46,12 @@ Prefer a small coherent change to local workarounds at each symptom.
 Keep public compatibility unless the assignment requires a change.
 Define input domain, numerical semantics, routing, and impact before changing a numerical operation.
 Keep a verified reference or fallback when it forms part of the current contract.
+
+Generalize optimized routes wherever correctness and resource constraints permit.
+Use the fastest validated route by default for each supported case.
+Preserve supported workload limits and semantics across routes.
+Base routing and tuning on operation constraints and representative measurements across the supported range.
+Avoid benchmark-specific cases and thresholds fitted to a single benchmark input.
 
 Use existing module boundaries and naming conventions.
 Split work by responsibility when a change becomes difficult to review.
@@ -73,6 +84,11 @@ Request independent static review or execution from test through main.
 A local build does not establish behavioral acceptance.
 If an environment is unavailable, identify the missing check and its impact.
 
+For optimized routes, use small boundary probes and realistic workloads to check correctness and dispatch through normal entry points.
+Observe actual graph replay where it is claimed.
+For tensor-parallel serving, verify effective target and draft dispatch and sharding separately.
+Compare performance against the pinned baseline with matching workloads, semantics, hardware, cache state, and resource budgets.
+
 Keep the candidate stable during independent verification.
 If source or configuration must change, inform main so affected evidence can be reassessed.
 Report out-of-scope defects separately without repairing them opportunistically.
@@ -83,5 +99,7 @@ Return changed paths and the worker contract's exact source and diff identities.
 Explain the cause, resulting behavior, compatibility impact, and relevant decisions.
 Include applicable build provenance, copied-source attribution, executed local commands, and unresolved assumptions.
 State the weakest implementation point and any simpler alternative considered.
+Give main each exception, fallback, nonpositive result, and unknown for explicit disclosure in the user conversation and durable documentation.
+State the affected cases, trigger, and impact, with the evidence or the missing check.
 List tests, documents, or source research needed from other workers.
 Do not declare acceptance or global completion.

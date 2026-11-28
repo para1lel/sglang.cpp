@@ -61,6 +61,13 @@ Score profiling turns that have successful transport, a finish choice, and `[DON
 | Actual KV cache hit rate | % | Divide the sum of server-reported `usage.prompt_tokens_details.cached_tokens` by the sum of `usage.prompt_tokens` over the same turns. Count logical tokens once at TP2. Report usage coverage and use engine counters to corroborate reuse. [Native final stream usage](../apps/server/text_completion.cpp#L591)<!-- prefix: "void TextRes" --> |
 | Theoretical KV cache hit rate | % | Divide the replay's hit blocks by its total 64-token blocks over the same finalized turns. Keep the harness aggregate `theoretical_prefix_cache_hit` as a cross-check. Report any difference in the scoring cohorts. [InferenceX metric][scorer] |
 
+The theoretical KV hit rate is fixed for an identical scored trace cohort, including the
+same replay turns, input block counts, and trace-derived hit blocks. A difference between
+closed-loop runs can reflect which turns finalized. Use theoretical hit rate to describe
+the scored cohort and compare actual hit rate on matched turns to assess cache reuse.
+Engine improvements can raise actual reuse, interactivity, or throughput while the
+theoretical rate stays fixed. [Pinned scorer][scorer]
+
 Keep one evidence directory per run under `artifacts/agentx-256k/`. Record its path and a SHA-256 manifest with the results. Preserve the following material:
 
 - Exact command lines, effective configs, build and dependency receipts, and binary or wheel hashes. Include model, tokenizer, trace, client, and scorer identities.

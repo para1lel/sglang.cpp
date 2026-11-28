@@ -24,11 +24,15 @@ DecoderBatch::DecoderBatch(const Decoder& decoder) : DecoderBatch(decoder, {}) {
 DecoderBatch::DecoderBatch(const Decoder& decoder, DecoderBatchOptions options)
     : state_(std::make_unique<State>(*decoder.model_, options, decoder.tp_.get())) {}
 void DecoderBatch::State::retire(std::optional<Lane>& lane, const TpDriver* tp_driver) {
-    if (lane) lane->prefix.reset();
-    if (lane) lane->peer_prefix.reset();
-    if (lane && lane->request) lane->request->memory.recycle_after_completion();
+    if (!lane)
+        return;
+    lane->prefix.reset();
+    lane->peer_prefix.reset();
+    if (lane->request)
+        lane->request->memory.recycle_after_completion();
     if (tp_driver) tp_driver->drain_peer(*lane);
-    if (lane && lane->draft && lane->resident_bytes) lane->draft->recycle_after_completion();
+    if (lane->draft && (lane->resident_bytes != 0 || lane->checkpoints()))
+        lane->draft->recycle_after_completion();
     lane.reset();
 }
 
@@ -75,8 +79,9 @@ void DecoderBatch::State::initialize(Lane& lane, int slot) {
     const auto& opts = lane.options;
     const auto stream = execution.stream();
     const int prompt = static_cast<int>(lane.prompt.size());
-    if (opts.mtp_steps != 0) lane.draft = std::make_unique<MtpDraftRequest>(
-        model.mtp_weights, lane.capacity(), lane.resident_bytes ? &storage->retired : nullptr);
+    if (opts.mtp_steps != 0)
+        lane.draft = std::make_unique<MtpDraftRequest>(model.mtp_weights, lane.capacity(),
+                                                       request_cache(opts));
     const auto [request_capacity, resident_limit] =
         residency.request_storage(prompt, lane.capacity(), opts.incremental_kv);
     lane.request->initialize(request_capacity, stream, resident_limit,
@@ -196,10 +201,11 @@ int DecoderBatch::admit_impl(int slot, std::vector<int> prompt, const DecoderOpt
         if (options.max_new_tokens != requested.max_new_tokens) {
             validate_request(prompt, options, true);
         }
-        auto request = std::make_unique<Request>(
-            state_->model.device, false, resident ? &state_->storage->retired : nullptr);
+        auto request =
+            std::make_unique<Request>(state_->model.device, false, state_->request_cache(options));
         lane.emplace(Lane{std::move(request), std::move(prompt), options});
-        if (state_->tp_driver) state_->tp_driver->create_peer_request(*lane);
+        if (state_->tp_driver)
+            state_->tp_driver->create_peer_request(*lane, state_->peer_request_cache(*lane));
         if (options.top_logits > 0 || options.label_token_ids) {
             lane->request->memory.transfers().logits.resize(vocab_size);
         }

@@ -23,7 +23,7 @@ const PrefixCacheLayout* tp2_prefix_layouts();
 struct DecoderBatch::TpDriver {
     TpDriver(const Decoder::Model& owner, Decoder::TpRuntime& runtime);
 
-    void create_peer_request(decoder::Lane& lane) const;
+    void create_peer_request(decoder::Lane& lane, decoder::RequestBlockCache* retired) const;
     void initialize_peer(decoder::Lane& lane, int request_capacity, int resident_limit) const;
     void grow_peer_kv(decoder::Lane& lane, int positions, int written) const;
     void sync_peer_stream() const noexcept;

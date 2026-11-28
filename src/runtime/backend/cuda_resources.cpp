@@ -53,6 +53,8 @@ void finish_retired_cleanup(CleanupError error) {
 struct DetachedDeviceBytes {
     std::mutex mutex;
     std::size_t value = 0;
+    std::size_t failed_bytes = 0;
+    CleanupError failure;
 };
 
 struct ExportedDeviceBlock {
@@ -62,25 +64,54 @@ struct ExportedDeviceBlock {
 
     ~ExportedDeviceBlock() {
         if (!block.pointer) return;
+        CleanupError failure;
         try {
-            if (reclaimer) {
-                const std::lock_guard lock(bytes->mutex);
-                if (reclaimer->submit({block.pointer, block.bytes}, true)) {
-                    bytes->value -= block.bytes;
-                    return;
-                }
-            }
+            if (queue_release())
+                return;
             DeviceScope scope(device);
-            auto status = release_cuda_block(block.pointer, cudaStreamPerThread);
-            if (status == cudaSuccess && bytes) status = cudaStreamSynchronize(cudaStreamPerThread);
-            report_cleanup(status, "Release detached decoder allocation");
-            if (status == cudaSuccess && bytes) {
-                const std::lock_guard lock(bytes->mutex);
-                bytes->value -= block.bytes;
-            }
+            failure = {
+                release_cuda_block(block.pointer, cudaStreamPerThread, true),
+                "Release detached decoder allocation",
+            };
+            if (!failure)
+                complete_release();
+            scope.restore();
         } catch (const CudaError& error) {
-            report_cleanup(error.status, "Release detached decoder allocation");
+            if (!failure || CudaError::terminal(error.status))
+                failure = {error.status, "Reclaim detached decoder allocation"};
         }
+        record_failure(failure.status, failure.operation);
+    }
+
+    bool queue_release() const {
+        if (!bytes)
+            return false;
+        const std::scoped_lock lock(bytes->mutex);
+        bytes->failure.raise();
+        if (!reclaimer || !reclaimer->submit({block.pointer, block.bytes}, true))
+            return false;
+        bytes->value -= block.bytes;
+        return true;
+    }
+
+    void complete_release() {
+        if (bytes) {
+            const std::scoped_lock lock(bytes->mutex);
+            bytes->value -= block.bytes;
+        }
+        block = {};
+    }
+
+    void record_failure(cudaError_t status, const char* operation) const {
+        if (status == cudaSuccess)
+            return;
+        report_cleanup(status, operation);
+        if (!bytes)
+            return;
+        const std::scoped_lock lock(bytes->mutex);
+        bytes->failed_bytes += block.bytes;
+        if (!bytes->failure || CudaError::terminal(status))
+            bytes->failure = {status, operation};
     }
 
     void detach(void* pointer, std::size_t size) {
@@ -362,11 +393,14 @@ void DeviceScope::restore() {
     }
 }
 
-RequestBlockCache::RequestBlockCache(int device, bool resident)
+RequestBlockCache::RequestBlockCache(int device, bool resident, bool detached_reclamation)
     : state_(std::make_unique<Allocations::State>(device, nullptr, true)),
-      reclaimer_(resident ? RetiredBlockReclaimer::create(device) : nullptr),
-      detached_bytes_(std::make_shared<DetachedDeviceBytes>()) {
-    state_->blocks.reserve(resident_blocks_limit());
+      detached_bytes_(std::make_shared<DetachedDeviceBytes>()), resident_(resident),
+      reusable_(resident) {
+    if (resident || detached_reclamation)
+        enable_detached_reclamation();
+    if (resident)
+        state_->blocks.reserve(resident_blocks_limit());
 }
 
 RequestBlockCache::~RequestBlockCache() {
@@ -399,6 +433,25 @@ std::size_t RequestBlockCache::unavailable_bytes() const {
 
 std::size_t RequestBlockCache::pending_bytes() const {
     return reclaimer_ ? reclaimer_->pending_bytes() : 0;
+}
+
+std::size_t RequestBlockCache::failed_release_bytes() const {
+    const std::scoped_lock lock(detached_bytes_->mutex);
+    return detached_bytes_->failed_bytes + (reclaimer_ ? reclaimer_->failed_release_bytes() : 0);
+}
+
+void RequestBlockCache::enable_detached_reclamation() {
+    if (!reclamation_enabled_) {
+        reclaimer_ = RetiredBlockReclaimer::create(state_->device);
+        reclamation_enabled_ = true;
+    }
+}
+
+void RequestBlockCache::check_releases() const {
+    const std::scoped_lock lock(detached_bytes_->mutex);
+    if (reclaimer_)
+        reclaimer_->check_releases();
+    detached_bytes_->failure.raise();
 }
 
 void* RequestBlockCache::take(std::size_t bytes) {
@@ -438,7 +491,7 @@ void RequestBlockCache::release_blocks(Allocations::State& state, bool keep) {
     for (std::size_t count = state.blocks.size(); count > state.uncertain_blocks; --count) {
         auto& block = state.blocks[count - 1];
         if (detach_exported_block(block) || (keep && retain(block)) ||
-            (reclaimer_ && reclaimer_->submit(block))) {
+            (resident_ && reclaimer_ && reclaimer_->submit(block))) {
             const auto bytes = block.bytes;
             if (count != state.blocks.size()) block = std::move(state.blocks.back());
             state.blocks.pop_back();
@@ -456,6 +509,7 @@ void RequestBlockCache::quarantine(Allocations::State& state) {
 void RequestBlockCache::clear() {
     if (!state_->uncertain && !state_->terminal) release_blocks(*state_, false);
     if (reclaimer_) reclaimer_->drain();
+    check_releases();
     if (!state_->terminal && state_->uncertain_blocks == state_->blocks.size()) return;
     std::shared_ptr<const void> drained_owners;
     const auto error = state_->release(drained_owners);
@@ -766,9 +820,11 @@ void* Allocations::allocate_bytes(std::size_t bytes) {
 
 namespace sglang::decoder {
 
-cudaError_t release_cuda_block(void* pointer, cudaStream_t stream,
-                                      bool wait_for_release) noexcept {
+cudaError_t release_cuda_block(void* pointer, cudaStream_t stream, bool wait_for_release,
+                               bool* enqueued) noexcept {
     const auto status = cudaFreeAsync(pointer, stream);
+    if (enqueued != nullptr)
+        *enqueued = status == cudaSuccess;
     if (status == cudaSuccess && wait_for_release) return cudaStreamSynchronize(stream);
     if (status != cudaErrorNotSupported) return status;
     const auto pending = cudaGetLastError();

@@ -6,6 +6,7 @@
 #include "sglang/runtime/backend/cuda_resources.h"
 #include "sglang/runtime/backend/tensor_parallel.h"
 
+#include <iostream>
 #include <utility>
 
 namespace sglang {
@@ -22,9 +23,10 @@ const PrefixCacheLayout* tp2_prefix_layouts() {
 DecoderBatch::TpDriver::TpDriver(const Decoder::Model& owner, Decoder::TpRuntime& runtime)
     : model(owner), tp(runtime) {}
 
-void DecoderBatch::TpDriver::create_peer_request(decoder::Lane& lane) const {
-    decoder::DeviceScope peer(tp.peer_device);
-    lane.peer_request = std::make_unique<decoder::Request>(tp.peer_device, false, nullptr);
+void DecoderBatch::TpDriver::create_peer_request(decoder::Lane& lane,
+                                                 decoder::RequestBlockCache* retired) const {
+    const decoder::DeviceScope peer(tp.peer_device);
+    lane.peer_request = std::make_unique<decoder::Request>(tp.peer_device, false, retired);
 }
 
 void DecoderBatch::TpDriver::initialize_peer(decoder::Lane& lane, int request_capacity,
@@ -44,8 +46,12 @@ void DecoderBatch::TpDriver::grow_peer_kv(decoder::Lane& lane, int positions,
 }
 
 void DecoderBatch::TpDriver::sync_peer_stream() const noexcept {
-    decoder::DeviceScope peer(tp.peer_device);
-    (void)cudaStreamSynchronize(tp.peer_stream);
+    try {
+        const decoder::DeviceScope peer(tp.peer_device);
+        decoder::synchronize_cuda(tp.peer_stream, "Drain peer decoder stream");
+    } catch (const decoder::CudaError& error) {
+        std::cerr << "sglang decoder: drain peer stream: " << error.what() << '\n';
+    }
 }
 
 void DecoderBatch::TpDriver::drain_peer(const decoder::Lane& lane) const {

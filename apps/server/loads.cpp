@@ -309,6 +309,8 @@ std::string format_metrics(const BatchMetrics& metrics, int running, std::size_t
          metrics.cache.prefill_checkpoints_declined);
     emit("sglang_cpp:lmcache_declined_stores_total", metrics.lmcache.declined_stores);
     emit("sglang_cpp:lmcache_pending_stores", metrics.lmcache.pending_stores);
+    emit("sglang_cpp:decoder_pending_release_bytes", metrics.cache.pending_release_bytes);
+    emit("sglang_cpp:decoder_failed_release_bytes", metrics.cache.failed_release_bytes);
     emit("sglang_cpp:lmcache_gqa_matched_tokens_total", metrics.cache.gqa_matched_tokens);
     emit("sglang_cpp:lmcache_gdn_matched_tokens_total", metrics.cache.gdn_matched_tokens);
     emit("sglang_cpp:lmcache_gqa_restored_tokens_total", metrics.cache.gqa_restored_tokens);

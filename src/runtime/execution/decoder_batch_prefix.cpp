@@ -13,7 +13,17 @@ using namespace decoder;
 using namespace decoder::batch_detail;
 
 void DecoderBatch::release_retired_allocations() try {
-    state_->storage->retired.clear();
+    auto& storage = *state_->storage;
+    std::exception_ptr local_failure;
+    try {
+        storage.retired.clear();
+    } catch (...) {
+        local_failure = std::current_exception();
+    }
+    if (storage.peer_retired)
+        storage.peer_retired->clear();
+    if (local_failure)
+        std::rethrow_exception(local_failure);
 } catch (...) {
     state_->disable();
     throw;
@@ -22,6 +32,13 @@ void DecoderBatch::release_retired_allocations() try {
 DecoderPrefixCacheStats DecoderBatch::prefix_cache_stats() const {
     auto stats = state_->prefix_stats;
     if (state_->acknowledged_stores) stats.stores = state_->acknowledged_stores->load();
+    const auto& storage = *state_->storage;
+    stats.pending_release_bytes = storage.retired.pending_bytes();
+    stats.failed_release_bytes = storage.retired.failed_release_bytes();
+    if (storage.peer_retired) {
+        stats.pending_release_bytes += storage.peer_retired->pending_bytes();
+        stats.failed_release_bytes += storage.peer_retired->failed_release_bytes();
+    }
     return stats;
 }
 
@@ -35,6 +52,7 @@ void DecoderBatch::reset_prefix_cache() {
 }
 
 DecoderBatchPrefixUpdate DecoderBatch::poll_prefix(int slot) {
+    state_->require_ready();
     auto& lane = state_->slot_at(slot);
     if (!lane) return {};
     try {

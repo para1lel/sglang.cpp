@@ -25,8 +25,8 @@ struct CudaError : std::runtime_error {
 
 std::size_t available_device_bytes();
 
-cudaError_t release_cuda_block(void* pointer, cudaStream_t stream,
-                                      bool wait_for_release = false) noexcept;
+cudaError_t release_cuda_block(void* pointer, cudaStream_t stream, bool wait_for_release = false,
+                               bool* enqueued = nullptr) noexcept;
 
 void copy_cuda_async(void* destination, const void* source, std::size_t bytes,
                             cudaMemcpyKind kind, cudaStream_t stream, const char* operation);
@@ -107,15 +107,18 @@ private:
 
 class RequestBlockCache {
 public:
-    explicit RequestBlockCache(int device, bool resident = false);
-    ~RequestBlockCache();
-    RequestBlockCache(const RequestBlockCache&) = delete;
-    RequestBlockCache& operator=(const RequestBlockCache&) = delete;
+  explicit RequestBlockCache(int device, bool resident = false, bool detached_reclamation = false);
+  ~RequestBlockCache();
+  RequestBlockCache(const RequestBlockCache&) = delete;
+  RequestBlockCache& operator=(const RequestBlockCache&) = delete;
 
-    std::size_t bytes() const;
-    std::size_t unavailable_bytes() const;
-    std::size_t pending_bytes() const;
-    void clear();
+  std::size_t bytes() const;
+  std::size_t unavailable_bytes() const;
+  std::size_t pending_bytes() const;
+  std::size_t failed_release_bytes() const;
+  void enable_detached_reclamation();
+  void check_releases() const;
+  void clear();
 
 private:
     friend class Allocations;
@@ -133,7 +136,9 @@ private:
     std::shared_ptr<RetiredBlockReclaimer> reclaimer_;
     std::shared_ptr<DetachedDeviceBytes> detached_bytes_;
     std::size_t quarantined_bytes_ = 0;
-    bool reusable_ = true;
+    const bool resident_;
+    bool reusable_;
+    bool reclamation_enabled_ = false;
 };
 
 class RetiredBlockReclaimer {
@@ -146,6 +151,8 @@ public:
     bool submit(DeviceBlock block, bool detached = false);
     std::size_t unavailable_bytes() const;
     std::size_t pending_bytes() const;
+    std::size_t failed_release_bytes() const;
+    void check_releases() const;
     void drain();
 
 private:

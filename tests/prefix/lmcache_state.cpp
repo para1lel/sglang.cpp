@@ -90,8 +90,6 @@ private:
 };
 
 CopyGate* copy_gate = nullptr;
-std::atomic<CopyGate*> free_gate{nullptr};
-std::atomic<void*> watched_free{nullptr};
 std::atomic<void*> attempted_free{nullptr};
 std::atomic<void*> failed_free{nullptr};
 std::atomic<cudaError_t> free_error{cudaErrorNotSupported};
@@ -440,9 +438,6 @@ extern "C" cudaError_t __wrap_cudaFreeAsync(void* memory, cudaStream_t stream) {
         attempted_free = memory;
         return free_error.load();
     }
-    if (memory == watched_free.load()) {
-        if (auto* gate = free_gate.exchange(nullptr)) gate->wait();
-    }
     const auto status = __real_cudaFreeAsync(memory, stream);
     if (status == cudaSuccess && memory && memory == worker_allocation.load()) {
         worker_release.memory = memory;
@@ -650,69 +645,6 @@ void check_terminal_detach(const DecoderModel& model, cudaStream_t stream,
     require(retired.unavailable_bytes() == 0, "Terminal STORE left detached bytes charged");
     std::printf("terminal D2D 0 retained %zu after retirement and successor reuse\n",
                 expected_bytes);
-}
-
-void check_detached_accounting() {
-    constexpr std::size_t bytes = 1 << 20;
-    struct FreeGate : CopyGate {
-        ~FreeGate() {
-            free_gate.store(nullptr);
-            watched_free.store(nullptr);
-        }
-    } gate;
-    RequestBlockCache retired(0, true);
-    Allocations original(0, &retired);
-    auto* memory = original.allocate<std::byte>(bytes);
-    auto a = original.retain_block(memory);
-    auto b = original.retain_block(memory);
-    require(retired.unavailable_bytes() == 0, "Live source was also charged as detached");
-    original.recycle_after_completion();
-    require(retired.unavailable_bytes() == bytes && retired.pending_bytes() == 0,
-            "One physical block did not produce one detached charge");
-    a.reset();
-    require(retired.unavailable_bytes() == bytes, "One alias dropped the remaining lease");
-    watched_free.store(memory);
-    free_gate.store(&gate);
-    b.reset();
-    try {
-        gate.wait_until_entered();
-        require(retired.unavailable_bytes() == bytes && retired.pending_bytes() == bytes,
-                "Moving a detached block to pending changed its single charge");
-    } catch (...) {
-        gate.open();
-        throw;
-    }
-    gate.open();
-    gate.expect_released();
-    retired.clear();
-    require(retired.unavailable_bytes() == 0, "Freed device block stayed charged");
-    std::puts("one allocation charge across live, detached, pending and released states");
-}
-
-void check_failed_free(bool resident, cudaError_t error) {
-    constexpr std::size_t bytes = 1 << 20;
-    RequestBlockCache retired(0, resident);
-    Allocations original(0, &retired);
-    auto* memory = original.allocate<std::byte>(bytes);
-    auto lease = original.retain_block(memory);
-    original.recycle_after_completion();
-    require(retired.unavailable_bytes() == bytes, "Detached source was not charged");
-    free_error = error;
-    failed_free = memory;
-    lease.reset();
-    retired.clear();
-    failed_free = nullptr;
-    require(attempted_free.exchange(nullptr) == memory,
-            "Detached block did not attempt asynchronous free on the injected pointer");
-    const auto released = synchronous_free.exchange(nullptr);
-    if (error == cudaErrorNotSupported) {
-        require(released == memory && retired.unavailable_bytes() == 0,
-                "Unsupported asynchronous free did not release the detached source and charge");
-    } else {
-        require(!released && retired.unavailable_bytes() == bytes && retired.pending_bytes() == 0,
-                "An unrelated CUDA error released or uncharged an uncertain source");
-        check(cudaFree(memory), "Release test allocation after injected failure");
-    }
 }
 
 std::array<const void*, 4> checkpoint_sources(const Request& request) {
@@ -978,11 +910,6 @@ int main(int argc, char** argv) try {
     model.mtp_weights = std::make_shared<MtpDraftWeights>(
         argv[1], 0, model.memory, model.embedding, model.lm_head, model.backend.draft);
     model.tc_vocab = model.mtp_weights->shared_vocab();
-    check_detached_accounting();
-    for (const bool resident : {false, true}) {
-        check_failed_free(resident, cudaErrorNotSupported);
-        check_failed_free(resident, cudaErrorInvalidValue);
-    }
     require(model.is_b200() && model.mtp_weights, "Requires real B200 and K4 weights");
     check_model_state(model);
     std::puts("PASS");

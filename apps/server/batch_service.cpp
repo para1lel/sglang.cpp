@@ -53,6 +53,17 @@ void BatchService::State::start() {
             } catch (...) {
                 fail_jobs(std::current_exception(), true);
             }
+            if (lmcache) {
+                lmcache->stop_restores();
+                lmcache->drain_transfers();
+            }
+            try {
+                batch.release_retired_allocations();
+            } catch (...) {
+                fail_jobs(std::current_exception(), true);
+            }
+            const std::scoped_lock lock(mutex);
+            counters.cache = batch.prefix_cache_stats();
         });
 }
 
@@ -159,6 +170,7 @@ std::optional<Work> BatchService::State::wait_for_jobs(BatchSession& batch) {
         lock.unlock();
         batch.release_retired_allocations();
         lock.lock();
+        counters.cache = batch.prefix_cache_stats();
     }
     changed.wait(lock, ready);
     const bool admitting = std::any_of(jobs.begin(), end, [](const auto& job) {

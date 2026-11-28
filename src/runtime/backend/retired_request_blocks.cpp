@@ -25,7 +25,8 @@ struct RetiredBlockReclaimer::State {
             queued.swap(active);
             const bool usable = failure == cudaSuccess;
             lock.unlock();
-            std::size_t released = 0;
+            std::size_t submitted = 0;
+            std::size_t completed = 0;
             std::size_t quarantined = 0;
             cudaError_t enqueue_error = cudaSuccess;
             for (const auto& block : active) {
@@ -33,23 +34,26 @@ struct RetiredBlockReclaimer::State {
                     quarantined += block.bytes;
                     continue;
                 }
-                const auto status = release_cuda_block(block.pointer, stream);
-                if (status == cudaSuccess) {
-                    released += block.bytes;
+                bool enqueued = false;
+                const auto status = release_cuda_block(block.pointer, stream, false, &enqueued);
+                if (enqueued) {
+                    submitted += block.bytes;
+                } else if (status == cudaSuccess) {
+                    completed += block.bytes;
                 } else {
                     quarantined += block.bytes;
                     enqueue_error = status;
                 }
             }
-            const auto sync = usable ? cudaStreamSynchronize(stream) : cudaSuccess;
+            const auto sync = submitted != 0 ? cudaStreamSynchronize(stream) : cudaSuccess;
             lock.lock();
-            if (sync != cudaSuccess) {
-                quarantined += released;
-                released = 0;
-            }
+            if (sync != cudaSuccess)
+                quarantined += submitted;
+            else
+                completed += submitted;
             fail(enqueue_error, "Queue retired CUDA block");
             fail(sync, "Drain retired CUDA blocks");
-            pending_bytes -= released + quarantined;
+            pending_bytes -= completed + quarantined;
             uncertain_bytes += quarantined;
             pending_blocks -= active.size();
             active.clear();
@@ -120,11 +124,10 @@ RetiredBlockReclaimer::~RetiredBlockReclaimer() {
 
 bool RetiredBlockReclaimer::submit(DeviceBlock block, bool detached) {
     const std::lock_guard lock(state_->mutex);
-    if (CudaError::terminal(state_->failure))
+    if (detached || CudaError::terminal(state_->failure))
         check(state_->failure, "Retire decoder allocation");
     if (state_->failure != cudaSuccess || state_->pending_blocks == block_limit ||
-        (!detached && (state_->pending_bytes >= byte_limit ||
-                       block.bytes > byte_limit - state_->pending_bytes)))
+        state_->pending_bytes >= byte_limit || block.bytes > byte_limit - state_->pending_bytes)
         return false;
     state_->queued.push_back(block);
     state_->pending_bytes += block.bytes;
@@ -135,8 +138,6 @@ bool RetiredBlockReclaimer::submit(DeviceBlock block, bool detached) {
 
 std::size_t RetiredBlockReclaimer::unavailable_bytes() const {
     const std::lock_guard lock(state_->mutex);
-    if (CudaError::terminal(state_->failure))
-        check(state_->failure, "Check retired decoder allocations");
     return state_->pending_bytes + state_->uncertain_bytes;
 }
 
@@ -145,11 +146,20 @@ std::size_t RetiredBlockReclaimer::pending_bytes() const {
     return state_->pending_bytes;
 }
 
+std::size_t RetiredBlockReclaimer::failed_release_bytes() const {
+    const std::scoped_lock lock(state_->mutex);
+    return state_->uncertain_bytes;
+}
+
+void RetiredBlockReclaimer::check_releases() const {
+    const std::scoped_lock lock(state_->mutex);
+    check(state_->failure, "Check retired decoder allocations");
+}
+
 void RetiredBlockReclaimer::drain() {
     std::unique_lock lock(state_->mutex);
     state_->changed.wait(lock, [&] { return state_->pending_blocks == 0; });
-    if (CudaError::terminal(state_->failure))
-        check(state_->failure, "Drain retired decoder allocations");
+    check(state_->failure, "Drain retired decoder allocations");
 }
 
 }

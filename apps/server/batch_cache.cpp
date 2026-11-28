@@ -640,10 +640,14 @@ void BatchCache::wake_readers() { state_->readers.discard_cancelled(); }
 
 void BatchCache::stop_restores() noexcept { state_->restore_stop.signal(); }
 
-void BatchCache::reset() {
+void BatchCache::drain_transfers() {
     state_->readers.drain();
     state_->restores.drain();
     state_->stores_queue.drain();
+}
+
+void BatchCache::reset() {
+    drain_transfers();
     try {
         state_->group->reset();
         if (state_->devices.empty())

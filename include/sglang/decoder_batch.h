@@ -92,6 +92,8 @@ struct DecoderPrefixCacheStats {
     std::uint64_t prefill_checkpoints_resident = 0;
     std::uint64_t prefill_checkpoints_published = 0;
     std::uint64_t prefill_checkpoints_declined = 0;
+    std::size_t pending_release_bytes = 0;
+    std::size_t failed_release_bytes = 0;
 };
 
 class DecoderBatch {

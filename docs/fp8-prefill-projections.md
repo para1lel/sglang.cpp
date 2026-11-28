@@ -27,7 +27,7 @@ Verification preserves BF16 rounding, E4M3 activations and FP32 scales. Compact 
 
 Wide fallback tries 40, 20, then ≤5 rows. Pending/recorded CUDA errors propagate, except optional setup reporting no status with only recorded `cudaErrorNotSupported`. [Wide dispatch](../src/text/decode_proj_fp8.cu#L618)<!-- prefix: "if (count ==" -->
 
-Stream-owned scratch is 87,040 B/lane (up to 2,785,280 B). Eight TP2 lanes reserve 696,320 B with 409,600 live for depth scoring. Scratch setup can decline to preserve the 2 GiB shared reserve or on allocation OOM. TP1 halves the candidate width and replans until scratch preparation succeeds or no wide group remains. TP2 keeps the planned groups and uses ordinary draft packets when depth scoring cannot use scratch. Other CUDA errors propagate. [Scratch reserve](../src/decoder_batch.cpp#L504)<!-- prefix: "bool Decoder" --> · [Group preparation](../src/decoder_batch.cpp#L534)<!-- prefix: "WideMtpGroup" -->
+Stream-owned scratch is 87,040 B/lane (up to 2,785,280 B). Eight TP2 lanes reserve 696,320 B with 409,600 live for depth scoring. Scratch setup can decline to preserve the 2 GiB shared reserve or on allocation OOM. TP1 halves the candidate width and replans until scratch preparation succeeds or no wide group remains. TP2 keeps the planned groups and uses ordinary draft packets when depth scoring cannot use scratch. Other CUDA errors propagate. [Scratch reserve](../src/decoder_batch.cpp#L510)<!-- prefix: "bool Decoder" --> · [Group preparation](../src/decoder_batch.cpp#L540)<!-- prefix: "WideMtpGroup" -->
 
 ### Large prefill tiles
 

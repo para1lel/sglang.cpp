@@ -105,6 +105,7 @@ public:
                std::function<void()> done);
     void wake_readers();
     void stop_restores() noexcept;
+    void drain_transfers();
     void reset();
     LmCacheMetrics metrics() const;
 

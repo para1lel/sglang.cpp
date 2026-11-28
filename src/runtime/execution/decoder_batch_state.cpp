@@ -90,6 +90,23 @@ DecoderBatch::State::State(const Decoder::Model& owner, DecoderBatchOptions opti
     device.restore();
 }
 
+RequestBlockCache* DecoderBatch::State::request_cache(const DecoderOptions& request) {
+    if (request.publish_prefix_checkpoints && request.store_prefix) {
+        storage->retired.enable_detached_reclamation();
+        return &storage->retired;
+    }
+    return residency.resident() ? &storage->retired : nullptr;
+}
+
+RequestBlockCache* DecoderBatch::State::peer_request_cache(const Lane& lane) {
+    if (!lane.checkpoints())
+        return nullptr;
+    auto& retired = storage->peer_retired;
+    if (!retired)
+        retired.emplace(tp->peer_device, false, true);
+    return &*retired;
+}
+
 void DecoderBatch::State::drain(const char* operation, std::optional<Lane>* lane) {
     try {
         DeviceScope device(model.device);
@@ -123,9 +140,16 @@ std::optional<Lane>& DecoderBatch::State::slot_at(int slot) {
     return storage->slots[slot];
 }
 
-void DecoderBatch::State::require_ready() const {
-    if (failed) {
+void DecoderBatch::State::require_ready() {
+    if (failed)
         throw std::runtime_error("Decoder batch is unavailable");
+    try {
+        storage->retired.check_releases();
+        if (storage->peer_retired)
+            storage->peer_retired->check_releases();
+    } catch (const CudaError&) {
+        disable();
+        throw;
     }
 }
 

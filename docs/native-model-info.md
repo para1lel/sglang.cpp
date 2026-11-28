@@ -2,7 +2,7 @@
 
 ## Responsibilities and sources of truth
 
-HTTP handles [model discovery](#model-discovery) and [server information](#server-information) outside the completion queue. The [startup writer](../apps/sglang-server.cpp#L219)<!-- prefix: "std::string " --> supplies metadata, and the [scheduler snapshot](../apps/server/batch_service.cpp#L788)<!-- prefix: "BatchRuntime" --> supplies live state under its mutex. [Implementation map](https://github.com/para1lel/sglang.cpp/blob/49a48f98e44223bd619e7b6f43569b45175504c0/docs/native-model-info.md#responsibilities-and-sources-of-truth)
+HTTP handles [model discovery](#model-discovery) and [server information](#server-information) outside the completion queue. The [startup writer](../apps/sglang-server.cpp#L219)<!-- prefix: "std::string " --> supplies metadata, and the [scheduler snapshot](../apps/server/batch_service.cpp#L800)<!-- prefix: "BatchRuntime" --> supplies live state under its mutex. [Implementation map](https://github.com/para1lel/sglang.cpp/blob/49a48f98e44223bd619e7b6f43569b45175504c0/docs/native-model-info.md#responsibilities-and-sources-of-truth)
 
 ## Runtime path
 
@@ -109,7 +109,7 @@ The list ignores the query and returns 404 on a non-GET or nonempty body. Retrie
 
 ### Server-info targets
 
-Both aliases ignore queries and framed GET bodies, return 200 even with `ready: false`, and redirect trailing slashes to the corresponding alias. Unknown paths return 404. Apply the [same 405/HEAD rule](#model-info-targets). Invalid framing fails before the handler. [Query split](../apps/server/http.cpp#L143)<!-- prefix: "const auto s" --> · [Method reply](../apps/server/http.cpp#L585)<!-- prefix: "void write_m" --> · [Worker flag](../apps/server/batch_service.cpp#L719)<!-- prefix: "bool BatchSe" -->
+Both aliases ignore queries and framed GET bodies, return 200 even with `ready: false`, and redirect trailing slashes to the corresponding alias. Unknown paths return 404. Apply the [same 405/HEAD rule](#model-info-targets). Invalid framing fails before the handler. [Query split](../apps/server/http.cpp#L143)<!-- prefix: "const auto s" --> · [Method reply](../apps/server/http.cpp#L585)<!-- prefix: "void write_m" --> · [Worker flag](../apps/server/batch_service.cpp#L731)<!-- prefix: "bool BatchSe" -->
 
 ## Verification
 

@@ -28,6 +28,7 @@ struct BatchStorage {
     BatchStorage(int device, std::shared_ptr<const Allocations> memory, bool resident, int lanes);
     std::shared_ptr<const Allocations> weights;
     RequestBlockCache retired;
+    std::optional<RequestBlockCache> peer_retired;
     std::array<std::optional<Lane>, decoder_batch_max_lanes> slots;
     BatchAdmissionOrder admission;
     DecodeGraphs decode_graphs;
@@ -131,12 +132,14 @@ struct DecoderBatch::State {
     void collect_scores(const std::array<Request*, decoder_batch_max_lanes>& scoring,
                         Steps& results);
     std::size_t reserve(DecoderOptions& request, int prompt, std::size_t extra_bytes) const;
+    RequestBlockCache* request_cache(const DecoderOptions& request);
+    RequestBlockCache* peer_request_cache(const Lane& lane);
     void initialize(Lane& lane, int slot);
     void drain(const char* operation, std::optional<Lane>* lane = nullptr);
     void fail_step(bool recoverable);
     std::optional<Lane>& slot_at(int slot);
 
-    void require_ready() const;
+    void require_ready();
 
     void disable() noexcept;
 

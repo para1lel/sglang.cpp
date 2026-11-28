@@ -55,13 +55,27 @@ GPU_UUID="$GPU_UUID" LMCACHE_SOCKET="$LMCACHE_SOCKET" \
     bash tests/prefix/run_lmcache_state.sh "${release_build:?set the Release build directory}" "$checkpoint" "$evidence"
 ```
 
-Require exit zero and `PASS` in both `state.log` and `graph.log`. The runner bounds each binary, including its STORE worker and receipt waits. `LMCACHE_TEST_TIMEOUT` defaults to `5m`. At the deadline GNU `timeout` sends SIGTERM, then SIGKILL if the process survives another five seconds. A timeout fails the run. [Device runner](run_lmcache_state.sh#L39)<!-- prefix: "CUDA_VISIBLE" -->
+Require exit zero and `PASS` in `state.log`, `graph.log`, and `release.log`. The runner bounds each binary, including its STORE worker and receipt waits. `LMCACHE_TEST_TIMEOUT` defaults to `5m`. At the deadline GNU `timeout` sends SIGTERM, then SIGKILL if the process survives another five seconds. A timeout fails the run. [Device runner](run_lmcache_state.sh#L57)<!-- prefix: "CUDA_VISIBLE" -->
 
-The state check compares payloads and scores, counts KV writes with imported GQA, and covers unequal GQA and GDN coverage, a hole in GQA, and K4 continuation. It checks nonterminal views across allocation growth and a failed store. Terminal views retain their source blocks after retirement without copying them. The fixture queues a nonterminal copy before cancelling and replacing its source request, and injects allocation, copy, and event failures. [Nonterminal view](lmcache_state.cpp#L585)<!-- prefix: "void check_d" --> · [Terminal view](lmcache_state.cpp#L610)<!-- prefix: "void check_t" --> · [Delayed copy](lmcache_state.cpp#L723)<!-- prefix: "static void " --> · [Copy failure](lmcache_state.cpp#L776)<!-- prefix: "void check_c" -->
+The state check compares payloads and scores, counts KV writes with imported GQA, and covers unequal GQA and GDN coverage, a hole in GQA, and K4 continuation. It checks nonterminal views across allocation growth and a failed store. Terminal views retain their source blocks after retirement without copying them. The fixture queues a nonterminal copy before cancelling and replacing its source request, and injects allocation, copy, and event failures. [Nonterminal view](lmcache_state.cpp#L580)<!-- prefix: "void check_d" --> · [Terminal view](lmcache_state.cpp#L605)<!-- prefix: "void check_t" --> · [Delayed copy](lmcache_state.cpp#L655)<!-- prefix: "static void " --> · [Copy failure](lmcache_state.cpp#L708)<!-- prefix: "void check_c" -->
 
-For a private GDN allocation, the test observes the STORE worker enqueue one free and synchronize the same stream. A second case injects a recoverable synchronization error after the real release and requires one diagnostic. For detached blocks, the test requires the attempted `cudaFreeAsync` pointer to match the injected pointer. `cudaErrorNotSupported` permits a synchronous free and clears the charge. `cudaErrorInvalidValue` retains the charge and skips the synchronous free. [STORE worker](lmcache_state.cpp#L812)<!-- prefix: "void check_w" --> · [Detached release](lmcache_state.cpp#L692)<!-- prefix: "void check_f" --> · [Accounting](lmcache_state.cpp#L655)<!-- prefix: "void check_d" -->
+For a private GDN allocation, the state test observes the STORE worker enqueue one free and synchronize the same stream. A second case injects a recoverable synchronization error after the real release and requires one diagnostic. [STORE worker](lmcache_state.cpp#L744)<!-- prefix: "void check_w" -->
 
 The graph check advances a K0 or K1 peer while a checkpoint transfer is held, then compares native state and continuation scores with the control. For direct K1 generation, it checks a restored hit and a cold restart after an exceptional GET. Both must match cache-off output IDs and produce a deferred terminal STORE receipt. A failed STORE must surface through its receipt and leave the successful-store count at zero.
+
+The release check requires the attempted `cudaFreeAsync` pointer to match the injected pointer. `cudaErrorNotSupported` permits a synchronous free and clears the charge. `cudaErrorInvalidValue` retains the charge and skips the synchronous free. [Detached release](lmcache_release.cpp#L212)<!-- prefix: "void check_f" --> · [Accounting](lmcache_release.cpp#L160)<!-- prefix: "void check_d" -->
+
+### TP2 release failure
+
+Reserve two B200 GPUs and set `GPU_UUIDS` to their comma-separated UUIDs in rank order. Set `release_evidence` to a fresh directory path. This mode runs the release checks without an LMCache daemon. [Runner mode](run_lmcache_state.sh#L24)<!-- prefix: "if [[ $mode " -->
+
+```bash
+GPU_UUID="$GPU_UUIDS" bash tests/prefix/run_lmcache_state.sh \
+    "${release_build:?set the Release build directory}" "$checkpoint" "$release_evidence" \
+    --serving-release-only
+```
+
+Require exit zero and `PASS` in `release.log`. The fixture injects a completion failure on each rank in turn. Admission and idle drain must report the recorded CUDA status and preserve the failed byte charge. [Rank failure](lmcache_release.cpp#L248)<!-- prefix: "void check_s" -->
 
 ## Historical resident-cache checks
 

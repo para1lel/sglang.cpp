@@ -6,13 +6,13 @@ Send `POST /parse_function_call` to extract function calls from supplied Qwen-st
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| HTTP reader | Check the media type and dispatch the request. | [Media types](../../apps/server/http.cpp#L117)<!-- prefix: "bool json_me" --> · [Dispatch](../../apps/server/prefix_controls.cpp#L661)<!-- prefix: ": path == pa" --> |
-| Native parser | Validate the request, select the detector, and return the parsed text and calls. | [Request handler](../../apps/server/parse_function_call.cpp#L26)<!-- prefix: "void parse_f" --> · [Text parser](../../apps/server/qwen/qwen_tool_output.cpp#L471)<!-- prefix: "std::string " --> |
+| HTTP reader | Check the media type and enqueue the request on the CPU FIFO. | [Media types](../../apps/server/http.cpp#L224)<!-- prefix: "const auto p" --> · [Dispatch](../../apps/server/prefix_controls.cpp#L610)<!-- prefix: "enqueue_auxi" --> |
+| Native parser | Validate the request, select the detector, and return the parsed text and calls. | [Request handler](../../apps/server/parse_function_call.cpp#L95)<!-- prefix: "void parse_f" --> · [Text parser](../../apps/server/qwen/qwen_tool_output.cpp#L471)<!-- prefix: "std::string " --> |
 | SGLang reference | Define the upstream route and detector aliases. | [Pinned route](https://github.com/sgl-project/sglang/blob/f04d886bf79aa3d6237cbb12a3311838eb9f9bd8/python/sglang/srt/entrypoints/http_server.py#L1739)<!-- prefix: "@app.post(\"/" --> · [Pinned detector registry](https://github.com/sgl-project/sglang/blob/f04d886bf79aa3d6237cbb12a3311838eb9f9bd8/python/sglang/srt/function_call/function_call_parser.py#L110)<!-- prefix: "\"qwen3_coder" --> |
 
 ## Runtime path
 
-The HTTP reader parses the supplied text without a completion slot, tokenizer call, or model inference. The request selects the detector independently of the [chat parser flags](../chat-serving.md#qwen-reasoning-and-tool-calls).
+The [CPU FIFO](../http-server.md#http-admission-and-shutdown) shares one worker with tokenization and `/separate_reasoning`. The worker parses the supplied text without a completion slot, tokenizer call, or model inference. The request selects the detector independently of the [chat parser flags](../chat-serving.md#qwen-reasoning-and-tool-calls). [CPU worker](../../apps/server/prefix_controls.cpp#L794)<!-- prefix: "void Connect" -->
 
 With a nonempty `tools` array and a literal `<tool_call>` marker, `normal_text` contains the exact text before the first marker. Otherwise, `normal_text` contains the full input and `calls` is empty.
 
@@ -36,6 +36,7 @@ Send a JSON object within the [shared HTTP limits](../http-server.md#http-admiss
 | Missing, null, or unsupported parser name | HTTP 400 with a JSON error. |
 | Method other than POST on the canonical path | HTTP 405 with `Allow: POST`. |
 | Trailing slash | HTTP 307 under the [shared redirect rules](../http-server.md#request-targets-and-redirects). |
+| CPU FIFO full | HTTP 503 with a JSON `ServiceUnavailableError`. |
 
 ### Compatibility limits
 

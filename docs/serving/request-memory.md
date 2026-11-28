@@ -8,7 +8,7 @@ The [native prefix cache](../prefix-cache.md#runtime-path) uses rank-local stora
 
 Each resident MTP slot reuses pinned host storage for up to five verifier winners. The batch keeps the buffer through its execution stream drain. Direct generation and a batch that cannot allocate the shared pinned buffer use the existing request-owned readback. [Winner buffer](../../src/decoder_verify.cpp#L512)<!-- prefix: "std::shared_" -->
 
-HTTP shutdown stops restores and drains LMCache transfers before the final request release drain. Execution streams drain before their request storage is destroyed. Outstanding IPC owners retain the referenced backing until the lease clears. [HTTP shutdown](../../apps/server/batch_service.cpp#L63)<!-- prefix: "if (lmcache)" --> · [Exported ranges](../../src/runtime/backend/cuda_resources.cpp#L65)<!-- prefix: "~ExportedDev" -->
+HTTP shutdown stops restores and drains LMCache transfers before the final request release drain. Execution streams drain before their request storage is destroyed. Outstanding IPC owners retain the referenced backing until the lease clears. [HTTP shutdown](../../apps/server/batch_service.cpp#L54)<!-- prefix: "if (lmcache)" --> · [Exported ranges](../../src/runtime/backend/cuda_resources.cpp#L65)<!-- prefix: "~ExportedDev" -->
 
 ## Peer draft repair
 

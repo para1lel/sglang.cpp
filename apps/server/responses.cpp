@@ -2,7 +2,6 @@
 
 #include "sglang/server/chat_template.h"
 #include "sglang/server/http.h"
-#include "sglang/server/vision_completion.h"
 #include "sglang/utf8.h"
 
 #include <algorithm>
@@ -352,9 +351,8 @@ void validate_text_options(const OrderedObject& fields) {
 }
 
 int responses_logprob_count(const OrderedObject& fields, bool stream) {
-    const auto& top = field(fields, "top_logprobs");
-    const auto width = top.is_null() ? std::optional<std::uint64_t>(0) : top.unsigned_integer();
-    if (!width || *width > decoder_max_generated_top_logprobs) {
+    const auto width = logprob_width(json::get(fields, "top_logprobs"));
+    if (!width) {
         throw RequestError(400, "Expected an integer top_logprobs from 0 to 20", "top_logprobs");
     }
     const auto& include = field(fields, "include");
@@ -369,7 +367,7 @@ int responses_logprob_count(const OrderedObject& fields, bool stream) {
     if (stream) {
         throw RequestError(400, "logprobs are not supported in streaming mode");
     }
-    return static_cast<int>(*width);
+    return *width;
 }
 
 OrderedObject schema_descriptor(const OrderedObject& format) {
@@ -597,12 +595,7 @@ void complete_responses(const Socket& connection, BatchService& service, int slo
             request.options.generated_top_logprobs = envelope.top_logprobs;
         }
         request.responses = &envelope;
-        complete_text(connection, request, tokenizer, [&](const auto& prompt, const auto& options,
-                                                          const auto& callbacks) {
-            return request.media ? vision->generate(service, slot, *request.media, options,
-                                                      callbacks) :
-                service.generate(slot, prompt, options, callbacks);
-        });
+        complete_text(connection, request, tokenizer, service, slot, vision);
     } catch (const RequestError& error) {
         responses_error(connection, error.code, error.what(), error.parameter);
     } catch (const json::ParseError&) {
@@ -670,9 +663,7 @@ OrderedObject ResponsesOutput::item_json(const Item& item, bool ready) const {
 }
 
 bool ResponsesOutput::event(std::string_view type, OrderedObject fields) {
-    fields.emplace_back("type", std::string(type));
-    fields.emplace_back("sequence_number", sequence_++);
-    return stream_.write(chat_template_json(fields), type);
+    return write_completion_event(stream_, type, std::move(fields), &sequence_);
 }
 
 bool ResponsesOutput::lifecycle(std::string_view type, const char* status, Value usage,
@@ -796,47 +787,36 @@ void ResponsesOutput::token(std::string_view piece) {
 
 namespace {
 
-struct OutputScore {
-    std::string token;
-    float value;
-};
-
-OutputScore output_score(const Tokenizer& tokenizer, const DecoderLogprob& score) {
-    return {repair_utf8(tokenizer.piece(score.token_id, false)), score.value};
+std::string response_score_text(const Tokenizer& tokenizer, int id) {
+    return repair_utf8(tokenizer.piece(id, false));
 }
 
-OrderedObject score_fields(OutputScore score) {
+OrderedObject score_fields(std::string token, float value) {
     Array bytes;
-    bytes.reserve(score.token.size());
-    for (unsigned char byte : score.token) bytes.emplace_back(static_cast<int>(byte));
-    return {{"token", std::move(score.token)}, {"bytes", std::move(bytes)},
-            {"logprob", static_cast<double>(score.value)}};
+    bytes.reserve(token.size());
+    for (const unsigned char byte : token)
+        bytes.emplace_back(static_cast<int>(byte));
+    return {
+        {"token", std::move(token)},
+        {"bytes", std::move(bytes)},
+        {"logprob", static_cast<double>(value)},
+    };
 }
 
 Array output_logprobs(const Tokenizer& tokenizer, const DecoderResult& result) {
-    if (result.generated_logprobs.size() != result.output_token_ids.size()) {
-        throw std::logic_error("Generated logprob count differs from output token count");
-    }
+    check_generated_scores(result);
     Array scores;
     scores.reserve(result.output_token_ids.size());
     for (std::size_t index = 0; index < result.output_token_ids.size(); ++index) {
-        const auto& row = result.generated_logprobs[index];
-        if (!row || row->selected.token_id != result.output_token_ids[index]) {
-            throw std::logic_error("Generated logprob ID differs from output token ID");
-        }
-        std::vector<OutputScore> distinct;
-        distinct.reserve(row->alternatives.size());
-        for (const auto& alternative : row->alternatives) {
-            auto candidate = output_score(tokenizer, alternative);
-            const auto existing = std::find_if(distinct.begin(), distinct.end(),
-                [&](const auto& entry) { return entry.token == candidate.token; });
-            if (existing == distinct.end()) distinct.push_back(std::move(candidate));
-            else existing->value = candidate.value;
-        }
+        const auto& row = *generated_score(result, index);
+        auto distinct = distinct_score_alternatives(tokenizer, row, response_score_text);
         Array alternatives;
         alternatives.reserve(distinct.size());
-        for (auto& score : distinct) alternatives.emplace_back(score_fields(std::move(score)));
-        auto selected = score_fields(output_score(tokenizer, row->selected));
+        for (auto& [token, value] : distinct) {
+            alternatives.emplace_back(score_fields(std::move(token), value));
+        }
+        auto selected =
+            score_fields(response_score_text(tokenizer, row.selected.token_id), row.selected.value);
         selected.emplace_back("top_logprobs", std::move(alternatives));
         scores.emplace_back(std::move(selected));
     }

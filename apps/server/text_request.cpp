@@ -324,16 +324,15 @@ void set_constraint(const json::Object& object, const CompletionTokenizer& token
 int openai_logprob_count(const json::Object& object, bool chat) {
     const auto* enabled = json::get(object, "logprobs");
     const auto* count = chat ? json::get(object, "top_logprobs") : enabled;
-    const auto top = count && !count->is_null() ? count->unsigned_integer()
-                                               : std::optional<std::uint64_t>{0};
-    if (!top || *top > decoder_max_generated_top_logprobs) {
+    const auto top = logprob_width(count);
+    if (!top) {
         bad_request(chat ? "Expected integer top_logprobs in [0, 20]"
                          : "Expected integer logprobs in [0, 20]");
     }
     if (chat) {
-        return read_bool(object, "logprobs") ? static_cast<int>(*top) : -1;
+        return read_bool(object, "logprobs") ? *top : -1;
     }
-    return enabled && !enabled->is_null() ? static_cast<int>(*top) : -1;
+    return enabled != nullptr && !enabled->is_null() ? *top : -1;
 }
 
 TextRequest text_options(const json::Object& object, const CompletionTokenizer& tokenizer,
@@ -614,6 +613,15 @@ TextCompletionRequest parse_text_request(const json::Object& body,
     return parse_text(body, tokenizer);
 }
 
+std::optional<int> logprob_width(const json::Value* value) {
+    if (value == nullptr || value->is_null())
+        return 0;
+    const auto width = value->unsigned_integer();
+    if (!width || *width > decoder_max_generated_top_logprobs)
+        return std::nullopt;
+    return static_cast<int>(*width);
+}
+
 namespace {
 
 void set_cache_salt_value(const json::Value& value, DecoderOptions& options) {
@@ -751,9 +759,8 @@ void generate_logprob_options(const GenerateInput& input, std::size_t index, Bat
     if (enabled && !enabled->is_null() && !enabled->boolean()) {
         bad_request("Expected boolean return_logprob");
     }
-    const auto count = top && !top->is_null() ? top->unsigned_integer()
-                                             : std::optional<std::uint64_t>{0};
-    if (!count || *count > decoder_max_generated_top_logprobs) {
+    const auto count = logprob_width(top);
+    if (!count) {
         bad_request("Expected integer top_logprobs_num in [0, 20]");
     }
     if (text && !text->is_null() && !text->boolean()) {
@@ -772,7 +779,7 @@ void generate_logprob_options(const GenerateInput& input, std::size_t index, Bat
         if (item.options.samples()) {
             bad_request("return_logprob requires greedy sampling");
         }
-        item.options.generated_top_logprobs = static_cast<int>(*count);
+        item.options.generated_top_logprobs = *count;
         item.return_text_in_logprobs = text && text->boolean() == true;
     }
 }

@@ -1,19 +1,16 @@
 """Exercise native tokenization HTTP routes with the Qwen checkpoint and CPU server."""
 
-from contextlib import closing
-from email.parser import BytesHeaderParser
-import http.client
 import json
-from pathlib import Path
 import socket
-from tempfile import TemporaryDirectory
 import time
 import unittest
+from email.parser import BytesHeaderParser
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from test_native_generate_cpu import abort, generate_client, get
 from test_sampling_routes_cpu import control_response, run_cpu_suite, server
-
 
 TOKENIZE = ("/tokenize", "/v1/tokenize")
 DETOKENIZE = ("/detokenize", "/v1/detokenize")
@@ -140,40 +137,33 @@ class NativeTokenization(unittest.TestCase):
                 self.assertEqual(post(port, DETOKENIZE[0], {"tokens": [87]}), (200, {"text": "x"}))
             self.assertNotIn("cpu admit", log.read_text())
 
-    def test_shared_queue_overflow_and_reuse(self):
-        cases = ((TOKENIZE[1], {"prompt": "x"},
-                  {"tokens": [87], "count": 1, "max_model_len": CONTEXT}, DETOKENIZE[0],
-                  {"tokens": []}),
-                 (DETOKENIZE[1], {"tokens": [87]}, {"text": "x"}, TOKENIZE[0], {"prompt": ""}))
-        for index, (queued_route, body, expected, overflow, overflow_body) in enumerate(cases):
-            with self.subTest(route=queued_route), TemporaryDirectory(dir=self.output) as directory:
-                gate = Path(directory) / "step"
-                log = self.output / f"queue-{index}.log"
-                with patch.dict("os.environ", SGLANG_TEST_BATCH_STEP_GATE=str(gate)), \
-                     server(self.binary, self.checkpoint, log, "--max-active", "1") as port:
-                    self.check_queue(port, log, queued_route, body, expected,
-                                     overflow, overflow_body)
-                self.assertEqual(log.read_text().count("cpu admit"), 1)
-
-    def check_queue(self, port, log, route, body, expected, overflow, overflow_body):
-        with generate_client(port, {
-            "input_ids": [32], "sampling_params": {"sampling_seed": -41, "max_new_tokens": 2},
-        }) as running, closing(http.client.HTTPConnection("127.0.0.1", port, timeout=5)) as queued:
-            deadline = time.monotonic() + 5
-            while "cpu admit slot=0" not in log.read_text():
-                self.assertLess(time.monotonic(), deadline, log.read_text())
-                time.sleep(0.01)
-            queued.request("POST", route, json.dumps(body).encode(), HEADERS)
-            deadline = time.monotonic() + 5
-            while b'vllm:num_requests_waiting{engine="0"} 1' not in get(port, "/metrics")[1]:
-                self.assertLess(time.monotonic(), deadline, log.read_text())
-                time.sleep(0.01)
-            self.check_error(post(port, overflow, overflow_body), 503, "ServiceUnavailableError")
-            self.assertEqual(get(port, "/health")[0], 200)
-            abort(running)
-            with queued.getresponse() as response:
-                self.assertEqual(packet(response), (200, expected))
-            self.assertEqual(post(port, overflow, overflow_body)[0], 200)
+    def test_tokenization_progress_during_generation(self) -> None:
+        with TemporaryDirectory(dir=self.output) as directory:
+            gate = Path(directory) / "step"
+            log = self.output / "tokenization-progress.log"
+            with (
+                patch.dict("os.environ", SGLANG_TEST_BATCH_STEP_GATE=str(gate)),
+                server(self.binary, self.checkpoint, log, "--max-active", "1") as port,
+                generate_client(
+                    port,
+                    {
+                        "input_ids": [32],
+                        "sampling_params": {"sampling_seed": -41, "max_new_tokens": 2},
+                    },
+                ) as running,
+            ):
+                deadline = time.monotonic() + 5
+                while "cpu admit slot=0" not in log.read_text():
+                    self.assertLess(time.monotonic(), deadline, log.read_text())
+                    time.sleep(0.01)
+                self.assertEqual(
+                    post(port, TOKENIZE[1], {"prompt": "x"}),
+                    (200, {"tokens": [87], "count": 1, "max_model_len": CONTEXT}),
+                )
+                self.assertEqual(post(port, DETOKENIZE[1], {"tokens": [87]}), (200, {"text": "x"}))
+                self.assertEqual(get(port, "/health")[0], 200)
+                abort(running)
+            self.assertEqual(log.read_text().count("cpu admit"), 1)
 
     def test_ollama_context_integer_text(self) -> None:
         payload = {"model": "Qwen3.8-27B-FP8", "prompt": "", "stream": False}

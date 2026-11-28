@@ -40,7 +40,7 @@ Compilation allows up to 4,096 nondeterministic states, 256 deterministic states
 
 ### Native generate
 
-Set `sampling_params.regex` in `POST /generate`. Each item can activate one of `regex`, `json_schema` and `ebnf`; omit a field or use null or `""` to disable it. Each item owns its cursor and budget. Broadcast one sampling object to share compilation, or pass an array to mix constraints or constrained and unconstrained items. [Native validation](../apps/server/native_generate.cpp#L734)<!-- prefix: "void set_gen" --> · [Batch example](https://github.com/para1lel/sglang.cpp/blob/49a48f98e44223bd619e7b6f43569b45175504c0/docs/output-constraints.md#native-generate)
+Set `sampling_params.regex` in `POST /generate`. Each item can activate one of `regex`, `json_schema` and `ebnf`; omit a field or use null or `""` to disable it. Each item owns its cursor and budget. Broadcast one sampling object to share compilation, or pass an array to mix constraints or constrained and unconstrained items. [Native validation](../apps/server/native_generate.cpp#L688)<!-- prefix: "void set_gen" --> · [Batch example](https://github.com/para1lel/sglang.cpp/blob/49a48f98e44223bd619e7b6f43569b45175504c0/docs/output-constraints.md#native-generate)
 
 An accepting state with no continuation finishes immediately, including below `min_new_tokens`. An early grammar finish reports `stop` with the last generated ID as `matched` and includes its text. A match at the token budget reports `length` unless a text stop or model EOS wins that step. While a match can continue, `min_new_tokens` masks model EOS until the minimum is reached. An explicit text stop can finish earlier and trim the displayed match.
 

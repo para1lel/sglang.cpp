@@ -6,8 +6,8 @@ Native keeps GQA pages and exact GDN checkpoints in separate GPU pools. A backgr
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| Server | Configure prefix reuse, validate salts, and report usage. | [Salt validation](../apps/server/text_request.cpp#L619)<!-- prefix: "void set_cac" --> · [Usage writer](../apps/server/text_completion.cpp#L50)<!-- prefix: "void append_" --> |
-| HTTP controls | Dispatch cache reset, metrics, and bounded scheduler profiling. | [Control routes](../apps/server/prefix_controls.cpp#L483)<!-- prefix: "void Connect" --> |
+| Server | Configure prefix reuse, validate salts, and report usage. | [Salt validation](../apps/server/text_request.cpp#L627)<!-- prefix: "void set_cac" --> · [Usage writer](../apps/server/text_completion.cpp#L52)<!-- prefix: "void append_" --> |
+| HTTP controls | Dispatch cache reset, metrics, and bounded scheduler profiling. | [Control routes](../apps/server/prefix_controls.cpp#L429)<!-- prefix: "void Connect" --> |
 | Native cache | Builds prefix identities, leases GPU pages and checkpoints, and schedules CPU backup. | [Prefix keys](../src/runtime/cache/prefix_payload.cpp#L108)<!-- prefix: "PrefixCacheK" --> · [Pool capacity](../src/runtime/cache/prefix_residency.cpp#L142)<!-- prefix: "PoolLimits p" --> |
 | LMCache | Resolves coverage, executes transfers, and retains CPU L1 records across native workers. | [Lookup](../tools/lmcache/sglang_lmcache.py#L165)<!-- prefix: "def coverage" --> · [Storage](../tools/lmcache/sglang_lmcache.py#L469)<!-- prefix: "class Record" --> |
 
@@ -77,7 +77,7 @@ The metrics, reset, and profile routes are available when LMCache is configured,
 
 Reset and [flush](#cache-flush) clear resident GPU records and the configured daemon store across both TP2 ranks. The scheduler drains native transfer tasks first. The pool pauses new backups and waits for the active ranked store before clearing records. The scheduler then waits for the daemon reset acknowledgement. Pool capacity and cumulative counters persist. Successful controls return 200 and malformed POST controls return 400. Queued generations wait through the reset response write. [Scheduler reset](../apps/server/detail/batch_service_cache.cpp#L64)<!-- prefix: "std::optiona" --> · [Pool reset](../src/runtime/cache/prefix_residency.cpp#L701)<!-- prefix: "void PrefixR" -->
 
-`vllm:prefix_cache_hits_total` counts coherently restored prompt IDs. `vllm:generation_tokens_total` counts published IDs. `sglang_cpp:prefix_` tracks pool capacity, occupancy, independent resident reuse, backups, and eviction. `sglang_cpp:lmcache_` reports daemon I/O and retains aggregate and per-rank transfer counters. Joint acknowledgements count once and per-rank receipts count successful rank replies. `lmcache_pending_stores` stays positive while an eligible backup is queued or its final pool accounting is pending. Pool and transport snapshots can cover different instants. Prefill counters distinguish planned, resident, published, and declined checkpoints. [Pool counters](../apps/server/loads.cpp#L263)<!-- prefix: "void emit_re" --> · [Pending stores](../apps/server/batch_service.cpp#L805)<!-- prefix: "BatchMetrics" --> · [Prefill counters](../apps/server/loads.cpp#L312)<!-- prefix: "emit(\"sglang" -->
+`vllm:prefix_cache_hits_total` counts coherently restored prompt IDs. `vllm:generation_tokens_total` counts published IDs. `sglang_cpp:prefix_` tracks pool capacity, occupancy, independent resident reuse, backups, and eviction. `sglang_cpp:lmcache_` reports daemon I/O and retains aggregate and per-rank transfer counters. Joint acknowledgements count once and per-rank receipts count successful rank replies. `lmcache_pending_stores` stays positive while an eligible backup is queued or its final pool accounting is pending. Pool and transport snapshots can cover different instants. Prefill counters distinguish planned, resident, published, and declined checkpoints. [Pool counters](../apps/server/loads.cpp#L263)<!-- prefix: "void emit_re" --> · [Pending stores](../apps/server/batch_service.cpp#L743)<!-- prefix: "BatchMetrics" --> · [Prefill counters](../apps/server/loads.cpp#L312)<!-- prefix: "emit(\"sglang" -->
 
 A profile samples completed nonempty `advance_chunked` iterations started after capture opened. Each sample has host `elapsed_ns`, `width`, `prefill_rows`, `decode_lanes` and the `graph_slots` mask. At the sample cap it stays open. [Sample fields](../apps/server/detail/batch_trace.cpp#L115)<!-- prefix: "BatchProfile" -->
 
@@ -91,10 +91,11 @@ A profile samples completed nonempty `advance_chunked` iterations started after 
 | Busy at zero timeout | 400, `Flush cache failed.\n` |
 | Still busy when a positive timeout expires | 400, `Timed out waiting for idle state.` |
 | Empty, malformed, negative, or NaN timeout | 400 JSON with `object="error"`, `type="Bad Request"`, `param=null`, `code=400`, and a `message` identifying `query.timeout`. |
+| Flush FIFO full | 503, `Native cache flush queue is full`. |
 
 The first three bodies are plain text without a `Content-Type` header. Each `\n` represents one line feed. The reader validates the timeout before queueing. [Replies](../apps/server/flush_cache.cpp#L107)<!-- prefix: "void write_f" --> · [Validation error](../apps/server/flush_cache.cpp#L75)<!-- prefix: "void write_i" -->
 
-The worker claims flushes FIFO and starts the timeout at claim. Busy includes queued or claimed completions, generation and tokenization, active generation, a health job, pending stores, retiring GETs, and reset. Other requests may progress during a deferred wait. With reuse on, daemon reset failure returns 503. Tokenizer, compiled tool grammars, and cumulative counters persist. [Scheduler guard](../apps/server/batch_service.cpp#L832)<!-- prefix: "bool BatchSe" --> · [Pinned upstream compatibility details](https://github.com/para1lel/sglang.cpp/blob/acbf95b0de14108b37c37bdc3dc40daaf2db2099/docs/prefix-cache.md#cache-flush).
+Flush has a dedicated FIFO with `--max-active` waiting slots and one worker. The worker starts the timeout at claim and checks for disconnects at intervals of up to 250 ms while the cache is busy. Queued or claimed model requests, native `/generate` preparation, active generation, and reset can delay a flush. An otherwise idle server can flush while tokenization or standalone parsing waits or runs on the separate CPU FIFO. Other requests may progress during a deferred wait. With LMCache enabled, reset drains outstanding transfers before clearing the cache. With reuse on, daemon reset failure returns 503. Tokenizer, compiled tool grammars, and cumulative counters persist. [Queue guard](../apps/server/prefix_controls.cpp#L284)<!-- prefix: "bool Connect" --> · [Flush worker](../apps/server/prefix_controls.cpp#L358)<!-- prefix: "FlushCacheRe" --> · [Scheduler guard](../apps/server/batch_service.cpp#L778)<!-- prefix: "bool BatchSe" --> · [Pinned upstream compatibility details](https://github.com/para1lel/sglang.cpp/blob/acbf95b0de14108b37c37bdc3dc40daaf2db2099/docs/prefix-cache.md#cache-flush).
 
 ## Verification
 
@@ -122,7 +123,7 @@ Check malformed controls, busy/idle reset, bounded profiles, and peer graph elig
 
 At idle, try both flush methods with reuse on and off. Check the [status, body, and headers](#cache-flush), including `?timeout=invalid`. With reuse on, prime a cacheable prompt and repeat it. Verify that a successful flush preserves cumulative counters and that the next two requests miss, then hit.
 
-Hold a stream active and send three overlapping HTTP flushes in order with short, short, and zero timeouts. Keep the stream active through both deadlines. Expect two timeout replies followed by the busy reply. Verify that a failed flush preserves a primed hit. Repeat with two longer waits and finish the stream. Expect both flushes to succeed in order. Check `/health` while the flush worker waits.
+With `--max-active` at least two, hold a stream active and send three overlapping HTTP flushes in order with short, short, and zero timeouts. Keep the stream active through both deadlines. Expect two timeout replies followed by the busy reply. Verify that a failed flush preserves a primed hit. Repeat with two longer waits and finish the stream. Expect both flushes to succeed in order. Check `/health` while the flush worker waits.
 
 ### Prefix continuation
 

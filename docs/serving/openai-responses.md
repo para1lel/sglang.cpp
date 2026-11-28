@@ -41,7 +41,7 @@ User messages can include an `input_image` part with an `image_url` such as
 codec-enabled build uses the [native chat media limits](../chat-serving.md) and reports
 expanded prompt tokens in `usage.input_tokens`. Blocking, SSE, and stored follow-ups use
 the same media path. External URLs, file IDs, video and image detail or resizing overrides
-return HTTP 400. [Image translation](../../apps/server/responses.cpp#L108)<!-- prefix: "Value messag" -->
+return HTTP 400. [Image translation](../../apps/server/responses.cpp#L107)<!-- prefix: "Value messag" -->
 
 ## Output logprobs
 
@@ -92,7 +92,7 @@ up to 256 UTF-8 bytes. The server validates the descriptor and compiles the
 [native JSON Schema subset](../output-constraints.md#json-schema) with the checkpoint
 tokenizer. Other formats such as `json_object`, unsupported schema keywords, text stops,
 and output budgets below the grammar minimum return HTTP 400 before SSE opens. The explicit
-budget still reserves two tokens. [Descriptor validation](../../apps/server/responses.cpp#L393)<!-- prefix: "OrderedObjec" -->
+budget still reserves two tokens. [Descriptor validation](../../apps/server/responses.cpp#L391)<!-- prefix: "OrderedObjec" -->
 
 The response echoes the descriptor in `text.format` and returns the generated JSON as an
 `output_text` string in the assistant message. The schema constrains output from the first

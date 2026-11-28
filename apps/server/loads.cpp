@@ -305,6 +305,11 @@ std::string format_metrics(const BatchMetrics& metrics, int running, std::size_t
     emit("vllm:request_prefill_kv_computed_tokens_count", metrics.prefill_requests);
     emit("vllm:request_prefill_kv_computed_tokens_sum", metrics.cache.prefill_tokens);
     emit_resident_prefix_metrics(metrics.cache, emit);
+    emit("sglang_cpp:resident_admission_retries_total", metrics.resident_admission_retries);
+    emit("sglang_cpp:mailbox_grace_timeouts_total", metrics.mailbox_grace_timeouts);
+    emit("sglang_cpp:admission_waiting_for_capacity", metrics.admission_waiting_for_capacity);
+    emit("sglang_cpp:admission_waiting_for_lookup", metrics.admission_waiting_for_lookup);
+    emit("sglang_cpp:admission_waiting_for_restore", metrics.admission_waiting_for_restore);
     emit("sglang_cpp:lmcache_enabled", metrics.lmcache.enabled);
     emit("sglang_cpp:lmcache_available", metrics.lmcache.available);
     emit("sglang_cpp:lmcache_lookup_misses_total", metrics.lmcache.lookup_misses);

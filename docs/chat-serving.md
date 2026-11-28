@@ -10,7 +10,7 @@ curl --fail-with-body -N http://127.0.0.1:17384/v1/chat/completions \
 
 ## Responsibilities and sources of truth
 
-The [request parser](../apps/server/text_request.cpp#L866)<!-- prefix: "TextRequest " --> validates chat input. The [Qwen template](../apps/server/qwen/qwen_chat_template.cpp#L555)<!-- prefix: "std::string " --> renders messages and tools. The [serving profile](../apps/server/qwen/qwen_serving_profile.cpp#L134)<!-- prefix: "const Servin" --> selects parsers, and the shared completion writer owns UTF-8 state. [Implementation map](https://github.com/para1lel/sglang.cpp/blob/49a48f98e44223bd619e7b6f43569b45175504c0/docs/chat-serving.md#responsibilities-and-sources-of-truth)
+The [request parser](../apps/server/text_request.cpp#L873)<!-- prefix: "TextRequest " --> validates chat input. The [Qwen template](../apps/server/qwen/qwen_chat_template.cpp#L555)<!-- prefix: "std::string " --> renders messages and tools. The [serving profile](../apps/server/qwen/qwen_serving_profile.cpp#L134)<!-- prefix: "const Servin" --> selects parsers, and the shared completion writer owns UTF-8 state. [Implementation map](https://github.com/para1lel/sglang.cpp/blob/49a48f98e44223bd619e7b6f43569b45175504c0/docs/chat-serving.md#responsibilities-and-sources-of-truth)
 
 ## Runtime path
 
@@ -86,13 +86,13 @@ Rendered prompts require 1–1,048,576 UTF-8 bytes. The prompt and budget share 
 
 First render loads the pinned `tokenizer_config.json` and `chat_template.jinja` from the checkpoint. Unreadable, missing, or mismatched assets return 500 before output. Later chat requests retry. [Tokenizer loading](text-serving.md#send-a-request) stays independent.
 
-Use shared [resident admission](batch-graphs.md#resident-memory-admission), [graph eligibility](batch-graphs.md#runtime-path), [MTP policy](mtp.md#runtime-path), and [stream failure handling](http-server.md#completion-streams). Failed writes and resets also discard pending UTF-8, buffered reasoning, and incomplete tool calls. [Request lifecycle](../apps/server/text_completion.cpp#L725)<!-- prefix: "void complet" -->
+Use shared [resident admission](batch-graphs.md#resident-memory-admission), [graph eligibility](batch-graphs.md#runtime-path), [MTP policy](mtp.md#runtime-path), and [stream failure handling](http-server.md#completion-streams). Failed writes and resets also discard pending UTF-8, buffered reasoning, and incomplete tool calls. [Request lifecycle](../apps/server/text_completion.cpp#L779)<!-- prefix: "void complet" -->
 
 ### Sampling defaults and output budget
 
 The server defaults to `--sampling-defaults model`. On first use chat reads `generation_config.json` from the selected checkpoint. For Qwen3.8-27B-FP8 this gives `temperature: 1`, `top_p: 0.95`, `top_k: 20`, and `min_p: 0`. Use `--sampling-defaults openai` for the [raw-text values](text-serving.md#sampling). Model mode also uses those values for missing assets or fields. Omission or null inherits the selected values. The request supplies the seed.
 
-If both budgets are absent or null, the limit is 262,142 minus the final prompt length. This requires fewer than 262,138 positions, including media expansion. [Resident admission](batch-graphs.md#resident-memory-admission) can lower the implicit budget. An explicit budget must fit in full. [Server option](../apps/sglang-server.cpp#L46)<!-- prefix: "SamplingDefa" --> · [Defaults loader](../apps/server/text_request.cpp#L586)<!-- prefix: "const Decode" --> · [Request overrides](../apps/server/text_request.cpp#L529)<!-- prefix: "} else if ((" --> · [Budget calculation](../apps/server/text_request.cpp#L381)<!-- prefix: "void finish_" --> · [Media expansion](../apps/server/text_request.cpp#L882)<!-- prefix: "if (media) {" --> · [Resident limit](../src/runtime/model/qwen_request.cpp#L131)<!-- prefix: "int limit_re" -->
+If both budgets are absent or null, the limit is 262,142 minus the final prompt length. This requires fewer than 262,138 positions, including media expansion. [Resident admission](batch-graphs.md#resident-memory-admission) can lower the implicit budget. An explicit budget must fit in full. [Server option](../apps/sglang-server.cpp#L46)<!-- prefix: "SamplingDefa" --> · [Defaults loader](../apps/server/text_request.cpp#L585)<!-- prefix: "const Decode" --> · [Request overrides](../apps/server/text_request.cpp#L528)<!-- prefix: "} else if ((" --> · [Budget calculation](../apps/server/text_request.cpp#L380)<!-- prefix: "void finish_" --> · [Media expansion](../apps/server/text_request.cpp#L889)<!-- prefix: "if (media) {" --> · [Resident limit](../src/runtime/model/qwen_request.cpp#L131)<!-- prefix: "int limit_re" -->
 
 ### Image and video inputs
 

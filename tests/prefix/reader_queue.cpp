@@ -1,6 +1,9 @@
 #include "sglang/server/batch_service.h"
+#include "sglang/server/completions.h"
 #include "sglang/server/http.h"
+#include "sglang/server/native_generate.h"
 #include "sglang/server/prefix_controls.h"
+#include "sglang/server/tokenization.h"
 
 #include <array>
 #include <atomic>
@@ -13,11 +16,13 @@
 #include <memory>
 #include <mutex>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <poll.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <thread>
 #include <utility>
+#include <vector>
 
 namespace {
 
@@ -25,6 +30,7 @@ using namespace std::chrono_literals;
 using namespace sglang::server;
 using Clock = std::chrono::steady_clock;
 constexpr auto timeout = 3s;
+std::ptrdiff_t fd_count();
 constexpr int capacity = 2;
 
 class ReaderQueueExecutor final : public BatchExecutor {
@@ -134,7 +140,9 @@ constexpr int large_body_bytes = 48 * 1024;
 
 namespace sglang::server {
 
-struct BatchService::State {};
+struct BatchService::State {
+    std::atomic<bool> abort_notified{false};
+};
 
 BatchService::BatchService(std::unique_ptr<BatchExecutor>, bool, int)
     : state_(std::make_unique<State>()) {}
@@ -143,6 +151,24 @@ BatchService::~BatchService() = default;
 std::optional<std::vector<DecoderResult>> BatchService::generate_batch(
     int, const std::vector<BatchPrompt>&, const BatchCallbacks&) {
     throw std::logic_error("Unexpected decoder batch generation in reader queue fixture");
+}
+
+DecoderResult BatchService::generate(int slot, const std::vector<int>& prompt,
+                                     const DecoderOptions& options,
+                                     [[maybe_unused]] const DecoderCallbacks& callbacks,
+                                     std::vector<DecoderMedia> media,
+                                     [[maybe_unused]] std::size_t expanded_tokens,
+                                     [[maybe_unused]] BatchRequestId* request_id) {
+    const auto aborted = state_->abort_notified.exchange(false);
+    media.clear();
+    throw std::logic_error("Unexpected decoder generation in slot " + std::to_string(slot) +
+                           " for " + std::to_string(prompt.size()) + " prompt tokens and " +
+                           std::to_string(options.max_new_tokens) + " output tokens" +
+                           (aborted ? " after an abort notification" : ""));
+}
+
+void BatchService::notify_abort() {
+    state_->abort_notified = true;
 }
 
 bool BatchService::ready() const { return !worker_failed; }
@@ -224,13 +250,36 @@ std::string request(std::string_view method, std::string_view path,
 }
 
 enum RequestId {
-    terminal, reset_waiter, nondraining, buffered_idle_first, buffered_idle_second,
-    first, second, survivor, contender_text, contender_chat, replacement, overflow,
-    buffered_first, buffered_second, buffered_overflow_first, buffered_overflow_second,
-    last_first, last_second, abandoned, request_count
+    terminal,
+    reset_waiter,
+    nondraining,
+    buffered_idle_first,
+    buffered_idle_second,
+    first,
+    second,
+    survivor,
+    contender_text,
+    contender_chat,
+    replacement,
+    overflow,
+    buffered_first,
+    buffered_second,
+    buffered_overflow_first,
+    buffered_overflow_second,
+    auxiliary_text,
+    auxiliary_chat,
+    prepare_text,
+    prepare_peer,
+    prepare_waiter,
+    last_first,
+    last_second,
+    abandoned,
+    request_count,
 };
 
-bool is_chat(RequestId id) { return id == survivor || id == contender_chat; }
+bool is_chat(RequestId id) {
+    return id == survivor || id == contender_chat || id == auxiliary_chat || id == prepare_waiter;
+}
 
 bool buffered(RequestId id) {
     return id == buffered_idle_first || id == buffered_idle_second ||
@@ -255,18 +304,10 @@ std::string response_body(RequestId id) {
 }
 
 class Server {
-public:
-    Server(BatchService& service, int cache) : cache_(cache), worker_([&, this] {
-        try {
-            serve_connections(listener_, service, capacity,
-                [&](const Socket& socket, int slot, std::string_view body, bool chat) {
-                    complete(socket, slot, body, chat);
-                }, R"({"max_active":2})", cache_ != 0);
-        } catch (...) {
-            failure_ = std::current_exception();
-        }
-        returned_ = true;
-    }) {}
+  public:
+    Server(BatchService& service, int cache)
+        : cache_(cache), native_(service, tokenizer_), worker_([&, this] { serve(service); }) {
+    }
 
     ~Server() {
         if (worker_.joinable()) {
@@ -312,6 +353,35 @@ public:
 
     Socket reset_request() { return submit(request("POST", "/reset_prefix_cache", "{}")); }
 
+    unsigned listen_backlog() const {
+        tcp_info info{};
+        socklen_t size = sizeof(info);
+        require(getsockopt(listener_.get(), IPPROTO_TCP, TCP_INFO, &info, &size) == 0,
+                "Cannot read the listener backlog limit");
+        return info.tcpi_sacked;
+    }
+
+    static constexpr std::string_view gated_tokenization = R"({"tokens": []})";
+    static constexpr std::string_view shutdown_tokenization = R"({ "tokens":[] })";
+
+    Socket generate(bool gated, bool rst = false) {
+        return submit(request("POST", "/generate", gated ? generate_body_ : plain_generate), rst);
+    }
+
+    Socket abort_waiting() {
+        return submit(request("POST", "/abort_request", R"({"rid":"waiting"})"));
+    }
+
+    Gate& preparing() {
+        return preparing_;
+    }
+    Gate& cpu_handler() {
+        return cpu_handler_;
+    }
+    Gate& cpu_shutdown() {
+        return cpu_shutdown_;
+    }
+
     void wait_queue(int running, int waiting) {
         if (cache_ == 0) {
             control("/health");
@@ -352,7 +422,44 @@ public:
         }
     }
 
-private:
+  private:
+    void serve(BatchService& service) {
+        try {
+            serve_connections(
+                listener_, service, capacity,
+                [&](const Socket& socket, int slot, std::string_view body, bool chat) {
+                    complete(socket, slot, body, chat);
+                },
+                R"({"max_active":2})", cache_ != 0,
+                [&](std::string_view body) {
+                    auto prepared = native_.prepare(body);
+                    if (body == generate_body_) {
+                        gates.enter(preparing_);
+                    }
+                    auto cancelled = prepared.aborted;
+                    prepared.complete = [cancelled = std::move(cancelled)](
+                                            const Socket& socket, std::optional<int> slot) {
+                        require(!slot && cancelled(), "Waiting abort used a completion slot");
+                        write_json(socket, "200 OK", R"({"aborted":true})");
+                    };
+                    return prepared;
+                },
+                [&](const Socket& socket, TokenizationRoute route, std::string_view body) {
+                    if (body == gated_tokenization) {
+                        gates.enter(cpu_handler_);
+                    } else if (body == shutdown_tokenization) {
+                        gates.enter(cpu_shutdown_);
+                    }
+                    serve_tokenization(socket, route, tokenizer_, body);
+                },
+                {},
+                [&](const Socket& socket, std::string_view body) { native_.abort(socket, body); });
+        } catch (...) {
+            failure_ = std::current_exception();
+        }
+        returned_ = true;
+    }
+
     void complete(const Socket& socket, int slot, std::string_view body, bool chat) {
         require(slot >= 0 && slot < capacity, "Completion received a foreign slot");
         for (int index = 0; index < request_count; ++index) {
@@ -360,7 +467,6 @@ private:
             if (is_chat(id) != chat || body != completion_body(id)) {
                 continue;
             }
-            // The fake model has finished. Only the final response remains.
             gates.enter(gate(id), slot);
             if (id == nondraining) {
                 const int bytes = 4096;
@@ -377,6 +483,16 @@ private:
     }
 
     const int cache_;
+    static constexpr sglang::model::ServingProfile profile_{};
+    static constexpr std::string_view plain_generate = R"({"input_ids":[101],"rid":"waiting"})";
+    const std::string generate_body_ =
+        std::string(plain_generate) + std::string(large_body_bytes - plain_generate.size(), ' ');
+    static constexpr ChatParsers parsers_{};
+    const CompletionTokenizer tokenizer_{"", SamplingDefaults::model, parsers_, profile_};
+    NativeGenerate native_;
+    Gate preparing_;
+    Gate cpu_handler_;
+    Gate cpu_shutdown_;
     const Socket listener_ = listen_loopback(0);
     std::array<Gate, request_count> completed_{};
     std::exception_ptr failure_;
@@ -409,24 +525,38 @@ void check_flush_queue(Server& server) {
     const auto first = server.submit(request("POST", "/flush_cache?timeout=.45"));
     server.control("/health");
     const auto second = server.submit(request("GET", "/flush_cache?timeout=.25"));
-    server.control("/ready");
-    const auto third = server.submit(request("GET", "/flush_cache"));
     require_status(read_closed(server.reset_request()), "409");
-    pollfd pending[] = {{first.get(), POLLIN, 0}, {second.get(), POLLIN, 0},
-                        {third.get(), POLLIN, 0}};
+    pollfd pending[] = {{first.get(), POLLIN, 0}, {second.get(), POLLIN, 0}};
     constexpr std::string_view expired = "Timed out waiting for idle state.";
     constexpr int timeout_ms = std::chrono::milliseconds(timeout).count();
-    require(poll(pending, 3, timeout_ms) > 0 && (pending[0].revents & POLLIN),
+    require(poll(pending, 2, timeout_ms) > 0 &&
+                (static_cast<unsigned>(pending[0].revents) & unsigned{POLLIN}) != 0,
             "A flush bypassed the busy FIFO head or the head did not expire");
     require_flush(first, "400", expired);
     require(Clock::now() - started >= 450ms, "First flush expired early");
-    require(poll(pending + 1, 2, timeout_ms) > 0 && (pending[1].revents & POLLIN),
+    const auto third = server.submit(request("GET", "/flush_cache"));
+    pollfd following_second[] = {{second.get(), POLLIN, 0}, {third.get(), POLLIN, 0}};
+    require(poll(following_second, 2, timeout_ms) > 0 &&
+                (static_cast<unsigned>(following_second[0].revents) & unsigned{POLLIN}) != 0,
             "The zero-timeout flush bypassed the second waiter or the waiter did not expire");
     require_flush(second, "400", expired);
     require(Clock::now() - started >= 700ms, "Second timeout overlapped the first budget");
     require_flush(third, "400", "Flush cache failed.\n");
     require(cache_resets == initial_resets, "A busy flush reached the cache");
-
+    {
+        const auto forever = server.submit(request("GET", "/flush_cache?timeout=inf"), true);
+        server.control("/health");
+        const auto cancelled = server.submit(request("GET", "/flush_cache?timeout=inf"), true);
+        server.control("/health");
+        const auto immediate = server.submit(request("GET", "/flush_cache"));
+        const auto overflow = server.submit(request("GET", "/flush_cache"));
+        pollfd deferred[] = {{immediate.get(), POLLIN, 0}, {overflow.get(), POLLIN, 0}};
+        require(poll(deferred, 2, timeout_ms) > 0, "Flush queue did not reject overload");
+        require_status(read_closed(deferred[0].revents != 0 ? immediate : overflow), "503");
+    }
+    const auto after_disconnect = server.submit(request("GET", "/flush_cache"));
+    require_flush(after_disconnect, "400", "Flush cache failed.\n");
+    require(cache_resets == initial_resets, "A cancelled flush reached the cache");
     const auto waiting = server.submit(request("GET", "/flush_cache?timeout=60"));
     server.control("/health");
     const auto following = server.submit(request("POST", "/flush_cache"));
@@ -460,6 +590,32 @@ void check_readers(Server& server) {
     write_request(recent, "\r\n");
     require_status(read_closed(recent), "200");
     server.check_controls("200");
+}
+
+void check_read_limits(Server& server) {
+    constexpr std::size_t header_limit = 8192;
+    constexpr std::size_t body_limit = std::size_t{2} * 1024 * 1024;
+    require(server.listen_backlog() == 16, "Unexpected TCP listener backlog limit");
+    auto header = std::string(incomplete_header) + "X-Pad: ";
+    header.resize(header_limit - 4, 'a');
+    require_status(read_closed(server.submit(header + "\r\n\r\n")), "200");
+    require_status(read_closed(server.submit(header + "a\r\n\r\n")), "431");
+    const auto too_large = std::string(incomplete_header) +
+                           "Content-Length: " + std::to_string(body_limit + 1) + "\r\n\r\n";
+    require_status(read_closed(server.submit(too_large)), "413");
+    const auto unknown = server.submit(request("POST", "/chat", std::string(body_limit, ' ')));
+    require_status(read_closed(unknown), "404");
+
+    const auto initial_descriptors = fd_count();
+    std::vector<Socket> clients;
+    clients.reserve(10);
+    for (int i = 0; i < 10; ++i) {
+        clients.push_back(server.submit(incomplete_body, true));
+    }
+    server.control("/health");
+    require(fd_count() <=
+                initial_descriptors + static_cast<std::ptrdiff_t>(clients.size()) + capacity + 1,
+            "The reader exceeded its accepted descriptor bound");
 }
 
 void check_read_deadline(Server& server) {
@@ -570,7 +726,6 @@ void check_queue(Server& server) {
         require_status(read_closed(ready[0].revents ? plain : chat), "503");
         server.check_controls("409");
     }
-    // Admission must discard the reset peer without a metrics call or a retiring worker.
     const auto last_queued = server.completion(replacement);
     const auto rejected = server.completion(overflow);
     require_status(read_closed(rejected), "503");
@@ -613,6 +768,89 @@ void check_queue(Server& server) {
     server.wait_queue(0, 0);
 }
 
+void check_auxiliary_queue(Server& server) {
+    const auto tokenize = server.submit(request("POST", "/detokenize", Server::gated_tokenization));
+    gates.wait_entered(server.cpu_handler());
+    const auto text = server.completion(auxiliary_text);
+    const int text_slot = gates.wait_entered(server.gate(auxiliary_text));
+    const auto chat = server.completion(auxiliary_chat);
+    require(gates.wait_entered(server.gate(auxiliary_chat)) != text_slot,
+            "A CPU tokenizer occupied a completion slot");
+    std::optional<Socket> parser;
+    {
+        const auto abandoned = server.submit(request("POST", "/parse_function_call", "{}"), true);
+        parser.emplace(
+            server.submit(request("POST", "/separate_reasoning",
+                                  R"({"reasoning_parser":"qwen3","text":"<think>r</think>x"})")));
+        require(shutdown(parser->get(), SHUT_WR) == 0, "Cannot half-close the parser request");
+        server.wait_queue(2, 0);
+        pollfd waiting{parser->get(), POLLIN, 0};
+        require(poll(&waiting, 1, 0) == 0, "A CPU parser bypassed the auxiliary FIFO");
+        const auto full =
+            read_closed(server.submit(request("POST", "/v1/messages/count_tokens", "{}")));
+        require_status(full, "503");
+        require(full.find(R"("type":"api_error")") != std::string::npos,
+                "Auxiliary overload returned the wrong error envelope");
+    }
+    const auto tool_parser =
+        server.submit(request("POST", "/parse_function_call",
+                              R"({"tool_call_parser":"qwen3_coder","text":"unchanged"})"));
+    server.control("/health");
+    gates.release(server.cpu_handler());
+    require_flush(tokenize, "200", R"({"text":""})");
+    require_flush(*parser, "200", R"({"reasoning_text":"r","text":"x"})");
+    require_status(read_closed(tool_parser), "200");
+    gates.release(server.gate(auxiliary_text));
+    gates.release(server.gate(auxiliary_chat));
+    require_completion(text, auxiliary_text);
+    require_completion(chat, auxiliary_chat);
+    server.wait_queue(0, 0);
+
+    std::optional<Socket> following;
+    {
+        const auto body = R"({"reasoning_parser":"qwen3","return_blocks":true,"text":")" +
+                          std::string((2 * 1024 * 1024) - 128, 'x') + R"("})";
+        const auto blocked =
+            server.submit(request("POST", "/separate_reasoning", body), true, true);
+        wait_readable(blocked, timeout);
+        server.control("/health");
+        following.emplace(server.submit(request("POST", "/detokenize", R"({"tokens":[]})")));
+        server.control("/ready");
+        pollfd pending{following->get(), POLLIN, 0};
+        require(poll(&pending, 1, 0) == 0,
+                "The large parser response did not stall its CPU worker");
+    }
+    require_flush(*following, "200", R"({"text":""})");
+}
+
+void check_generate_preparation(Server& server) {
+    const auto text = server.completion(prepare_text);
+    const int text_slot = gates.wait_entered(server.gate(prepare_text));
+    const auto peer = server.completion(prepare_peer);
+    gates.wait_entered(server.gate(prepare_peer));
+    const auto waiter = server.completion(prepare_waiter);
+    server.wait_queue(2, 1);
+    {
+        const auto cancelled = server.generate(true, true);
+        gates.wait_entered(server.preparing());
+        gates.release(server.gate(prepare_text));
+        require_completion(text, prepare_text);
+        require(gates.wait_entered(server.gate(prepare_waiter)) == text_slot,
+                "A ready chat request could not take its freed slot during native preparation");
+    }
+    gates.release(server.preparing());
+    server.wait_queue(2, 0);
+    const auto waiting = server.generate(false);
+    require_flush(server.abort_waiting(), "200", "");
+    require_flush(waiting, "200", R"({"aborted":true})");
+    server.wait_queue(2, 0);
+    gates.release(server.gate(prepare_waiter));
+    gates.release(server.gate(prepare_peer));
+    require_completion(waiter, prepare_waiter);
+    require_completion(peer, prepare_peer);
+    server.wait_queue(0, 0);
+}
+
 void check_shutdown(Server& server, bool reader_failure) {
     const auto active_first = server.completion(last_first);
     gates.wait_entered(server.gate(last_first));
@@ -620,6 +858,10 @@ void check_shutdown(Server& server, bool reader_failure) {
     gates.wait_entered(server.gate(last_second));
     const auto queued = server.completion(abandoned);
     server.wait_queue(2, 1);
+    const auto active_cpu =
+        server.submit(request("POST", "/detokenize", Server::shutdown_tokenization));
+    gates.wait_entered(server.cpu_shutdown());
+    const auto queued_cpu = server.submit(request("POST", "/separate_reasoning", "{}"));
     const auto partial = server.submit(incomplete_body);
     server.control("/health");
     if (reader_failure) {
@@ -627,14 +869,16 @@ void check_shutdown(Server& server, bool reader_failure) {
     } else {
         stop_serving();
     }
-    // Wake the listener while the active callbacks are still held.
     const auto wake = server.submit({});
     require(read_closed(queued).empty(), "Shutdown delivered a queued response");
+    require(read_closed(queued_cpu).empty(), "Shutdown delivered a queued CPU response");
     require(read_closed(partial).empty(), "Shutdown did not close the incomplete request");
     gates.wait_released(restore_stop);
     require(!server.returned(), "Serving returned while completion gates were held");
     gates.release(server.gate(last_first));
     gates.release(server.gate(last_second));
+    gates.release(server.cpu_shutdown());
+    require(read_closed(active_cpu).empty(), "Active CPU request did not close during shutdown");
     require(read_closed(active_first).empty() && read_closed(active_second).empty(),
             "Active completions did not close during shutdown");
     bool accept_error = false;
@@ -719,6 +963,8 @@ int main(int argc, char** argv) {
                 require(server.control("/ready", "503").find("worker_failed") != std::string::npos,
                         "Unavailable worker omitted the readiness reason");
                 require_status(read_closed(server.completion(terminal)), "500");
+                require_flush(server.submit(request("POST", "/detokenize", R"({"tokens":[]})")),
+                              "200", R"({"text":""})");
                 stop_serving();
                 server.join();
             } else {
@@ -727,6 +973,12 @@ int main(int argc, char** argv) {
                 if (mode == "--cache-on") {
                     phase = "incomplete request deadline";
                     check_read_deadline(server);
+                    phase = "request and descriptor limits";
+                    check_read_limits(server);
+                    phase = "independent auxiliary queue";
+                    check_auxiliary_queue(server);
+                    phase = "native generation preparation and abort";
+                    check_generate_preparation(server);
                 }
                 phase = "buffered completions with idle slots";
                 check_buffered_readers(server);

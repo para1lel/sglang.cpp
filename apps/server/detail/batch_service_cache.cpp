@@ -91,6 +91,56 @@ std::optional<std::uint64_t> BatchService::State::begin_iteration(BatchSession& 
     return profile && profile->steps.size() < profile_limit ? profile_epoch : 0;
 }
 
+bool BatchService::State::admit(BatchSession& batch, int slot, Job& job) {
+    try {
+        if (lmcache != nullptr || resident_prefix_cache || prefix_cache_entries != 0) {
+            configure_checkpoint(job);
+            job.options.claim_completion = [this, current = &job] {
+                const std::scoped_lock lock(mutex);
+                if (current->cancelled || closing)
+                    return false;
+                current->completion_claimed =
+                    current->request_id == nullptr || current->request_id->claim_completion();
+                return current->completion_claimed;
+            };
+        }
+        if (job.media.empty()) {
+            job.cached_tokens = batch.admit(slot, std::move(job.prompt), job.options);
+        } else {
+            job.cached_tokens =
+                batch.admit_multimodal(slot, std::move(job.prompt), job.options, job.media);
+            job.media.clear();
+        }
+        job.options.prefix_cache_read.reset();
+        const std::scoped_lock lock(mutex);
+        job.admission_retry_at = {};
+        job.prefix_pending = job.prefix_operation.valid();
+        job.admitted = !job.prefix_pending;
+        if (job.admitted)
+            job.cache_read.reset();
+        job.cache_cancel.reset();
+        changed.notify_all();
+        return job.admitted;
+    } catch (...) {
+        if (!batch.available())
+            throw;
+        const auto error = std::current_exception();
+        if (defer_capacity_retry(batch, job, error))
+            return false;
+        const std::scoped_lock lock(mutex);
+        job.admission_retry_at = {};
+        if (job.request_id == nullptr || job.request_id->finish()) {
+            job.error = error;
+        } else {
+            job.request_id->finish_abort();
+            job.finish = DecoderFinishReason::aborted;
+        }
+        jobs[slot].reset();
+        changed.notify_all();
+        return false;
+    }
+}
+
 bool BatchService::State::defer_capacity_retry(BatchSession& batch, Job& job,
                                                std::exception_ptr error) {
     if (!resident_prefix_cache)
@@ -113,6 +163,7 @@ bool BatchService::State::defer_capacity_retry(BatchSession& batch, Job& job,
         return false;
     }
     job.admission_retry_at = Clock::now() + disconnect_poll;
+    ++counters.resident_admission_retries;
     return true;
 }
 

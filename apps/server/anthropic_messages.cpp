@@ -2,6 +2,7 @@
 
 #include "sglang/server/chat_template.h"
 #include "sglang/server/http.h"
+#include "sglang/server/text_completion.h"
 
 #include <algorithm>
 
@@ -38,8 +39,7 @@ OrderedObject AnthropicMessages::usage(std::size_t output, std::size_t cached) c
 }
 
 bool AnthropicMessages::event(std::string_view kind, OrderedObject fields) {
-    fields.emplace_back("type", std::string(kind));
-    return stream_.write(chat_template_json(fields), kind);
+    return write_completion_event(stream_, kind, std::move(fields));
 }
 
 bool AnthropicMessages::start(bool failed) {

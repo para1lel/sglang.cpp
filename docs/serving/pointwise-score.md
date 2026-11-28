@@ -7,14 +7,14 @@
 | Part | Responsibility | Source |
 | --- | --- | --- |
 | HTTP reader | Require the `application/json` media type for score `POST` requests. | [Media type](../../apps/server/http.cpp#L209)<!-- prefix: "(request.met" --> |
-| Route dispatcher | Require `POST` before queue admission. | [Method](../../apps/server/prefix_controls.cpp#L666)<!-- prefix: "const bool s" --> |
+| Route dispatcher | Require `POST` before queue admission. | [Method](../../apps/server/prefix_controls.cpp#L616)<!-- prefix: "const bool s" --> |
 | Score worker | Parse the request, build prompts, submit the batch, and write the response. | [Worker](../../apps/server/score.cpp#L370)<!-- prefix: "void serve_s" --> · [Parser](../../apps/server/score.cpp#L271)<!-- prefix: "ScoreRequest" --> · [Response](../../apps/server/score.cpp#L336)<!-- prefix: "std::string " --> |
 | Decoder | Project the last prompt row and calculate label log probabilities over the model vocabulary. | [Readback](../../src/decoder.cpp#L910)<!-- prefix: "void Decoder" --> · [Normalization](../../src/text/label_logprobs.cpp#L11)<!-- prefix: "std::vector<" --> |
 | Reference | Define causal pointwise scoring with upstream `--enable-mis` off. | [Pinned schema](https://github.com/sgl-project/sglang/blob/f04d886bf79aa3d6237cbb12a3311838eb9f9bd8/python/sglang/srt/entrypoints/openai/protocol.py#L1619)<!-- prefix: "class Scorin" --> · [Label validation](https://github.com/sgl-project/sglang/blob/f04d886bf79aa3d6237cbb12a3311838eb9f9bd8/python/sglang/srt/managers/tokenizer_manager_score_mixin.py#L920)<!-- prefix: "is_generatio" --> · [Pointwise prefill](https://github.com/sgl-project/sglang/blob/f04d886bf79aa3d6237cbb12a3311838eb9f9bd8/python/sglang/srt/managers/tokenizer_manager_score_mixin.py#L1173)<!-- prefix: "batch_reques" --> |
 
 ## Runtime path
 
-One HTTP request enters the [shared admission queue](../http-server.md#http-admission-and-shutdown). The worker submits one zero-output decoder job per item. If the client disconnects, the worker cancels unfinished work. A request with zero items returns without decoder work. [Dispatch](../../apps/server/prefix_controls.cpp#L802)<!-- prefix: "} else if (s" --> · [Worker](../../apps/server/score.cpp#L370)<!-- prefix: "void serve_s" -->
+One HTTP request enters the [shared admission queue](../http-server.md#http-admission-and-shutdown). The worker submits one zero-output decoder job per item. If the client disconnects, the worker cancels unfinished work. A request with zero items returns without decoder work. [Dispatch](../../apps/server/prefix_controls.cpp#L778)<!-- prefix: "} else if (s" --> · [Worker](../../apps/server/score.cpp#L370)<!-- prefix: "void serve_s" -->
 
 Score lanes use K0 and share target prefill grants with generation. Compatible lanes can share dense projections. A full prefix hit restores the terminal hidden and residual rows for next-token scoring. When the prompt completes, the decoder queues its full BF16 vocabulary row for host readback. The response preserves label order. [MTP depth](../../src/decoder_batch.cpp#L217)<!-- prefix: "if (options." --> · [Full-hit dispatch](../../src/decoder_batch.cpp#L414)<!-- prefix: "if (lane.res" --> · [Label logits](../../src/decoder_batch.cpp#L583)<!-- prefix: "if (lane.opt" -->
 
@@ -70,7 +70,7 @@ bash tests/text/build_chat_cpu.sh . - "$output/sglang-server-cpu"
     --checkpoint "$checkpoint" --output "$output"
 ```
 
-Require exit status zero for each command. The score contract checks budget arithmetic, prompt composition, ordered labels, empty items, normalization, and response fields. The tokenization suite includes a score fixture for methods, `HEAD` body suppression, and an empty score `POST`. [Budget arithmetic](../../tests/decoder/score_check.cpp#L26)<!-- prefix: "void check_b" --> · [HTTP fixture](../../tests/text/test_native_tokenization_cpu.py#L108)<!-- prefix: "def test_sco" -->
+Require exit status zero for each command. The score contract checks budget arithmetic, prompt composition, ordered labels, empty items, normalization, and response fields. The tokenization suite includes a score fixture for methods, `HEAD` body suppression, and an empty score `POST`. [Budget arithmetic](../../tests/decoder/score_check.cpp#L26)<!-- prefix: "void check_b" --> · [HTTP fixture](../../tests/text/test_native_tokenization_cpu.py#L105)<!-- prefix: "def test_sco" -->
 
 On a reserved B200, match the checkpoint, prefill policy, and token history. Compare label log probabilities with appended-label prompt scores from `/generate`. Compare isolated score requests with concurrent scores and generation. Cover cache-off, cold, full-hit, and suffix-hit requests. Verify label order and check cache counters separately from the score response. [Mixed route checks](../../tests/media/http-contract.md)
 

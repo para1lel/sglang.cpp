@@ -2,7 +2,7 @@
 
 ## Responsibilities and sources of truth
 
-HTTP handles [model discovery](#model-discovery) and [server information](#server-information) outside the completion queue. The [startup writer](../apps/sglang-server.cpp#L243)<!-- prefix: "std::string " --> supplies metadata, and the [scheduler snapshot](../apps/server/batch_service.cpp#L825)<!-- prefix: "BatchRuntime" --> supplies live state under its mutex. [Implementation map](https://github.com/para1lel/sglang.cpp/blob/49a48f98e44223bd619e7b6f43569b45175504c0/docs/native-model-info.md#responsibilities-and-sources-of-truth)
+HTTP handles [model discovery](#model-discovery) and [server information](#server-information) outside the completion queue. The [startup writer](../apps/sglang-server.cpp#L243)<!-- prefix: "std::string " --> supplies metadata, and the [scheduler snapshot](../apps/server/batch_service.cpp#L771)<!-- prefix: "BatchRuntime" --> supplies live state under its mutex. [Implementation map](https://github.com/para1lel/sglang.cpp/blob/49a48f98e44223bd619e7b6f43569b45175504c0/docs/native-model-info.md#responsibilities-and-sources-of-truth)
 
 ## Runtime path
 
@@ -27,7 +27,7 @@ Both model-info aliases bypass the queue and return HTTP 200 with identical star
 
 ### Server information
 
-Both `GET /server_info` and deprecated `GET /get_server_info` return startup settings and a live scheduler snapshot. Like [model discovery](#model-discovery), they bypass the completion queue regardless of prefix reuse. [Reader dispatch](../apps/server/prefix_controls.cpp#L692)<!-- prefix: "write_json(c" -->
+Both `GET /server_info` and deprecated `GET /get_server_info` return startup settings and a live scheduler snapshot. Like [model discovery](#model-discovery), they bypass the completion queue regardless of prefix reuse. [Reader dispatch](../apps/server/prefix_controls.cpp#L642)<!-- prefix: "write_json(c" -->
 
 | Top-level field | JSON type and meaning |
 | --- | --- |
@@ -107,11 +107,11 @@ Both routes accept empty GETs, ignore the query, and follow [shared redirects](h
 
 ### Discovery targets and errors
 
-The list ignores the query and returns 404 on a non-GET or nonempty body. Retrieval ignores query and framed body. The case-sensitive ID is the decoded suffix, including any trailing slash. An interior line feed prevents matching. Empty or unknown IDs return 404 with `error.message: "The model '<id>' does not exist"`, `type: "invalid_request_error"`, `param: "model"`, and `code: "model_not_found"`. Unsupported retrieval methods follow the [model-info 405 rule](#model-info-targets). [ID decoding](../apps/server/http.cpp#L353)<!-- prefix: "std::string " --> · [Lookup and errors](../apps/server/prefix_controls.cpp#L467)<!-- prefix: "void retriev" --> · [Method response](../apps/server/http.cpp#L585)<!-- prefix: "void write_m" -->
+The list ignores the query and returns 404 on a non-GET or nonempty body. Retrieval ignores query and framed body. The case-sensitive ID is the decoded suffix, including any trailing slash. An interior line feed prevents matching. Empty or unknown IDs return 404 with `error.message: "The model '<id>' does not exist"`, `type: "invalid_request_error"`, `param: "model"`, and `code: "model_not_found"`. Unsupported retrieval methods follow the [model-info 405 rule](#model-info-targets). [ID decoding](../apps/server/http.cpp#L353)<!-- prefix: "std::string " --> · [Lookup and errors](../apps/server/prefix_controls.cpp#L413)<!-- prefix: "void retriev" --> · [Method response](../apps/server/http.cpp#L585)<!-- prefix: "void write_m" -->
 
 ### Server-info targets
 
-Both aliases ignore queries and framed GET bodies, return 200 even with `ready: false`, and redirect trailing slashes to the corresponding alias. Unknown paths return 404. Apply the [same 405/HEAD rule](#model-info-targets). Invalid framing fails before the handler. [Query split](../apps/server/http.cpp#L143)<!-- prefix: "const auto s" --> · [Method reply](../apps/server/http.cpp#L585)<!-- prefix: "void write_m" --> · [Worker flag](../apps/server/batch_service.cpp#L752)<!-- prefix: "bool BatchSe" -->
+Both aliases ignore queries and framed GET bodies, return 200 even with `ready: false`, and redirect trailing slashes to the corresponding alias. Unknown paths return 404. Apply the [same 405/HEAD rule](#model-info-targets). Invalid framing fails before the handler. [Query split](../apps/server/http.cpp#L143)<!-- prefix: "const auto s" --> · [Method reply](../apps/server/http.cpp#L585)<!-- prefix: "void write_m" --> · [Worker flag](../apps/server/batch_service.cpp#L690)<!-- prefix: "bool BatchSe" -->
 
 ## Verification
 

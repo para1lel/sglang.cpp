@@ -19,11 +19,6 @@ namespace {
 
 constexpr std::string_view bad_request = "400 Bad Request";
 
-const json::Value* supplied(const json::OrderedObject& object, std::string_view field) {
-    const auto* value = json::get(object, field);
-    return value && !value->is_null() ? value : nullptr;
-}
-
 [[noreturn]] void invalid_request(const char* message) {
     throw HttpError(bad_request, message);
 }
@@ -315,18 +310,18 @@ json::Value history_arguments(const json::Value& value) {
 }
 
 void normalize_history(json::OrderedObject& turn) {
-    const auto* value = supplied(turn, "tool_calls");
-    if (!value) return;
+    const auto found = std::find_if(turn.begin(), turn.end(),
+                                    [](const auto& field) { return field.first == "tool_calls"; });
+    if (found == turn.end() || found->second.is_null())
+        return;
     json::Array calls;
-    for (const auto& call : *value->array()) {
+    for (const auto& call : *found->second.array()) {
         const auto& function = *json::get(*call.ordered_object(), "function")->ordered_object();
         const auto* args = supplied(function, "arguments");
         calls.emplace_back(json::OrderedObject{{"name", *json::get(function, "name")},
             {"arguments", args ? history_arguments(*args) : json::Value{}}});
     }
-    for (auto& [key, field] : turn) {
-        if (key == "tool_calls") field = std::move(calls);
-    }
+    found->second = std::move(calls);
 }
 
 std::optional<json::Value> reasoning_effort(const json::Value* value, bool allow_boolean) {

@@ -53,11 +53,6 @@ bool digit(char character) {
     return character >= '0' && character <= '9';
 }
 
-const Value* present(const OrderedObject& fields, std::string_view key) {
-    const auto* value = get(fields, key);
-    return value && !value->is_null() ? value : nullptr;
-}
-
 [[noreturn]] void invalid(std::string_view field, std::string_view format) {
     throw std::invalid_argument(std::string(field) + " " + std::string(format));
 }
@@ -93,29 +88,29 @@ std::optional<double> bounded_integer(const OrderedObject& fields, std::string_v
 }
 
 void validate_response_format(const OrderedObject& body) {
-    const auto* field = present(body, "response_format");
+    const auto* field = supplied(body, "response_format");
     if (!field) return;
     const auto* format = field->ordered_object();
-    const auto* type = format ? present(*format, "type") : nullptr;
+    const auto* type = format != nullptr ? supplied(*format, "type") : nullptr;
     const auto kind = type ? type->string().value_or("") : "";
     if (kind != "text" && kind != "json_object" && kind != "json_schema" &&
         kind != "structural_tag") {
         invalid("response_format", "must specify a supported type");
     }
-    const auto* field_schema = present(*format, "json_schema");
+    const auto* field_schema = supplied(*format, "json_schema");
     const auto* schema = field_schema ? field_schema->ordered_object() : nullptr;
     if (field_schema && !schema) invalid("json_schema", "must be an object");
     if (schema) {
-        const auto* name = present(*schema, "name");
-        const auto* description = present(*schema, "description");
-        const auto* strict = present(*schema, "strict");
-        const auto* fields = present(*schema, "schema");
+        const auto* name = supplied(*schema, "name");
+        const auto* description = supplied(*schema, "description");
+        const auto* strict = supplied(*schema, "strict");
+        const auto* fields = supplied(*schema, "schema");
         if (!name || !name->string() || (description && !description->string()) ||
             (strict && !strict->boolean()) || (fields && !fields->ordered_object())) {
             invalid("json_schema", "contains invalid fields");
         }
         if (fields) return;
-    } else if (const auto* legacy = present(*format, "schema");
+    } else if (const auto* legacy = supplied(*format, "schema");
                legacy && legacy->ordered_object() && !legacy->ordered_object()->empty()) {
         return;
     }
@@ -226,6 +221,30 @@ Value schema_tree(const Value& value) {
 
 }
 
+void request_validation::invalid(std::string_view field, std::string_view message) {
+    throw std::invalid_argument(std::string(field) + ": " + std::string(message));
+}
+
+bool request_validation::optional_bool(const Value* value, std::string_view field, bool fallback) {
+    if (value == nullptr)
+        return fallback;
+    if (const auto flag = chat_boolean(*value))
+        return *flag;
+    invalid(field, "Input should be a valid boolean");
+}
+
+const Value* supplied(const OrderedObject& fields, std::string_view key) {
+    const auto* value = get(fields, key);
+    return value != nullptr && !value->is_null() ? value : nullptr;
+}
+
+bool python_whitespace(char32_t point) {
+    return (point >= 9 && point <= 13) || (point >= 0x1c && point <= 0x20) || point == 0x85 ||
+           point == 0xa0 || point == 0x1680 || (point >= 0x2000 && point <= 0x200a) ||
+           point == 0x2028 || point == 0x2029 || point == 0x202f || point == 0x205f ||
+           point == 0x3000;
+}
+
 std::optional<detail::IntegerText> detail::scan_integer_text(std::string_view text,
                                                              IntegerSeparators separators) {
     text = trim_integer_text(text);
@@ -321,10 +340,10 @@ void validate_chat_generation(const OrderedObject& body) {
     const auto top = bounded_integer(body, "top_logprobs", 0, unbounded, true);
     if (top && *top > model_vocab_size) {
         throw std::invalid_argument("top_logprobs must be in [0, " +
-            std::to_string(model_vocab_size) + "], got " +
-            integer_label(*present(body, "top_logprobs"), *top) + ".");
+                                    std::to_string(model_vocab_size) + "], got " +
+                                    integer_label(*supplied(body, "top_logprobs"), *top) + ".");
     }
-    if (const auto* temperature = present(body, "temperature")) {
+    if (const auto* temperature = supplied(body, "temperature")) {
         const auto value = chat_number(*temperature);
         if (!value || !std::isfinite(*value) || *value < 0) {
             invalid("temperature", "must be a finite nonnegative number");
@@ -337,7 +356,7 @@ void validate_chat_generation(const OrderedObject& body) {
     }
     const auto budget = maximum ? maximum : legacy;
     if (budget && *budget > checkpoint_context) {
-        const auto* value = present(body, maximum ? "max_completion_tokens" : "max_tokens");
+        const auto* value = supplied(body, maximum ? "max_completion_tokens" : "max_tokens");
         throw std::invalid_argument("max_completion_tokens is too large: " +
             integer_label(*value, *budget) + ".This model supports at most " +
             std::to_string(checkpoint_context) + " completion tokens.");

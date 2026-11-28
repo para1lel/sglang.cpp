@@ -2,7 +2,7 @@
 
 `GET /v1/loads` reports the local HTTP scheduler load on one native worker.
 It works with prefix reuse off or on. The HTTP reader serves the request
-without claiming a completion slot or querying CUDA. [Dispatch](../../apps/server/prefix_controls.cpp#L652)<!-- prefix: "if (path == " --> · [Pinned Python route](https://github.com/sgl-project/sglang/blob/f04d886bf79aa3d6237cbb12a3311838eb9f9bd8/python/sglang/srt/entrypoints/v1_loads.py#L96)<!-- prefix: "@router.get(" -->
+without claiming a completion slot or querying CUDA. [Dispatch](../../apps/server/prefix_controls.cpp#L600)<!-- prefix: "if (path == " --> · [Pinned Python route](https://github.com/sgl-project/sglang/blob/f04d886bf79aa3d6237cbb12a3311838eb9f9bd8/python/sglang/srt/entrypoints/v1_loads.py#L96)<!-- prefix: "@router.get(" -->
 
 ## Filters and formats
 
@@ -46,4 +46,4 @@ for readiness. Native omits upstream token-pool, throughput, utilization,
 cache-hit-rate, memory, speculation, adapter, and disaggregation measures
 that this endpoint cannot derive with the same definitions. Prefix cache
 metrics remain available separately through [`/metrics`](../prefix-cache.md#native-http-controls).
-[Queue snapshot](../../apps/server/prefix_controls.cpp#L655)<!-- prefix: "const LoadSn" --> · [CUDA device properties](../../src/runtime/backend/cuda_backend_policy.cpp#L39)<!-- prefix: "check(cudaGe" -->
+[Queue snapshot](../../apps/server/prefix_controls.cpp#L603)<!-- prefix: "const LoadSn" --> · [CUDA device properties](../../src/runtime/backend/cuda_backend_policy.cpp#L39)<!-- prefix: "check(cudaGe" -->

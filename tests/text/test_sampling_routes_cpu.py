@@ -1,23 +1,23 @@
 """Exercise public text and chat sampling routes with the CPU decoder double."""
 
 import argparse
-from concurrent.futures import ThreadPoolExecutor
-from contextlib import closing, contextmanager
-from functools import partial
 import http.client
 import json
 import os
-from pathlib import Path
 import socket
 import subprocess
-from tempfile import TemporaryDirectory
-from threading import Barrier
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing, contextmanager
+from functools import partial
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from threading import Barrier
+from unittest.mock import patch
 
 from test_native_chat import request
 from test_native_text import MODEL, event, legacy
-
 
 TEXT = "/v1/completions"
 CHAT = "/v1/chat/completions"
@@ -848,6 +848,71 @@ class Routes(unittest.TestCase):
         self.assertEqual(seen["budget"], 1)
         self.assertEqual(packets[-1]["usage"]["completion_tokens"], 1)
         self.exchange(TEXT, payload | {"seed": 1}, status=400)
+
+    def test_default_completion_burst_reserves_idle_workers(self) -> None:
+        self.check_completion_burst((), active=8, row_budget=32768, assert_overload=True)
+
+    def test_explicit_sixteen_completion_workers(self) -> None:
+        self.check_completion_burst(
+            ("--max-active", "16", "--max-num-batched-tokens", "8192"),
+            active=16,
+            row_budget=8192,
+            assert_overload=False,
+        )
+
+    def check_completion_burst(
+        self, flags: tuple[str, ...], *, active: int, row_budget: int, assert_overload: bool
+    ) -> None:
+        width = 16
+        barrier = Barrier(width)
+        payload = body(TEXT, prompt=[32], max_tokens=1, temperature=0, seed=-41, ignore_eos=True)
+        log = self.output / f"burst-{active}.log"
+        with TemporaryDirectory(dir=self.output) as directory:
+            gate = Path(directory) / "step"
+            with (
+                patch.dict(os.environ, SGLANG_TEST_BATCH_STEP_GATE=str(gate)),
+                server(self.binary, self.checkpoint, log, *flags) as port,
+            ):
+                self.assertEqual(
+                    self.control(port, "/health"),
+                    {"max_active": active, "max_num_batched_tokens": row_budget},
+                )
+
+                def launch() -> tuple[int, dict[str, object]]:
+                    barrier.wait(timeout=5)
+                    return send(port, TEXT, payload)
+
+                expected = {
+                    f'vllm:num_requests_running{{engine="0"}} {active}',
+                    f'vllm:num_requests_waiting{{engine="0"}} {width - active}',
+                }
+                with ThreadPoolExecutor(max_workers=width) as clients:
+                    requests = [clients.submit(launch) for _ in range(width)]
+                    try:
+                        deadline = time.monotonic() + 3
+                        while True:
+                            metrics = self.control(port, "/metrics", content_type="text/plain")
+                            if expected <= set(metrics.decode().splitlines()):
+                                break
+                            finished = [client.result() for client in requests if client.done()]
+                            self.assertEqual(
+                                finished, [], "A burst client completed before release"
+                            )
+                            self.assertLess(time.monotonic(), deadline, metrics)
+                            time.sleep(0.01)
+                        if assert_overload:
+                            status, error = send(port, TEXT, payload)
+                            self.assertEqual(status, 503)
+                            self.assertEqual(
+                                error["error"]["message"], "Native completion queue is full"
+                            )
+                    finally:
+                        gate.with_suffix(".0").touch()
+                    for client in requests:
+                        status, result = client.result()
+                        self.assertEqual(status, 200, result)
+                        self.assertEqual(result["usage"]["completion_tokens"], 1)
+                self.assertEqual(len(receipts(log)), width)
 
     def test_mixed_batch_preserves_request_options_positive(self):
         log = self.output / "mixed.log"

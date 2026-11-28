@@ -94,6 +94,12 @@ Disposable compiler-generated output is exempt from maintained-source limits.
 Document size and language rules belong to [doc's writing reference](../../doc-mode/references/writing.md).
 Mechanically testable requirements belong in [incremental gates](../../test-mode/references/evidence.md#examine-the-selected-index).
 
+When the project limits total physical production lines, count production implementation wherever it lives.
+Meet the budget by sharing general mechanisms across supported cases and removing obsolete code.
+Preserve supported features, numerical semantics, and failure behavior.
+Use normal formatting and count production logic in generators, generated sources, and test files.
+Disclose dependencies that take over production responsibilities and account for the transferred implementation.
+
 ## Edit instruction files
 
 When assigned a skill edit, keep its purpose and essential workflow in `SKILL.md`.

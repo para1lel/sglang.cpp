@@ -26,6 +26,40 @@ Assign `runtime/` files to their named layer and `apps/server/` and `include/sgl
 
 The cutover and consolidation were measured on canonical Git trees `6a745945d81ecdd78102b5f0a6cd3bb9cf3a9fac` and `2e18e98c29ab0cc35c5de645fc625da9bc834caf`, respectively. The consolidated production trees are `6e4b41639ba24254a426d76103f92863592c0f40` for `apps/`, `37929c2c714603ab3694f100443eb72683241653` for `src/`, and `9d8f3e3b2498176820bbae8289a71cd88a7d3027` for `include/sglang/`.
 
+## Production framework size
+
+The framework must fit within **30,000 physical lines of maintained runtime implementation**, including blank lines, comments, and a final line without a newline. Preserve supported behavior, precision, resource ownership, and failure semantics. Use normal formatting. Count native and daemon runtime sources, headers, templates, generated runtime code, and project-maintained adaptations of upstream code. Count production logic even when it moves into scripts, test directories, generators, build files, or another package. [Implementation standards](../.agents/skills/coding-mode/references/code-standards.md#maintained-size-limits)
+
+The fixed baseline has **73,798 runtime lines**, so reaching the ceiling requires a net reduction of at least **43,798 lines**. Its Git tree is `48fe37ab150dd15278df98bf3e7e98cb5c8d3dd3`. [Baseline source](https://github.com/para1lel/sglang.cpp/tree/7312cbababbaa0c82712932896c2dcb8cac0cf10)
+
+| Runtime at the baseline | Physical lines |
+| --- | ---: |
+| Native applications and server (`apps/`) | 17,393 |
+| Native implementation (`src/`) | 43,886 |
+| Native headers (`include/`, excluding test-only headers) | 10,864 |
+| LMCache daemon, transfer code, and launcher (`tools/lmcache/`) | 1,655 |
+| Total | 73,798 |
+
+The header subtotal includes 1,883 checked-in Unicode table lines. The source subtotal includes 990 lines of the adapted MNNVL collective. Outside the runtime total, the baseline has 619 XMake lines, 575 lines of build and toolchain scripts and probes, 161 lines in the Unicode data regeneration tool, 104 test-only header lines, and three LMCache dependency manifest lines. Tests, benchmarks, documentation, licenses, and the unmodified source of external dependencies are outside the runtime total. [Unicode data provenance](../tools/unicode/README.md) · [MNNVL provenance](../src/runtime/backend/mnnvl_ar.LICENSE#L1)<!-- prefix: "src/runtime/" -->
+
+Reproduce the baseline count from Git objects. The path selection below describes the frozen baseline. For every candidate, audit the full source tree and build and runtime entry points, update the selected paths to cover newly added or moved runtime implementation, and report the revised inventory and total against its exact commit or tree. Identify any upstream dependency that takes over a production responsibility. Record its pin, license, purpose, counted local integration or adaptation, and execution or deployment cost. [Execution identity](../.agents/skills/coding-mode/references/execution-identity.md)
+
+```sh
+revision=7312cbababbaa0c82712932896c2dcb8cac0cf10
+git grep -I -c -e '^' "$revision" -- apps src include tools/lmcache \
+  ':(exclude)include/sglang/testing' ':(exclude,glob)**/*.LICENSE' \
+  ':(exclude)tools/lmcache/requirements.txt' |
+  awk -F: '{
+    split($2, path, "/")
+    group = (path[1] == "tools" ? "tools/lmcache" : path[1])
+    lines[group] += $NF
+    total += $NF
+  } END {
+    for (group in lines) print group, lines[group]
+    print "total", total
+  }' | sort
+```
+
 ## Current matched K4 status
 
 Use a verified Release build and run one matched row at a time on the same reserved B200 device or pair for both arms. [Gates and frozen evidence](performance.md) · [TP1 driver](../benchmarks/paired/README.md#matched-k4-timing-protocol) · [TP2 driver](serving/tp2.md#acceptance-target)

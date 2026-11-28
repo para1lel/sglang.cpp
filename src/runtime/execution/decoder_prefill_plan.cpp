@@ -33,6 +33,7 @@ struct ProjectionCursor {
     int max_rows = 0;
     bool whole_tiles = false;
     bool ranked = false;
+    bool resident = false;
     std::array<int, decoder_batch_max_lanes> offsets{};
 
     int remaining(int source) const {
@@ -137,6 +138,23 @@ struct ProjectionCursor {
         return true;
     }
 
+    void causal_group(ProjectionStep& step, int source) {
+        const int tiles = std::min(remaining(source), max_rows) / batch_prefill_tile_rows;
+        step.attention = PrefillAttentionMode::causal_segments;
+        for (int lane = 0; lane < tiles; ++lane) {
+            add(step, source, batch_prefill_tile_rows);
+        }
+    }
+
+    bool prefer_resident_group(int source, int tiles) const {
+        const auto& grant = grants[source];
+        const int start = position(source);
+        return resident && tiles >= 3 && has_tile(source) && grant.media == nullptr &&
+               grant.request != nullptr && start % batch_prefill_tile_rows == 0 &&
+               wants_resident_gqa_staging(grant.request->cached_gqa_tokens, start,
+                                          tiles * batch_prefill_tile_rows);
+    }
+
     bool next(ProjectionStep& step) {
         step.group = {};
         step.attention = PrefillAttentionMode::serial_segments;
@@ -145,15 +163,16 @@ struct ProjectionCursor {
             ++first;
         if (first == count)
             return false;
+        const int first_rows = remaining(first);
+        const int causal_tiles = std::min(first_rows, max_rows) / batch_prefill_tile_rows;
+        if (prefer_resident_group(first, causal_tiles)) {
+            causal_group(step, first);
+            return true;
+        }
         if (cold_pair(step, first) || full_tiles(step, first))
             return true;
-        const int first_rows = remaining(first);
-        const int causal_rows = std::min(first_rows, max_rows) / batch_prefill_tile_rows;
-        if (has_tile(first) && causal_rows >= 3) {
-            step.attention = PrefillAttentionMode::causal_segments;
-            for (int lane = 0; lane < causal_rows; ++lane) {
-                add(step, first, batch_prefill_tile_rows);
-            }
+        if (has_tile(first) && causal_tiles >= 3) {
+            causal_group(step, first);
             return true;
         }
         add(step, first, first_rows);
@@ -170,6 +189,16 @@ struct ProjectionCursor {
         return true;
     }
 };
+
+int projection_capacity(ProjectionCursor cursor) {
+    ProjectionStep step;
+    int capacity = 0;
+    while (cursor.next(step)) {
+        if (step.group.grants > 1)
+            capacity = std::max(capacity, step.group.rows);
+    }
+    return capacity;
+}
 
 void dispatch_projection_groups(ProjectionCursor& cursor, const PartialProjectionSchedule& schedule,
                                 PrefillWorkspace& workspace, int serial_capacity,
@@ -294,24 +323,37 @@ bool execute_partial_projection_groups(const PrefillGrant* grants, int count, cu
         }
     }
     int max_rows = grouped_prefill_max_rows;
+    bool resident = false;
     std::optional<PrefillWorkspace> workspace;
+    const auto prepare = [&](int capacity, bool require_resident) {
+        workspace.emplace(stream, capacity, staged_geometry, staged_visible, resident_staging);
+        if (workspace->data() == nullptr)
+            return false;
+        resident = workspace->resident_gqa_staging();
+        if ((!require_resident || resident) &&
+            (schedule.prepare == nullptr || schedule.prepare(schedule.state, capacity, resident)) &&
+            (!require_resident || resident))
+            return true;
+        workspace->close();
+        check(cudaStreamSynchronize(stream), "Release provisional prefill workspace");
+        return false;
+    };
     for (;;) {
         ProjectionCursor cursor{grants, count, min_rows, max_rows, whole_tiles, ranked};
-        ProjectionStep step;
-        int capacity = 0;
-        while (cursor.next(step)) {
-            if (step.group.grants > 1)
-                capacity = std::max(capacity, step.group.rows);
-        }
-        if (capacity == 0)
+        const int grouped_capacity = projection_capacity(cursor);
+        if (grouped_capacity == 0)
             return false;
-        capacity = std::max(capacity, serial_capacity);
-        workspace.emplace(stream, capacity, staged_geometry, staged_visible, resident_staging);
-        if (workspace->data() != nullptr) {
-            if (schedule.prepare == nullptr || schedule.prepare(schedule.state, capacity))
+        const int capacity = std::max(grouped_capacity, serial_capacity);
+        int resident_capacity = 0;
+        if (resident_staging && max_rows >= 3 * batch_prefill_tile_rows) {
+            cursor.resident = true;
+            resident_capacity = projection_capacity(cursor);
+            if (resident_capacity > capacity && prepare(resident_capacity, true))
                 break;
-            workspace->close();
-            check(cudaStreamSynchronize(stream), "Release provisional prefill workspace");
+        }
+        if (prepare(capacity, false)) {
+            resident = resident && resident_capacity <= capacity;
+            break;
         }
         constexpr int pair_rows = 2 * batch_prefill_tile_rows;
         if (capacity <= std::max(pair_rows, serial_capacity))
@@ -320,7 +362,7 @@ bool execute_partial_projection_groups(const PrefillGrant* grants, int count, cu
     }
 
     stats.prefill_workspace_bytes = std::max(stats.prefill_workspace_bytes, workspace->bytes());
-    ProjectionCursor cursor{grants, count, min_rows, max_rows, whole_tiles, ranked};
+    ProjectionCursor cursor{grants, count, min_rows, max_rows, whole_tiles, ranked, resident};
     dispatch_projection_groups(cursor, schedule, *workspace, serial_capacity, stats);
     workspace->close();
     return true;

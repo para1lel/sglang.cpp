@@ -99,8 +99,8 @@ bool schedule_projection_groups(const PrefillGrant* grants, int count, cudaStrea
             static_cast<const Callbacks*>(state)->native(source, grant, workspace, capacity,
                                                          offset);
         },
-        [](const void* state, int capacity) {
-            return static_cast<const Callbacks*>(state)->prepare(capacity);
+        [](const void* state, int capacity, bool& resident) {
+            return static_cast<const Callbacks*>(state)->prepare(capacity, resident);
         },
     };
     return execute_partial_projection_groups(grants, count, stream, stats, schedule, min_rows,
@@ -476,8 +476,8 @@ bool decoder::try_prefill_projection_groups(
         [&](int, const PrefillGrant* grant, PrefillWorkspace& workspace, int capacity, int offset) {
             enqueue_native_prefill_grants(model, grant, 1, workspace, capacity, offset);
         },
-        [](int) { return true; }, min_partial_prefill_rows, resident_visible, gqa_full_geometry,
-        resident_visible != 0, model.backend.paired_prefill);
+        [](int, bool&) { return true; }, min_partial_prefill_rows, resident_visible,
+        gqa_full_geometry, resident_visible != 0, model.backend.paired_prefill);
 }
 
 void Decoder::Model::prefill_chunk(Request& request, const int* tokens, int rows, int position,
@@ -637,18 +637,25 @@ bool try_prefill_projection_groups_tp(const DecoderModel& model, const DecoderMo
                                              1, workspace, *peer_workspace, capacity, offset,
                                              stream, peer_stream, group);
         },
-        [&](int capacity) {
+        [&](int capacity, bool& resident) {
             const DeviceScope scope(peer.device);
+            if (peer_workspace && peer_workspace->data() != nullptr) {
+                peer_workspace->close();
+                check(cudaStreamSynchronize(peer_stream), "Release provisional peer prefill");
+            }
             peer_workspace.emplace(peer_stream, capacity, gqa_rank_geometry, staged_visible,
                                    resident_visible != 0);
-            stats.prefill_workspace_bytes =
-                std::max(stats.prefill_workspace_bytes, peer_workspace->bytes());
+            resident = resident && peer_workspace->resident_gqa_staging();
             return peer_workspace->data() != nullptr;
         },
         prefill_chunk_rows, staged_visible, gqa_rank_geometry, resident_visible != 0,
         model.backend.paired_prefill && peer.backend.paired_prefill, true);
     if (peer_workspace) {
         const DeviceScope scope(peer.device);
+        if (scheduled) {
+            stats.prefill_workspace_bytes =
+                std::max(stats.prefill_workspace_bytes, peer_workspace->bytes());
+        }
         peer_workspace->close();
     }
     return scheduled;

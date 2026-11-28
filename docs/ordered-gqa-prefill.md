@@ -2,7 +2,7 @@
 
 ## Responsibilities and sources of truth
 
-Model prefill appends uncovered KV and selects the attention path. The native dispatcher picks Flash, staged or direct ordered tiles, or protected single-row attention. Ordered attention owns causal FP32 scoring and token-ordered accumulation. [Caller](../src/runtime/execution/decoder_prefill_tiles.cpp#L346)<!-- prefix: "void Chunk::" --> · [Policy](../src/decoder_prefill.cpp#L659)<!-- prefix: "void Decoder" --> · [Dispatch](../src/text/gqa/ordered_prefill.cu#L382)<!-- prefix: "cudaError_t " --> · [Score](../src/text/gqa/ordered_prefill.cu#L34)<!-- prefix: "__device__ v" --> · [Tile loop](../src/text/gqa/ordered_prefill.cu#L188)<!-- prefix: "for (int fir" -->
+Model prefill appends uncovered KV and selects the attention path. The native dispatcher picks Flash, staged or direct ordered tiles, or protected single-row attention. Ordered attention owns causal FP32 scoring and token-ordered accumulation. [Caller](../src/runtime/execution/decoder_prefill_tiles.cpp#L346)<!-- prefix: "void Chunk::" --> · [Policy](../src/decoder_prefill.cpp#L666)<!-- prefix: "void Decoder" --> · [Dispatch](../src/text/gqa/ordered_prefill.cu#L382)<!-- prefix: "cudaError_t " --> · [Score](../src/text/gqa/ordered_prefill.cu#L34)<!-- prefix: "__device__ v" --> · [Tile loop](../src/text/gqa/ordered_prefill.cu#L188)<!-- prefix: "for (int fir" -->
 
 ## Runtime path
 
@@ -28,7 +28,7 @@ The ordinary long serial TP2 route stages 992–1,024 rows at 32,769–131,072 v
 
 A mixed 4,096-row group can use this reader after grouped readers decline. Contiguous causal groups use their [causal reader](flash-prefill.md#same-request-causal-gqa). Clean setup decline uses ordinary per-lane GQA. CUDA errors propagate. [Lane fallback](../src/runtime/execution/decoder_prefill_staged_gqa.cpp#L72)<!-- prefix: "if (!submitt" --> · [Reader dispatch](../src/runtime/execution/decoder_prefill_tiles.cpp#L328)<!-- prefix: "if (long_sta" -->
 
-For the ordinary serial route, optional [dedicated scratch](native-prefill-workspace.md#dedicated-long-context-staging) follows the largest eligible span per step. It uses up to 268,443,648 B per rank for page-rounded K/V and metadata. On clean OOM the failing rank retries the base arena and both ranks use ordinary attention. [Span planning](../src/runtime/execution/decoder_prefill_plan.cpp#L202)<!-- prefix: "int long_ser" --> · [Both-rank gate](../src/runtime/execution/decoder_prefill_tiles.cpp#L304)<!-- prefix: "PrefillGqaSt" -->
+For the ordinary serial route, optional [dedicated scratch](native-prefill-workspace.md#dedicated-long-context-staging) follows the largest eligible span per step. It uses up to 268,443,648 B per rank for page-rounded K/V and metadata. On clean OOM the failing rank retries the base arena and both ranks use ordinary attention. [Span planning](../src/runtime/execution/decoder_prefill_plan.cpp#L231)<!-- prefix: "int long_ser" --> · [Both-rank gate](../src/runtime/execution/decoder_prefill_tiles.cpp#L304)<!-- prefix: "PrefillGqaSt" -->
 
 ## Constraints and failure behavior
 

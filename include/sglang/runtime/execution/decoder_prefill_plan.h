@@ -34,7 +34,7 @@ struct PartialProjectionSchedule {
     void (*group)(const void*, const PrefillSegment*, const PrefillGrant*, PrefillGroup,
                   PrefillWorkspace&, PrefillAttentionMode, int);
     void (*native)(const void*, int, const PrefillGrant*, PrefillWorkspace&, int, int);
-    bool (*prepare)(const void*, int) = nullptr;
+    bool (*prepare)(const void*, int, bool&) = nullptr;
 };
 
 bool execute_partial_projection_groups(const PrefillGrant* grants, int count, cudaStream_t stream,

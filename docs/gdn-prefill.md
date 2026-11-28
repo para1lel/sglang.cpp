@@ -2,7 +2,7 @@
 
 ## Responsibilities and sources of truth
 
-The decoder selects precision policy and lends scratch. The operator prepares GDN rows, advances recurrence and writes output/history. Verification covers ordered parity, chunked error and continuation. [Policy](../src/decoder_prefill.cpp#L659)<!-- prefix: "void Decoder" --> · [First-layer guard](../src/runtime/execution/decoder_prefill_tiles.cpp#L198)<!-- prefix: "const bool c" --> · [Prefill submission](../src/text_attention_gdn.cu#L249)<!-- prefix: "cudaError_t " --> · [Segmented probe](../tests/decoder/gdn_check.cu#L424)<!-- prefix: "void check_s" --> · [Chunked probe](../tests/decoder/gdn_check.cu#L551)<!-- prefix: "void check_c" --> · [Default route](../tests/decoder/gdn_routes.cpp#L66)<!-- prefix: "void check_d" --> · [Prefix fallback](../tests/decoder/gdn_routes.cpp#L104)<!-- prefix: "void check_p" -->
+The decoder selects precision policy and lends scratch. The operator prepares GDN rows, advances recurrence and writes output/history. Verification covers ordered parity, chunked error and continuation. [Policy](../src/decoder_prefill.cpp#L666)<!-- prefix: "void Decoder" --> · [First-layer guard](../src/runtime/execution/decoder_prefill_tiles.cpp#L198)<!-- prefix: "const bool c" --> · [Prefill submission](../src/text_attention_gdn.cu#L249)<!-- prefix: "cudaError_t " --> · [Segmented probe](../tests/decoder/gdn_check.cu#L424)<!-- prefix: "void check_s" --> · [Chunked probe](../tests/decoder/gdn_check.cu#L551)<!-- prefix: "void check_c" --> · [Default route](../tests/decoder/gdn_routes.cpp#L66)<!-- prefix: "void check_d" --> · [Prefix fallback](../tests/decoder/gdn_routes.cpp#L104)<!-- prefix: "void check_p" -->
 
 ## Runtime path
 

@@ -1,5 +1,7 @@
 #include "sglang/text/decode_proj_sm100.cuh"
 
+#include <cuda/ptx>
+
 namespace sglang::decode_proj {
 
 __device__ __inline_hint__ unsigned shared_address(const void* pointer) {
@@ -51,25 +53,20 @@ __device__ __inline_hint__ std::uint64_t matrix_desc(unsigned start) {
 }
 
 __device__ __inline_hint__ void fence_after_sync() {
-    asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+    cuda::ptx::tcgen05_fence_after_thread_sync();
 }
 
 __device__ __inline_hint__ void fence_before_sync() {
-    asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
+    cuda::ptx::tcgen05_fence_before_thread_sync();
 }
 
 __device__ __inline_hint__ void allocate_tmem(unsigned* address, int columns) {
-    const auto shared = shared_address(address);
-    asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" ::"r"(shared),
-                 "r"(columns)
-                 : "memory");
-    asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;" ::: "memory");
+    cuda::ptx::tcgen05_alloc(cuda::ptx::cta_group_1, address, columns);
+    cuda::ptx::tcgen05_relinquish_alloc_permit(cuda::ptx::cta_group_1);
 }
 
 __device__ __inline_hint__ void free_tmem(const unsigned* address, int columns) {
-    asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;" ::"r"(*address),
-                 "r"(columns)
-                 : "memory");
+    cuda::ptx::tcgen05_dealloc(cuda::ptx::cta_group_1, *address, columns);
 }
 
 template <int Columns, int Accumulators, int Slots>
@@ -96,7 +93,7 @@ __device__ __inline_hint__ void init_pipeline(DecodePipeline<Slots>& pipe) {
         init_barrier(&pipe.accum_ready[slot], 1);
         init_barrier(&pipe.accum_empty[slot], consumer_warps);
     }
-    asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+    cuda::ptx::fence_mbarrier_init(cuda::ptx::sem_release, cuda::ptx::scope_cluster);
 }
 
 __device__ __inline_hint__ void load_tmem16(unsigned source, unsigned* out) {

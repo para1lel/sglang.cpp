@@ -2,7 +2,7 @@
 
 ## Responsibilities and sources of truth
 
-The decoder selects precision and buffers. Fused RMSNorm and attention quantizers provide packed activations and scales. The SM100 operator selects and runs the BF16-output tile. [Packed call](../include/sglang/runtime/execution/decoder_prefill_tiles.h#L102)<!-- prefix: "bool project" --> · [Launcher](../src/text_normalization.cu#L539)<!-- prefix: "cudaError_t " --> · [Row launcher](../src/text_ops.cu#L491)<!-- prefix: "cudaError_t " --> · [Separate dispatch](../src/prefill_fp8_sm100.cu#L548)<!-- prefix: "if (rows \u003e 1" --> · [Packed dispatch](../src/prefill_fp8_sm100.cu#L657)<!-- prefix: "if (rows \u003c 1" -->
+The decoder selects precision and buffers. Fused RMSNorm and attention quantizers provide packed activations and scales. The SM100 operator selects and runs the BF16-output tile. [Packed call](../include/sglang/runtime/execution/decoder_prefill_tiles.h#L102)<!-- prefix: "bool project" --> · [Launcher](../src/text_normalization.cu#L539)<!-- prefix: "cudaError_t " --> · [Row launcher](../src/text_ops.cu#L491)<!-- prefix: "cudaError_t " --> · [Separate dispatch](../src/prefill_fp8_sm100.cu#L509)<!-- prefix: "if (rows > 1" --> · [Packed dispatch](../src/prefill_fp8_sm100.cu#L618)<!-- prefix: "if (rows < 1" -->
 
 ## Runtime path
 
@@ -31,7 +31,7 @@ Stream-owned scratch is 87,040 B/lane (up to 2,785,280 B). Eight TP2 lanes reser
 
 ### Large prefill tiles
 
-Separate K0 Tensor Core projections need at least three rows, input width divisible by 128, and 16-byte-aligned contiguous FP8. At 129–1,023 rows, output width ≥8,192 or input width ≥6,144 selects paired 128×128 TMA. Packed projections need contiguous weights and scales and slices divisible by 128. [Eligibility](../src/prefill_fp8_sm100.cu#L512)<!-- prefix: "const int pr" --> · [Separate projection tiles](../src/prefill_fp8_sm100.cu#L548)<!-- prefix: "if (rows \u003e 1" -->
+Separate K0 Tensor Core projections need at least three rows, input width divisible by 128, and 16-byte-aligned contiguous FP8. At 129–1,023 rows, output width ≥8,192 or input width ≥6,144 selects paired 128×128 TMA. Packed projections need contiguous weights and scales and slices divisible by 128. [Eligibility](../src/prefill_fp8_sm100.cu#L473)<!-- prefix: "const int pr" --> · [Separate projection tiles](../src/prefill_fp8_sm100.cu#L509)<!-- prefix: "if (rows > 1" -->
 
 | Packed shape | First eligible tile |
 | --- | --- |
@@ -61,7 +61,7 @@ The specialization preserves FP32 RMS accumulation and BF16 residuals. It quanti
 
 ## Constraints and failure behavior
 
-The `sm_100a` TMA, TMEM, and `tcgen05` path requires capability 10.0, a matching image, sufficient opt-in shared memory, and tensor maps. Output slices must be disjoint from inputs and each other. Clean separate and packed declines try the ordinary shape-selected tile and 128×128 tile, respectively. If packing declines, the decoder projects slices separately. Ineligible Tensor Core calls use SIMT. CUDA errors propagate. [Build](../xmake.lua#L176)<!-- prefix: "target(\"sgla" --> · [Narrow packed launch](../src/prefill_fp8_sm100.cu#L670)<!-- prefix: "return launc" --> · [Separate projection](../src/runtime/execution/decoder_prefill_tiles.cpp#L592)<!-- prefix: "void Prefill" -->
+The `sm_100a` TMA, TMEM, and `tcgen05` path requires capability 10.0, a matching image, sufficient opt-in shared memory, and tensor maps. Output slices must be disjoint from inputs and each other. Clean separate and packed declines try the ordinary shape-selected tile and 128×128 tile, respectively. If packing declines, the decoder projects slices separately. Ineligible Tensor Core calls use SIMT. CUDA errors propagate. [Build](../xmake.lua#L176)<!-- prefix: "target(\"sgla" --> · [Narrow packed launch](../src/prefill_fp8_sm100.cu#L631)<!-- prefix: "return launc" --> · [Separate projection](../src/runtime/execution/decoder_prefill_tiles.cpp#L592)<!-- prefix: "void Prefill" -->
 
 Attention output quantization requires an FP32 scale buffer with ordinary float alignment. Partial groups or valid operands without 4 B packing use the scalar kernel. The row launcher rejects null pointers, nonpositive widths, and row counts outside 1 through 65,535. The selected launch returns its CUDA status. [Row launcher](../src/text_ops.cu#L491)<!-- prefix: "cudaError_t " -->
 

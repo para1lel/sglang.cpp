@@ -7,6 +7,7 @@
 #include <limits>
 
 #include <cuda.h>
+#include <cuda/ptx>
 #include <cuda_runtime.h>
 #include <cudaTypedefs.h>
 
@@ -20,7 +21,6 @@ using decode_proj::expect_bytes;
 using decode_proj::fence_after_sync;
 using decode_proj::free_tmem;
 using decode_proj::init_barrier;
-using decode_proj::load_tmem16;
 using decode_proj::matrix_desc;
 using decode_proj::release_slot;
 using decode_proj::shared_address;
@@ -136,46 +136,6 @@ __device__ void multiply_tiles(Pipeline<Config>& pipe, unsigned shared, int grou
     }
 }
 
-template <int Count>
-__device__ void load_partial(unsigned source, unsigned (&out)[Count]) {
-    if constexpr (Count == 16) {
-        load_tmem16(source, out);
-    } else if constexpr (Count == 32) {
-        asm volatile("tcgen05.ld.sync.aligned.32x32b.x32.b32 {%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,"
-                     "%10,%11,%12,%13,%14,%15,%16,%17,%18,%19,%20,%21,%22,%23,%24,%25,"
-                     "%26,%27,%28,%29,%30,%31}, [%32];\ntcgen05.wait::ld.sync.aligned;"
-                     : "=r"(out[0]), "=r"(out[1]), "=r"(out[2]), "=r"(out[3]), "=r"(out[4]),
-                       "=r"(out[5]), "=r"(out[6]), "=r"(out[7]), "=r"(out[8]), "=r"(out[9]),
-                       "=r"(out[10]), "=r"(out[11]), "=r"(out[12]), "=r"(out[13]), "=r"(out[14]),
-                       "=r"(out[15]), "=r"(out[16]), "=r"(out[17]), "=r"(out[18]), "=r"(out[19]),
-                       "=r"(out[20]), "=r"(out[21]), "=r"(out[22]), "=r"(out[23]), "=r"(out[24]),
-                       "=r"(out[25]), "=r"(out[26]), "=r"(out[27]), "=r"(out[28]), "=r"(out[29]),
-                       "=r"(out[30]), "=r"(out[31])
-                     : "r"(source) : "memory");
-    } else {
-        static_assert(Count == 64);
-        asm volatile("tcgen05.ld.sync.aligned.32x32b.x64.b32 {%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,"
-                     "%10,%11,%12,%13,%14,%15,%16,%17,%18,%19,%20,%21,%22,%23,%24,%25,%26,%27,"
-                     "%28,%29,%30,%31,%32,%33,%34,%35,%36,%37,%38,%39,%40,%41,%42,%43,%44,%45,"
-                     "%46,%47,%48,%49,%50,%51,%52,%53,%54,%55,%56,%57,%58,%59,%60,%61,%62,%63"
-                     "}, [%64];\ntcgen05.wait::ld.sync.aligned;"
-                     : "=r"(out[0]), "=r"(out[1]), "=r"(out[2]), "=r"(out[3]), "=r"(out[4]),
-                       "=r"(out[5]), "=r"(out[6]), "=r"(out[7]), "=r"(out[8]), "=r"(out[9]),
-                       "=r"(out[10]), "=r"(out[11]), "=r"(out[12]), "=r"(out[13]), "=r"(out[14]),
-                       "=r"(out[15]), "=r"(out[16]), "=r"(out[17]), "=r"(out[18]), "=r"(out[19]),
-                       "=r"(out[20]), "=r"(out[21]), "=r"(out[22]), "=r"(out[23]), "=r"(out[24]),
-                       "=r"(out[25]), "=r"(out[26]), "=r"(out[27]), "=r"(out[28]), "=r"(out[29]),
-                       "=r"(out[30]), "=r"(out[31]), "=r"(out[32]), "=r"(out[33]), "=r"(out[34]),
-                       "=r"(out[35]), "=r"(out[36]), "=r"(out[37]), "=r"(out[38]), "=r"(out[39]),
-                       "=r"(out[40]), "=r"(out[41]), "=r"(out[42]), "=r"(out[43]), "=r"(out[44]),
-                       "=r"(out[45]), "=r"(out[46]), "=r"(out[47]), "=r"(out[48]), "=r"(out[49]),
-                       "=r"(out[50]), "=r"(out[51]), "=r"(out[52]), "=r"(out[53]), "=r"(out[54]),
-                       "=r"(out[55]), "=r"(out[56]), "=r"(out[57]), "=r"(out[58]), "=r"(out[59]),
-                       "=r"(out[60]), "=r"(out[61]), "=r"(out[62]), "=r"(out[63])
-                     : "r"(source) : "memory");
-    }
-}
-
 __device__ void scale_pair(float& result0, float& result1, float value0, float value1,
                            float scale) {
     asm("{ .reg .b64 values, scales, sums;\n"
@@ -204,7 +164,8 @@ __device__ void accumulate(Pipeline<Config>& pipe, const float* activation,
         #pragma unroll
         for (int base = 0; base < Config::warp_cols; base += Config::partial_cols) {
             unsigned partial[Config::partial_cols];
-            load_partial(tmem + slot * Config::accum_cols + base, partial);
+            cuda::ptx::tcgen05_ld_32x32b(partial, tmem + slot * Config::accum_cols + base);
+            cuda::ptx::tcgen05_wait_ld();
             #pragma unroll
             for (int col = 0; col < Config::partial_cols; col += 2) {
                 scale_pair(result[base + col], result[base + col + 1],
@@ -274,7 +235,7 @@ void fp8_tma(const __grid_constant__ CUtensorMap activation_map,
             init_barrier(&pipe.accum_ready[slot], 1);
             init_barrier(&pipe.accum_empty[slot], Config::consumers);
         }
-        asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+        cuda::ptx::fence_mbarrier_init(cuda::ptx::sem_release, cuda::ptx::scope_cluster);
     }
     if (warp == Config::consumers) {
         allocate_tmem(&pipe.tmem, Config::tmem_cols);

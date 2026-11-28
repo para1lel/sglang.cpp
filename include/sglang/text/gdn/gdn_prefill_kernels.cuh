@@ -21,7 +21,24 @@ static_assert(conv_taps == 4);
 
 __device__ __inline_hint__ float warp_sum(float value);
 __device__ __inline_hint__ float sigmoid(float value);
-__device__ __inline_hint__ float softplus(float value);
+struct GateParameters {
+    float negative_a;
+    float dt_bias;
+};
+
+struct OrderedQK {
+    const float* keys;
+    const float* queries;
+    int stride;
+};
+
+__device__ __inline_hint__ float2 gated_decay(GateParameters weights, const __nv_bfloat162& inputs);
+__device__ __inline_hint__ float ordered_row(float (&state)[keys_per_lane], OrderedQK qk,
+                                             float2 gates, float target);
+__device__ __inline_hint__ __nv_bfloat16 finish_value(float2 value_rms,
+                                                      const __nv_bfloat162& norm_z);
+__device__ __inline_hint__ float finish_rms(const __nv_bfloat16* observable,
+                                            float (&values)[keys_per_lane]);
 
 struct RawInput {
     const __nv_bfloat16* qkv;
@@ -44,6 +61,10 @@ struct Checkpoints {
     int count;
     TextGdnPrefillCheckpoint values[text_gdn_max_prefill_checkpoints];
 };
+
+__device__ __inline_hint__ void store_checkpoint(const Checkpoints& checkpoints, int& next,
+                                                 RowChannel point,
+                                                 const float (&state)[keys_per_lane]);
 
 struct Segment {
     int rows;

@@ -40,11 +40,19 @@ template <int Rows> struct DraftTile {
     float qk[Rows][2][head_dim];
 };
 
-__device__ float warp_sum(float value) {
+template <int Count> __device__ void warp_sum_values(float (&values)[Count]) {
     for (int offset = warp_size / 2; offset != 0; offset /= 2) {
-        value += __shfl_xor_sync(0xffffffffU, value, offset);
+#pragma unroll
+        for (auto& value : values) {
+            value += __shfl_xor_sync(0xffffffffU, value, offset);
+        }
     }
-    return value;
+}
+
+__device__ float warp_sum(float value) {
+    float values[] = {value};
+    warp_sum_values(values);
+    return values[0];
 }
 
 __device__ float sigmoid(float value) {
@@ -355,12 +363,7 @@ __device__ DraftResult solve_row(float (&held)[values_per_warp][key_parts],
             prediction[pair] = fmaf(held[pair][part], key, prediction[pair]);
         }
     }
-    for (int offset = warp_size / 2; offset != 0; offset /= 2) {
-#pragma unroll
-        for (auto& value : prediction) {
-            value += __shfl_xor_sync(0xffffffffU, value, offset);
-        }
-    }
+    warp_sum_values(prediction);
 #pragma unroll
     for (int pair = 0; pair < values_per_warp; ++pair) {
         result.update[pair] = gates.y * (target[pair] - prediction[pair]);
@@ -376,12 +379,7 @@ __device__ DraftResult solve_row(float (&held)[values_per_warp][key_parts],
             result.observable[pair] = fmaf(held[pair][part], query, result.observable[pair]);
         }
     }
-    for (int offset = warp_size / 2; offset != 0; offset /= 2) {
-#pragma unroll
-        for (auto& value : result.observable) {
-            value += __shfl_xor_sync(0xffffffffU, value, offset);
-        }
-    }
+    warp_sum_values(result.observable);
     return result;
 }
 

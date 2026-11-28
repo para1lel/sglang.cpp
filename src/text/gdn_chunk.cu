@@ -831,20 +831,19 @@ cudaError_t configure(bool& enabled, bool grouped, Recurrence* recurrence, bool 
 }
 
 template <typename S, bool StageValues, int PipelineSlots = 0>
-static cudaError_t enqueue_chunk(int count, const Bf16* convolved, const float2* gates,
-                                 void* scratch, float* recurrent, Bf16* observable,
-                                 cudaStream_t stream, gdn_prefill::Checkpoints* points) {
-    auto* matrices = static_cast<Matrices*>(scratch);
+static cudaError_t enqueue_chunk(Segment& segment, cudaStream_t stream,
+                                 gdn_prefill::Checkpoints* points) {
     void* prepare_args[] = {
-        &count,
-        static_cast<void*>(&convolved),
-        static_cast<void*>(&gates),
-        static_cast<void*>(&matrices),
+        &segment.count,
+        static_cast<void*>(&segment.convolved),
+        static_cast<void*>(&segment.gates),
+        static_cast<void*>(&segment.matrices),
     };
     constexpr int shared_heads = StageValues ? S::heads_per_qk : 1;
-    const auto status = cudaLaunchKernel(
-        prepare<S, shared_heads>, dim3(S::value_heads / shared_heads, (count + rows - 1) / rows),
-        dim3(threads * shared_heads), prepare_args, 0, stream);
+    const auto status =
+        cudaLaunchKernel(prepare<S, shared_heads>,
+                         dim3(S::value_heads / shared_heads, (segment.count + rows - 1) / rows),
+                         dim3(threads * shared_heads), prepare_args, 0, stream);
     if (status != cudaSuccess) {
         return status;
     }
@@ -854,41 +853,47 @@ static cudaError_t enqueue_chunk(int count, const Bf16* convolved, const float2*
         StageValues ? warp_mma::value_dynamic_bytes : warp_mma::dynamic_bytes;
     constexpr int shared = PipelineSlots != 0 ? frame_bytes[PipelineSlots] : ordinary_bytes;
     void* recur_args[] = {
-        &count,
-        static_cast<void*>(&convolved),
-        static_cast<void*>(&matrices),
-        static_cast<void*>(&recurrent),
-        static_cast<void*>(&observable),
+        &segment.count,
+        static_cast<void*>(&segment.convolved),
+        static_cast<void*>(&segment.matrices),
+        static_cast<void*>(&segment.recurrent),
+        static_cast<void*>(&segment.observable),
         points,
     };
-    const auto kernel = recurrence_kernel<S, StageValues, PipelineSlots>(points != nullptr);
     return cudaLaunchKernel(
-        kernel, dim3(S::value_heads, dimension / (warp_mma::columns * recurrence_warps<S>)),
+        recurrence_kernel<S, StageValues, PipelineSlots>(points != nullptr),
+        dim3(S::value_heads, dimension / (warp_mma::columns * recurrence_warps<S>)),
         dim3(recurrence_threads), recur_args, shared, stream);
 }
 
-static int interior_chunk_start(int count, int endpoint) {
-    return endpoint < count && endpoint % rows != 0 ? endpoint / rows * rows : -1;
+template <typename S>
+static Segment interior_prefix(const Segment& segment, TextGdnPrefillCheckpoint point) {
+    if (point.rows >= segment.count || point.rows % rows == 0) {
+        return {};
+    }
+    const int first = point.rows / rows * rows;
+    return {
+        point.rows - first,
+        segment.convolved + static_cast<std::size_t>(first) * S::qkv_width,
+        segment.gates + first * S::value_heads,
+        segment.matrices,
+        point.state.recurrent,
+        nullptr,
+    };
 }
 
 template <typename S, bool StageValues, int PipelineSlots = 0>
-static cudaError_t launch_chunk(int count, const Bf16* convolved, const float2* gates,
-                                void* scratch, float* recurrent, Bf16* observable,
-                                cudaStream_t stream, gdn_prefill::Checkpoints* points) {
-    auto status = enqueue_chunk<S, StageValues, PipelineSlots>(
-        count, convolved, gates, scratch, recurrent, observable, stream, points);
+static cudaError_t launch_chunk(Segment segment, cudaStream_t stream,
+                                gdn_prefill::Checkpoints* points) {
+    auto status = enqueue_chunk<S, StageValues, PipelineSlots>(segment, stream, points);
     if (status != cudaSuccess || !points) {
         return status;
     }
     gdn_prefill::Checkpoints empty{};
     for (int index = 0; index < points->count; ++index) {
-        const auto& point = points->values[index];
-        const int first = interior_chunk_start(count, point.rows);
-        if (first >= 0) {
-            status = enqueue_chunk<S, StageValues, PipelineSlots>(
-                point.rows - first, convolved + static_cast<std::size_t>(first) * S::qkv_width,
-                gates + first * S::value_heads, scratch, point.state.recurrent, nullptr, stream,
-                &empty);
+        auto prefix = interior_prefix<S>(segment, points->values[index]);
+        if (prefix.count != 0) {
+            status = enqueue_chunk<S, StageValues, PipelineSlots>(prefix, stream, &empty);
             if (status != cudaSuccess) {
                 return status;
             }
@@ -898,25 +903,20 @@ static cudaError_t launch_chunk(int count, const Bf16* convolved, const float2* 
 }
 
 template <typename S>
-cudaError_t launch(int count, const Bf16* convolved, const float2* gates, void* scratch,
-                   float* recurrent, Bf16* observable, cudaStream_t stream, Recurrence recurrence,
+cudaError_t launch(Segment segment, cudaStream_t stream, Recurrence recurrence,
                    gdn_prefill::Checkpoints* checkpoints) {
     if constexpr (std::is_same_v<S, GdnLocal>) {
         if (recurrence == Recurrence::three_frames) {
-            return launch_chunk<S, true, 3>(count, convolved, gates, scratch, recurrent, observable,
-                                            stream, checkpoints);
+            return launch_chunk<S, true, 3>(segment, stream, checkpoints);
         }
         if (recurrence == Recurrence::two_frames) {
-            return launch_chunk<S, true, 2>(count, convolved, gates, scratch, recurrent, observable,
-                                            stream, checkpoints);
+            return launch_chunk<S, true, 2>(segment, stream, checkpoints);
         }
         if (recurrence == Recurrence::staged) {
-            return launch_chunk<S, true>(count, convolved, gates, scratch, recurrent, observable,
-                                         stream, checkpoints);
+            return launch_chunk<S, true>(segment, stream, checkpoints);
         }
     }
-    return launch_chunk<S, false>(count, convolved, gates, scratch, recurrent, observable, stream,
-                                  checkpoints);
+    return launch_chunk<S, false>(segment, stream, checkpoints);
 }
 
 template <typename S>
@@ -954,20 +954,10 @@ cudaError_t launch_segments(Segments segments, int count, int max_rows, cudaStre
             if (index >= points.count) {
                 continue;
             }
-            const auto& point = points.values[index];
-            const auto& segment = segments.values[lane];
-            const int first = interior_chunk_start(segment.count, point.rows);
-            if (first >= 0) {
-                const int prefix = point.rows - first;
-                prefixes.values[pending++] = {
-                    prefix,
-                    segment.convolved + static_cast<std::size_t>(first) * S::qkv_width,
-                    segment.gates + first * S::value_heads,
-                    segment.matrices,
-                    point.state.recurrent,
-                    nullptr,
-                };
-                longest = std::max(longest, prefix);
+            const auto prefix = interior_prefix<S>(segments.values[lane], points.values[index]);
+            if (prefix.count != 0) {
+                prefixes.values[pending++] = prefix;
+                longest = std::max(longest, prefix.count);
             }
         }
         if (pending != 0) {
@@ -984,10 +974,8 @@ template bool eligible<GdnFull>(int, const void*, std::size_t);
 template bool eligible<GdnLocal>(int, const void*, std::size_t);
 template cudaError_t configure<GdnFull>(bool&, bool, Recurrence*, bool);
 template cudaError_t configure<GdnLocal>(bool&, bool, Recurrence*, bool);
-template cudaError_t launch<GdnFull>(int, const Bf16*, const float2*, void*, float*, Bf16*,
-                                     cudaStream_t, Recurrence, gdn_prefill::Checkpoints*);
-template cudaError_t launch<GdnLocal>(int, const Bf16*, const float2*, void*, float*, Bf16*,
-                                      cudaStream_t, Recurrence, gdn_prefill::Checkpoints*);
+template cudaError_t launch<GdnFull>(Segment, cudaStream_t, Recurrence, gdn_prefill::Checkpoints*);
+template cudaError_t launch<GdnLocal>(Segment, cudaStream_t, Recurrence, gdn_prefill::Checkpoints*);
 template cudaError_t launch_segments<GdnFull>(Segments, int, int, cudaStream_t,
                                               SegmentCheckpoints*);
 template cudaError_t launch_segments<GdnLocal>(Segments, int, int, cudaStream_t,

@@ -42,8 +42,7 @@ cudaError_t configure(bool& enabled, bool grouped = false, Recurrence* recurrenc
                       bool checkpoints = false);
 
 template <typename S = GdnFull>
-cudaError_t launch(int count, const Bf16* convolved, const float2* gates, void* scratch,
-                   float* recurrent, Bf16* observable, cudaStream_t stream, Recurrence recurrence,
+cudaError_t launch(Segment segment, cudaStream_t stream, Recurrence recurrence,
                    gdn_prefill::Checkpoints* checkpoints = nullptr);
 
 template <typename S = GdnFull>

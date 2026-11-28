@@ -44,7 +44,7 @@ Zero rows succeed. For other inputs, negative positions, negative rows, and posi
 
 ## Verification
 
-Run the [P2 GQA checker](development.md#p2-gqa-verification) on a reserved B200. The [public multirow overflow control](../tests/mxfp8_gqa_prefill_check.cu#L820)<!-- prefix: "void check_o" --> covers 65 rows at 65, 32,768, 32,769, 131,072, and 131,073 visible tokens. It compares aligned graph replay against an FP64 known answer and requires bitwise parity with unaligned K. The [evidence gate](../tests/batch/check_graph_evidence.py#L308)<!-- prefix: "def verify_o" --> requires the matching CUPTI graph sequence and CTA counts of 33, 17, 2, 2, and 2.
+Run the [GQA checker](development.md#gqa-verification) on a reserved B200. The [public multirow overflow control](../tests/mxfp8_gqa_prefill_check.cu#L820)<!-- prefix: "void check_o" --> covers 65 rows at 65, 32,768, 32,769, 131,072, and 131,073 visible tokens. It compares aligned graph replay against an FP64 known answer and requires bitwise parity with unaligned K. The [evidence gate](../tests/batch/check_graph_evidence.py#L308)<!-- prefix: "def verify_o" --> requires the matching CUPTI graph sequence and CTA counts of 33, 17, 2, 2, and 2.
 
 Replay identical checkpoint Q and KV with remapped pages and guarded outputs. Compare complete BF16 outputs and the corresponding rows from a shortened causal grant. Run memcheck, initcheck, and synccheck on eager replays with unwritten tail slots.
 
@@ -52,8 +52,8 @@ For grouped staging, compare with ordinary per-lane dispatch. Use unequal 256–
 
 To isolate the page-wide reader, keep the grants, staged K/V, and page remaps fixed. Compare all BF16 outputs bitwise with the prior 64-key staged reader. Include a final page with only one live 64-key chunk, an invalid visible KV entry, and an unwritten KV tail. Check lane-local repair and output canaries. [64-key control](https://github.com/para1lel/sglang.cpp/blob/0d03fd96f1f5d6d25322913bcfb3732e9c6472e2/include/sglang/text/mxfp8_gqa_prefill_paired.cuh#L384)<!-- prefix: "__global__ _" -->
 
-Use identical scheduled grants and token histories to compare full BF16 vocabulary scores and greedy IDs. Report operator replay timings and trace-weighted kernel estimates separately from end-to-end serving measurements.
+Use identical scheduled grants and token histories to compare full BF16 vocabulary scores and greedy IDs. For isolated operator timing, report the B200 rank configuration, row count, and visible span.
 
-Compare both W5 rank shards at 1,004 rows and 65,516 visible tokens. Restore a 65,536-token prefix and compare 1- and 32-token continuations and rank-local GQA, GDN, and draft state. Inject clean pool OOM on either GPU and require both ranks to select ordinary attention. [Frozen operator and decoder replays](https://github.com/para1lel/sglang.cpp/blob/a5974ba4eb99bd8e8f890c2e7262a27dbc3aace1/docs/ordered-gqa-prefill.md#verification)
+Compare both B200 rank shards at 1,004 rows and 65,516 visible tokens. Restore a 65,536-token prefix and compare 1- and 32-token continuations and rank-local GQA, GDN, and draft state. Inject clean pool OOM on either GPU and require both ranks to select ordinary attention.
 
 Reject staging on insufficient scratch and check the eligible raw grouped or per-lane fallback. Inject an unexpected CUDA launch error and require propagation without a second attention launch. Include invalid visible KV and check lane-local repair. Follow the [numerical and quality checks](performance.md#operator-qualification).

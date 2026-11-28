@@ -42,7 +42,7 @@ B/A fast paths need Tensor Core prefill and two BF16 48×5,120 weight matrices. 
 | SM100 | 512–4,096 rows, including partial 32-row tails. Nonnull buffers, weights/input/scratch aligned to 16 B, and supported TMA. Borrow 3,840 B per row from MLP gate; consume on the same stream before reuse. [Decoder dispatch](../src/runtime/execution/decoder_prefill_tiles.cpp#L186)<!-- prefix: "if (tensor_c" --> · [SM100 preflight](../src/text/prefill_gdn_gates_sm100.cu#L197)<!-- prefix: "std::optiona" --> |
 | Fused SIMT, then separate | On clean SM100 decline, try multiples of four from 16–65,535 rows with aligned weights/input. A further decline projects B then A separately. [SIMT preflight](../src/text_decode_bandwidth.cu#L569)<!-- prefix: "if (rows < 1" --> · [Descriptor errors](../src/text/prefill_gdn_gates_sm100.cu#L137)<!-- prefix: "std::optiona" --> · [Separate fallback](../src/runtime/execution/decoder_prefill_tiles.cpp#L207)<!-- prefix: "project(laye" --> |
 
-At absolute position zero the first GDN layer uses ordered recurrence. Later layers and tiles may use chunked recurrence. Resume uses the restored absolute position. [Frozen first-call W2 observation](https://github.com/para1lel/sglang.cpp/blob/57ac5fbbdf20a5a80c5bc079b49073a44c06680f/docs/gdn-prefill.md#constraints-and-failure-behavior)
+At absolute position zero the first GDN layer uses ordered recurrence. Later layers and tiles may use chunked recurrence. Resume uses the restored absolute position.
 
 | Recurrence stage | Eligibility and resources |
 | --- | --- |
@@ -66,18 +66,30 @@ Use the [LMCache device state and graph checks](../tests/prefix/README.md#device
 
 Keep GQA, grants, positions and B/A dispatch fixed for grouped recurrence checks. Compare both 4,096-row shapes, smaller or unequal groups, and bank zero at zero and later starts against per-grant execution. Match BF16 output/history, FP32 carry, and positive-depth draft continuation bitwise where arithmetic is preserved. At 127/128/129 rows, perturb a later row and check causality. Trace submission grouping, clean decline, independent setup and launch errors without retry, and a fresh cohort after recovery. [workspace pressure checks](native-prefill-workspace.md#verification)
 
-For B/A, compare fused SM100 and SIMT with an FP64 oracle at 511/512 rows, a partial 32-row block and 4,096 rows. Keep recurrence and attention fixed. Check fallback and errors and time projection plus reduction together. [Frozen B/A projection and checkpoint comparisons](https://github.com/para1lel/sglang.cpp/blob/a5974ba4eb99bd8e8f890c2e7262a27dbc3aace1/docs/gdn-prefill.md#verification) · [Expanded checkpoint and grouped probes](https://github.com/para1lel/sglang.cpp/blob/6debe50edccdeda34ff307235ed38e74b6b8f2ee/docs/gdn-prefill.md#verification)
+For B/A, compare fused SM100 and SIMT with an FP64 oracle at 511/512 rows, a partial 32-row block and 4,096 rows. Keep recurrence and attention fixed. Check fallback and errors. A B200 operator comparison measured projection plus reduction together and found lower device time at tested sizes from 512 to 4,096 rows. Fixed-history natural-document comparisons changed some top predictions, while the document-level bootstrap intervals for mean loss change included zero.
 
-For reordered arithmetic, follow the [operator qualification procedure](performance.md#operator-qualification). Compare logits and labeled-token negative log likelihood on identical prompt and teacher histories. Record greedy divergence separately. Trace the position-zero first-layer guard, eligible layers, short tails, exact, and positive-depth MTP. Use the [frozen serving protocols](performance.md) with matched tile schedules, graph settings, and warmups. To isolate GDN when flash is active, hold flash dispatch fixed across both arms.
+For reordered arithmetic, follow the [operator qualification procedure](performance.md#operator-qualification). Compare logits and labeled-token negative log likelihood on identical prompt and teacher histories. Record greedy divergence separately. Trace the position-zero first-layer guard, eligible layers, short tails, exact, and positive-depth MTP. Keep the tile schedule and graph settings fixed. Hold flash dispatch fixed across both arms to isolate GDN.
 
-For unchanged arithmetic, compare BF16 output, FP32 carry, and BF16 history bitwise from nonzero carry. Time isolated recurrence separately from serving. Report samples, variability, and peak device memory. [Frozen W6 and checkpoint diagnostics](https://github.com/para1lel/sglang.cpp/blob/4dd8c887c278c67744ed80e7feb2a825a92197a2/docs/gdn-prefill.md#verification)
+For unchanged arithmetic, compare BF16 output, FP32 carry, and BF16 history bitwise from nonzero carry. On B200, time isolated recurrence with fixed inputs and report row counts, rank width, samples, variability, and peak device memory.
 
 ### Native TP2 four-warp replay
 
-Compare preparation through finish on both rank shards at 1,024, 4,096, and 8,192 rows and check the 127/128/129 dispatch boundary. Match FP8 codes, FP32 scales and carry, and raw BF16 history. Cover split restore, a 128-row suffix, and BF16 decode. Force missing, short, and unaligned scratch and a pre-SM100 device. [Frozen fixtures, geometry, medians, and projection](https://github.com/para1lel/sglang.cpp/blob/a5974ba4eb99bd8e8f890c2e7262a27dbc3aace1/docs/gdn-prefill.md#native-tp2-four-warp-replay)
+Compare preparation through finish on both rank shards at 1,024, 4,096, and 8,192 rows and check the 127/128/129 dispatch boundary. Match FP8 codes, FP32 scales and carry, and raw BF16 history. Cover split restore, a 128-row suffix, and BF16 decode. Force missing, short, and unaligned scratch and a pre-SM100 device.
+
+One B200 replayed layer 0 for each TP2 rank separately, with 28 rotated CUDA-event samples per arm. Warm preparation-through-finish medians compared eight-warp scalar with four-warp paired recurrence.
+
+| Start position | Rows | Rank 0 (ms) | Rank 1 (ms) |
+| --- | ---: | ---: | ---: |
+| 4,096 | 4,096 | 0.5892 → 0.4570 | 0.5892 → 0.4580 |
+| 4,096 | 8,192 | 1.1732 → 0.9090 | 1.1737 → 0.9087 |
+| 40,960 | 1,024 | 0.1547 → 0.1232 | 0.1544 → 0.1219 |
+| 40,960 | 4,096 | 0.5868 → 0.4553 | 0.5869 → 0.4549 |
+| 40,960 | 8,192 | 1.1701 → 0.9053 | 1.1696 → 0.9056 |
 
 ### Native TP2 staged value replay
 
-Compare FP8 codes, BF16 output and history, and FP32 scales and carry against unstaged four-warp recurrence. Cover W4/W5 layers, bank zero and later banks, restore, and continuation across both ranks. Time isolated recurrence and fenced full-model prefill separately. [Frozen operator and caller receipts](https://github.com/para1lel/sglang.cpp/blob/a5974ba4eb99bd8e8f890c2e7262a27dbc3aace1/docs/gdn-prefill.md#native-tp2-staged-value-replay)
+Compare FP8 codes, BF16 output and history, and FP32 scales and carry against unstaged four-warp recurrence on both B200 rank shards. Cover bank zero and later banks, restores, and continuation. Time preparation through recurrence finish on fixed rank-local inputs and report the row counts and selected shared-memory configuration.
+
+On one B200, isolated 8,192-row replay with 1,024-row spans and banks 0 and 15 reduced medians by 14.12–14.31% on the two TP2 rank shards. FP8 codes, BF16 output and history, and FP32 scales and carry matched bitwise, as did restore and continuation.
 
 For three frames, compare the original and candidate with fixed inputs, states and grants. Require bitwise BF16 output and history, FP32 carry and scales, and E4M3 codes in eager and graph replay, including changed inputs at stable addresses. Wrap CUDA device queries, kernel configuration and submissions. Check the 24×4 recurrence grid, dynamic and total shared bytes, 1,023/1,024 rows, and both sides of each capacity threshold. Exercise old devices, scratch declines, and injected query, attribute, matrix and recurrence launch failures. Clean eligibility decline uses the documented fallback. CUDA errors propagate without retry.

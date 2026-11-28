@@ -1,13 +1,21 @@
 """Metrics and reset controls shared by the sampled HTTP regression."""
 
+from __future__ import annotations
+
 import http.client
 import json
+import re
 import time
 from contextlib import closing
+from decimal import Decimal, InvalidOperation
 from http import HTTPStatus
-from pathlib import Path
+from typing import TYPE_CHECKING
 
 from routes import HEADERS
+
+if TYPE_CHECKING:
+    from collections.abc import Collection
+    from pathlib import Path
 
 RUNNING = "vllm:num_requests_running"
 WAITING = "vllm:num_requests_waiting"
@@ -15,6 +23,43 @@ GENERATED = "vllm:generation_tokens_total"
 GDN_ENTRIES = "sglang_cpp:prefix_cache_entries"
 STORES = "sglang_cpp:lmcache_stores_total"
 PENDING_STORES = "sglang_cpp:lmcache_pending_stores"
+PREFIX_HITS = "vllm:prefix_cache_hits_total"
+METRIC = re.compile(r"([\w:]+)(?:\{.*\})?\s+(\S+)")
+PREFILL_CHECKPOINTS = tuple(
+    "sglang_cpp:lmcache_" + name + "_total"
+    for name in (
+        "prefill_checkpoints_planned",
+        "prefill_checkpoints_resident",
+        "prefill_checkpoints_published",
+        "prefill_checkpoints_declined",
+        "prefill_checkpoint_stores",
+        "prefill_checkpoint_failures",
+    )
+)
+
+
+def parse_metrics(text: str, names: Collection[str]) -> dict[str, int]:
+    result = {}
+    for line in text.splitlines():
+        match = METRIC.fullmatch(line)
+        if match is None or match[1] not in names:
+            continue
+        name, number = match.groups()
+        try:
+            value = Decimal(number)
+        except InvalidOperation as error:
+            raise ValueError(f"Invalid cache metric {name}: {number}") from error
+        if (
+            name in result
+            or not value.is_finite()
+            or value < 0
+            or value != value.to_integral_value()
+        ):
+            raise ValueError(f"Invalid or duplicate cache metric {name}")
+        result[name] = int(value)
+    if result.keys() != set(names):
+        raise ValueError("Missing cache metrics from the single-engine endpoint")
+    return result
 
 
 class Controls:

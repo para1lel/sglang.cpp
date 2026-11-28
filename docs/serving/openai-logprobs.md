@@ -14,7 +14,7 @@ In OpenAI completions and native `/generate`, `logit_bias` maps decimal token ID
 
 ## Text completions
 
-Set integer `logprobs` from `0` through `20` on any of the [four prompt forms](../text-serving.md#send-a-request). `0` returns selected token scores and an empty `top_logprobs` array. Values `1`–`20` add a token-string-to-score map for each selected token. When ranked IDs map to the same string, the last ranked entry supplies that key's score. Omission or null leaves the response field absent. The [frozen benchmark request](../../benchmarks/streaming/README.md#wire-contract) rejects `logprobs`.
+Set integer `logprobs` from `0` through `20` on any of the [four prompt forms](../text-serving.md#send-a-request). `0` returns selected token scores and an empty `top_logprobs` array. Values `1`–`20` add a token-string-to-score map for each selected token. When ranked IDs map to the same string, the last ranked entry supplies that key's score. Omission or null leaves the response field absent. The [token-ID streaming alias](../text-serving.md#token-id-streaming-alias) rejects `logprobs`.
 
 JSON includes `logprobs` inside each choice, with `tokens`, `token_logprobs`, `top_logprobs`, and `text_offset`. Offsets are `-1`. Score token strings preserve valid UTF-8 and map invalid byte fragments through Latin-1. In SSE, collect new scores by choice index. [Completion score writer](../../apps/server/text_completion.cpp#L92)<!-- prefix: "void append_" -->
 

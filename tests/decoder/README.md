@@ -155,16 +155,14 @@ beginning of the file. The check forces that ID as the first output in all five 
 
 ### K4 boundary crossings
 
-Build `long-decode-routes` with the commands above. Set `w5_fixtures` to the `W5`
-subdirectory from [frozen prompt generation](../../benchmarks/concurrent/README.md#regenerate-and-measure).
-Use `jq` to write one prompt per line in lane order.
+Build `long-decode-routes` with the commands above. Run the prompt generator with
+Python and `tokenizers` (available in the pinned vLLM environment). It writes one
+fixed 32,768-token prompt per lane and verifies the generated IDs against a digest.
 
 ```bash
-for case in "$w5_fixtures"/*.request.json; do
-    jq -er '.prompt | join(" ")' "$case" || exit
-done > "$out/w5.ids"
+python -B tests/decoder/make_k4_route_prompts.py "$checkpoint/tokenizer.json" 32 > "$out/k4-32.ids"
 CUDA_VISIBLE_DEVICES="$GPU_UUID" \
-    "$out/bin/long-decode-routes" "$checkpoint" --mtp-crossings "$out/w5.ids"
+    "$out/bin/long-decode-routes" "$checkpoint" --mtp-crossings "$out/k4-32.ids"
 ```
 
 The check requires full K4 acceptance and the expected output IDs. Each wave
@@ -173,8 +171,8 @@ verification readers.
 
 ### Mixed K4 verification
 
-Use the same extraction above with the frozen `W4` or `W5` subdirectory to
-write the 16 or 32 prompts in lane order. Set `mixed_ids` to that ID file.
+Use the same prompt generator with `16` or `32` lanes. Set `mixed_ids` to the
+resulting ID file.
 
 ```bash
 CUDA_VISIBLE_DEVICES="$GPU_UUID" \

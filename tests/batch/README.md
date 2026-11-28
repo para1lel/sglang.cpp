@@ -216,7 +216,7 @@ error for the active peer.
 Start a dedicated [LMCache 0.5.8 daemon](../../docs/serving/lmcache.md#start-the-daemon) on the reserved B200.
 Use a private absolute path for `LMCACHE_SOCKET` and wait for the daemon to be ready.
 The runner rejects the standard daemon sockets. It drains requests and pending stores,
-then clears the daemon store before W1 and between independent cases. This removes other
+then clears the daemon store before the session replay and between independent cases. This removes other
 workers' records too. Keep the daemon exclusive to this run and use a fresh evidence directory.
 
 ```bash
@@ -231,9 +231,9 @@ drain. It requires zero CPU stores, backup starts, I/O errors, and declined anch
 Batch traces show K4 verification, the one-row decode at a crossed boundary, and
 terminal retirement.
 
-- W1 retains the prefill checkpoint at 128 and the terminal checkpoint at 255.
+- The session retains the prefill checkpoint at 128 and the terminal checkpoint at 255.
   Two session branches restore 255 target rows and 254 draft rows and match cold
-  output IDs. Replaying W1 hits the 128-token entry and leaves the entry count unchanged.
+  output IDs. Replaying the original prompt hits the 128-token entry and leaves the entry count unchanged.
 - For each prompt length `b`, the sparse cases probe the exact prefill endpoint `b`,
   each positive `b−2^k` for `k≥10`, and the final committed cursor after generation.
 - Abort and disconnect preserve published prefill checkpoints. The interrupted

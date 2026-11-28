@@ -15,7 +15,7 @@ from time import monotonic, perf_counter_ns, sleep
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, TypeVar, cast
 
-from cold_cache import LMCACHE_METRICS, PENDING_STORES, RUNNING, WAITING, metrics, parse_metrics
+from live_controls import PENDING_STORES, PREFIX_HITS, RUNNING, WAITING, parse_metrics
 from lmcache_relay import ERASE, LOOKUP, RANK_PUT, RESET, control, key_body
 
 from media import http_routes as http
@@ -34,6 +34,21 @@ LOGGER = logging.getLogger(__name__)
 CACHE_PAGES = 16
 CHECKPOINT_SLOTS = 8
 PAGE_ROWS = 128
+PREFIX_STORES = "sglang_cpp:prefix_cache_stores_total"
+LMCACHE_METRICS = tuple(
+    "sglang_cpp:lmcache_" + name + "_total"
+    for name in (
+        "io_errors",
+        "gqa_restored_tokens",
+        "gqa_read_only_tokens",
+        "gdn_restored_tokens",
+        "draft_restored_rows",
+        "lookup_misses",
+        "gqa_computed_tokens",
+        "gqa_written_tokens",
+        "gdn_computed_tokens",
+    )
+)
 
 
 class Witness:
@@ -61,7 +76,8 @@ class Witness:
         self.drain()
         raw = self.get("/metrics")
         (self.evidence / f"{label}.prom").write_bytes(raw)
-        summary = metrics(raw.decode(), "lmcache")
+        names = (RUNNING, WAITING, PREFIX_HITS, *LMCACHE_METRICS, PREFIX_STORES)
+        summary = parse_metrics(raw.decode(), names)
         return {
             name.removeprefix("sglang_cpp:lmcache_").removesuffix("_total"): summary[name]
             for name in LMCACHE_METRICS

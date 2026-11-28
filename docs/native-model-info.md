@@ -23,7 +23,7 @@ Both model-info aliases bypass the queue and return HTTP 200 with identical star
 
 ### Model discovery
 
-`GET /v1/models` returns 200 with `object: "list"` and one card in `data`. `GET /v1/models/Qwen3.8-27B-FP8` returns the card. Its `id` and `root` are that model ID. Other fields are `object: "model"`, `owned_by: "sglang"`, `parent: null`, integer Unix seconds in `created`, and `max_model_len: 262144`. See [resident admission](batch-graphs.md#resident-memory-admission) and the [benchmark alias](../benchmarks/streaming/README.md#wire-contract). [Pinned SGLang discovery comparison](https://github.com/para1lel/sglang.cpp/blob/6debe50edccdeda34ff307235ed38e74b6b8f2ee/docs/native-model-info.md#model-discovery)
+`GET /v1/models` returns 200 with `object: "list"` and one card in `data`. `GET /v1/models/Qwen3.8-27B-FP8` returns the card. Its `id` and `root` are that model ID. Other fields are `object: "model"`, `owned_by: "sglang"`, `parent: null`, integer Unix seconds in `created`, and `max_model_len: 262144`. See [resident admission](batch-graphs.md#resident-memory-admission) and the [token-ID alias](text-serving.md#token-id-streaming-alias).
 
 ### Server information
 

@@ -47,8 +47,6 @@ A paired boundary at `P` seeds shifted draft row `P-1` with the first suffix ID 
 
 Prompt scoring restores no farther than `logprob_start_len` and leaves at least the last prompt row to compute. Offset zero, including OpenAI echo scoring, restores no rows. Generated-only or [pointwise label scores](serving/pointwise-score.md) can use full hits. [Lookup limit](../apps/server/detail/batch_service_cache.cpp#L31)<!-- prefix: "const int ma" --> · [Full hit](../src/decoder_batch.cpp#L414)<!-- prefix: "if (lane.res" -->
 
-[Archived TP2 replay receipts](https://github.com/para1lel/sglang.cpp/blob/acbf95b0de14108b37c37bdc3dc40daaf2db2099/docs/prefix-cache.md#checkpoint-compatibility-and-resume) include eight cohorts, cache restores, cancellation and ranked payloads.
-
 ### Media identity and prefill
 
 Keys bind covered media patch identity, layout, feature row, and rotary positions. A change inside the covered prefix changes its identity. External C++ features can run without a cache identity. Key construction stops before the first such media row. [Media key construction](../src/runtime/cache/prefix_payload.cpp#L130)<!-- prefix: "const auto e" --> · [Media execution](multimodal-decoder.md#runtime-path)
@@ -114,11 +112,11 @@ PYTHONPATH="$PWD" python3 -B tests/prefix/pool_routes.py \
 
 Keep `run.json`, `relay.json`, and the metric scrapes. The pressure fixture checks idle reuse, acknowledged backups under pressure, backed eviction, reload, cancellation, reset, and clean shutdown. The anchor fixture checks exact offsets and deeper GQA coverage than the GDN resume boundary. [Pressure fixture](../tests/prefix/pool_routes.py#L344)<!-- prefix: "def pressure" --> · [Anchor fixture](../tests/prefix/pool_routes.py#L459)<!-- prefix: "def anchors(" --> · [GPU pool checks](performance.md#gpu-pool-engineering-checks)
 
-The archived direct-store fixture covers held IPC leases, worker restart, and terminal STORE reply order. [Archived v4 procedure](https://github.com/para1lel/sglang.cpp/blob/3b138b699bdf47b02a7dde8ef5e07142ee699d3f/docs/prefix-cache.md#verification) · [Device state and graph controls](../tests/prefix/README.md#device-state-and-graph-controls)
+Check held IPC leases, worker restart, and terminal STORE reply order with the [device state and graph controls](../tests/prefix/README.md#device-state-and-graph-controls).
 
 ### Live control regression
 
-Check malformed controls, busy/idle reset, bounded profiles, and peer graph eligibility. After cold reset require zero cached IDs. On replay after acknowledge and drain, require the expected restored length and identical first scores, IDs, finish and usage. [Former resident-cache procedure](https://github.com/para1lel/sglang.cpp/blob/a7583f7b6346b5eb91aba2cba4748a6461e60fb4/docs/prefix-cache.md#verification). [In-process fence installation](../tests/prefix/lmcache_relay.py#L496)<!-- prefix: "def install_" --> · [Terminal send trace](../tests/prefix/lmcache_send_trace.py#L31)<!-- prefix: "def terminal" -->
+Check malformed controls, busy/idle reset, bounded profiles, and peer graph eligibility. After cold reset require zero cached IDs. On replay after acknowledge and drain, require the expected restored length and identical first scores, IDs, finish and usage. [In-process fence installation](../tests/prefix/lmcache_relay.py#L496)<!-- prefix: "def install_" --> · [Terminal send trace](../tests/prefix/lmcache_send_trace.py#L31)<!-- prefix: "def terminal" -->
 
 ### Flush verification
 
@@ -126,6 +124,6 @@ At idle, try both flush methods with reuse on and off. Check the [status, body, 
 
 Hold a stream active and send three overlapping HTTP flushes in order with short, short, and zero timeouts. Keep the stream active through both deadlines. Expect two timeout replies followed by the busy reply. Verify that a failed flush preserves a primed hit. Repeat with two longer waits and finish the stream. Expect both flushes to succeed in order. Check `/health` while the flush worker waits.
 
-### W3-prefix
+### Prefix continuation
 
-Use the current [K4 warm-prefix diagnostic](../benchmarks/paired/README.md#prefix-reuse-diagnostic) for both engines. The [historical K0 W3-prefix procedure](https://github.com/para1lel/sglang.cpp/blob/28148cda233e5522274e258d5eb5caa9ab83e313/docs/prefix-cache.md#w3-prefix) preserves the 25,600 restored and 7,168 computed row gates.
+Follow the [LMCache route checks](../tests/prefix/README.md#device-state-and-graph-controls) for restored and independently computed row counts, cache misses, and first-score and continuation parity.

@@ -1,6 +1,6 @@
 # Native text completions
 
-`POST /v1/completions` serves `Qwen3.8-27B-FP8` with text or token-ID prompts and the frozen `benchmark` model with [token-ID SSE](../benchmarks/streaming/README.md#wire-contract). See [native chat](chat-serving.md), [`POST /generate`](native-generate.md), and [CPU tokenization](native-tokenization.md).
+`POST /v1/completions` serves `Qwen3.8-27B-FP8` with text or token-ID prompts and the `benchmark` alias with [token-ID SSE](#token-id-streaming-alias). See [native chat](chat-serving.md), [`POST /generate`](native-generate.md), and [CPU tokenization](native-tokenization.md).
 
 ## Send a request
 
@@ -21,7 +21,7 @@ curl --fail-with-body http://127.0.0.1:17384/v1/completions \
 
 Each string must contain 1 to 1,048,576 UTF-8 bytes. Each ID sequence must be nonempty and contain integers in `[0, 248320)`. IDs go directly to the decoder. Each prompt and its output budget must fit 262,144 tokens. A batch contains 1 to 32 prompts of one form and shares request options across all items. The sum of output budgets must be at most 262,144 tokens. Invalid prompts and options return HTTP 400 before decoder admission. [Prompt parsing](../apps/server/text_request.cpp#L464)<!-- prefix: "TextCompleti" --> · [Resident memory admission](batch-graphs.md#resident-memory-admission)
 
-The [HTTP reader](http-server.md#http-admission-and-shutdown) limits headers and bodies. Text and chat reject malformed JSON, duplicate decoded keys, more than 32 nested containers, and floating-point range errors. Oversized integer `top_k` is validated before clamping. The frozen `benchmark` parser retains signed-zero underflow and fixed fields. [Numeric dispatch](../apps/server/completions.cpp#L175)<!-- prefix: "json::Value " --> · [Benchmark parser](../apps/server/completions.cpp#L28)<!-- prefix: "CompletionRe" -->
+The [HTTP reader](http-server.md#http-admission-and-shutdown) limits headers and bodies. Text and chat reject malformed JSON, duplicate decoded keys, more than 32 nested containers, and floating-point range errors. Oversized integer `top_k` is validated before clamping. The [token-ID alias](#token-id-streaming-alias) accepts signed-zero underflow for `temperature`. [Numeric dispatch](../apps/server/completions.cpp#L175)<!-- prefix: "json::Value " -->
 
 | Field | Behavior |
 | --- | --- |
@@ -47,6 +47,12 @@ Echo copies string prompts and decodes ID prompts with special tokens hidden. Ea
 The text route accepts [output penalties](output-penalties.md), including `repetition_penalty`, and rejects `max_completion_tokens` and unknown options. [Request options](../apps/server/text_request.cpp#L453)<!-- prefix: "bool is_text" -->
 
 Text, chat, and `/generate` share the immutable tokenizer. The server verifies checkpoint `tokenizer.json` size and SHA-256 on first use. Missing, unreadable, or mismatched assets return 500 before output. Later requests retry. Benchmark IDs need no tokenizer.
+
+## Token-ID streaming alias
+
+For `model: "benchmark"`, send a nonempty `prompt` array of token IDs and a nonnegative integer `max_tokens`. Set `temperature` and `seed` to `0`, `stream`, `ignore_eos`, and `return_token_ids` to `true`, `stream_interval` to `1`, `add_special_tokens` to `false`, and `stream_options` to `{"include_usage":true}`. The parser also accepts `cache_salt` and `stop_token_ids` containing one nonnegative integer. Other fields return 400. [Alias parser](../apps/server/completions.cpp#L28)<!-- prefix: "CompletionRe" -->
+
+The response uses `text/event-stream`. Each token event contains one choice with `index: 0`, the new ID in `token_ids`, and `finish_reason: null`. The terminal choice has an empty `token_ids` array and the finish reason. The first choice includes `prompt_token_ids`, even when it is also the terminal choice. A usage event follows with `choices: []`, prompt and completion counts, and restored prompt IDs in `prompt_tokens_details.cached_tokens`. The stream ends with `data: [DONE]`. [Token and terminal events](../apps/server/completions.cpp#L113)<!-- prefix: "void finish_" --> · [HTTP stream behavior](http-server.md#completion-streams)
 
 ## Serial prefill
 
@@ -80,9 +86,9 @@ Raw text defaults to `temperature: 1`, `top_p: 1`, `top_k: -1`, and `min_p: 0`. 
 
 CUDA orders scores descending, breaking ties by lowest token ID. It exponentiates temperature-scaled differences. The nucleus includes the first token whose cumulative weight exceeds `top_p` times total row weight. Draw from the intersection of nucleus, top-k and weights meeting `min_p`. The resolved seed and zero-based output index determine each draw. Identical rows and options preserve draws across slots. Options are validated even for greedy decoding.
 
-Unseeded sampling resolves one seed with `std::random_device`. Text can use [sampled MTP](mtp.md#sampled-mtp), including constraints. K0 uses eager or [eligible graph logits](batch-graphs.md#runtime-path). The frozen benchmark client stays greedy with `temperature: 0`, `seed: 0`, and `ignore_eos: true`.
+Unseeded sampling resolves one seed with `std::random_device`. Text can use [sampled MTP](mtp.md#sampled-mtp), including constraints. K0 uses eager or [eligible graph logits](batch-graphs.md#runtime-path).
 
-Negative infinity masks a token. NaN, positive infinity, or no finite logits yields `DecoderSamplingError` in direct unconstrained generation and `sampling_failed` in batch mode. The failed lane retires and peers continue. See [HTTP failure mapping](http-server.md#completion-streams). [Seed resolution](../src/decoder.cpp#L122)<!-- prefix: "SamplingPara" --> · [Cutoff and draw](../src/decoder_sampling.cu#L195)<!-- prefix: "__global__ v" --> · [Batch dispatch](../apps/server/batch_service.cpp#L873)<!-- prefix: "DecoderResul" --> · [Sample readback](../src/decoder.cpp#L378)<!-- prefix: "int read_tok" --> · [Batch retirement](../src/decoder_batch.cpp#L871)<!-- prefix: "if (result.s" --> · [Benchmark request](../benchmarks/streaming/client.py#L40)<!-- prefix: "def request_" -->
+Negative infinity masks a token. NaN, positive infinity, or no finite logits yields `DecoderSamplingError` in direct unconstrained generation and `sampling_failed` in batch mode. The failed lane retires and peers continue. See [HTTP failure mapping](http-server.md#completion-streams). [Seed resolution](../src/decoder.cpp#L122)<!-- prefix: "SamplingPara" --> · [Cutoff and draw](../src/decoder_sampling.cu#L195)<!-- prefix: "__global__ v" --> · [Batch dispatch](../apps/server/batch_service.cpp#L873)<!-- prefix: "DecoderResul" --> · [Sample readback](../src/decoder.cpp#L378)<!-- prefix: "int read_tok" --> · [Batch retirement](../src/decoder_batch.cpp#L871)<!-- prefix: "if (result.s" -->
 
 ## Finite-choice constraints
 
@@ -129,7 +135,7 @@ On a reserved B200, run `python -B tests/text/test_native_text.py --port 17384 -
 
 Require matched seeded IDs, finishes, and usage across text/chat and JSON/SSE at identical logits, including eager, replay and slot reuse. Use the [CUDA oracle](../tests/text/README.md#sampling) for tie, cutoff, mask and invalid rows. Check greedy and seed boundaries, omitted seed, `top_k` clamping, invalid controls, peer survival and one four-byte readback per sampled row without diagnostics. Apply the [positive depth gates](mtp.md#sampled-verification).
 
-Use a separate checkpoint directory sharing immutable weights. Remove or invalidate its tokenizer and run the fixture with `--expect-tokenizer-error`. Require exit zero, text 500 and unchanged benchmark IDs. Restore the tokenizer and require the next text request to succeed in the same process. Follow the [benchmark checks](development.md#streaming-verification).
+Use a separate checkpoint directory sharing immutable weights. Remove or invalidate its tokenizer and run the fixture with `--expect-tokenizer-error`. Require exit zero, text 500 and unchanged token-ID alias output. Restore the tokenizer and require the next text request to succeed in the same process. Follow the [streaming smoke check](development.md#streaming-verification).
 
 ### Finite-choice verification
 

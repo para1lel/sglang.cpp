@@ -1,4 +1,4 @@
-"""Check W3 cache reuse, selective recovery, and isolation using a private real daemon."""
+"""Check cache reuse, selective recovery, and isolation using a private daemon."""
 
 import argparse
 import base64
@@ -10,7 +10,6 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "benchmarks" / "paired"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tests"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
@@ -41,13 +40,12 @@ from lmcache_split_routes import (
     worker_restart,
 )
 
-from benchmarks.concurrent.reference import load_lanes
 from media import http_routes as http
 
 
-def fixture(fixtures: Path) -> list[list[int]]:
-    lanes = load_lanes(fixtures, "W3")
-    return [case["prompt_token_ids"] for _, _, case in lanes[:2]]
+def fixture() -> list[list[int]]:
+    path = Path(__file__).resolve().parents[1] / "fixtures/cache_route_prompts.json"
+    return json.loads(path.read_bytes())
 
 
 def natural_prefix(witness: Witness, source: list[int], unrelated: list[int], tp: int) -> Evidence:
@@ -215,7 +213,6 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("server", type=Path)
     parser.add_argument("checkpoint", type=Path)
-    parser.add_argument("fixtures", type=Path)
     parser.add_argument("daemon", type=Path, help="Private LMCache 0.5.8 Unix socket")
     parser.add_argument("evidence", type=Path)
     parser.add_argument(
@@ -231,7 +228,7 @@ def main() -> None:
     args = parser.parse_args()
     args.evidence.mkdir(parents=True)
     assert control(args.daemon, NAMESPACE, READY) == (0, WIRE_VERSION)
-    source, unrelated = fixture(args.fixtures)
+    source, unrelated = fixture()
     with TemporaryDirectory(prefix="sglang-cache-test.", dir="/tmp") as work:
         relay_path = Path(work) / "cache.sock"
         relay = Relay(relay_path, args.daemon)

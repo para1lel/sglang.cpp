@@ -32,27 +32,16 @@ CUDA submission errors propagate. An execution failure can leave request state a
 
 For current ReplaySSM, compare outputs and materialized checkpoints against an independent recurrence. Exercise zero, partial and full consumption, replacement rows, rollover, and mixed-length packed lanes. Rebind requests before replaying each captured path and verify that an actual graph launch occurred. Compare fixed-history logits and continuation across restore. Report free-running output differences separately. [Operator qualification](performance.md#operator-qualification)
 
-The isolated B200 probe matched the packaged `81b477126d5b` build bitwise in 40 cases at full and rank-local widths. It compared outputs, replay state, and materialized checkpoints for 1, 2, 8 and 16 lanes with one to five rows. The 12-layer captured probe used 16 rank-local lanes accepting all five rows. Its median fell from 62.912 to 50.116 µs per layer, including convolution, recurrence, finish and commit. The packaged object's encoded instructions matched the timed variant. See `all-shape-parity.log`, `rank-local-interleaved.log` and `packaged-sass-parity.log` in `artifacts/pool-w6/verification/w4-ordered-replay/`.
+The isolated B200 probe matched the packaged `81b477126d5b` build bitwise in 40 cases at full and rank-local widths. It compared outputs, replay state, and materialized checkpoints for 1, 2, 8 and 16 lanes with one to five rows. The 12-layer captured probe used 16 rank-local lanes accepting all five rows. Its median fell from 62.912 to 50.116 µs per layer, including convolution, recurrence, finish and commit. The packaged object's encoded instructions matched the timed variant.
 
-The packaged TP1 checkpoint check passed six cases and graph reuse at accepted cuts of 5, 2 and 0 rows. A shortened TP2 W4 comparison on the same ordered B200 pair matched all 16,384 output IDs. Across 16 lanes with 32,768 prompt and 1,024 output tokens each, median steady latency fell from 3.353 to 3.210 ms/token. Makespan fell from 18.214 to 17.905 seconds. See `artifacts/pool-w6/verification/w4-4895ca-recurrence-comparison.json` and `artifacts/pool-w6/verification/w4-ordered-replay/model-checkpoint.log`.
+The packaged TP1 checkpoint check passed six cases and graph reuse at accepted cuts of 5, 2 and 0 rows.
 
-Check bitwise gate output and intact guards at both rank widths for 2–5, 20, 40, 60, 80 and 160 rows. Require one launch for eligible shapes and zero submissions for invalid tails or misalignment. In isolated TP2 80-row tests, 48 layers took 0.822288 ms with grouped launches and 0.290915 ms with one launch per layer. See `artifacts/pool-w6/verification/w6-prefill-nsys.H85aZmFJ/w4-gate.VoIJ7bEg/final-paired-timing.log`. [Gate checks](../tests/decoder/decode_bandwidth_check.cpp#L109)<!-- prefix: "void verific" -->
+Check bitwise gate output and intact guards at both rank widths for 2–5, 20, 40, 60, 80 and 160 rows. Require one launch for eligible shapes and zero submissions for invalid tails or misalignment. In the isolated 80-row B200 TP2 gate projection, 48 layers took 0.822288 ms with grouped launches and 0.290915 ms with one launch per layer. [Gate checks](../tests/decoder/decode_bandwidth_check.cpp#L109)<!-- prefix: "void verific" -->
 
-### Historical TP2 80-row caller replay
+### TP2 80-row caller checks
 
-Compare complete verifier results on both ranks. Replay one- through four-row prefixes and check carry mutation detection. Cover alignment, full-model and wider controls, guarded buffers, and direct operator capture. [Frozen W4 target interval and prefix replay receipts](https://github.com/para1lel/sglang.cpp/blob/a5974ba4eb99bd8e8f890c2e7262a27dbc3aace1/docs/gdn-decode.md#tp2-80-row-caller-replay)
+Compare complete verifier results on both ranks. Replay one- through four-row prefixes and check carry mutation detection. Cover alignment, wider controls, guarded buffers, and direct operator capture.
 
-Use the focused replay bundle on a B200 with the default Pixi CUDA 13.4 environment and CUDA compatibility library. The wrapper requires both shared GPU4 reservations. From a copy of the bundle, verify the executable and input hashes against the frozen checkpoint identity. Use fresh run tags.
+Use the [batched target GDN fixture](../tests/decoder/README.md#batched-target-gdn) for scalar comparison and graph reuse. In operator replay, require bitwise parity for BF16 observables, output and convolution history, and FP32 recurrent state. Check inactive output sentinels and compare eager execution with graph replay after rebinding state pointers. Cover zero, partial, and full active counts across the submitted buckets. Use unfiltered initcheck to observe both the writer and the reader.
 
-```bash
-set -euo pipefail
-awk 'NF == 2 && $1 ~ /^[0-9a-f]+$/ && length($1) == 64' \
-    runs/frozen-checkpoint.identity | sha256sum -c -
-cmp source/replay-probe.sm100 build/bin/probe
-bash gpu4.sh review-checkpoint checkpoint 13
-bash gpu4.sh review-sweep sweep 13
-```
-
-Require bitwise parity for the BF16 observable, final BF16 output, BF16 convolution history, and FP32 recurrent state. Check inactive output sentinels and compare eager execution with graph replay after rebinding the state pointers. Cover zero, partial, and full active counts across all submitted buckets. Record which checkpoint inputs were reconstructed and which were synthetic. For sanitizer coverage, use unfiltered initcheck so it observes both the writer and the reader.
-
-Time convolution, recurrence, and finish together with paired CUDA events. Exclude capture and bindings. Report submitted and active widths and the width-eight boundary. [Frozen workload and isolated-to-serving projection](https://github.com/para1lel/sglang.cpp/blob/a5974ba4eb99bd8e8f890c2e7262a27dbc3aace1/docs/gdn-decode.md#verification)
+Time convolution, recurrence, and finish together with paired CUDA events. Exclude capture and bindings. Report submitted and active widths and the width-eight boundary.

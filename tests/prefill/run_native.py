@@ -20,7 +20,7 @@ from batch.run_native import (
 )
 
 BOUNDARIES = (1, 2, 127, 128, 129, 257, 511)
-PROMPT_SHA256 = "314fb913d558ac717a0a0a2ac86c7d310ea06dd0b4558ce160a141dd18564c43"
+PROMPT_SHA256 = "1d8e1d0fcb8b2bb3d79bda9aab7159cb0009e4e9e2ff11365e5a033216232797"
 BATCH_TOKEN_BUDGET = 128
 PREFILL = re.compile(
     rb"^batch width=(\d+) decode=(\d+) request_bytes=\d+\n"
@@ -29,10 +29,9 @@ PREFILL = re.compile(
 
 
 def load_cases():
-    prompt_file = ROOT.parent.parent / "benchmarks" / "streaming" / "W2.json"
-    prompt_bytes = prompt_file.read_bytes()
-    require(hashlib.sha256(prompt_bytes).hexdigest() == PROMPT_SHA256, "W2 prompt changed")
-    prompt = json.loads(prompt_bytes)["prompt_token_ids"]
+    prompt_bytes = (ROOT.parent / "fixtures/prefill_prompt.json").read_bytes()
+    require(hashlib.sha256(prompt_bytes).hexdigest() == PROMPT_SHA256, "Prefill prompt changed")
+    prompt = json.loads(prompt_bytes)
     oracle = json.loads((ROOT / "serial-oracle.json.fixture").read_text())
     require(tuple(map(int, oracle)) == BOUNDARIES, "Invalid prefill boundary fixture")
     cases = {}

@@ -286,7 +286,7 @@ void emit_resident_prefix_metrics(const DecoderPrefixCacheStats& cache, const Em
 }
 
 std::string format_metrics(const BatchMetrics& metrics, int running, std::size_t waiting) {
-    std::string text = "# Native sglang.cpp metrics with frozen W3-prefix compatibility names\n";
+    std::string text = "# Native sglang.cpp metrics\n";
     const auto emit = [&text](std::string_view name, auto value) {
         text += name;
         text += "{engine=\"0\"} ";

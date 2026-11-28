@@ -48,7 +48,7 @@ The resident path can combine three or four consecutive full tiles from the same
 
 Check staged and ordinary readers with fixed grants and source pages. Cover unaligned starts, three- and four-tile groups, eligible tail tiles, visible KV repair, and visibility through 262,144. Require clean decline when scratch is short and propagation on unexpected CUDA errors.
 
-The isolated reader probe compared 198,180,864 output elements across 24 TP1 and TP2 cases against FP64. Maximum absolute error was 0.0086611 and maximum normalized RMSE was 0.0023062. The probe also checked clean decline for missing, short or overlapping scratch and graph capture. See `artifacts/pool-w6/tmem/w6-profile.kecUkXXS/resident-parity-tp{1,2}.log`.
+The isolated reader probe on B200 compared 198,180,864 output elements across 24 TP1 and TP2 cases against FP64. Maximum absolute error was 0.0086611 and maximum normalized RMSE was 0.0023062. The probe also checked clean decline for missing, short or overlapping scratch and graph capture.
 
 ## Constraints and failure behavior
 
@@ -73,7 +73,7 @@ See the [upstream attention and operand-precision references](https://github.com
 
 Check BF16 results against independent FP64 and compare logits and IDs. Test causality, remaps, guards, repair, graph replay, and dispatch fallbacks.
 
-Run the [Flash regression](../tests/mxfp8_gqa_flash_check.cu#L936)<!-- prefix: "void check_f" --> on a reserved B200 using the [checker commands](development.md#p2-gqa-verification). Against FP64, require sampled maximum absolute error below 0.08 and normalized RMSE below 0.005. [FP64 limits](../tests/mxfp8_gqa_flash_check.cu#L400)<!-- prefix: "if (!(max_ab" -->
+Run the [Flash regression](../tests/mxfp8_gqa_flash_check.cu#L936)<!-- prefix: "void check_f" --> on a reserved B200 using the [checker commands](development.md#gqa-verification). Against FP64, require sampled maximum absolute error below 0.08 and normalized RMSE below 0.005. [FP64 limits](../tests/mxfp8_gqa_flash_check.cu#L400)<!-- prefix: "if (!(max_ab" -->
 
 The [partial boundary cases](../tests/mxfp8_gqa_flash_check.cu#L814)<!-- prefix: "void check_p" --> cover the 143/144 and 191/192/193 row boundaries and unaligned K/V scale parity. [Tail recovery](../tests/mxfp8_gqa_flash_check.cu#L852)<!-- prefix: "void check_t" --> confines nonfinite outputs to affected channels on the final active row.
 
@@ -81,7 +81,7 @@ The [long-context cases](../tests/mxfp8_gqa_flash_check.cu#L752)<!-- prefix: "vo
 
 Check ordered and protected fallback bitwise against the ordered FP32 reference for finite scores and quotients. Check FP64 recovery independently. Use the [exact prefill runbook](../tests/prefill/README.md) for the separate `exact` contract.
 
-If a partial Flash change preserves arithmetic, match BF16 outputs bitwise on identical checkpoint Q and KV. In that comparison, match full-vocabulary BF16 logits and greedy IDs across prefill and decode with identical grants and teacher tokens. For reordered arithmetic, follow the [operator qualification procedure](performance.md#operator-qualification). Cover unaligned starts, remaps, unwritten tails, and unchanged shapes. Weight eager timings by recorded tile counts.
+If a partial Flash change preserves arithmetic, match BF16 outputs bitwise on identical checkpoint Q and KV. In that comparison, match full-vocabulary BF16 logits and greedy IDs across prefill and decode with identical grants and teacher tokens. For reordered arithmetic, follow the [operator qualification procedure](performance.md#operator-qualification). Cover unaligned starts, remaps, unwritten tails, and unchanged shapes.
 
 The [lower-edge cases](../tests/mxfp8_gqa_flash_check.cu#L731)<!-- prefix: "void check_p" --> check dispatch and alignment at 4,096. [Graph checks](../tests/mxfp8_gqa_flash_check.cu#L338)<!-- prefix: "void check_d" --> require one node for the automatic path. The [historical split checks](https://github.com/para1lel/sglang.cpp/blob/93648269d852e0fee78f7af4d1c3ffe4897aa361/tests/mxfp8_gqa_flash_check.cu#L352)<!-- prefix: "void check_t" --> verified graph dependencies and scratch lifetime.
 
@@ -89,11 +89,11 @@ The [lower-edge cases](../tests/mxfp8_gqa_flash_check.cu#L731)<!-- prefix: "void
 
 The [aligned regression](../tests/mxfp8_gqa_flash_check.cu#L628)<!-- prefix: "void check_p" --> checks dispatch, replay, causality, and 1,023-row parity with synchronous 64-row Flash using unaligned V scales. The [unaligned regression](../tests/mxfp8_gqa_flash_check.cu#L710)<!-- prefix: "void check_u" --> checks page offsets 1, 63, 64, and 127, replay, short page counts, and causal repair.
 
-Check complete BF16 parity and exactly one paired graph node on remapped aligned and unaligned 1,024-row captures. Mutate visible V on full and partial pages, check unaffected rows and heads, then run memcheck, initcheck and synccheck on repair with unwritten tails. Record racecheck coverage. Test raw at zero, singleton staging at 31,744/32,768, group starts 1,024/7,168/8,192/130,048, both visibility transitions, off-grid starts, mixed grant order, and short-page or misaligned inputs. Compare staged one- and two-lane subgroups against paired for full BF16 scores, IDs, GDN, hidden/residual state and target KV, and draft continuation. Check causality with an independent FP64 sample. Require parity on clean decline and propagate submission errors. Time raw paired graphs A/B/B/A, weighted by launch count. Use [partial-grant checks](ordered-gqa-prefill.md#verification) for 256/512-row grants and [serving gates](performance.md#scheduler-and-reporting-policy) for release. [Full paired replay and timing matrix](https://github.com/para1lel/sglang.cpp/blob/6debe50edccdeda34ff307235ed38e74b6b8f2ee/docs/flash-prefill.md#paired-ordered-tmem-verification)
+Check complete BF16 parity and exactly one paired graph node on remapped aligned and unaligned 1,024-row captures. Mutate visible V on full and partial pages, check unaffected rows and heads, then run memcheck, initcheck and synccheck on repair with unwritten tails. Record racecheck coverage. Test raw at zero, singleton staging at 31,744/32,768, group starts 1,024/7,168/8,192/130,048, both visibility transitions, off-grid starts, mixed grant order, and short-page or misaligned inputs. Compare staged one- and two-lane subgroups against paired for full BF16 scores, IDs, GDN, hidden/residual state and target KV, and draft continuation. Check causality with an independent FP64 sample. Require parity on clean decline and propagate submission errors. Time isolated raw paired graphs A/B/B/A on a B200 and record the grant shape and visible span. Use the [partial-grant checks](ordered-gqa-prefill.md#verification) for 256/512-row grants.
 
 ### Ordered TMEM operator verification
 
-Repeat remaps and causal boundaries with visible KV NaNs and query infinity. Compare BF16 against wide Flash. Measure operator, checkpoint, and serving separately.
+Repeat remaps and causal boundaries with visible KV NaNs and query infinity. Compare BF16 against wide Flash. For isolated timing, report the B200 rank configuration, row count and visible span.
 
 ### Split TMEM operator verification
 
@@ -101,4 +101,4 @@ Verify graph replay, output guards, and causal invariance at 65,536, 98,304, and
 
 ### TMEM checkpoint verification
 
-The archived split TMEM checkpoint probe changed greedy first tokens at 65,536 and 98,304 tokens. The retired page-128 study changed first tokens at 16,384 and 32,768 tokens. [Frozen TMEM verification and reproduction](https://github.com/para1lel/sglang.cpp/blob/f6c74b50d57dff48137d2e4a19c0a9c99a15bd20/docs/flash-prefill.md#tmem-checkpoint-verification) · [Page-128 study](https://github.com/para1lel/sglang.cpp/blob/4dd8c887c278c67744ed80e7feb2a825a92197a2/docs/sm100-page128-prefill.md) · [Serving gate](performance.md#measurement)
+The split TMEM checkpoint probe changed greedy first tokens at 65,536 and 98,304 tokens. The retired page-128 study changed first tokens at 16,384 and 32,768 tokens. [Page-128 study](https://github.com/para1lel/sglang.cpp/blob/4dd8c887c278c67744ed80e7feb2a825a92197a2/docs/sm100-page128-prefill.md)

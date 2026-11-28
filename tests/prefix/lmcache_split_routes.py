@@ -5,7 +5,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, NamedTuple
 
-from cold_cache import parse_metrics
+from live_controls import parse_metrics
 from lmcache_relay import DRAFT, GDN, GQA, PREFIX_DETAIL, RANK_GET, RANK_PUT
 from lmcache_route_helpers import Stream, Witness, backup_under_pressure, tokens, transfer_records
 

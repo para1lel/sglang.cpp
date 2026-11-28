@@ -42,11 +42,11 @@ busy replies, reader responsiveness, and separate reset acknowledgements after t
 
 ## LMCache route checks
 
-Use a Release server, the frozen W3 fixtures, and a private LMCache 0.5.8 daemon with at least 4 GiB on the same GPUs. Set `TP` to `1` or `2` and pass a fresh evidence directory. Add `--alternate-checkpoint` with a compatible checkpoint containing different weights to check weight isolation.
+Use a Release server and a private LMCache 0.5.8 daemon with at least 4 GiB on the same GPUs. The runner reads its fixed prompts from the test tree. Set `TP` to `1` or `2` and pass a fresh evidence directory. Add `--alternate-checkpoint` with a compatible checkpoint containing different weights to check weight isolation.
 
 ```bash
 PYTHONPATH="$PWD" python3 -B tests/prefix/lmcache_routes.py \
-    "$SGLANG_SERVER" "$CHECKPOINT" "$W3_FIXTURES" "$LMCACHE_SOCKET" "$EVIDENCE" \
+    "$SGLANG_SERVER" "$CHECKPOINT" "$LMCACHE_SOCKET" "$EVIDENCE" \
     --tp "$TP"
 ```
 

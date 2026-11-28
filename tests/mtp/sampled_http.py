@@ -17,6 +17,7 @@ from uuid import uuid4
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from batch.run_native import Stream, choose_port, require, stop_server, wait_until_ready, write_json
+from checkpoint_prompts import load_prompt
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "prefix"))
 from live_controls import GDN_ENTRIES, Controls
@@ -342,12 +343,11 @@ def finish_stream(stream):
 
 
 def checkpoint_prompt():
-    fixture = Path(__file__).resolve().parents[2] / "benchmarks/streaming/W2.json"
-    return json.loads(fixture.read_text())["prompt_token_ids"] * 4
+    return load_prompt("prefill") * 4
 
 
 def check_queue_and_reset(args):
-    output = args.evidence / "w2-prefix-queue"
+    output = args.evidence / "prefix-queue"
     flags = ("--batch-cuda-graphs", "--lmcache-socket", str(args.lmcache_socket))
     with server(args, output, 2, 0, flags=flags, token_budget=CACHE_BOUNDARY) as (port, _):
         controls = Controls(port, output)
@@ -389,7 +389,7 @@ def check_queue_and_reset(args):
 
 
 def check_eager_cache(args):
-    output = args.evidence / "w1-eager-prefix"
+    output = args.evidence / "eager-prefix"
     flags = ("--eager", "--lmcache-socket", str(args.lmcache_socket))
     prompt = checkpoint_prompt()
     body = LONG | {"prompt": prompt + [31], "cache_salt": uuid4().hex}

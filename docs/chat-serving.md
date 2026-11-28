@@ -121,7 +121,7 @@ The server caps patch grids at 4,096 patches per frame and 16,384 per request. M
 
 On a reserved B200, use a release server with the pinned checkpoint and `--max-active 1 --mtp-steps 0`. Run `python3 -B tests/text/test_native_chat.py --port 17384 -v` with the [chat fixtures](../tests/text/README.md#chat-layer-1). Require exact rendered IDs and usage, JSON/SSE parity, stop IDs without stop text, HTTP rejection and reset recovery. Compare equivalent raw text with a cross-token stop, fixed seed and scores. Cover omitted, null, and explicit sampling in both modes, both alias orders, and default-budget boundaries after rendering and expansion.
 
-Apply [MTP parity checks](mtp.md#verification) at singleton and overlapping widths and the [constraint checks](mtp.md#constrained-verification). A mixed chat/text/benchmark cohort must match same-policy controls and launch a real multi-lane graph. Match peers and replacements after a chat reset. Run [text](text-serving.md#verification) and [benchmark](development.md#streaming-verification) separately. Record the [performance controls](performance.md).
+Apply [MTP parity checks](mtp.md#verification) at singleton and overlapping widths and the [constraint checks](mtp.md#constrained-verification). A cohort mixing chat, text and the token-ID alias must match same-policy controls and launch a real multi-lane graph. Match peers and replacements after a chat reset. Run the [text](text-serving.md#verification) and [streaming smoke](development.md#streaming-verification) checks separately.
 
 ### Qwen output checks
 
@@ -129,8 +129,8 @@ Run the [Qwen chat output checks](../tests/text/README.md#qwen-chat-output) on i
 
 ### Media checks
 
-Run `python3 -B -m benchmarks.media.collect verify` on a reserved B200 with K0, capacity one, and reuse off. Decode the [frozen](../benchmarks/media/README.md) PNG and MP4 frames `[0,2,4,7]` to RGB8 and check byte hashes. Preserve text, FPS, indices and options except codec-only kwargs. Require all 128 frozen expanded IDs, 128 output IDs, `length`, usage `128/128/256`, zero cached IDs and SSE `[DONE]`. Match IDs across JSON, SSE and eager. Check pre-SSE rejection and cancellation. Use the [mixed media/text gates](../tests/media/http-contract.md) for positive depth, cold/warm usage, and changed-media misses. [Build and replay procedure](https://github.com/para1lel/sglang.cpp/blob/acbf95b0de14108b37c37bdc3dc40daaf2db2099/docs/chat-serving.md#media-checks)
+Run the [RGB8 media contract checks](../tests/media/http-contract.md) on a reserved B200. Match prompt and output IDs, usage, finish, and SSE `[DONE]` across JSON and SSE. Check pre-SSE rejection and cancellation. Run the mixed media/text and feature-complete modes for positive depth, cold and warm usage, and changed-media misses.
 
 ### Codec checks
 
-Set an absolute `--media-codec-prefix` with libpng and FFmpeg headers and libraries (`png16`, `avformat`, `avcodec`, `swscale`, `avutil`). Match expanded IDs, outputs, usage and finishes across JSON/SSE for RGB8 on both builds and unchanged frozen compressed requests on the codec build, in default and eager modes. Reject disabled codecs and malformed or over-limit input before SSE. [Codec build and replay](https://github.com/para1lel/sglang.cpp/blob/acbf95b0de14108b37c37bdc3dc40daaf2db2099/docs/chat-serving.md#codec-checks) · [Cross-engine timing](../benchmarks/media/README.md#reproduce-the-measurement)
+Set an absolute `--media-codec-prefix` with libpng and FFmpeg headers and libraries (`png16`, `avformat`, `avcodec`, `swscale`, `avutil`). Follow the [codec fixture procedure](../tests/media/http-contract.md#optional-codecs). Match expanded IDs, outputs, usage and finishes across JSON/SSE for RGB8 on both builds and compressed requests on the codec build, in default and eager modes. Reject disabled codecs and malformed or over-limit input before SSE.

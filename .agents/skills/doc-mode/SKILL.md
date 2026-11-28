@@ -88,6 +88,8 @@ Keep durable conclusions in component documents and project knowledge.
 Research reports remain under `docs/research/` with their own owner.
 Use a run record for values that change on a rerun while the contract stays the same.
 Examples include candidate tree IDs, report hashes, check totals, timings, and local report paths.
+Follow the target project's formal performance standard. For sglang.cpp, use AgentX as documented in `docs/performance.md` at the project root.
+Keep independent correctness and kernel diagnostics associated with their actual hardware and shape.
 Keep source citations that support a durable claim and dependency pins that define the environment.
 Before removing an old document report, preserve its reusable conclusions and required evidence.
 Retain original bytes and hashes or an exact recoverable Git revision.

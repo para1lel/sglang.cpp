@@ -38,13 +38,13 @@ The TP runtime owns one executable for its verifier stream pair. Each replay ref
 
 On B200 TP2, one unbound greedy MTP lane with three to five target rows and Tensor Core vocabulary scratch can write packed FP8 directly if both ranks select Tensor Core projections and neither binds an external packed buffer. Sampling, constraints, and requested logits or logprobs bypass this singleton route. Healthy eager MNNVL can also fuse reduction with RMSNorm and quantization. A transport decline keeps ordinary allreduce and local fused preparation. The route preserves BF16 rounding, E4M3 values, and FP32 scales. [Caller](../src/runtime/execution/tp_verify_graph.cpp#L409)<!-- prefix: "const auto f" --> · [Selection](../src/runtime/execution/decoder_forward_tp.cpp#L224)<!-- prefix: "const bool n" --> · [Partial RMSNorm](../src/text_normalization.cu#L464)<!-- prefix: "cudaError_t " -->
 
-Require 127 fused sites per rank for eligible singleton widths three through five and the two-lane ten-row control. Require zero for two-row, sampled, and scored singleton controls. Compare IDs, both ranks’ KV, GDN, hidden and residual state, and winner scores. [Frozen two-B200 and W1 HTTP replays](https://github.com/para1lel/sglang.cpp/blob/a5974ba4eb99bd8e8f890c2e7262a27dbc3aace1/docs/batch-graphs.md#eager-tp2-singleton-verification)
+On two B200s, require 127 fused sites per rank for eligible singleton widths three through five and the two-lane ten-row control. Require zero for two-row, sampled, and scored singleton controls. Compare IDs, both ranks’ KV, GDN, hidden and residual state, and winner scores.
 
 ### Eight-row TP2 draft repair
 
 For a greedy eight-lane TP2 group, rank 0 collects draft KV repairs across both four-lane commits when no output callback is active and packed scratch covers all lanes. Media, sampling, and constraints retain packet repair. Each depth needs all eight repair rows and scalar rotary positions below `text_attention_max_tokens`. Partial depths, MRoPE, and out-of-range positions use four-lane packets. Batched BF16 FC and FP8 K/V keep the packet arithmetic and MXFP8 cache layout. [Group guard](../src/decoder_batch.cpp#L814)<!-- prefix: "const bool g" --> · [Depth guard](../src/decoder_mtp.cpp#L692)<!-- prefix: "const bool g" --> · [BF16 FC](../src/text_ops.cu#L112)<!-- prefix: "__global__ v" --> · [FP8 K/V](../src/text/fp8_projection.cu#L623)<!-- prefix: "const bool e" -->
 
-Match hidden and KV repair records, proposals, and output IDs through full acceptance and a forced rejection. Require 28 captured nodes for eight and sixteen eligible lanes. Check ordinary MRoPE dispatch and zero live request bytes after slot reuse. [Frozen W3 replay and capture evidence](https://github.com/para1lel/sglang.cpp/blob/a5974ba4eb99bd8e8f890c2e7262a27dbc3aace1/docs/batch-graphs.md#eight-row-tp2-draft-repair)
+On two B200s, match hidden and KV repair records, proposals, and output IDs through full acceptance and a forced rejection. Require 28 captured nodes for eight and sixteen eligible lanes. Check ordinary MRoPE dispatch and zero live request bytes after slot reuse.
 
 ## Resident memory admission
 
@@ -100,10 +100,8 @@ The [grouped head checks](../tests/decoder/README.md#grouped-decode-lm-head) req
 
 Use [scheduler admission](../tests/batch/README.md#scheduler-admission) for caps, queueing, reuse, row accounting, and the [admission failure contract](#resident-memory-admission). Verify peer IDs, subsequent completion and readiness after recoverable OOM. On terminal fault, require 500 for new completions, 503 from readiness, and unchanged health limits. Pre-submission rejection and capture failure use eager. Post-submission failure propagates and retains resources until safe. Check reuse under Compute Sanitizer.
 
-Use an FP64 oracle with packed KV for both edges and adjacent lengths of page-parallel and legacy narrow dispatch. Check graph/eager parity, remaps, rebound positions, ordered fallback, masks, scratch guards, and unaffected heads through score overflow and cancellation. [GQA verifier](development.md#p2-gqa-verification) · [Full graph probe matrix](https://github.com/para1lel/sglang.cpp/blob/5ee79416d3e30cd178abab69598d047c4393793d/docs/batch-graphs.md#verification) [Test target](../xmake.lua#L427)<!-- prefix: "target(\"batc" -->
+Use an FP64 oracle with packed KV for both edges and adjacent lengths of page-parallel and legacy narrow dispatch. Check graph/eager parity, remaps, rebound positions, ordered fallback, masks, scratch guards, and unaffected heads through score overflow and cancellation. [GQA verifier](development.md#gqa-verification) · [Test target](../xmake.lua#L427)<!-- prefix: "target(\"batc" -->
 
-## Timing
+### Capture and replay diagnostics
 
-Compare default graph selection with `--eager` on one binary, with fixed prefill and prefix reuse off. Freeze requests, arrivals, device, and warmups. Measure request latency, replay, and cold capture separately. Verify widths in untimed traces.
-
-Before timing, repeat each native route for stable output IDs. If native builds diverge, compare full BF16 logit rows at the first differing step on their common history. Record the winner margin. Use the [strict concurrent policy](performance.md#native-concurrent-workloads) for HTTP serving.
+On a reserved B200, compare default graph selection with `--eager` in the same binary. Keep inputs, active lanes, prefill schedule, and prefix reuse fixed. Time graph capture and isolated replay separately and verify widths in untimed traces. If output IDs diverge, compare full BF16 logits and the winner margin at the first differing step on the common history.

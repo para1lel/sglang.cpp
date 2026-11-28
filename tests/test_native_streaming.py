@@ -14,7 +14,7 @@ import struct
 import unittest
 
 
-FIXTURE = Path(__file__).resolve().parents[1] / "benchmarks/vllm/small-fp8.json"
+FIXTURE = Path(__file__).resolve().parent / "fixtures/short_fp8.json"
 LOOPBACK = "127.0.0.1"
 COMPLETIONS = "/v1/completions"
 HEADERS = {

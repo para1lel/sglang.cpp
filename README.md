@@ -64,9 +64,8 @@ visibility of every GPU serving the model. [LMCache setup](docs/serving/lmcache.
 - The default build accepts text and decoded RGB8 images and video. Inline PNG
   and MP4 require the optional libpng and FFmpeg build. [Chat API](docs/chat-serving.md)
 - Text completions accept UTF-8 prompts and expose the benchmark token-ID API.
-  [Text API](docs/text-serving.md) · [Token-ID wire contract](benchmarks/streaming/README.md#wire-contract)
+  [Text API](docs/text-serving.md) · [Token-ID wire contract](docs/text-serving.md#token-id-streaming-alias)
 - See the HTTP guide for discovery, readiness, and admission limits. [HTTP server](docs/http-server.md)
-- The performance gate requires native LMCache makespan at or below 1.10× pinned
-  vLLM with KV offload disabled on every W1–W5 workload at each TP width. Run the
-  TP2 driver’s separate route qualification before timing. [Benchmark protocol](docs/performance.md) · [TP2 runbook and results](docs/serving/tp2.md)
+- AgentX 256k is the performance standard for comparing native LMCache and pinned
+  vLLM on TP1 and TP2. [Benchmark procedure](docs/performance.md#agentx-performance-standard) · [Measured AgentX results](docs/agentx-256k.md#timed-agentx-results)
 - Find component responsibilities and development commands in the [development guide](docs/development.md).

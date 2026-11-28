@@ -67,7 +67,7 @@ log = (Path(sys.argv[1]) / 'tp2.log').read_text()
 for rank, gpu in enumerate(sys.argv[2:]):
     match = re.search(rf'^rank={rank} device={rank} pid=\d+ .* uuid=([a-f0-9]+)$', log, re.M)
     assert match and match[1] == gpu[4:].replace('-', ''), (rank, gpu, log)
-golden = json.loads(Path("benchmarks/vllm/small-fp8-result.json").read_bytes())["output_ids"]
+golden = json.loads(Path("tests/fixtures/short_fp8.json").read_bytes())["expected_output_ids"]
 frames = []
 for tp in (1, 2):
     rows = {}

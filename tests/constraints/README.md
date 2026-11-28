@@ -30,7 +30,7 @@ The HTTP suite saves JSON and SSE. Select an idle GPU and set `LMCACHE_SOCKET` t
 
 ```bash
 server="$build/bin/sglang-server"
-python "$tests/http_contract.py" "$server" "$checkpoint" "$evidence/w1"
+python "$tests/http_contract.py" "$server" "$checkpoint" "$evidence/width-one"
 python "$tests/http_contract.py" "$server" "$checkpoint" "$evidence/eager" --eager
 python "$tests/http_contract.py" "$server" "$checkpoint" "$evidence/graph" \
     --width 4 --graph --mtp 1

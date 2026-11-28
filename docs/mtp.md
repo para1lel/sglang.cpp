@@ -87,7 +87,7 @@ Run the [MTP acceptance procedure](../tests/mtp/README.md) with both release bin
 
 For grouped winners compare full BF16 rows, IDs and scores at widths 2–4, including ties and invalid inputs. Trace mapped writes and lane fallback in eager and graph. Seed probes cover positions 1/127/128/129/257, long, partial, media and restored tiles and scores. Compare paired projection/rotary against per-slice controls and TMA FC against WMMA, and exercise SIMT. Match target state, draft KV and later logits when arithmetic is preserved. Require one paired projection and append per tile. Inject a second-slice failure and require first-slice-only advance and lane reuse.
 
-Compare target state with row-wise controls across zero, partial and full acceptance, rewind, KV crossings, mixed depths and score capacity. At widths 8/16/32 match grants, target dispatch, and fixed histories with four-lane drafting. Cover sparse K1 wider than four, one-row no-proposal grants, final eager token, zero budget, decline, hard errors, reset and zero retired bytes at capacity 32. Match IDs, finish and usage, distinguishing draft drift from committed state. [Wide projection controls](fp8-prefill-projections.md#wide-verifier-checks) · [Full MTP probe matrix](https://github.com/para1lel/sglang.cpp/blob/5ee79416d3e30cd178abab69598d047c4393793d/docs/mtp.md#verification) · [Timing](performance.md#native-mtp)
+Compare target state with row-wise controls across zero, partial and full acceptance, rewind, KV crossings, mixed depths and score capacity. At widths 8/16/32 match grants, target dispatch, and fixed histories with four-lane drafting. Cover sparse K1 wider than four, one-row no-proposal grants, final eager token, zero budget, decline, hard errors, reset and zero retired bytes at capacity 32. Match IDs, finish and usage, distinguishing draft drift from committed state. [Wide projection controls](fp8-prefill-projections.md#wide-verifier-checks) · [Native MTP diagnostics](performance.md#native-mtp)
 
 ### Verification graph checks
 
@@ -121,6 +121,4 @@ Follow the [positive-depth constraint checks](output-constraints.md#positive-dep
 
 ### Measured trade-offs
 
-Early rejection can waste precomputed rows and require GDN replay. Measure the intended prompts, depth, verifier, and seed policy against K0 before changing a default.
-
-[Frozen draft-head operator, decode-step, and ranked payload replays](https://github.com/para1lel/sglang.cpp/blob/a5974ba4eb99bd8e8f890c2e7262a27dbc3aace1/docs/mtp.md#measured-trade-offs)
+Early rejection can waste precomputed rows and require GDN replay. Check the intended depth and seed policy on fixed prompts. Follow [AgentX](performance.md#agentx-performance-standard) for performance evaluation. A fixed-schedule TP2 state fixture matched all 80 terminal payloads byte for byte, along with output IDs and acceptance.

@@ -2,22 +2,19 @@
 
 import argparse
 import base64
-from contextlib import closing
-from hashlib import sha256
 import http.client
 import json
-from pathlib import Path
 import re
 import subprocess
-import sys
+from contextlib import closing
+from hashlib import sha256
+from pathlib import Path
 from types import SimpleNamespace
 
-from http_routes import HEADERS, MODEL, RGB8, received, serve, stream_result
+from http_routes import CHAT, HEADERS, MODEL, RGB8, Json, received, serve, stream_result
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from benchmarks.media import collect
-
-
+FIXTURES = Path(__file__).resolve().with_name("fixtures")
+MEDIA_KINDS = ("image", "video")
 CODECS = {"png16", "avformat", "avcodec", "swscale", "avutil"}
 
 
@@ -35,6 +32,14 @@ def check_linkage(args):
         prefix = (args.codec_prefix / "lib").resolve()
         for name in expected:
             assert Path(resolved[name]).resolve().parent == prefix, (name, resolved[name])
+
+
+def read_request(name: str) -> tuple[Json, bytes]:
+    case = json.loads((FIXTURES / f"{name}.case.json").read_bytes())
+    data = (FIXTURES / f"{name}.http-body").read_bytes()
+    assert sha256(data).hexdigest() == case["request_sha256"]
+    assert len(data) == case["request_bytes"]
+    return case, data
 
 
 def decoded_request(case, frozen, path):
@@ -67,7 +72,7 @@ def decoded_request(case, frozen, path):
 def post(args, port, label, request, status, mime):
     (args.evidence / f"{label}.request").write_bytes(request)
     with closing(http.client.HTTPConnection("127.0.0.1", port, timeout=90)) as client:
-        client.request("POST", collect.ENDPOINT, request, HEADERS)
+        client.request("POST", CHAT, request, HEADERS)
         with client.getresponse() as response:
             raw = response.read()
             kind = response.headers.get_content_type()
@@ -78,18 +83,28 @@ def post(args, port, label, request, status, mime):
 
 
 def validate(args, port, label, request, case):
+    body = json.loads(request)
     raw = post(args, port, f"{label}-sse", request, 200, "text/event-stream")
-    budget = len(case["effective_input_ids"])
+    budget = body["max_tokens"]
     ids, usage, prompt = stream_result(raw, budget)
     frames = raw.rstrip(b"\n").split(b"\n\n")
     events = [json.loads(frame[6:]) for frame in frames[:-1]]
-    record = {"status": 200, "content_type": "text/event-stream", "submission_ns": 0,
-              "events": [(index, frame.decode()) for index, frame in enumerate(frames)]}
-    collect.validate(record, case, ids)
-    text = "".join(event["choices"][0]["delta"].get("content") or ""
-                   for event in events if event["choices"])
+    assert frames[-1] == b"data: [DONE]"
+    expected_prompt = case["effective_input_ids"]
+    assert prompt == expected_prompt
+    assert usage["prompt_tokens"] == len(expected_prompt)
+    assert events[-1]["choices"] == []
+    assert events[-1].get("prompt_token_ids") is None
+    for index, event in enumerate(events[:-1]):
+        assert event.get("prompt_token_ids") == (expected_prompt if index == 0 else None)
+        (choice,) = event["choices"]
+        assert choice["index"] == 0
+        assert choice.get("stop_reason") is None
+        tokens = choice.get("token_ids") or []
+        assert type(tokens) is list
+        assert all(type(token) is int and token >= 0 for token in tokens)
+    text = "".join(event["choices"][0]["delta"].get("content") or "" for event in events[:-1])
 
-    body = json.loads(request)
     body["stream"] = False
     del body["stream_options"]
     reply = json.loads(post(args, port, f"{label}-json", json.dumps(body).encode(),
@@ -115,9 +130,9 @@ def invalid_requests(name, request):
     payload["url"] = prefix + ",AB=="
     yield "base64", json.dumps(body).encode(), "canonical base64"
     payload["url"] = prefix + ",AAAA"
-    reason = "png" if name == "W1-image" else "mp4"
+    reason = "png" if name == "image" else "mp4"
     yield "container", json.dumps(body).encode(), reason
-    if name == "W1-image":
+    if name == "image":
         png = bytearray(base64.b64decode(encoded))
         png[16:20] = (1025).to_bytes(4, "big")
         payload["url"] = prefix + "," + base64.b64encode(png).decode()
@@ -128,8 +143,8 @@ def run(args):
     args.evidence.mkdir()
     check_linkage(args)
     pairs = {}
-    for name in collect.NAMES:
-        case, frozen = collect.read_request(name)
+    for name in MEDIA_KINDS:
+        case, frozen = read_request(name)
         pixels = args.rgb / name / "input" / "frames.rgb8"
         pairs[name] = (case, frozen, decoded_request(case, frozen, pixels))
 

@@ -43,8 +43,6 @@ On clean allocation pressure the workspace retries with row scratch only. TP2 us
 
 The [batch planner](batch-graphs.md#runtime-path) sends generation and scoring to one prefill executor, separate from decode. Compatible work groups into tiles of at most 1,024 rows. Order, KV, recurrence, rotary positions, media, scores and outputs stay request-local. On [Cache restore](prefix-cache.md#checkpoint-compatibility-and-resume), fully covered GQA tiles project only queries and gates. Others append only uncovered KV. [Attention dispatch](flash-prefill.md#runtime-path) · [Step dispatch](../src/decoder_batch.cpp#L495)<!-- prefix: "if (max_rows" --> · [Grant assembly](../src/decoder_batch.cpp#L527)<!-- prefix: "void Decoder" --> · [Cached GQA append](../src/runtime/execution/decoder_prefill_tiles.cpp#L285)<!-- prefix: "void Chunk::" -->
 
-[K0 campaign](https://github.com/para1lel/sglang.cpp/blob/8b4e3f62e0a7a053ffdefe85da99a841fabeb5d3/docs/serving/paired-measurement-ledger.md) · [Previous workspace guide](https://github.com/para1lel/sglang.cpp/blob/4dd8c887c278c67744ed80e7feb2a825a92197a2/docs/native-prefill-workspace.md#tiled-prefill-under-saturation) document the archived fair-share, tiled and grouped K0 campaign.
-
 ### Projection pairs for MTP
 
 B200 prioritizes whole-tile grouping for equal grants made entirely of 1,024-row tiles. Each lane keeps its own absolute start, KV, recurrent and draft state. [Tile eligibility](../src/runtime/execution/decoder_prefill_workspace.cpp#L66)<!-- prefix: "bool decoder" --> · [Group selection](../src/decoder_prefill.cpp#L552)<!-- prefix: "bool decoder" --> · [Tile offsets](../src/decoder_prefill.cpp#L532)<!-- prefix: "for (int off" --> · [Draft seed](../src/decoder_prefill.cpp#L198)<!-- prefix: "auto seed = " -->
@@ -89,7 +87,7 @@ Eager 4,096-row TP2 Tensor Core causal groups can fuse reduction, RMSNorm and E4
 
 Both streams record projection-ready before waiting for each other, and read-complete before buffer reuse. Each rank rounds the joint sum to BF16 before residual, normalization and quantization. Submission errors synchronize both streams and prioritize terminal CUDA status. [Event ordering](../src/runtime/execution/decoder_prefill_workspace.cpp#L191)<!-- prefix: "bool Prefill" --> · [BF16 sum](../src/text_normalization.cu#L37)<!-- prefix: "__device__ _" --> · [Error handling](../src/runtime/execution/decoder_prefill_workspace.cpp#L223)<!-- prefix: "check(termin" -->
 
-[Frozen two-lane W4 prefix and rank-state audit](https://github.com/para1lel/sglang.cpp/blob/a5974ba4eb99bd8e8f890c2e7262a27dbc3aace1/docs/native-prefill-workspace.md#tp2-causal-prefill-reduction-fusion)
+Compare fused and ordinary reduction at 4,096 rows of causal prefill on both B200 ranks. Reuse a prefix and compare the rank-local state and continuation on identical inputs.
 
 ## Verification
 
@@ -113,5 +111,3 @@ Compare state and first-token logits on both ranks, proposals and acceptances, a
 <a id="tp2-long-down-projection-replay"></a>
 
 Compare both rank shards for grouped RMSNorm, causal GQA, gate/up, packed QKV, attention output, and the long down projection. Match BF16 tensors, quantized values and scales, and teacher logits where arithmetic is preserved. Exercise eager, replay, clean fallback, and injected submission failures. Include zero and nonzero cached rows, two 4,096-row grants, and 4,096/1,024-row down with a 1,004-row decline. Check committed state and MTP continuation after priming.
-
-[Full replay matrix and pinned receipts](https://github.com/para1lel/sglang.cpp/blob/5ee79416d3e30cd178abab69598d047c4393793d/docs/native-prefill-workspace.md#verification)

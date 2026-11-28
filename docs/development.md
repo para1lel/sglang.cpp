@@ -20,49 +20,39 @@ Keep production CUDA operators in this project. Use CUDA and NVIDIA open-source 
 
 Production C/C++/CUDA grew from 67,153 physical lines at the baseline to 68,714 at the declaration-only cutover, then fell to 68,663 after prefill and dependency consolidation. Internal include directives changed from 704 to 757 to 743. Upward directives fell from 85 across 16 layer pairs to 74 across 14, then to 66 across the same 14 pairs. The last cut removed three backend-to-execution, three kernel-to-execution, and two cache-to-execution directives. Model and runtime server together went from 14 direct HTTP includes and 13 transitively reachable HTTP files to zero. [Baseline source](https://github.com/para1lel/sglang.cpp/tree/a5974ba4eb99bd8e8f890c2e7262a27dbc3aace1)
 
-Count physical lines in `.c`, `.cc`, `.cpp`, `.cxx`, `.cu`, `.h`, `.hh`, `.hpp`, `.cuh`, `.inl`, and `.ipp` files under `apps/`, `src/`, and `include/sglang/`, excluding `include/sglang/testing/`. Count repeated and conditional literal includes. Resolve quoted paths beside the including file first, then resolve both forms under `include/`. Count targets among the measured files. A directive is upward when its source layer precedes its target. The layer order is utility, tokenizer, backend, media, kernels, cache, model, execution, runtime server, HTTP server, application.
+For this architecture comparison, count physical lines in `.c`, `.cc`, `.cpp`, `.cxx`, `.cu`, `.h`, `.hh`, `.hpp`, `.cuh`, `.inl`, and `.ipp` files under `apps/`, `src/`, and `include/sglang/`, excluding `include/sglang/testing/`. Count repeated and conditional literal includes. Resolve quoted paths beside the including file first, then resolve both forms under `include/`. Count targets among the measured files. A directive is upward when its source layer precedes its target. The layer order is utility, tokenizer, backend, media, kernels, cache, model, execution, runtime server, HTTP server, application.
 
 Assign `runtime/` files to their named layer and `apps/server/` and `include/sglang/server/` to HTTP. Other `apps/` files are application. Under `src/` and `include/sglang/`, assign `json.*` and `utf8.*` to utility, `tokenizer/` to tokenizer, `media*`, `multimodal_prompt.*`, `vision*`, and `decoder_media.*` to media, and `checkpoint.*` to model. `text/`, `text_*`, `mxfp8_*`, `prefill_fp8*`, `decoder_cuda.*`, `decoder_sampling.*`, and `decoder_constraint_cuda.*` are kernels. The remaining `decoder*` files are execution.
 
 The cutover and consolidation were measured on canonical Git trees `6a745945d81ecdd78102b5f0a6cd3bb9cf3a9fac` and `2e18e98c29ab0cc35c5de645fc625da9bc834caf`, respectively. The consolidated production trees are `6e4b41639ba24254a426d76103f92863592c0f40` for `apps/`, `37929c2c714603ab3694f100443eb72683241653` for `src/`, and `9d8f3e3b2498176820bbae8289a71cd88a7d3027` for `include/sglang/`.
 
-## Production framework size
+## Framework code size
 
-The framework must fit within **30,000 physical lines of maintained runtime implementation**, including blank lines, comments, and a final line without a newline. Preserve supported behavior, precision, resource ownership, and failure semantics. Use normal formatting. Count native and daemon runtime sources, headers, templates, generated runtime code, and project-maintained adaptations of upstream code. Count production logic even when it moves into scripts, test directories, generators, build files, or another package. [Implementation standards](../.agents/skills/coding-mode/references/code-standards.md#maintained-size-limits)
+All maintained framework code must fit within **30,000 physical lines**. Count production code, headers, tests, benchmarks, tools, hooks, build code, and configurations that define executable steps. Include maintained generated and vendored code and any maintained program embedded in a document or fixture. Count blank lines, comments, and a final line without a newline. Exclude prose, licenses, fixtures consumed only as data, scalar tool settings, and unmodified dependencies outside the tree. Follow the coding standards and preserve supported behavior, numerical semantics, resource ownership, failure behavior, and AgentX performance. [Implementation standards](../.agents/skills/coding-mode/references/code-standards.md#maintained-size-limits) · [AgentX performance standard](performance.md#agentx-performance-standard)
 
-The fixed baseline has **73,798 runtime lines**, so reaching the ceiling requires a net reduction of at least **43,798 lines**. Its Git tree is `48fe37ab150dd15278df98bf3e7e98cb5c8d3dd3`. [Baseline source](https://github.com/para1lel/sglang.cpp/tree/7312cbababbaa0c82712932896c2dcb8cac0cf10)
+The fixed source baseline contains **133,369 physical lines across 547 code files**. Meeting the cap requires a net reduction of at least **103,369 lines** from that baseline. [Baseline source](https://github.com/para1lel/sglang.cpp/tree/adf795a5966574e4f38a8b8abe0babe5ac5afd26)
 
-| Runtime at the baseline | Physical lines |
+| Baseline paths | Physical lines |
 | --- | ---: |
-| Native applications and server (`apps/`) | 17,393 |
-| Native implementation (`src/`) | 43,886 |
-| Native headers (`include/`, excluding test-only headers) | 10,864 |
-| LMCache daemon, transfer code, and launcher (`tools/lmcache/`) | 1,655 |
-| Total | 73,798 |
+| `src/` | 43,886 |
+| `include/` | 10,968 |
+| `apps/` | 17,393 |
+| `tests/` | 46,023 |
+| `benchmarks/` | 9,186 |
+| `tools/` | 2,391 |
+| `.agents/` | 2,866 |
+| `.githooks/` | 37 |
+| `xmake.lua` | 619 |
+| Total | 133,369 |
 
-The header subtotal includes 1,883 checked-in Unicode table lines. The source subtotal includes 990 lines of the adapted MNNVL collective. Outside the runtime total, the baseline has 619 XMake lines, 575 lines of build and toolchain scripts and probes, 161 lines in the Unicode data regeneration tool, 104 test-only header lines, and three LMCache dependency manifest lines. Tests, benchmarks, documentation, licenses, and the unmodified source of external dependencies are outside the runtime total. [Unicode data provenance](../tools/unicode/README.md) · [MNNVL provenance](../src/runtime/backend/mnnvl_ar.LICENSE#L1)<!-- prefix: "src/runtime/" -->
-
-Reproduce the baseline count from Git objects. The path selection below describes the frozen baseline. For every candidate, audit the full source tree and build and runtime entry points, update the selected paths to cover newly added or moved runtime implementation, and report the revised inventory and total against its exact commit or tree. Identify any upstream dependency that takes over a production responsibility. Record its pin, license, purpose, counted local integration or adaptation, and execution or deployment cost. [Execution identity](../.agents/skills/coding-mode/references/execution-identity.md)
+Reproduce the baseline from its Git tree. Audit each candidate for added or relocated code, including new languages, extensionless programs, executable configuration, and code embedded in documents or fixture files. Report the candidate inventory against its exact commit or tree. When a dependency takes over a responsibility, record its pin, license, purpose, local integration or adaptation, and execution or deployment cost. [Execution identity](../.agents/skills/coding-mode/references/execution-identity.md)
 
 ```sh
-revision=7312cbababbaa0c82712932896c2dcb8cac0cf10
-git grep -I -c -e '^' "$revision" -- apps src include tools/lmcache \
-  ':(exclude)include/sglang/testing' ':(exclude,glob)**/*.LICENSE' \
-  ':(exclude)tools/lmcache/requirements.txt' |
-  awk -F: '{
-    split($2, path, "/")
-    group = (path[1] == "tools" ? "tools/lmcache" : path[1])
-    lines[group] += $NF
-    total += $NF
-  } END {
-    for (group in lines) print group, lines[group]
-    print "total", total
-  }' | sort
+revision=adf795a5966574e4f38a8b8abe0babe5ac5afd26
+git grep -a -c -e '^' "$revision" -- \
+  '*.cpp' '*.cu' '*.cuh' '*.h' '*.py' '*.sh' '*.lua' .githooks .agents/gates.json |
+  awk -F: '{ files++; lines += $NF } END { print files, lines }'
 ```
-
-## Current matched K4 status
-
-Use a verified Release build and run one matched row at a time on the same reserved B200 device or pair for both arms. [Gates and frozen evidence](performance.md) · [TP1 driver](../benchmarks/paired/README.md#matched-k4-timing-protocol) · [TP2 driver](serving/tp2.md#acceptance-target)
 
 <a id="p2-gqa-cache-contract"></a>
 ## CUDA operator contracts
@@ -181,7 +171,7 @@ The scheduler uses the session for admission, cancellation, and whole batch step
 
 Call `BatchSession` operations on the worker thread that owns the session. `admit()` returns the number of prompt positions restored. After an admission exception, the scheduler checks `available()` to see whether the session can continue. If it can, the scheduler ends the affected request. Otherwise, the scheduler rethrows the exception. [Worker session](../src/runtime/server/single_device_batch_executor.cpp#L84)<!-- prefix: "void SingleD" --> · [Admission and failure](../apps/server/batch_service.cpp#L272)<!-- prefix: "job->cached_" -->
 
-Use the serving contracts for [native generation](native-generate.md), [text](text-serving.md), [chat](chat-serving.md), [benchmark token-ID streams](../benchmarks/streaming/README.md#wire-contract), and [launch migration](native-model-info.md#migrate-old-launch-commands).
+Use the serving contracts for [native generation](native-generate.md), [text](text-serving.md), [chat](chat-serving.md), [benchmark token-ID streams](text-serving.md#token-id-streaming-alias), and [launch migration](native-model-info.md#migrate-old-launch-commands).
 
 ### Streaming verification
 
@@ -217,9 +207,9 @@ Verify [prefix checkpoints](prefix-cache.md#verification), [MTP state](mtp.md#ve
 
 Start with source and checkpoint identity and an [isolated Release build](serving/isolated-builds.md). Run the applicable [GQA](#gqa-verification), [decoder](#verification), [chunked prefill](#chunked-prefill-verification), [MTP](mtp.md#verification), and [streaming checks](#streaming-verification) before measuring end to end. Keep raw evidence in ignored `artifacts/` and accepted procedures in maintained documentation.
 
-Profile separately from timing. Match the pinned vLLM dispatch by shape, visible length, precision, and fusion boundary. Record reference source and revision. Validate changes at the operator and execution-step boundaries, then repeat on the same hardware and workload. [Acceptance gate](performance.md#measurement)
+Profile separately from formal measurement. Match the pinned vLLM dispatch by shape, visible length, precision, and fusion boundary for operator comparisons. Record reference source and revision. Validate changes at the operator and execution-step boundaries before comparing end-to-end performance. [AgentX performance standard](performance.md#agentx-performance-standard)
 
-Recover the [previous guide](https://github.com/para1lel/sglang.cpp/blob/4dd8c887c278c67744ed80e7feb2a825a92197a2/docs/development.md) for the detailed decoder operator notes and historical diagnostic inputs.
+See the pinned decoder notes for additional operator details and diagnostic inputs. [Decoder notes](https://github.com/para1lel/sglang.cpp/blob/4dd8c887c278c67744ed80e7feb2a825a92197a2/docs/development.md#native-text-decoder)
 
 ### Check and format staged source
 

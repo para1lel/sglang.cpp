@@ -247,7 +247,7 @@ private:
 
 int main(int argc, char** argv) {
     try {
-        expect(argc >= 2, "Supply the checkpoint and optional captured W1 packets");
+        expect(argc >= 2, "Supply the checkpoint and optional captured short decode packets");
         int devices = 0;
         check(cudaGetDeviceCount(&devices), "Locate isolated accelerator");
         expect(devices == 1, "Run with only the reserved GPU visible");

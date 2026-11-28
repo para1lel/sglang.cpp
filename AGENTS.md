@@ -69,10 +69,12 @@ private headers and `.ipp` and `.tpp` files. Put function bodies, lambdas, and `
 definitions in compiled `.cpp` or `.cu` files. The sole exception is a deleted function
 written `= delete` on its first declaration.
 
+Keep maintained framework code within the [30,000-line project-wide cap](docs/development.md#framework-code-size).
+
 Run tests only when concrete evidence strongly supports the expected outcome.
 Prioritize operator and framework tuning and focused local measurements.
-Start E2E only when prior evidence makes success highly likely, and stop at the first missed
-gate (W5 before W6).
+Start formal performance measurement only when prior evidence makes success highly likely.
+Use the [AgentX performance standard](docs/performance.md#agentx-performance-standard).
 
 Develop each feature on a feature branch and open a pull request to `main`.
 Commit each independently verified change using Conventional Commits. Push each commit to

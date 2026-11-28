@@ -27,9 +27,9 @@ if TYPE_CHECKING:
     from lmcache_route_helpers import Witness
 
 ROOT = Path(__file__).resolve().parents[2]
-sys.path[:0] = [str(ROOT), str(ROOT / "tests"), str(ROOT / "benchmarks" / "paired")]
+sys.path[:0] = [str(ROOT), str(ROOT / "tests")]
 
-cache_metrics = import_module("cold_cache")
+cache_metrics = import_module("live_controls")
 PENDING_STORES = cache_metrics.PENDING_STORES
 PREFILL_CHECKPOINTS = cache_metrics.PREFILL_CHECKPOINTS
 RUNNING = cache_metrics.RUNNING

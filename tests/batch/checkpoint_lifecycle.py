@@ -13,6 +13,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "prefix"))
+from checkpoint_prompts import load_prompt
 from live_controls import GDN_ENTRIES, STORES, Controls
 
 from media import http_routes as http
@@ -22,11 +23,6 @@ SESSION_CAPACITY = 24576
 DRAFT_ROWS = "sglang_cpp:lmcache_draft_restored_rows_total"
 PREFILL = re.compile(rb"(?m)^batch prefill_rows=([\d,]+) workspace_bytes=")
 PACKET = re.compile(rb"(?m)^batch mtp slot=\d+ drafted=(\d+) accepted=(\d+) verified=(\d+)")
-ROOT = Path(__file__).resolve().parents[2]
-
-
-def fixture(row):
-    return json.loads((ROOT / f"benchmarks/streaming/{row}.json").read_text())["prompt_token_ids"]
 
 
 def settled(cache, label, expected=None):
@@ -82,35 +78,43 @@ def turn(ids, session, rid, budget, parent=None, *, stream=False, **options):
     return body | {"rid": rid, "session_params": params, "stream": stream}
 
 
-def test_w1(args, cache, log, prompt):
+def check_session_branches(
+    args: argparse.Namespace, cache: Controls, log: Path, prompt: list[int]
+) -> None:
     port = cache.port
-    reset(cache, "w1")
-    open_session(args, port, "w1")
-    before = settled(cache, "w1-before")[GDN_ENTRIES]
+    reset(cache, "session")
+    open_session(args, port, "session")
+    before = settled(cache, "session-before")[GDN_ENTRIES]
     start = log.stat().st_size
-    w1 = generate(args, port, "w1-parent", turn(prompt, "w1", "w1-parent", 128, stream=True))
-    output, _, _ = http.native_result(w1, prompt, 128, 0)
-    resident = settled(cache, "w1-after-done", before + 2)
-    trace = snapshot_steps(args, log, "w1-parent", start)
+    body = turn(prompt, "session", "session-parent", 128, stream=True)
+    parent = generate(args, port, "session-parent", body)
+    output, _, _ = http.native_result(parent, prompt, 128, 0)
+    resident = settled(cache, "session-after-done", before + 2)
+    trace = snapshot_steps(args, log, "session-parent", start)
     assert b"batch width=1 decode=1 request_bytes=0\n" in trace, trace
     assert any(int(draft) == 4 and int(rows) == 5 for draft, _, rows in PACKET.findall(trace))
-    replay = generate(args, port, "w1-raw-replay", http.native_text(prompt, 128))
+    replay = generate(args, port, "session-raw-replay", http.native_text(prompt, 128))
     replay_ids, _, _ = http.native_result(replay, prompt, 128, len(prompt))
     assert replay_ids == output, (replay_ids, output)
-    settled(cache, "w1-after-replay", resident[GDN_ENTRIES])
+    settled(cache, "session-after-replay", resident[GDN_ENTRIES])
     for branch, suffix in (("a", [13, 220, 32]), ("b", [11, 220, 33])):
-        body = turn(suffix, "w1", f"w1-branch-{branch}", 8, "w1-parent", stream=branch == "a")
+        label = f"session-branch-{branch}"
+        body = turn(suffix, "session", label, 8, "session-parent", stream=branch == "a")
         assembled = prompt + output + suffix
         before_draft = settled(cache, f"before-draft-{branch}")[DRAFT_ROWS]
         start = log.stat().st_size
-        resumed = generate(args, port, f"w1-branch-{branch}", body)
+        resumed = generate(args, port, label, body)
         resumed_ids, _, _ = http.native_result(resumed, assembled, 8, 255)
         after = settled(cache, f"after-draft-{branch}")
-        trace = snapshot_steps(args, log, f"w1-branch-{branch}", start)
+        trace = snapshot_steps(args, log, label, start)
         assert sum(sum(map(int, rows.split(b","))) for rows in PREFILL.findall(trace)) == 4
         assert after[DRAFT_ROWS] == before_draft + 254, after
-        cold = generate(args, port, f"w1-branch-{branch}-cold",
-                        http.native_text(assembled) | {"cache_salt": f"cold-{branch}"})
+        cold = generate(
+            args,
+            port,
+            f"{label}-cold",
+            http.native_text(assembled) | {"cache_salt": f"cold-{branch}"},
+        )
         http.native_result(cold, assembled, 8, 0)
         assert resumed_ids == cold["output_ids"], (resumed_ids, cold["output_ids"])
 
@@ -264,14 +268,15 @@ def main():
     if not endpoint.is_socket() or any(p.exists() and endpoint.samefile(p) for p in defaults):
         parser.error("--lmcache-socket must name a live, dedicated, non-default socket")
     args.evidence.mkdir()
-    prompt = fixture("W1")
+    prompt = load_prompt("checkpoint")
+    prefill = load_prompt("prefill")
     with http.serve(args, "checkpoint-lifecycle", "--lmcache-socket", str(endpoint)) as (port, log):
         http.server_policy(args, port, "default", True)
         cache = Controls(port, args.evidence)
-        test_w1(args, cache, log, prompt)
-        sparse_prefill(args, cache, fixture("W2") * 9)
+        check_session_branches(args, cache, log, prompt)
+        sparse_prefill(args, cache, prefill * 9)
         abort_turn(args, cache, log, prompt, disconnect=False)
-        abort_turn(args, cache, log, fixture("W2") * 4 + [31], disconnect=True)
+        abort_turn(args, cache, log, prefill * 4 + [31], disconnect=True)
         mid_packet_stop(args, cache, log, prompt)
         settled(cache, "lifecycle-complete")
     print("Exact resident GDN anchors, cancellation, and K4 session continuation passed.")

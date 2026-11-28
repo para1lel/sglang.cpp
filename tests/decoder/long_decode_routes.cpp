@@ -313,15 +313,15 @@ void check_crossing_tokens(const DecoderBatchStep& result, int& ordinal) {
     check(result.decode && !result.finish_reason && result.mtp_drafted_tokens == 4 &&
               result.mtp_accepted_tokens == 4 && result.mtp_verified_rows == 5 &&
               result.mtp_replayed_rows == 0 && result.extra_token_count == 4,
-          "W5 K4 acceptance changed");
-    check(result.token == cycle[ordinal++ % cycle.size()], "W5 first ID changed");
+          "K4 crossing acceptance changed");
+    check(result.token == cycle[ordinal++ % cycle.size()], "K4 crossing first ID changed");
     for (int index = 0; index < result.extra_token_count; ++index) {
-        check(result.extra_tokens[index] == cycle[ordinal++ % cycle.size()], "W5 draft ID changed");
+        check(result.extra_tokens[index] == cycle[ordinal++ % cycle.size()], "Draft ID changed");
     }
 }
 
 template <typename Setup, typename Expect>
-void check_mtp_w4(Setup setup_lane, Expect expect, decoder::VerificationRow& last) {
+void check_mtp_ranked_wide(Setup setup_lane, Expect expect, decoder::VerificationRow& last) {
     constexpr int lanes = gqa_decode::long_rank_wide_requests;
     constexpr int steps = decoder::target_verify_max_rows;
     constexpr int full = lanes * steps;
@@ -349,8 +349,8 @@ void check_mtp_w4(Setup setup_lane, Expect expect, decoder::VerificationRow& las
 }
 
 template <typename Setup, typename Expect>
-void check_mtp_w3(Setup setup_lane, Expect expect, decoder::Request& first,
-                  decoder::Request& last, decoder::VerificationRow& row) {
+void check_mtp_ranked_narrow(Setup setup_lane, Expect expect, decoder::Request& first,
+                             decoder::Request& last, decoder::VerificationRow& row) {
     constexpr int lanes = decoder::wide_mtp_lanes;
     constexpr int steps = decoder::target_verify_max_rows;
     constexpr int full = lanes * steps;
@@ -379,13 +379,12 @@ void check_mtp_w3(Setup setup_lane, Expect expect, decoder::Request& first,
     expect(full, 1, full - steps + 1, gqa_decode::long_single_rank_splits);
 }
 
-template <bool W4>
-void mtp_rank_long() {
+template <bool Wide> void mtp_rank_long() {
     using namespace decoder;
-    constexpr int lanes = W4 ? gqa_decode::long_rank_wide_requests : wide_mtp_lanes;
+    constexpr int lanes = Wide ? gqa_decode::long_rank_wide_requests : wide_mtp_lanes;
     constexpr int steps = target_verify_max_rows;
-    constexpr int last_position = W4 ? gqa_decode::long_rank_wide_end + steps - 1
-                                     : gqa_decode::long_min_position;
+    constexpr int last_position =
+        Wide ? gqa_decode::long_rank_wide_end + steps - 1 : gqa_decode::long_min_position;
     constexpr int logical_pages = last_position / mxfp8_page_size + 1;
     constexpr int physical_pages = lanes * logical_pages;
     constexpr int kv_heads = gqa_rank_geometry.kv_heads;
@@ -426,7 +425,7 @@ void mtp_rank_long() {
         requests[lane] = std::make_unique<Request>(0);
         requests[lane]->pages = {table + lane * logical_pages, logical_pages};
         requests[lane]->caches[0] = cache;
-        setup_lane(lane, W4 ? gqa_decode::long_min_position : 8191 + lane);
+        setup_lane(lane, Wide ? gqa_decode::long_min_position : 8191 + lane);
     }
     for (auto& row : work) {
         row = Workspace(memory);
@@ -457,15 +456,15 @@ void mtp_rank_long() {
                   launches.merges == launches.readers && !launches.legacy && remaining == left,
               "Unexpected ranked shared-KV routing or remainder");
     };
-    if constexpr (W4) {
-        check_mtp_w4(setup_lane, expect, rows.back());
-        synchronize_cuda(stream, "Complete W4 route regression");
-        std::cout << "w4_shared_kv_routes=pass\n";
+    if constexpr (Wide) {
+        check_mtp_ranked_wide(setup_lane, expect, rows.back());
+        synchronize_cuda(stream, "Complete wide ranked route regression");
+        std::cout << "wide_ranked_routes=pass\n";
         return;
     }
-    check_mtp_w3(setup_lane, expect, *requests.front(), *requests.back(), rows.back());
-    synchronize_cuda(stream, "Complete W3 route regression");
-    std::cout << "w3_shared_kv_routes=pass\n";
+    check_mtp_ranked_narrow(setup_lane, expect, *requests.front(), *requests.back(), rows.back());
+    synchronize_cuda(stream, "Complete narrow ranked route regression");
+    std::cout << "narrow_ranked_routes=pass\n";
 }
 
 void mtp_crossings(const char* checkpoint, const char* fixture) {
@@ -473,7 +472,7 @@ void mtp_crossings(const char* checkpoint, const char* fixture) {
     constexpr int quota = 8192;
     constexpr std::array ahead{0, 2, 3, 4, 7, 10, 12, 24, 27, 29, 30, 31};
     const Decoder decoder(checkpoint, 0, true);
-    check(slots == 32 && decoder.uses_b200_operators(), "W5 route check requires a B200");
+    check(slots == 32 && decoder.uses_b200_operators(), "K4 crossing check requires a B200");
     DecoderBatch batch(decoder, {true, slots, 0, quota});
     DecoderOptions options;
     options.mtp_steps = 4;
@@ -482,20 +481,21 @@ void mtp_crossings(const char* checkpoint, const char* fixture) {
     std::ifstream file(fixture);
     for (int slot = 0; slot < slots; ++slot) {
         std::string line;
-        check(bool(std::getline(file, line)), "Missing W5 fixture lane");
+        check(static_cast<bool>(std::getline(file, line)), "Missing K4 crossing fixture lane");
         std::istringstream ids(line);
         std::vector<int> prompt{std::istream_iterator<int>(ids), {}};
-        check(ids.eof() && prompt.size() == prompt_length, "Invalid W5 fixture lane");
-        check(batch.admit(slot, std::move(prompt), options) == 0, "Unexpected W5 prefix hit");
+        check(ids.eof() && prompt.size() == prompt_length, "Invalid K4 crossing fixture lane");
+        check(batch.admit(slot, std::move(prompt), options) == 0, "Unexpected prefix hit");
     }
     Selection all;
     all.fill(true);
     DecoderBatchStepStats stats;
     for (int start = 0; start < prompt_length; start += quota / slots) {
         const auto steps = batch.advance_chunked(all, &stats);
-        check(stats.target_rows == quota && stats.verification_lanes == 0, "W5 prefill changed");
+        check(stats.target_rows == quota && stats.verification_lanes == 0, "K4 prefill changed");
         if (start + quota / slots == prompt_length) {
-            for (const auto& step : steps) check(step.token == 760, "W5 seed changed");
+            for (const auto& step : steps)
+                check(step.token == 760, "K4 seed changed");
         }
     }
     std::array<int, slots> ordinals;
@@ -503,7 +503,7 @@ void mtp_crossings(const char* checkpoint, const char* fixture) {
     Selection lead{};
     for (int slot : ahead) lead[slot] = true;
     const auto first = batch.advance_chunked(lead, &stats);
-    check(stats.verification_lanes == int(ahead.size()), "W5 lead roster changed");
+    check(stats.verification_lanes == static_cast<int>(ahead.size()), "K4 lead roster changed");
     for (int slot : ahead) check_crossing_tokens(first[slot], ordinals[slot]);
 
     int crossing_waves = 0;
@@ -519,12 +519,13 @@ void mtp_crossings(const char* checkpoint, const char* fixture) {
         mtp_routes = nullptr;
         check(stats.verification_lanes == slots && stats.verification_rows == 5 * slots &&
                   std::all_of(stats.prefill_rows.begin(), stats.prefill_rows.end(),
-                              [](int rows) { return rows == 0; }), "W5 verify geometry changed");
+                              [](int rows) { return rows == 0; }),
+              "K4 verify geometry changed");
         check(launches.readers == gqa_layers && launches.merges == gqa_layers && !launches.legacy,
-              "W5 verification lost its grouped long reader or merge");
+              "K4 verification lost its grouped long reader or merge");
         for (int slot = 0; slot < slots; ++slot) check_crossing_tokens(steps[slot], ordinals[slot]);
         if (crossings) {
-            check(crossings == (crossing_waves % 2 == 0 ? 12 : 20), "W5 crossing setup changed");
+            check(crossings == (crossing_waves % 2 == 0 ? 12 : 20), "K4 crossing setup changed");
             ++crossing_waves;
             std::cout << "K4 crossing lanes=" << crossings << " readers=" << launches.readers
                       << " merges=" << launches.merges << " legacy=" << launches.legacy << '\n';
@@ -543,7 +544,7 @@ std::vector<std::vector<int>> read_mtp_cohort(const char* fixture) {
         prompt.assign(std::istream_iterator<int>(ids), {});
         check(ids.eof() && prompt.size() == 32768, "Invalid 32K MTP fixture lane");
     }
-    check(prompts.size() == 16 || prompts.size() == slots, "Expected W4 or W5 MTP cohort");
+    check(prompts.size() == 16 || prompts.size() == slots, "Expected 16 or 32 MTP lanes");
     return prompts;
 }
 
@@ -844,11 +845,11 @@ extern "C" cudaError_t __wrap_cudaLaunchKernel(const void* function, dim3 grid, 
 }
 
 int main(int argc, char** argv) try {
-    if (argc == 2 && std::string_view(argv[1]) == "--mtp-w3") {
+    if (argc == 2 && std::string_view(argv[1]) == "--mtp-ranked-narrow") {
         mtp_rank_long<false>();
         return 0;
     }
-    if (argc == 2 && std::string_view(argv[1]) == "--mtp-w4") {
+    if (argc == 2 && std::string_view(argv[1]) == "--mtp-ranked-wide") {
         mtp_rank_long<true>();
         return 0;
     }
@@ -866,8 +867,8 @@ int main(int argc, char** argv) try {
     }
     check(argc >= 3 && argc <= 5,
           "Usage: long-decode-routes CHECKPOINT "
-          "{PROMPT [LOGITS [TEACHER]]|--mtp-crossings W5|--mtp-mixed IDS|--serial-prefill IDS} "
-          "or long-decode-routes --mtp-w3|--mtp-w4");
+          "{PROMPT [LOGITS [TEACHER]]|--mtp-crossings IDS|--mtp-mixed IDS|--serial-prefill IDS} "
+          "or long-decode-routes --mtp-ranked-narrow|--mtp-ranked-wide");
     const Decoder decoder(argv[1], 0, false);
     check(decoder.uses_b200_operators(), "Long decode route check requires a B200");
     const DecoderBatchOptions options{.cuda_graphs = true, .max_lanes = slots,

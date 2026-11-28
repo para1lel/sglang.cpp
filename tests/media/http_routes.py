@@ -18,7 +18,9 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any, TypedDict, Unpack
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "prefix"))
+from checkpoint_prompts import load_prompt
 from live_controls import GDN_ENTRIES, Controls
 
 Json = dict[str, Any]
@@ -346,8 +348,7 @@ def main(args):
 
 def mixed_service(args):
     args.evidence.mkdir()
-    prompt = json.loads((Path(__file__).parents[2] / "benchmarks/streaming/W1.json").read_text())[
-        "prompt_token_ids"]
+    prompt = load_prompt("checkpoint")
     description = {"type": "text", "text": "Describe the visual content in detail. " * 16}
     queries = {
         "image": (CHAT, chat([visual("image_url"), description])),
@@ -570,8 +571,7 @@ def resident_scores(
 
 def feature_complete(args):
     args.evidence.mkdir()
-    fixture = Path(__file__).resolve().parents[2] / "benchmarks/streaming/W2.json"
-    ids = json.loads(fixture.read_text())["prompt_token_ids"]
+    ids = load_prompt("prefill")
     prefix = ids * 4
     extension = prefix + ids[:1024]
     scoring = ids[:132]

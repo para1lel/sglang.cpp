@@ -6,17 +6,9 @@ TP2 uses one node-local LMCache daemon, socket and namespace across both ranks. 
 
 Both ranks own target workers and store 16,896 target KV bytes per token per rank. Rank 0 owns draft weights and cache. Restore requires the same GDN endpoint on both ranks. [Cold, warm, and one-sided eviction receipts](https://github.com/para1lel/sglang.cpp/blob/a5974ba4eb99bd8e8f890c2e7262a27dbc3aace1/docs/serving/tp2.md#tp2-serving-status-and-acceptance-target)
 
-## Campaign record
+## Matched benchmark
 
-On `7394130`, all five TP2 rows passed. Native/vLLM makespan ratios for W1–W5 were 0.88024×, 0.61236×, 1.00232×, 1.06919×, and 1.03767×. Native used one LMCache daemon with a 128 GiB CPU L1. Measured W4 and W5 stored 80 and 136 checkpoints per rank, respectively. The campaign `comparison.json` has SHA-256 `0fca3af708b54d7bfd37629853c993edb86d7e67b410cafd9149e3df6d9733fa`. [PR #3 campaign evidence](https://github.com/para1lel/sglang.cpp/pull/3) · [Archived `e912b39b` campaign](https://github.com/para1lel/sglang.cpp/blob/a5974ba4eb99bd8e8f890c2e7262a27dbc3aace1/docs/serving/tp2.md#campaign-record)
-
-<a id="w4-wide-verification-release"></a>
-<a id="w1-diagnostic-profile"></a>
-<a id="w2-divergence-evidence"></a>
-<a id="w4-readiness-diagnostic"></a>
-<a id="w3-wide-verify-diagnostic"></a>
-
-[Archived W1–W4 profiles, readiness, and wide verification](https://github.com/para1lel/sglang.cpp/blob/a5974ba4eb99bd8e8f890c2e7262a27dbc3aace1/docs/serving/tp2.md#w4-wide-verification-release)
+See the [matched W1–W6 results](../performance.md#matched-k4-evidence) for both widths and engines. The [acceptance target](#acceptance-target) defines the TP2 run controls.
 
 ## Two-rank wide verification
 

@@ -43,8 +43,6 @@ Resume GDN at the usable boundary, or compute it from row zero. Read GQA through
 
 `sglang_cpp:lmcache_gqa_computed_tokens_total` counts regenerated target GQA cache rows. Restored rows skip key normalization, rotary and MXFP8 cache append. A tile fully covered by GQA skips K/V projection; a tile crossing the boundary can still run packed QKV. [Tile projection](../src/runtime/execution/decoder_prefill_tiles.cpp#L270)<!-- prefix: "void Chunk::" --> · [Tile append](../src/runtime/execution/decoder_prefill_tiles.cpp#L285)<!-- prefix: "void Chunk::" --> · [Accounting](../src/decoder_batch.cpp#L881)<!-- prefix: "prefix_stats" -->
 
-Cache pressure can evict a published record before the next lookup. The [AgentX pressure diagnostic](agentx-256k.md#focused-cache-pressure-diagnostic) illustrates this on the earlier direct-store implementation.
-
 A paired boundary at `P` seeds shifted draft row `P-1` with the first suffix ID on a partial hit or the first committed output on a full hit. Full hits score from restored hidden/residual rows using the request's [grammar](text-serving.md#finite-choice-constraints) and [sampler](text-serving.md#sampling). Restore and full-hit scoring do not charge [target rows](batch-graphs.md#runtime-path) or change other lanes' decode policy.
 
 Prompt scoring restores no farther than `logprob_start_len` and leaves at least the last prompt row to compute. Offset zero, including OpenAI echo scoring, restores no rows. Generated-only or [pointwise label scores](serving/pointwise-score.md) can use full hits. [Lookup limit](../apps/server/detail/batch_service_cache.cpp#L31)<!-- prefix: "const int ma" --> · [Full hit](../src/decoder_batch.cpp#L414)<!-- prefix: "if (lane.res" -->
@@ -114,7 +112,7 @@ PYTHONPATH="$PWD" python3 -B tests/prefix/pool_routes.py \
     --tp "$TP" --device-bytes "${DEVICE_BYTES[@]}" --anchors-only
 ```
 
-Keep `run.json`, `relay.json`, and the metric scrapes. The pressure fixture checks idle reuse, acknowledged backups under pressure, backed eviction, reload, cancellation, reset, and clean shutdown. The anchor fixture checks exact offsets and deeper GQA coverage than the GDN resume boundary. [Pressure fixture](../tests/prefix/pool_routes.py#L344)<!-- prefix: "def pressure" --> · [Anchor fixture](../tests/prefix/pool_routes.py#L459)<!-- prefix: "def anchors(" --> · [TP1 and TP2 evidence](performance.md#gpu-pool-engineering-checks)
+Keep `run.json`, `relay.json`, and the metric scrapes. The pressure fixture checks idle reuse, acknowledged backups under pressure, backed eviction, reload, cancellation, reset, and clean shutdown. The anchor fixture checks exact offsets and deeper GQA coverage than the GDN resume boundary. [Pressure fixture](../tests/prefix/pool_routes.py#L344)<!-- prefix: "def pressure" --> · [Anchor fixture](../tests/prefix/pool_routes.py#L459)<!-- prefix: "def anchors(" --> · [GPU pool checks](performance.md#gpu-pool-engineering-checks)
 
 The archived direct-store fixture covers held IPC leases, worker restart, and terminal STORE reply order. [Archived v4 procedure](https://github.com/para1lel/sglang.cpp/blob/3b138b699bdf47b02a7dde8ef5e07142ee699d3f/docs/prefix-cache.md#verification) · [Device state and graph controls](../tests/prefix/README.md#device-state-and-graph-controls)
 

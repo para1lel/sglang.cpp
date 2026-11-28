@@ -90,26 +90,15 @@ Exclude startup, model load, JIT, and graph capture. Drain and acknowledge reset
 
 Native pool receipts require zero occupied entries and pages after reset and unchanged positive pool capacities. Require no pending stores at settlement and no daemon restores for a cold cohort. W6 can record cache hits and restores inside its measured chain. Report LMCache activity separately from GPU-resident reuse. [Pool receipt](../benchmarks/paired/cold_cache.py#L234)<!-- prefix: "def verify_p" -->
 
-The historical `drain-suffix` receipt requires acknowledgement of every planned prompt checkpoint and distinct terminal store. It checks zero resident checkpoints, declines, store failures, restores, read bytes, and I/O errors. Short GQA chunks can overlap at different endpoints, so validate writes against the physical transfer bound. At TP2, both ranks acknowledge every store. GQA and GDN write bytes must be positive and equal across ranks. Rank 0 alone writes draft bytes. [Drain verification](https://github.com/para1lel/sglang.cpp/blob/3b138b699bdf47b02a7dde8ef5e07142ee699d3f/benchmarks/paired/cold_cache.py#L153)<!-- prefix: "def verify_l" --> · [Rank receipts](https://github.com/para1lel/sglang.cpp/blob/3b138b699bdf47b02a7dde8ef5e07142ee699d3f/benchmarks/tp2/cache_activity.py#L16)<!-- prefix: "def replay(r" -->
-
 Report absolute metrics and successful and attempted requests for each engine, row, and mode. Give the latency sample count and percentile method.
 
 For new offline timing, use `--warmup 1 --repeats 1` and omit `--top-logits`. `load_ms` covers model initialization. `request_ms` includes request allocation and graph capture. Allocation metrics include resident storage on the serial graph path. Keep JSON, invocation, binary hash, and device UUID. [Generator measurement](../apps/sglang-generate.cpp#L256)<!-- prefix: "Measurements" -->
 
 ### GPU pool engineering checks
 
-Controlled TP1 and TP2 tests used the [submitted release](#submitted-hbm-pool-release). Each B200 reported a 168,524,838,338-byte budget and a 168,522,940,416-byte committed arena. The tests set the GQA pool to 16 pages and the GDN pool to four checkpoints to exercise pressure.
+Use the [prefix cache fixtures](prefix-cache.md#verification) at TP1 and TP2. Check cold prefill, HBM-only reuse, mixed-tier restore, and CPU reload on the same token history. Hold one TP2 STORE reply to verify that the backup stays pending until both ranks acknowledge it.
 
-| Width | Completed backups | Backed evictions | Unbacked evictions | CUDA IPC map and unmap events | Module-static bytes |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| TP1 | 64 | 62 | 0 | 132 | 12 |
-| TP2 | 64 | 62 | 0 | 224 | 41 |
-
-The cold, HBM-only, mixed-tier, and CPU-reload checks all returned greedy ID 17. At TP2, rank 0 completed while the fixture held rank 1's STORE reply. The backup stayed pending until the fixture released the reply.
-
-Nsight Systems captured zero physical device allocation or free calls and zero corresponding events from readiness to shutdown start in the server and daemon. IPC maps committed backing. CUDA loads the module-static symbols automatically. The table reports fixture counts outside the timed campaign.
-
-`artifacts/pool-w6/verification/official-verification.sha256` identifies each `routes/run.json`, `api-summary.json`, and exported trace. The release proof directories are `tp1-official-0788856-proof/` and `tp2-official-0788856-proof-b/`.
+Check physical device allocations and frees in the server and daemon from readiness to shutdown start. Count IPC maps and module-static symbols separately. Retain the route receipts and exported trace outside the timed campaign.
 
 ### Operator qualification
 
@@ -169,68 +158,27 @@ Retain the run manifest, commands, environment, fixture hashes, raw samples, and
 
 ## Matched K4 evidence
 
-### Wide verification release
+Native source `b0596c25eab50dfbe4b5a340da3a06f84f89b339` used server SHA-256 `59748dd6424d97019d49360fe42d87ea9d6aaaf5472ed98cdfc19b41a3a806d8`. The reference was vLLM `81a8cb063e6247fe254d7caf7e98a6691d71022a`.
 
-Native `81b477126d5bbcf1166fbc5fb27353c5e651de23` used server SHA-256 `d2c01558e9b60a04f3292b8da73204b73cd61922973baa15aee8f5c71d14b0e1`. Each width paired both engines on the same B200s and CPU sets.
+TP1 used B200 0 on NUMA 0, with server CPUs 24–33 and client CPUs 34–35. TP2 used B200s 4→5 on NUMA 1, with server CPUs 60–69 and client CPUs 70–71. Both engines used the same devices and CPU sets at each width.
 
-TP1 used GPU 0 on NUMA 0, with server CPUs 24–33 and client CPUs 34–35. TP2 used GPUs 4→5 on NUMA 1, with server CPUs 60–69 and client CPUs 70–71.
+Both engines used MTP4, a 32,768-token step cap, and eight slots per GPU. Native used 0.88 GPU memory utilization, automatic GPU pools, and one LMCache daemon per width. The daemon used 64 GiB at TP1 and 128 GiB at TP2. vLLM used local prefix caching with KV offload disabled.
 
-Both engines used MTP4, a 32,768-token step cap, and eight active slots per GPU. Native used 0.88 memory utilization, automatic GPU pools, and LMCache. Pinned vLLM used local prefix caching with KV offload disabled.
+All 12 measured native/vLLM ratios were within the 1.10× makespan limit.
 
-Five of six measured cells passed the 1.10× makespan gate. TP1 W1–W5 passed, and the next release superseded TP1 W6 before launch. TP2 W4 exceeded the limit by 24.069 ms, so TP2 W1–W3, W5 and W6 remained unmeasured.
-
-| Width | Row | Completed per arm | Native (ns) | vLLM (ns) | Ratio | Gate |
+| Width | Row | Requests completed per arm | Native (ns) | vLLM (ns) | Native / vLLM | Timing gate |
 | --- | --- | ---: | ---: | ---: | ---: | --- |
-| TP1 | W1 | 1 | 574,596,795 | 657,854,124 | 0.873441× | Pass |
-| TP1 | W2 | 1 | 1,383,710,704 | 1,945,530,399 | 0.711225× | Pass |
-| TP1 | W3 | 4 | 4,278,837,817 | 4,355,186,050 | 0.982470× | Pass |
-| TP1 | W4 | 8 | 26,887,706,164 | 27,917,806,074 | 0.963102× | Pass |
-| TP1 | W5 | 4 | 38,895,223,037 | 36,822,021,878 | 1.056303× | Pass |
-| TP2 | W4 | 16 | 28,037,442,347 | 25,466,703,294 | 1.100945× | Miss |
+| TP1 | W1 | 1 | 587,873,203 | 717,222,183 | 0.819653× | Pass |
+| TP1 | W2 | 1 | 1,386,329,951 | 1,948,254,502 | 0.711575× | Pass |
+| TP1 | W3 | 4 | 4,260,391,054 | 4,135,764,552 | 1.030134× | Pass |
+| TP1 | W4 | 8 | 26,417,963,763 | 27,929,400,877 | 0.945884× | Pass |
+| TP1 | W5 | 4 | 38,807,917,973 | 36,727,422,658 | 1.056647× | Pass |
+| TP1 | W6 | 20 | 71,744,251,350 | 66,839,293,143 | 1.073384× | Pass |
+| TP2 | W1 | 2 | 515,768,012 | 560,978,526 | 0.919408× | Pass |
+| TP2 | W2 | 2 | 1,381,815,049 | 1,312,484,124 | 1.052824× | Pass |
+| TP2 | W3 | 8 | 3,922,045,906 | 4,115,852,250 | 0.952912× | Pass |
+| TP2 | W4 | 16 | 27,621,177,840 | 26,302,791,966 | 1.050123× | Pass |
+| TP2 | W5 | 8 | 41,007,480,757 | 39,870,936,066 | 1.028506× | Pass |
+| TP2 | W6 | 20 | 53,711,372,451 | 52,972,333,926 | 1.013951× | Pass |
 
-Two TP1 W4 startup attempts on GPU 1 ended before either arm measured. All reported TP1 cells used GPU 0.
-
-The campaign at `artifacts/pool-w6/campaign/official-81b477126d5b-d2c01558e9b6/` retains raw streams, comparisons, and final cell status in `closure/results.json`. See `artifacts/pool-w6/verification/audit-formal-digest-81b477126d5b.json` for the independent audit. [Earlier AgentX results](agentx-256k.md) predate these changes.
-
-### Single-request split release
-
-Native `3808bf3034cd` passed all six TP1 cells. TP2 W4 missed at 1.105433× by 142.663 ms, leaving five TP2 cells unmeasured. [Full archived results and receipts](https://github.com/para1lel/sglang.cpp/blob/31cbe16db2ba51bce13989f4d5a38ad8e2ad6174/docs/performance.md#single-request-split-release)
-
-### Warm GQA release
-
-Native `cb8bcbd88423` passed eleven of twelve matched cells. TP1 W6 reached 0.977955×. TP2 W4 passed by 34.74 ms and TP2 W6 missed at 1.139227×.
-
-### Submitted HBM pool release
-
-Native `0788856a586a` passed TP1 W1–W5. TP1 W6 missed at 1.210904×. TP2 remained unmeasured.
-
-[Full archived tables, binary identities, and replay receipts](https://github.com/para1lel/sglang.cpp/blob/4946ef447dded20a8fec21cdb5d3c423274eb63a/docs/performance.md#matched-k4-evidence)
-
-### Warm GQA diagnostics
-
-A separate TP1 replay of turn 20 matched all 1,024 output IDs from the timed native run. Its two prefill grants spanned 3.168 s. The trace attributed 1.074 s to 16 tiled singleton calls and 1.724 s to 144 raw paired calls. Together those readers accounted for 2.798 s of prefill. The replay receipt is `artifacts/pool-w6/verification/w6-prefill-nsys.H85aZmFJ/turn20-coverage.txt`.
-
-A focused TP1 replay with the chunked singleton reader preserved the cache hits and first eight output IDs on turns 6 and 20. Turn 20 time to first token fell from 3,271.929 to 2,394.973 ms. Its first 2,049-row grant fell from 1,560.879 to 689.398 ms. The second stayed near 1,604 ms. The short replay receipts are under `artifacts/pool-w6/hotpool/control.FmgaURB3/` and `artifacts/pool-w6/hotpool/singleton-generation.2prfpSKU/`.
-
-The resident staged reader passed 24 eager TP1 and TP2 rank-local cases against an independent FP64 reference. Across 198,180,864 outputs, maximum absolute error was 0.00866110 and maximum normalized RMSE was 0.00230620. For 1,024 query rows with 195,583 visible tokens, the three-trial median fell from 12.324 to 5.656 ms at TP1. At TP2, the rank-local median fell from 6.191 to 2.750 ms. These isolated readings compare raw paired attention with the staged reader. The `exact-final-resident-parity-tp{1,2}.log` files are under `artifacts/pool-w6/tmem/w6-profile.kecUkXXS/`.
-
-### Historical PR #3 campaign
-
-The historical PR #3 campaign covered W1–W5. Native release `739413015202541bdb4bdabcc1580aceb381e86b` passed the 1.10× gate independently on all five rows at both widths. Each native arm used one LMCache daemon with a 64 GiB CPU L1 at TP1 and 128 GiB at TP2. [PR #3 campaign evidence](https://github.com/para1lel/sglang.cpp/pull/3)
-
-| Row | TP1 native (ns) | TP1 vLLM (ns) | TP1 ratio | TP2 native (ns) | TP2 vLLM (ns) | TP2 ratio |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| W1 | 565,244,798 | 644,300,564 | 0.87730× | 495,706,506 | 563,151,345 | 0.88024× |
-| W2 | 1,288,408,231 | 1,779,069,188 | 0.72420× | 1,235,557,398 | 2,017,694,876 | 0.61236× |
-| W3 | 3,950,017,357 | 4,442,892,822 | 0.88906× | 3,877,101,752 | 3,868,120,684 | 1.00232× |
-| W4 | 26,478,343,436 | 27,963,477,695 | 0.94689× | 27,371,598,131 | 25,600,380,451 | 1.06919× |
-| W5 | 38,757,275,298 | 36,979,270,671 | 1.04808× | 41,606,364,017 | 40,096,070,795 | 1.03767× |
-
-The scored TP1 W4 pair excludes an earlier pair with external GPU PID 833580 during measured vLLM requests. The independent replay receipt `consolidated.json` has SHA-256 `53fd6f8b86df28787269dbf0a48d30f2183122e2922ecf70fb7aee72cdf0b181`.
-
-<a id="traced-one-output-prefill-diagnostic"></a>
-<a id="current-single-round-v5"></a>
-<a id="archived-single-round-v5"></a>
-<a id="archived-multi-cohort-v4"></a>
-
-[Archived TP1 `c701d294` results and SSE replay](https://github.com/para1lel/sglang.cpp/blob/a5974ba4eb99bd8e8f890c2e7262a27dbc3aace1/docs/performance.md#matched-k4-evidence) · [Archived v4, v5, and one-output diagnostics](https://github.com/para1lel/sglang.cpp/blob/5ee79416d3e30cd178abab69598d047c4393793d/docs/performance.md#matched-k4-evidence) · [TP2 campaign record](serving/tp2.md#campaign-record)
+The campaign directory `artifacts/pool-w6/campaign/official-b0596c25eab5-59748dd6424d/` contains the saved streams, clock receipts, and placements. The independent replay record is `artifacts/pool-w6/verification/audit-formal-digest-b0596c25eab5.json`.

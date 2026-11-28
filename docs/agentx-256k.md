@@ -6,9 +6,7 @@ Compare native serving with LMCache against pinned vLLM with Simple KV Offload o
 
 | Input | Identity |
 | --- | --- |
-| Initial native baseline | `3813c20f53a27f31dadb5698ef3d319af25f4b99` on `bench/agentx-256k-tp1-tp2`. This build was used for the aborted TP2 warmup and operator diagnosis. |
-| Historical native source | `fad939383840a545e03ae2d2fe17277b52403cf3`, tree `7bcc82a5f0f05956baf2e7e9d658ce039065d006`, Release binary SHA-256 `c6f750ecb4205a49ab6c6a29643ab1df9f597606bf43a85acbc4ea3ae8e11ca8`. [Original results and receipts][historical-results] |
-| Current native source | `bdaec36dbb985edd57e54b3565315ba321290a23`, tree `982baef6e1bfe7113f3b10e145c1ae4a0024bf7d`, Release binary SHA-256 `d83223fdcf988f24b7d919ad97b499757e9abcd1876127ff174ddb0a9282fa5d`. The release receipt is `artifacts/agentx-256k/kvfix/official-peer-release/release-identity.json`. |
+| Native source | `bdaec36dbb985edd57e54b3565315ba321290a23`, tree `982baef6e1bfe7113f3b10e145c1ae4a0024bf7d`, Release binary SHA-256 `d83223fdcf988f24b7d919ad97b499757e9abcd1876127ff174ddb0a9282fa5d`. The release receipt is `artifacts/agentx-256k/kvfix/official-peer-release/release-identity.json`. |
 | Native LMCache | Wheel `0.5.8`, SHA-256 `4ec775bda3a8c5f1f5b1ef0bbc441b666db86b57c3c2a7bcba47a4f6550b07cd`. Each width used one private daemon. [Daemon setup](serving/lmcache.md#start-the-daemon) |
 | vLLM source | `vllm-project/vllm` at `81a8cb063e6247fe254d7caf7e98a6691d71022a`. Use `/data1/shared/dongwu.chen/environments/vllm-81a8cb063e62`. Both runs use `0.34.0rc1.dev787+g81a8cb063`, wheel SHA-256 `25358fa092260117176d78f4efeabfd06a0e49731d29bbcffd717dfedc498ad9`. [Baseline agreement](performance.md#implementations-and-controls) |
 | Model and tokenizer | `/data0/shared/Qwen3.8-27B-FP8` for both engines and the replay tokenizer. The checkpoint matches Qwen revision `c3a462cc3d38cf351f3b26cbd763469eeb74ef81` and supports 262,144 tokens. [Checkpoint record](research/checkpoint.md) |
@@ -17,7 +15,7 @@ Compare native serving with LMCache against pinned vLLM with Simple KV Offload o
 
 ## Run matrix
 
-At each width, both native releases and vLLM used the same ordered GPU UUIDs. vLLM ran first. The current native TP1 and TP2 profiles overlapped on separate NUMA nodes.
+At each width, native and vLLM used the same ordered GPU UUIDs. vLLM ran first. The native TP1 and TP2 profiles overlapped on separate NUMA nodes.
 
 | TP | Engine | CPU cache capacity | Physical GPUs in rank order | Live agent clients | Profile |
 | ---: | --- | ---: | --- | ---: | ---: |
@@ -71,15 +69,9 @@ Keep one evidence directory per run under `artifacts/agentx-256k/`. Record its p
 - Raw `/metrics` samples at warmup and profiling boundaries and after drain. Retain native LMCache activity and vLLM local and offload activity with the engine receipts.
 - Scoring invocation, numerators, denominators, sample counts, and any exclusion reason.
 
-## Initial native warmup diagnosis
-
-The original native TP2 warmup on B200s 0 and 1 stopped before profiling. At 131,073 visible tokens, an isolated MXFP8 GQA probe fell from paired TMEM to protected prefill. Median operator latency rose from 3.894 ms at 131,072 tokens to 489.734 ms at 131,073 tokens. The probe used 1,024 query rows, 12 query heads, and two KV heads on B200 3.
-
-The final GQA fix, `835f877b819473fccb1bcbaf297bf50c0d56bebb`, uses paired TMEM for eligible full long tiles and ordered single-CTA TMEM for eligible partial tiles. At 131,073 visible tokens, three-trial medians for full tiles were 8.270 ms at TP1 and 4.149 ms at TP2. The final archive passed six production cases, four direct split cases, and exceptional repair. [Dispatch](ordered-gqa-prefill.md#constraints-and-failure-behavior) · [Archived warmup and operator receipts][historical-warmup]
-
 ## Timed AgentX results
 
-Attempt 01 was stopped after abnormal TP2 peer HBM growth. The scores below use only the completed native attempt 02 and the frozen vLLM runs. Closed-loop dependencies can change the mix of finalized requests. Metrics use each run’s own finalized cohort and observation span.
+Closed-loop dependencies can change the mix of finalized requests. Metrics use each run’s own finalized cohort and observation span.
 
 | TP | Engine | P90 E2E normalized interactivity (output tokens/s/user) | Input tokens/s/chip | Output tokens/s/chip | Actual KV hit (%) | Theoretical KV hit (%) |
 | ---: | --- | ---: | ---: | ---: | ---: | ---: |
@@ -88,20 +80,11 @@ Attempt 01 was stopped after abnormal TP2 peer HBM growth. The scores below use 
 | 2 | Native + LMCache | 9.09 | 20,471.22 | 173.00 | 84.04 | 95.70 |
 | 2 | vLLM + Simple KV Offload | 53.05 | 36,530.15 | 331.35 | 94.83 | 96.32 |
 
-Native actual KV hits rose by 2.08 percentage points at TP1 and fell by 0.18 points at TP2 versus the historical native runs. They remained 9.08 and 10.79 points below vLLM and 10.70 and 11.66 points below the replay theory. At TP1 and TP2, native P90 interactivity was 76.4% and 82.9% lower than vLLM. Input throughput per chip was 32.7% and 44.0% lower. Output throughput per chip was 32.7% and 47.8% lower.
-
-### Historical native results
-
-The historical native rows used the former checkpoint and verifier paths. [Original cohort, manifests, and counters][historical-results]
-
-| TP | Engine | P90 E2E normalized interactivity (output tokens/s/user) | Input tokens/s/chip | Output tokens/s/chip | Actual KV hit (%) | Theoretical KV hit (%) |
-| ---: | --- | ---: | ---: | ---: | ---: | ---: |
-| 1 | Historical native + LMCache | 13.47 | 26,509.24 | 242.53 | 83.07 | 95.82 |
-| 2 | Historical native + LMCache | 11.06 | 20,884.43 | 179.15 | 84.22 | 95.65 |
+Actual native KV hit rates were 9.08 percentage points below vLLM at TP1 and 10.79 points below at TP2. They were 10.70 and 11.66 points below the replay theory. Native P90 interactivity was 76.4% and 82.9% lower than vLLM at TP1 and TP2. Input throughput per chip was 32.7% and 44.0% lower. Output throughput per chip was 32.7% and 47.8% lower.
 
 ### Observation and coverage
 
-Attempt 02 used seed `42`. The client logged 1,800.000 s of TP1 dispatch and 1,800.001 s at TP2. The launcher observed profile starts at 01:13:08.500 UTC for TP1 and 01:14:02.535 UTC for TP2 on 2026-11-28. Each finalized turn had timing, final token and cache usage, trace blocks, and a positive-latency P90 sample. The theoretical block totals matched the harness. Both valid native arms and both vLLM arms had zero errors or context-overflow skips.
+The client used seed `42` and logged 1,800.000 s of native TP1 dispatch and 1,800.001 s at TP2. Each finalized turn had timing, final token and cache usage, trace blocks, and a positive-latency P90 sample. The theoretical block totals matched the harness. All four arms had zero errors or context-overflow skips.
 
 | TP | Engine | Finalized / sent | Observation (s) | Chip-seconds | Input tokens | Cached input tokens | Output tokens | Theoretical hit / total blocks |
 | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -114,23 +97,11 @@ Native TP1 engine counters reconciled exactly with finalized warmup and profilin
 
 ### Effective server and cache settings
 
-Native used 8/16 running-request slots, the 32,768-token batch limit, 262,144 context, and four-token MTP. LMCache 0.5.8 reported native-v4 over SLC3. The dispatcher retained the original seed, warmup, and grace period. [Cache accounting](prefix-cache.md#checkpoint-compatibility-and-resume) · [Ranked restores](serving/lmcache.md#ranked-tp2-transport)
+Native used 8/16 running-request slots, the 32,768-token batch limit, 262,144 context, and four-token MTP. LMCache 0.5.8 reported native-v4 over SLC3.
 
-The drained whole replay restored 47,215,357 coherent target tokens at TP1 and 75,923,335 at TP2, with zero LMCache I/O errors. Read-only GQA coverage beyond the coherent span accounted for 2,491,722 and 4,324,357 rows respectively. Against the historical native runs, LMCache writes rose from 0.463 to 0.989 TiB at TP1 and from 0.808 to 1.528 TiB at TP2. Eviction events rose from 33 to 69 and 27 to 54 respectively. These totals cover warmup, profiling, and drain for each closed-loop cohort. Per-request attribution would require key-level data.
+The drained whole replay restored 47,215,357 coherent target tokens at TP1 and 75,923,335 at TP2, with zero LMCache I/O errors. Read-only GQA coverage beyond the coherent span accounted for 2,491,722 and 4,324,357 rows respectively. These totals cover warmup, profiling, and drain for each closed-loop cohort.
 
-Both vLLM widths used four-token Qwen MTP, FlashInfer attention, FP8 E4M3 KV, and eager `SimpleCPUOffloadConnector`. GPU KV capacity was 112 GiB at TP1 and 128 GiB per rank at TP2. The TP1 128 GiB warmup exhausted memory. Both scored arms recorded CPU stores with zero external hits. All measured vLLM cache hits came from GPUs.
-
-### Matched-request cache coverage
-
-A join on trace ID, branch-aware conversation ID, turn, and normalized payload hash matched 599 TP1 requests and 759 TP2 requests across native releases. Theoretical hit totals were equal within each matched cohort. TP1 gained 897,187 cached tokens (+1.87 percentage points). TP2 lost 714,657 (−0.96 points). At TP2, 636 improved requests gained 2,469,849 tokens while 40 partial regressions lost 2,283,020 and eight former hits lost 983,040. Request arrival and cache history could still differ. The join measures changes in reuse, and has no per-key eviction data. See `artifacts/agentx-256k/kvfix/attribution/post-release/summary.json`.
-
-### TP2 peer HBM
-
-Five-second `nvidia-smi` board samples on GPU 2 started at 18,938 MiB, peaked at 58,122 MiB, and settled at 22,304 MiB after drain. The maximum idle sample was 23,728 MiB. At the settled sample, GPU 2 reported 21,346 MiB for the server and 680 MiB for LMCache. In the first 450.074 sampler seconds, the corrected board peaked at 55,100 MiB versus 177,050 MiB in the stopped attempt.
-
-Board samples include live requests, allocator state, and pending releases. The sampler reports their combined usage. TP2 reported zero resident target and draft prefix bytes at sampled phase boundaries. With zero running requests at profiling completion, aggregate pending release was 544,555,960 bytes. The settled scrape had zero pending and failed release bytes. The measured revision's peer reclaimer fenced the releasing stream before clearing the charge. [Archived peer cache role](https://github.com/para1lel/sglang.cpp/blob/bdaec36dbb985edd57e54b3565315ba321290a23/src/runtime/execution/decoder_batch_state.cpp#L106)<!-- prefix: "retired.empl" --> · [Archived release fence](https://github.com/para1lel/sglang.cpp/blob/bdaec36dbb985edd57e54b3565315ba321290a23/src/runtime/backend/retired_request_blocks.cpp#L48)<!-- prefix: "const auto s" -->
-
-In a separate matched two-wave fixture, with identical prompts and output IDs and balanced IPC maps and closes, second-wave settled peer server growth fell from 4,812 MiB to zero. See `hbm-matched-final-shared-reclaimer.json` in the audit directory. That fixture reports server allocations. The campaign reports whole-board peaks.
+Both vLLM widths used four-token Qwen MTP, FlashInfer attention, FP8 E4M3 KV, and eager `SimpleCPUOffloadConnector`. GPU KV capacity was 112 GiB at TP1 and 128 GiB per rank at TP2. Both arms recorded CPU stores with zero external hits. All measured vLLM cache hits came from GPUs.
 
 ### Run receipts
 
@@ -143,40 +114,6 @@ Run files for the current native release are under `artifacts/agentx-256k/kvfix/
 | `native-tp2/` | `64fa764b4fb86e353495a378b855eeb8496c513048d24926e51ec51a205d8130` | `2d733b6021fc66b25440eb0c5ca4557358c8b0f3e9604672ef6b98971ebf3cff` |
 | `vllm-tp2/` | `c79f6d33492c2f1408559f817b5f1020a98c9f5131f78a582082df49fce38e2b` | `a37ddc962e4d830e236f29e397aa5621c47a8c51706eb803094e2397a8431424` |
 
-A focused historical TP1 cold publisher hit one opcode 11 timeout. The later instrumented restart fixture completed 58 STORE ARMs and 372 IPC closes. Alternate weights missed, and matching weights reused persisted state with exact continuation IDs after restart. See `persistence-restart-7119-tp1/phase-coverage.json` in the audit directory.
-
-### Offline suffix checkpoint replay
-
-The offline model used the 602 TP1 and 774 TP2 finalized historical native requests. It matched exact prefixes to completed earlier requests and assumed no eviction. The [suffix policy](prefix-cache.md#checkpoint-boundaries) modeled 45,703,556 of 48,023,046 input tokens reusable at TP1 (95.17%) and 72,766,151 of 76,311,656 at TP2 (95.35%). It selected about seven checkpoints per request on average, with at most 12. In the TP2 fork from export row 839 to 616, the isolated grid comparison lost 24,576 rows. The exact-token simulation lost 24,571 rows for that fork against its periodic control.
-
-Across 3,999 historical finalized requests, no longer prompt preserved an entire earlier prompt. AgentX reconstructs historical assistant turns, so generated terminal suffixes added zero reused rows to the offline cohorts. Exact live continuation can reuse them. See `artifacts/agentx-256k/kvfix/attribution/{output-interior.json,suffix-policy-tp*.log,fenwick-policy-tp2.log}`.
-
-### Focused cache-pressure diagnostic
-
-The predecessor’s 64 GiB TP1 pool recorded evictions between each prime and follow-up, restoring 0 of 373,710 rows. Its 128 GiB TP2 diagnostic restored 298,038 of 660,414 rows, up from 204,800 on a different GPU pair. One restore used the common GDN endpoint 91,573. [Full pressure evidence][historical-pressure]
-
-### Focused native numerical diagnostic
-
-For trace fork 658 → 332, native IPC restore and independent GPU-resident prefill used the same schedule and selected greedy token 760. FP32 GDN carry, raw GDN state, hidden and residual values matched bitwise across all 48 layers. Cold unsegmented prefill of the same 144,653 IDs selected 1596. The first inspected endpoint difference was in layer 0 FP8 GDN, where changed tile boundaries altered prior rounded carry. The historical `c6f750ec…` binary showed partition sensitivity on two small W3 cases. See `artifacts/agentx-256k/replay-partitions.OD3VXl8i/`.
-
-Transformers `Qwen3_5ForCausalLM` used BF16-dequantized weights and higher-precision GDN on the same IDs. Its top logits with probabilities were `The` (760) 23.75 (66.59%), `Let` (9764) 22.75 (24.50%), and `We` (1596) 20.875 (3.76%). The 760-minus-1596 logit margin was +2.875 in the reference, +1.125 with native restore, and −0.125 with cold prefill.
-
-Across 248,320 vocabulary entries, total variation was 0.1462 warm and 0.3589 cold. Reference-to-native KL was 0.0974 and 0.3889 nats, respectively. Log-probability RMSE was 0.7840 and 0.6428 unweighted, or 0.3668 and 0.7695 weighted by reference probability. See `artifacts/agentx-256k/kvfix/reference-transformers/{result,comparison}.json`.
-
-Pinned vLLM used the same IDs, zero cache hits, 32,768-token chunks, FP8 weights, BF16 activations and FP32 GDN state, with MTP off. It selected 760, ranked 9764 second and 1596 fifth, and gave 760 a 4.625 log-probability lead over 1596. Total variation against native was 0.24550 warm and 0.45807 cold. Both references cover one next token. See `artifacts/agentx-256k/kvfix/reference-vllm/{result,comparison}.json`.
-
-### Focused full-width checkpoint publication
-
-The `caf3f622…` Release binary processed bursts of 1,535-token prompts at observed widths 8 (TP1) and 16 (TP2). Each request wrote five prompt checkpoints at rows 511, 1,023, 1,279, 1,407, and 1,535. This produced 40 physical endpoints at TP1 and 80 on each TP2 rank. All planned prompt stores were acknowledged, with zero declines or failures. See `artifacts/agentx-256k/kvfix/verification/final-release-burst-tp{1,2}/route-evidence/wide-burst.json`.
-
-### Focused terminal continuation
-
-TP1 and TP2 each generated eight tokens from a 257-token prompt. The committed cache ended at row 264. After removing all other GDN checkpoints, an exact token-history continuation restored 264 coherent target rows and 263 shifted draft rows. It computed zero prompt GQA or GDN rows. All eight continuation token IDs matched uninterrupted generation at each width. See `artifacts/agentx-256k/kvfix/verification/ordered-history-terminal-tp{1,2}/route-evidence/summary.json`.
-
-### Focused ReplaySSM verification
-
-The integrated `c3c1ba29…` build generated identical 24-token sequences per lane at each width in K0, mixed eager K4/K2, and captured K4. It ran 14 actual graph launches at TP1 and seven at TP2, with zero target reruns. Cancellation and slot reuse passed. The isolated `13f2969a…` operator passed CPU and bitwise state checks. [Graph proofs and isolated B200 timing][historical-replay]
-
 [methodology]: https://inferencex.semianalysis.com/agentx/methodology
 [leaderboard]: https://inferencex.semianalysis.com/zh/infx/inference/deepseek-v41-flash
 [trace]: https://huggingface.co/datasets/semianalysisai/cc-traces-weka-062126-256k/blob/8fecd2fc56694469f758f0afbbb6335ad3043740/traces.jsonl
@@ -185,7 +122,3 @@ The integrated `c3c1ba29…` build generated identical 24-token sequences per la
 [scorer]: https://github.com/SemiAnalysisAI/InferenceX/blob/d490919c996b5169a3e9345ae3c64e32ccfba357/inferencex-e2e/infx/results/agentic/request_metrics.py
 [offload]: https://github.com/vllm-project/vllm/blob/81a8cb063e6247fe254d7caf7e98a6691d71022a/vllm/config/vllm.py#L1231
 [capacity]: https://github.com/vllm-project/vllm/blob/81a8cb063e6247fe254d7caf7e98a6691d71022a/vllm/config/cache.py#L412
-[historical-results]: https://github.com/para1lel/sglang.cpp/blob/bdaec36dbb985edd57e54b3565315ba321290a23/docs/agentx-256k.md#timed-agentx-results
-[historical-warmup]: https://github.com/para1lel/sglang.cpp/blob/bdaec36dbb985edd57e54b3565315ba321290a23/docs/agentx-256k.md#initial-native-warmup-diagnosis
-[historical-pressure]: https://github.com/para1lel/sglang.cpp/blob/bdaec36dbb985edd57e54b3565315ba321290a23/docs/agentx-256k.md#focused-cache-pressure-diagnostic
-[historical-replay]: https://github.com/para1lel/sglang.cpp/blob/bdaec36dbb985edd57e54b3565315ba321290a23/docs/agentx-256k.md#focused-replayssm-verification

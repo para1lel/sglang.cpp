@@ -98,18 +98,18 @@ For new offline timing, use `--warmup 1 --repeats 1` and omit `--top-logits`. `l
 
 ### GPU pool engineering checks
 
-The TP1 and TP2 pressure fixtures used preview server SHA-256 `8bee22e0c2242d276666e2e74fe41ceb89e27cb321d044d33f6739dfcf094cb0`. Each B200 reported `budget_bytes` of 168,524,838,338 and `capacity_bytes` of 168,522,940,416.
+Controlled TP1 and TP2 tests used the [submitted release](#submitted-hbm-pool-release). Each B200 reported a 168,524,838,338-byte budget and a 168,522,940,416-byte committed arena. The tests set the GQA pool to 16 pages and the GDN pool to four checkpoints to exercise pressure.
 
-| Width | Completed backups at pressure settlement | Backed evictions | Unbacked evictions | CUDA IPC map and unmap events | Module-static bytes |
+| Width | Completed backups | Backed evictions | Unbacked evictions | CUDA IPC map and unmap events | Module-static bytes |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| TP1 | 42 | 40 | 0 | 132 | 12 |
-| TP2 | 44 | 42 | 0 | 232 | 41 |
+| TP1 | 64 | 62 | 0 | 132 | 12 |
+| TP2 | 64 | 62 | 0 | 224 | 41 |
 
 The cold, HBM-only, mixed-tier, and CPU-reload checks all returned greedy ID 17. At TP2, rank 0 completed while the fixture held rank 1's STORE reply. The backup stayed pending until the fixture released the reply.
 
-The Nsight Systems traces cover the server and daemon. From readiness until shutdown started, they recorded zero physical device allocation or free calls and zero corresponding events. IPC maps existing backing. CUDA loads the module-static symbols automatically.
+Nsight Systems captured zero physical device allocation or free calls and zero corresponding events from readiness to shutdown start in the server and daemon. IPC maps committed backing. CUDA loads the module-static symbols automatically. The table reports fixture counts outside the timed campaign.
 
-Receipts are in `artifacts/pool-w6/verification/tp1-preview2-a/` and `artifacts/pool-w6/verification/tp2-preview2-a/`. Each contains `routes/run.json`, `api-summary-classified.json`, and `identity.sha256`.
+`artifacts/pool-w6/verification/official-verification.sha256` identifies each `routes/run.json`, `api-summary.json`, and exported trace. The release proof directories are `tp1-official-0788856-proof/` and `tp2-official-0788856-proof-b/`.
 
 ### Operator qualification
 
@@ -168,6 +168,29 @@ Collect kernel, scheduler, queue, and utilization diagnostics separately. Record
 Retain the run manifest, commands, environment, fixture hashes, raw samples, and failures in ignored `artifacts/` storage. A missing counter is unavailable. A missing baseline, failed correctness check, or changed workload leaves that performance claim open.
 
 ## Matched K4 evidence
+
+### Submitted HBM pool release
+
+Native source `0788856a586a6f484135bc627270ddc509a29687` produced server SHA-256 `6874dc330b996616128a897d7f26896b2891fc3485652879f41d585a61585a78`. Native used LMCache. Pinned vLLM used local prefix caching with KV offload disabled. The arms in each pair ran on the same B200 devices.
+
+The first attempt measured all six TP1 rows. W1–W5 passed. W6 reached 1.210904283× and missed the 1.10× limit. This build has no TP2 timings. Each arm ran one warmup and one timed cohort or chain per row. The ratio divides native makespan by vLLM makespan.
+
+| Width | Row | Completed / attempted per arm | Native (ns) | vLLM (ns) | Ratio | Gate |
+| --- | --- | ---: | ---: | ---: | ---: | --- |
+| TP1 | W1 | 1 / 1 | 572,171,374 | 641,618,759 | 0.891762× | Pass |
+| TP1 | W2 | 1 / 1 | 1,383,434,795 | 1,952,919,939 | 0.708393× | Pass |
+| TP1 | W3 | 4 / 4 | 4,305,343,466 | 4,911,358,733 | 0.876609× | Pass |
+| TP1 | W4 | 8 / 8 | 27,103,415,230 | 27,924,394,892 | 0.970600× | Pass |
+| TP1 | W5 | 4 / 4 | 38,855,159,394 | 36,724,431,609 | 1.058019× | Pass |
+| TP1 | W6 | 20 / 20 | 88,663,772,515 | 73,221,123,885 | 1.210904× | Miss |
+
+W1–W5 span the earliest submission through the last valid `[DONE]`. W6 spans the first POST through the twentieth HTTP EOF. Each comparison has one measured makespan per arm. The W1–W5 `median_ns` fields hold that single sample. Warmups and occupancy sampling are outside the makespan calculation.
+
+Each TP1 W6 arm served 2,129,920 measured input tokens and emitted 20,480 output tokens. Native reported 1,945,581 cached prompt tokens. vLLM reported 1,925,248. The occupancy audit observed no foreign compute owner. The comparison SHA-256 is `658f2635617fdeb382dfeb315caf43437dd873034567e0bb45ab68abaae88c8f`.
+
+The campaign root is `artifacts/pool-w6/campaign/official-0788856a586a-6874dc330b99/`. Retained `comparison.json` and arm receipts give exact timings, streams, cache counters, and launch controls.
+
+### Historical PR #3 campaign
 
 The historical PR #3 campaign covered W1–W5. Native release `739413015202541bdb4bdabcc1580aceb381e86b` passed the 1.10× gate independently on all five rows at both widths. Each native arm used one LMCache daemon with a 64 GiB CPU L1 at TP1 and 128 GiB at TP2. [PR #3 campaign evidence](https://github.com/para1lel/sglang.cpp/pull/3)
 

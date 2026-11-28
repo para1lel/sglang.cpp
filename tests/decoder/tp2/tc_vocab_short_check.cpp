@@ -1,6 +1,7 @@
 #include "sglang/checkpoint.h"
 #include "sglang/decoder_internal.h"
 #include "sglang/runtime/backend/cuda_resources.h"
+#include "sglang/runtime/backend/device_arena.h"
 #include "sglang/text/bf16_head_projection.h"
 #include "sglang/text/mtp/tc_vocab.h"
 
@@ -251,6 +252,9 @@ int main(int argc, char** argv) {
         check(cudaGetDeviceCount(&devices), "Locate isolated accelerator");
         expect(devices == 1, "Run with only the reserved GPU visible");
         check(cudaSetDevice(0), "Select isolated accelerator");
+        const auto arena =
+            sglang::decoder::DeviceArena::start(0, sglang::decoder::default_gpu_memory_utilization);
+        arena->commit();
         const Checkpoint checkpoint(argv[1]);
         OperatorTest test(checkpoint);
         for (int i = 2; i < argc; ++i) test.capture(argv[i]);

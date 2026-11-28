@@ -3,6 +3,7 @@
 #include "sglang/decoder_prefill.h"
 #include "sglang/decoder_prefix_cache.h"
 #include "sglang/decoder_verify.h"
+#include "sglang/runtime/backend/device_arena.h"
 #include "sglang/runtime/cache/lmcache_group.h"
 #include "sglang/runtime/server/batch_cache.h"
 #include "sglang/text/decoder_logprobs.h"
@@ -90,22 +91,16 @@ private:
 };
 
 CopyGate* copy_gate = nullptr;
-std::atomic<void*> attempted_free{nullptr};
-std::atomic<void*> failed_free{nullptr};
-std::atomic<cudaError_t> free_error{cudaErrorNotSupported};
-std::atomic<void*> synchronous_free{nullptr};
-thread_local void* last_allocation = nullptr;
-struct WorkerRelease {
-    void* memory = nullptr;
-    cudaStream_t stream = nullptr;
-    int queued = 0, completed = 0, fallbacks = 0;
-    cudaError_t sync_error = cudaSuccess;
-    int reports = 0;
+struct PhysicalStorageCalls {
+    std::atomic<bool> watching{false};
+    std::atomic<int> count{0};
 };
-thread_local WorkerRelease worker_release;
-std::atomic<void*> worker_allocation{nullptr};
-std::atomic<bool> inject_sync_error{false};
-enum class CheckpointFault { none, allocation, second_copy, event };
+
+PhysicalStorageCalls& physical_storage_calls() {
+    static PhysicalStorageCalls calls;
+    return calls;
+}
+enum class CheckpointFault { none, second_copy, event };
 CheckpointFault checkpoint_fault = CheckpointFault::none;
 std::size_t checkpoint_copies = 0;
 
@@ -426,64 +421,30 @@ extern "C" cudaError_t __wrap_cudaMemcpyAsync(void* dst, const void* src, std::s
 
 extern "C" cudaError_t __real_cudaFree(void*);
 extern "C" cudaError_t __wrap_cudaFree(void* memory) {
-    if (memory && memory == worker_allocation.load()) ++worker_release.fallbacks;
-    const auto status = __real_cudaFree(memory);
-    if (status == cudaSuccess && memory == failed_free.load()) synchronous_free = memory;
-    return status;
-}
-
-extern "C" cudaError_t __real_cudaFreeAsync(void*, cudaStream_t);
-extern "C" cudaError_t __wrap_cudaFreeAsync(void* memory, cudaStream_t stream) {
-    if (memory && memory == failed_free.load()) {
-        attempted_free = memory;
-        return free_error.load();
-    }
-    const auto status = __real_cudaFreeAsync(memory, stream);
-    if (status == cudaSuccess && memory && memory == worker_allocation.load()) {
-        worker_release.memory = memory;
-        worker_release.stream = stream;
-        ++worker_release.queued;
-    }
-    return status;
-}
-
-extern "C" cudaError_t __real_cudaStreamSynchronize(cudaStream_t);
-extern "C" cudaError_t __real_cudaEventRecord(cudaEvent_t, cudaStream_t);
-extern "C" cudaError_t __wrap_cudaStreamSynchronize(cudaStream_t stream) {
-    const auto status = __real_cudaStreamSynchronize(stream);
-    if (status == cudaSuccess && worker_release.memory && stream == worker_release.stream) {
-        ++worker_release.completed;
-        if (inject_sync_error) {
-            worker_release.sync_error = __real_cudaEventRecord(nullptr, stream);
-            return worker_release.sync_error;
-        }
-    }
-    return status;
-}
-
-extern "C" const char* __real_cudaGetErrorString(cudaError_t);
-extern "C" const char* __wrap_cudaGetErrorString(cudaError_t status) {
-    if (status != cudaSuccess && status == worker_release.sync_error) ++worker_release.reports;
-    return __real_cudaGetErrorString(status);
+    auto& calls = physical_storage_calls();
+    if (memory != nullptr && calls.watching)
+        ++calls.count;
+    return __real_cudaFree(memory);
 }
 
 extern "C" cudaError_t __real_cudaMalloc(void**, std::size_t);
 extern "C" cudaError_t __wrap_cudaMalloc(void** memory, std::size_t size) {
-    if (checkpoint_fault == CheckpointFault::allocation) {
-        checkpoint_fault = CheckpointFault::none;
-        return __real_cudaMalloc(memory, std::numeric_limits<std::size_t>::max() / 2);
-    }
-    const auto status = __real_cudaMalloc(memory, size);
-    if (status == cudaSuccess) last_allocation = *memory;
-    return status;
+    auto& calls = physical_storage_calls();
+    if (calls.watching)
+        ++calls.count;
+    return __real_cudaMalloc(memory, size);
 }
 
-extern "C" cudaError_t __wrap_cudaEventRecord(cudaEvent_t event, cudaStream_t stream) {
+extern "C" cudaError_t real_event_record(cudaEvent_t event,
+                                         cudaStream_t stream) asm("__real_cudaEventRecord");
+extern "C" cudaError_t wrap_event_record(cudaEvent_t event,
+                                         cudaStream_t stream) asm("__wrap_cudaEventRecord");
+extern "C" cudaError_t wrap_event_record(cudaEvent_t event, cudaStream_t stream) {
     if (checkpoint_fault == CheckpointFault::event) {
         checkpoint_fault = CheckpointFault::none;
-        return __real_cudaEventRecord(nullptr, stream);
+        return real_event_record(nullptr, stream);
     }
-    return __real_cudaEventRecord(event, stream);
+    return real_event_record(event, stream);
 }
 
 struct GraphCheckpointOracle {
@@ -707,9 +668,36 @@ static void check_delayed_checkpoint(const DecoderModel& model, const LmCacheCli
 
 void check_checkpoint_faults(const Lane& lane, const LmCacheClient& cache,
                              const PrefixCacheKeys& keys, cudaStream_t stream) {
+    const auto arena = DeviceArena::current(0);
+    const auto available = arena->cache_available_bytes();
+    Allocations held(0);
+    std::size_t block = 256;
+    while (block <= available / 2)
+        block *= 2;
+    for (; block >= 256; block /= 2) {
+        while (arena->cache_available_bytes() >= block) {
+            try {
+                held.allocate_cache<std::byte>(block);
+            } catch (const CudaError& error) {
+                if (error.status != cudaErrorMemoryAllocation)
+                    throw;
+                break;
+            }
+        }
+    }
+    require(arena->cache_available_bytes() == 0,
+            "Checkpoint fixture did not exhaust its cache slices");
+    bool exhausted = false;
+    try {
+        export_prefix_view(lane.request, 0, 0, prompt_end, stream, &lane.draft);
+    } catch (const CudaError& error) {
+        exhausted = error.status == cudaErrorMemoryAllocation;
+    }
+    held.close();
+    require(exhausted && arena->cache_available_bytes() == available,
+            "Exhausted checkpoint lost its error or leaked cache storage");
     struct Case { CheckpointFault fault; cudaError_t status; std::size_t submitted; };
-    for (const auto test : {Case{CheckpointFault::allocation, cudaErrorMemoryAllocation, 0},
-                            Case{CheckpointFault::second_copy, cudaErrorInvalidValue, 2},
+    for (const auto test : {Case{CheckpointFault::second_copy, cudaErrorInvalidValue, 2},
                             Case{CheckpointFault::event, cudaErrorInvalidResourceHandle, 0}}) {
         checkpoint_copies = 0;
         checkpoint_fault = test.fault;
@@ -722,20 +710,17 @@ void check_checkpoint_faults(const Lane& lane, const LmCacheClient& cache,
         require(failed && checkpoint_fault == CheckpointFault::none &&
                     checkpoint_copies == test.submitted && cudaPeekAtLastError() == cudaSuccess,
                 "A checkpoint CUDA submission error was lost or left stale state");
+        require(arena->cache_available_bytes() == available,
+                "Failed checkpoint leaked cache storage");
     }
     const auto unmatched = cache.lookup_prefix(keys, true);
     require(unmatched.gqa == 0 && unmatched.endpoints.empty(),
             "Failed checkpoint unexpectedly reached LMCache");
     auto version = export_prefix_view(lane.request, 0, 0, prompt_end, stream, &lane.draft);
-    auto* const data = last_allocation;
     store(cache, keys, version);
-    free_error = cudaErrorNotSupported;
-    failed_free = data;
     version = {};
-    failed_free = nullptr;
-    require(data && synchronous_free.exchange(nullptr) == data,
-            "Unsupported asynchronous free leaked the checkpoint state version");
-    require(attempted_free.exchange(nullptr) == data, "Checkpoint free missed injected pointer");
+    synchronize_cuda(stream, "Confirm successful checkpoint version release");
+    require(arena->cache_available_bytes() == available, "Completed checkpoint retained its slice");
     require(LmCacheGroup(cache).lookup_prefix({&keys}, prompt_end, true).usable_gdn == prompt_end,
             "Same-thread publication failed after recoverable CUDA errors");
     std::puts("actual checkpoint allocation, second-copy and event failures drain; retry succeeds");
@@ -746,39 +731,37 @@ void check_worker_release(const Lane& lane, const LmCacheClient& cache,
     server::BatchCache worker(std::make_unique<LmCacheClient>(cache), "", 1);
     auto pairing = std::make_shared<server::BatchStorePairing>();
     const std::vector rank_keys{std::make_shared<PrefixCacheKeys>(keys)};
-    for (const bool fail_sync : {false, true}) {
-        last_allocation = nullptr;
+    const auto arena = DeviceArena::current(0);
+    const auto available = arena->cache_available_bytes();
+    for (const bool retain : {false, true}) {
         auto view = export_prefix_view(lane.request, prompt_end, prompt_end - 1, prompt_end,
                                        stream, &lane.draft);
-        auto* const data = last_allocation;
-        require(data && view.transfer.allocations.size() == 1, "Missing checkpoint state version");
-        cudaIpcMemHandle_t handle;
-        check(cudaIpcGetMemHandle(&handle, data), "Identify worker checkpoint allocation");
-        require(std::memcmp(&handle, view.transfer.allocations.front().handle.data(),
-                            sizeof(handle)) == 0, "Checkpoint handle differs from watched pointer");
+        const auto leased = arena->cache_available_bytes();
+        require(leased < available && !view.transfer.allocations.empty(),
+                "Checkpoint state version did not lease cache storage");
+        auto alias = retain ? view.store_owner : nullptr;
         std::shared_ptr<void> reservation;
         require(worker.reserve_store(reservation), "Checkpoint worker declined reservation");
         auto stores = std::make_shared<std::atomic_uint64_t>(0);
         const auto caller = std::this_thread::get_id();
         std::promise<bool> done;
-        worker_allocation = data;
-        inject_sync_error = fail_sync;
-        worker.store(pairing, rank_keys, nullptr, 0, std::move(view), std::move(reservation),
-                     stores, [&] {
-            const auto release = std::exchange(worker_release, WorkerRelease{});
-            done.set_value(std::this_thread::get_id() != caller && release.memory == data &&
-                release.stream == cudaStreamPerThread && release.queued == 1 &&
-                release.completed == 1 && release.fallbacks == 0 &&
-                release.sync_error == (fail_sync ? cudaErrorInvalidResourceHandle : cudaSuccess) &&
-                release.reports == int(fail_sync) && cudaPeekAtLastError() == cudaSuccess);
-        });
+        auto& calls = physical_storage_calls();
+        calls.watching = true;
+        worker.store(
+            pairing, rank_keys, nullptr, 0, std::move(view), std::move(reservation), stores, [&] {
+                done.set_value(std::this_thread::get_id() != caller &&
+                               arena->cache_available_bytes() == (retain ? leased : available) &&
+                               cudaPeekAtLastError() == cudaSuccess);
+            });
         const bool completed = done.get_future().get();
-        worker_allocation = nullptr;
-        require(completed && *stores == 1 && !worker.stores_pending(),
-                "STORE worker did not finish its version release before acknowledging completion");
+        calls.watching = false;
+        require(completed && *stores == 1 && !worker.stores_pending() && calls.count == 0,
+                "STORE worker acknowledged before returning its lease or changed physical storage");
+        alias.reset();
+        synchronize_cuda(stream, "Confirm checkpoint alias release");
+        require(arena->cache_available_bytes() == available, "Last alias retained its cache slice");
     }
-    std::puts(
-        "STORE worker completed the version free on its own stream; sync error reported once");
+    std::puts("STORE worker returns its lease before acknowledging completion; aliases stay valid");
 }
 
 void check_continued_prefill(const Lane& cold, const Lane& warm,
@@ -906,10 +889,12 @@ int main(int argc, char** argv) try {
     require(tokenizer::sha256("abc") ==
         "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", "SHA-256 differs");
     check(cudaSetDevice(0), "Select leased device");
+    const auto arena = DeviceArena::start(0, default_gpu_memory_utilization);
     DecoderModel model(argv[1], 0);
     model.mtp_weights = std::make_shared<MtpDraftWeights>(
         argv[1], 0, model.memory, model.embedding, model.lm_head, model.backend.draft);
     model.tc_vocab = model.mtp_weights->shared_vocab();
+    arena->commit(arena->startup_remaining_bytes() / 2);
     require(model.is_b200() && model.mtp_weights, "Requires real B200 and K4 weights");
     check_model_state(model);
     std::puts("PASS");

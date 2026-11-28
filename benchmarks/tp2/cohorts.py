@@ -1,23 +1,39 @@
 """Capture or independently replay one frozen TP2 row. Use the paired driver's PYTHONPATH."""
 
+from __future__ import annotations
+
 import argparse
 import gzip
 import json
 from pathlib import Path
+from typing import TYPE_CHECKING
 from unittest.mock import patch
 from urllib.parse import urlsplit
 
-from benchmarks.concurrent import client, reference
-from benchmarks.streaming.client import StreamingConnection
 import cache_activity
 import cold_cache
 import k4
 import lifecycle
-from makespan import compare, K4_MAKESPAN_CRITERION, validate_cohort
-from saved_evidence import digest, load, require
 from driver_health import require_healthy_driver_log
+from makespan import K4_MAKESPAN_CRITERION, compare, validate_cohort
+from saved_evidence import digest, load, require
 from tp2_corpus import load_lanes
-from workload_suite import ROWS
+from workload_suite import TP2_POOL_PROTOCOL, geometry, is_serial, rows
+
+from benchmarks.concurrent import client, reference
+from benchmarks.serial import chain
+from benchmarks.serial import fixture as serial_fixture
+from benchmarks.streaming.client import StreamingConnection
+
+if TYPE_CHECKING:
+    from urllib.parse import SplitResult
+
+
+NATIVE_ENGINES = {
+    "tp2-paired-v3": cold_cache.LMCACHE_DRAIN_ALIGNED,
+    "tp2-paired-v4": cold_cache.LMCACHE_DRAIN_SUFFIX,
+    TP2_POOL_PROTOCOL: cold_cache.LMCACHE_POOL_TP2,
+}
 
 
 def binding(run):
@@ -28,39 +44,50 @@ def binding(run):
 
 def handle(run, fixtures, endpoint=None, *, probe=False):
     row = "W1" if probe else run.parent.name
-    lanes = load_lanes(fixtures, row)
     identity = load(run.parent.parent / "identity.json")
-    engines = {
-        "tp2-paired-v3": cold_cache.LMCACHE_DRAIN_ALIGNED,
-        "tp2-paired-v4": cold_cache.LMCACHE_DRAIN_SUFFIX,
-    }
     engine = (
         "vllm"
         if run.name == "vllm-k4"
-        else engines.get(identity.get("protocol"), cold_cache.LMCACHE_DRAIN)
+        else NATIVE_ENGINES.get(identity.get("protocol"), cold_cache.LMCACHE_DRAIN)
     )
     require(run.name in ("vllm-k4", "native-k4", "native-k4-trace"), "Unknown TP2 arm")
     server_log = run / "server.log"
     require(server_log.is_file(), f"{run.name}: missing server log")
     require_healthy_driver_log(server_log.read_text(), run.name)
+    url = checked_url(endpoint) if endpoint else None
+    if is_serial(row, identity.get("protocol")):
+        require(run.name != "native-k4-trace", "W6 requires a matched timing arm")
+        inputs = serial_fixture.load_inputs(fixtures)
+        timings, _ = chain.handle(run, inputs, engine, binding(run), url=url)
+        require_healthy_driver_log(server_log.read_text(), run.name)
+        return timings
+    if probe:
+        require(
+            run.name == "native-k4" and identity["mode"] == "qualify",
+            "Functional probes require a separate native qualification arm",
+        )
+    return handle_cohort(run, fixtures, engine, url, probe=probe)
+
+
+def handle_cohort(
+    run: Path, fixtures: Path, engine: str, url: SplitResult | None, *, probe: bool
+) -> dict:
+    row = "W1" if probe else run.parent.name
+    server_log = run / "server.log"
+    lanes = load_lanes(fixtures, row)
     policy = reference.reference()["policy"]
     measured = {}
     previous = prior_ranks = None
     tags = ["trace"] if run.name == "native-k4-trace" else ["warmup-01", "measured-01"]
     if probe:
-        require(run.name == "native-k4" and identity["mode"] == "qualify",
-                "Functional probes require a separate native qualification arm")
         lanes = lanes[:1]
         tags = ["probe"]
-    if not endpoint:
+    if url is None:
         require({p.name for p in run.glob("*.json.gz")} == {f"{tag}.json.gz" for tag in tags},
                 "Unexpected or missing frozen cohort")
     for tag in tags:
         path = run / f"{tag}.json.gz"
-        if endpoint:
-            url = urlsplit(endpoint)
-            require(url.hostname == "127.0.0.1" and url.scheme == "http" and url.port,
-                    "Expected loopback endpoint")
+        if url is not None:
             receipt = cold_cache.before_cohort(url, engine)
             with patch.object(client.http.client, "HTTPConnection", StreamingConnection):
                 raw = client.capture_cohort(url, row, lanes, tag, policy)
@@ -88,7 +115,24 @@ def handle(run, fixtures, endpoint=None, *, probe=False):
                 before = cold_cache.parse_metrics(raw["cold_cache"]["cleared"], prior_ranks)
                 return {"request_sha256": lanes[0][0]["request_sha256"], "binding": binding(run),
                         "rank_deltas": {k: value - before[k] for k, value in prior_ranks.items()}}
+        if probe and engine in cold_cache.LMCACHE_POOL_ENGINES:
+            return {
+                "request_sha256": lanes[0][0]["request_sha256"],
+                "binding": binding(run),
+                "pool_capacity": {
+                    key: previous["after"][key] for key in cold_cache.LMCACHE_POOL_CAPACITIES
+                },
+            }
     return measured
+
+
+def checked_url(endpoint: str) -> SplitResult:
+    url = urlsplit(endpoint)
+    require(
+        url.hostname == "127.0.0.1" and url.scheme == "http" and url.port,
+        "Expected loopback endpoint",
+    )
+    return url
 
 
 def assess(directory, fixtures):
@@ -97,8 +141,11 @@ def assess(directory, fixtures):
     arms = ["native-k4", "vllm-k4"]
     if row == "W1":
         arms.append("native-k4-trace")
-    require(row in ROWS and {p.name for p in directory.iterdir() if p.is_dir()} == set(arms),
-            "Wrong campaign row or arm set")
+    require(
+        row in rows(identity["protocol"])
+        and {p.name for p in directory.iterdir() if p.is_dir()} == set(arms),
+        "Wrong campaign row or arm set",
+    )
     samples, diagnostics = {}, {}
     for arm in arms:
         run = directory / arm
@@ -113,20 +160,30 @@ def assess(directory, fixtures):
             k4.read_activity(run, "vllm")
         result = data["measured-01"]
         samples[arm] = {row: [result["makespan_ns"]]}
-        diagnostics[arm] = result | {"all_lanes_generating_before_first_done":
-                                     result["all_generating_overlap_ms"] > 0}
-    return compare(samples["native-k4"], samples["vllm-k4"], True,
-                   criterion=K4_MAKESPAN_CRITERION) | {"diagnostics": diagnostics}
+        diagnostics[arm] = result
+        if not is_serial(row, identity["protocol"]):
+            diagnostics[arm] = result | {
+                "all_lanes_generating_before_first_done": result["all_generating_overlap_ms"] > 0
+            }
+    result = compare(
+        samples["native-k4"], samples["vllm-k4"], eligible=True, criterion=K4_MAKESPAN_CRITERION
+    ) | {"diagnostics": diagnostics}
+    if is_serial(row, identity["protocol"]):
+        result["workload"] = geometry(row, len(identity["devices"]))
+    return result
 
 
 def comparison(base, fixtures):
-    rows = {}
-    for name in ROWS:
+    results = {}
+    for name in rows(lifecycle.campaign(base)["protocol"]):
         row = assess(base / name, fixtures)
         require(row == load(base / name / "comparison.json"), f"Changed {name} row verdict")
-        rows[name] = row["workloads"][name]
-    return {"passed": all(row["passed"] for row in rows.values()), "workloads": rows,
-            "makespan_criterion": K4_MAKESPAN_CRITERION}
+        results[name] = row["workloads"][name]
+    return {
+        "passed": all(row["passed"] for row in results.values()),
+        "workloads": results,
+        "makespan_criterion": K4_MAKESPAN_CRITERION,
+    }
 
 
 if __name__ == "__main__":

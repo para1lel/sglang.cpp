@@ -42,7 +42,7 @@ if TYPE_CHECKING:
 
 
 VERSION = "0.5.8"
-WIRE_VERSION = VERSION + "+native-v4"
+WIRE_VERSION = VERSION + "+native-v5"
 MAGIC = b"SLC3"
 HEADER = struct.Struct("!4sIQ")
 MAX_METADATA = 64 << 20
@@ -162,34 +162,39 @@ class PrefixLookup:
                 return end - PREFIX_CHUNK
         return limit // PREFIX_CHUNK * PREFIX_CHUNK
 
-    def coverage(self):
+    def coverage(self) -> tuple[int, int, list[tuple[int, bool]]]:
         full = self.full_coverage(1, self.count)
         tail = range(min(self.count, full + PREFIX_CHUNK - 1), full, -1)
         gqa = next((end for end, found in zip(tail, self.present(1, tail)) if found), full)
         ends = self.records.gdn_endpoints.snapshot(self.count)
         states = [end for end, found in zip(ends, self.present(2, ends)) if found]
-        if not self.draft or not states:
-            return gqa, [(end, False) for end in states]
+        if not self.draft:
+            return gqa, 0, [(end, False) for end in states]
 
-        draft_full = self.full_coverage(DRAFT_FAMILY, states[0] - 1)
-        tails = [
-            end - 1
-            for end in states
-            if end <= draft_full + PREFIX_CHUNK and (end - 1) % PREFIX_CHUNK
-        ]
+        draft_limit = max(0, self.count - 1)
+        draft_full = self.full_coverage(DRAFT_FAMILY, draft_limit)
+        tails = set(range(draft_full + 1, min(draft_limit, draft_full + PREFIX_CHUNK - 1) + 1))
+        tails.update(end - 1 for end in states if end - 1 < draft_full and (end - 1) % PREFIX_CHUNK)
+        ordered_tails = sorted(tails)
         resident_tails = {
             end
-            for end, found in zip(tails, self.present(DRAFT_FAMILY, tails), strict=True)
+            for end, found in zip(
+                ordered_tails, self.present(DRAFT_FAMILY, ordered_tails), strict=True
+            )
             if found
         }
-        return gqa, [
-            (
-                end,
-                end <= draft_full + PREFIX_CHUNK
-                and ((end - 1) % PREFIX_CHUNK == 0 or end - 1 in resident_tails),
-            )
-            for end in states
-        ]
+        return (
+            gqa,
+            max(draft_full, max(resident_tails, default=0)),
+            [
+                (
+                    end,
+                    (end - 1 <= draft_full and (end - 1) % PREFIX_CHUNK == 0)
+                    or end - 1 in resident_tails,
+                )
+                for end in states
+            ],
+        )
 
 
 class Request:
@@ -786,10 +791,10 @@ class Handler(socketserver.BaseRequestHandler):
             _, skipped = records.storage.delete_l1_keys([key])
             request.reply(1 if skipped else 0)
         elif request.op == LOOKUP_PREFIX_OP:
-            gqa, entries = PrefixLookup(request, namespace, records).coverage()
+            gqa, draft, entries = PrefixLookup(request, namespace, records).coverage()
             request.reply(
                 0,
-                struct.pack("!II", gqa, len(entries))
+                struct.pack("!III", gqa, draft, len(entries))
                 + b"".join(struct.pack("!IB", end, draft_ok) for end, draft_ok in entries),
             )
         else:

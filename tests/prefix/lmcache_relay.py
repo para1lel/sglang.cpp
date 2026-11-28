@@ -27,12 +27,14 @@ MAGIC = b"SLC3"
 READY, LOOKUP, RESET, ERASE, LEASE = 1, 2, 5, 6, 8
 PREFIX_DETAIL, RANK_GET, RANK_PUT = range(9, 12)
 TRANSFERS = (RANK_GET, RANK_PUT)
-WIRE_VERSION = b"0.5.8+native-v4"
+WIRE_VERSION = b"0.5.8+native-v5"
 ADMISSION = struct.Struct("!16s16sI")
 RECEIPT = struct.Struct("!QQQI")
 GQA, GDN, DRAFT = range(1, 4)
 TIMEOUT = 30
 BLOCK_TOKENS = 256
+PAGE_TOKENS = 128
+PAGE_MAP_FLAG = 0x80000000
 
 
 def receive(sock, size):
@@ -181,75 +183,83 @@ def _prior_inventory(read: Callable[[int], bytes], records: list[dict[str, int]]
 
 
 def _prefix_inventory(body: bytes) -> dict:
-    gqa, count = struct.unpack("!II", body[:8])
-    checkpoints = list(struct.iter_unpack("!IB", body[8:]))
+    gqa, draft, count = struct.unpack("!III", body[:12])
+    checkpoints = list(struct.iter_unpack("!IB", body[12:]))
     if len(checkpoints) != count:
         raise ValueError("Invalid prefix inventory response length")
-    return {"gqa": gqa, "checkpoints": checkpoints}
+    return {"gqa": gqa, "draft": draft, "checkpoints": checkpoints}
 
 
-def frame_metadata(opcode, payload):
+def _transfer_metadata(
+    entry: dict, read: Callable[[int], bytes], number: Callable[[int], int]
+) -> None:
+    entry["device"] = read(16).hex()
+    read(64)
+    entry["allocations"] = number(4)
+    read(72 * entry["allocations"])
+    records = []
+    for family, layers in ((GQA, 16), (DRAFT, 1)):
+        begin, end = number(4), number(4)
+        if begin == end == 0:
+            continue
+        kv_heads = number(4)
+        pages = number(4)
+        read(4 * 12)
+        if pages & PAGE_MAP_FLAG:
+            count = (end + PAGE_TOKENS - 1) // PAGE_TOKENS - begin // PAGE_TOKENS
+            if count < 0:
+                raise ValueError("Invalid mapped LMCache extent")
+            entry.setdefault("page_maps", {})[family] = tuple(
+                page for (page,) in struct.iter_unpack("!I", read(4 * count))
+            )
+        for start in range(begin, end, BLOCK_TOKENS):
+            entry["keys"].append((family, read(64)))
+            tokens = min(BLOCK_TOKENS, end - start)
+            records.append(
+                {
+                    "bytes": tokens * layers * kv_heads * 528,
+                    "tokens": tokens,
+                    "family": family,
+                    "begin": start,
+                    "end": start + tokens,
+                }
+            )
+    endpoint = number(4)
+    if endpoint:
+        entry["keys"].append((GDN, read(64)))
+        widths = []
+        for _ in range(4):
+            read(12)
+            widths.append(number(8))
+        records.append(
+            {
+                "bytes": sum(widths),
+                "tokens": 0,
+                "family": GDN,
+                "endpoint": endpoint,
+                "widths": widths,
+            }
+        )
+    entry["records"] = records
+    if entry["opcode"] == RANK_PUT:
+        entry.update(_prior_inventory(read, records))
+
+
+def frame_metadata(opcode: int, payload: bytes) -> dict:
     view = BytesIO(payload)
 
-    def read(size):
+    def read(size: int) -> bytes:
         part = view.read(size)
         if len(part) != size:
             raise ValueError("Incomplete LMCache request metadata")
         return part
 
-    def number(size):
+    def number(size: int) -> int:
         return int.from_bytes(read(size), "big")
 
-    def read_field():
-        return read(number(2))
-
-    def read_key():
-        return number(1), read_field()
-
-    entry = {"opcode": opcode, "namespace": read_field().decode(), "keys": []}
+    entry = {"opcode": opcode, "namespace": read(number(2)).decode(), "keys": []}
     if opcode in TRANSFERS:
-        entry["device"] = read(16).hex()
-        read(64)
-        entry["allocations"] = number(4)
-        read(72 * entry["allocations"])
-        records = []
-        for family, layers in ((GQA, 16), (DRAFT, 1)):
-            begin, end = number(4), number(4)
-            if begin == end == 0:
-                continue
-            kv_heads = number(4)
-            read(4 + 4 * 12)
-            for start in range(begin, end, BLOCK_TOKENS):
-                entry["keys"].append((family, read(64)))
-                tokens = min(BLOCK_TOKENS, end - start)
-                records.append(
-                    {
-                        "bytes": tokens * layers * kv_heads * 528,
-                        "tokens": tokens,
-                        "family": family,
-                        "begin": start,
-                        "end": start + tokens,
-                    }
-                )
-        endpoint = number(4)
-        if endpoint:
-            entry["keys"].append((GDN, read(64)))
-            widths = []
-            for _ in range(4):
-                read(12)
-                widths.append(number(8))
-            records.append(
-                {
-                    "bytes": sum(widths),
-                    "tokens": 0,
-                    "family": GDN,
-                    "endpoint": endpoint,
-                    "widths": widths,
-                }
-            )
-        entry["records"] = records
-        if opcode == RANK_PUT:
-            entry.update(_prior_inventory(read, records))
+        _transfer_metadata(entry, read, number)
     elif opcode == READY:
         entry["devices"] = [read(16).hex() for _ in range((len(payload) - view.tell()) // 16)]
     elif opcode == PREFIX_DETAIL:
@@ -264,7 +274,7 @@ def frame_metadata(opcode, payload):
         entry["incarnation"], entry["lease"] = read(16).hex(), read(16).hex()
     elif opcode in (LOOKUP, ERASE):
         count = number(4) if opcode == LOOKUP else 1
-        entry["keys"] = [read_key() for _ in range(count)]
+        entry["keys"] = [(number(1), read(number(2))) for _ in range(count)]
     if view.read(1):
         raise ValueError("Trailing LMCache request metadata")
     return entry

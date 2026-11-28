@@ -170,8 +170,12 @@ bool Job::can_overlap_mtp_output() const {
 }
 
 bool Job::ready(bool buffered) const {
-    return !prefix_pending && (cancelled || aborted() || (!cache_reading &&
-        (buffered || can_overlap_mtp_output() ? !pending.full() : pending.empty())));
+    const bool retry_wait =
+        admission_retry_at != Clock::time_point{} && Clock::now() < admission_retry_at;
+    return !prefix_pending &&
+           (cancelled || aborted() ||
+            (!retry_wait && !cache_reading &&
+             (buffered || can_overlap_mtp_output() ? !pending.full() : pending.empty())));
 }
 
 bool Job::can_buffer(bool per_token) const {

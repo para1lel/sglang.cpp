@@ -41,9 +41,9 @@ struct Job {
     std::shared_ptr<BatchCacheRead> cache_read;
     std::vector<std::shared_ptr<decoder::PrefixCacheKeys>> cache_keys;
     std::shared_ptr<BatchRestoreJoin> restore_join;
-    std::shared_ptr<BatchStorePairing> store_pairing;
     std::shared_future<bool> prefix_operation;
     std::optional<DecoderFinishReason> deferred_finish;
+    std::chrono::steady_clock::time_point admission_retry_at;
 
     ~Job();
 
@@ -99,6 +99,7 @@ struct BatchService::State {
     bool wide_decode_ready(bool buffered) const;
     bool decode_mailboxes_ready(bool require_all) const;
     bool prepare(BatchSession& batch, int slot, const std::shared_ptr<Job>& job, bool buffered);
+    bool defer_capacity_retry(BatchSession& batch, Job& job, std::exception_ptr error);
     bool publish(int slot, Job& job, const DecoderBatchStep& step);
     void publish_steps(const Jobs& snapshot, const Selection& selected, Steps& steps);
     void begin_cache_read(int slot, const std::shared_ptr<Job>& job);
@@ -131,6 +132,8 @@ struct BatchService::State {
     const int max_active;
     const int prefix_cache_entries;
     const int max_num_batched_tokens;
+    const bool resident_prefix_cache;
+    const std::string cache_identity;
     std::mutex mutex;
     std::condition_variable changed;
     Jobs jobs;
@@ -141,10 +144,11 @@ struct BatchService::State {
     Clock::time_point last_generation = Clock::time_point::min();
     std::optional<HealthProbe> health_probe;
     BatchMetrics counters;
+    BatchSession* session = nullptr;
     std::optional<BatchProfile> profile;
     std::uint64_t profile_epoch = 0;
     std::size_t profile_limit = 0;
-    bool reset_pending = false;
+    std::shared_ptr<std::promise<void>> reset_pending;
     bool closing = false;
     std::exception_ptr failure;
     std::atomic_bool failed{false};

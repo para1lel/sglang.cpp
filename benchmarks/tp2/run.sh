@@ -4,8 +4,8 @@ source "$(dirname -- "${BASH_SOURCE[0]}")/session.sh"
 source "$paired_dir/lmcache_arm.sh"
 tp2_dir=$project/benchmarks/tp2
 export PYTHONPATH=$project:$paired_dir
-[[ $# == 6 && ( $1 == qualify || $1 == measure ) && ( $4 == W[1-5] || $4 == all ) ]] || {
-    echo 'Usage: run.sh qualify|measure GPU0 GPU1 W1..W5|all NATIVE_BINARY CAMPAIGN_DIR' >&2
+[[ $# == 6 && ( $1 == qualify || $1 == measure ) && ( $4 == W[1-6] || $4 == all ) ]] || {
+    echo 'Usage: run.sh qualify|measure GPU0 GPU1 W1..W6|all NATIVE_BINARY CAMPAIGN_DIR' >&2
     exit 2
 }
 mode=$1
@@ -31,8 +31,8 @@ exec {campaign_lock}<"$base"
 flock -n -E 75 "$campaign_lock"
 session=$base
 if [[ -e $base/identity.json ]]; then
-    if [[ $(jq -er .protocol "$base/identity.json") != tp2-paired-v4 ]]; then
-        echo 'Use a new campaign root for the exact prompt checkpoint policy.' >&2
+    if [[ $(jq -er .protocol "$base/identity.json") != tp2-paired-v5 ]]; then
+        echo 'Use a new campaign root for the startup HBM prefix pool protocol.' >&2
         exit 1
     fi
     [[ $mode == measure && $4 != all && ! -e $base/$4 ]]
@@ -46,6 +46,12 @@ exec 3>>"$vllm_root/loopback-$lmcache_port.lock"
 flock -n -E 75 3
 lmcache_port_free
 "$client_python" -B "$paired_dir/tp2_corpus.py" verify "$fixtures" >"$session/corpus.json"
+if [[ $4 == W6 || $4 == all ]]; then
+    "$client_python" -B -m benchmarks.serial.fixture verify "$fixtures" \
+        >"$session/serial-inputs.json"
+fi
+serial_sha=$("$client_python" -B -c \
+    'from benchmarks.serial.fixture import INPUTS_SHA256; print(INPUTS_SHA256)')
 lmcache_evidence verify-wheel "$wheel" "$lmcache_python" "$lmcache_pythonpath" \
     >"$session/lmcache-wheel.json"
 (cd "$project" && sha256sum \
@@ -54,6 +60,7 @@ lmcache_evidence verify-wheel "$wheel" "$lmcache_python" "$lmcache_pythonpath" \
     benchmarks/paired/{tp2_corpus.py,tp2-corpus-v1.json,k4.py,vllm_worker.py,default_evidence.py} \
     benchmarks/paired/{saved_evidence.py,cold_cache.py,makespan.py,workload_suite.py} \
     benchmarks/paired/{measure_concurrent.py,identity.py,driver_health.py} \
+    benchmarks/serial/{fixture.py,chain.py} \
     benchmarks/streaming/{client.py,vllm_observer.py,check_vllm.py,gpu3-reference.json} \
     benchmarks/concurrent/{client.py,reference.py,freeze_prompts.py} \
     benchmarks/concurrent/{gpu2-reference.json,fixture-manifest.json} \
@@ -66,13 +73,15 @@ jq -n --arg mode "$mode" --arg id "$campaign_id" --arg rev "$native_source" \
     --arg root "$vllm_root" --arg python "$client_python" \
     --arg protocol "$(sha256sum "$session/protocol.sha256" | cut -d' ' -f1)" \
     --arg wire "$(jq -r .manifest_sha256 "$session/corpus.json")" --argjson port "$port" \
+    --arg serial_sha "$serial_sha" \
     --arg server "$server_cpus" --arg client "$client_cpus" \
     --arg dev0 "${devices[0]}" --arg dev1 "${devices[1]}" \
     --argjson cache_port "$lmcache_port" --argjson uid "$EUID" \
     --argjson capacity "$((lmcache_memory_gib << 30))" \
     --slurpfile lm "$session/lmcache-wheel.json" \
     --slurpfile ref "$project/benchmarks/concurrent/gpu2-reference.json" \
-    '{protocol:"tp2-paired-v4",protocol_sha256:$protocol,corpus_sha256:$wire,
+    '{protocol:"tp2-paired-v5",protocol_sha256:$protocol,corpus_sha256:$wire,
+      serial_fixture_sha256:$serial_sha,
       campaign_id:$id,mode:$mode,
       native_source:$rev,binary:$binary,binary_sha256:$sha,checkpoint_path:$model,
       checkpoint_sha256:$ref[0].checkpoint_manifest_sha256,vllm_pin:$ref[0].vllm_pin,
@@ -80,7 +89,7 @@ jq -n --arg mode "$mode" --arg id "$campaign_id" --arg rev "$native_source" \
       client_python:$python,port:$port,
       server_cpus:$server,client_cpus:$client,devices:[$dev0,$dev1],
       daemon_port:$cache_port,lmcache_capacity_bytes:$capacity,lmcache_uid:$uid,
-      lmcache_wire:"SLC3",lmcache_ready_version:"0.5.8+native-v4",lmcache_python:$lm[0].python,
+      lmcache_wire:"SLC3",lmcache_ready_version:"0.5.8+native-v5",lmcache_python:$lm[0].python,
       lmcache_pythonpath:$lm[0].pythonpath}' >"$session/identity.json"
 if [[ $session != "$base" ]]; then
     receipts=(identity.json protocol.sha256 corpus.json lmcache-wheel.json
@@ -174,7 +183,7 @@ run_arm() {
 }
 
 rows=("$4")
-[[ $4 != all ]] || rows=(W1 W2 W3 W4 W5)
+[[ $4 != all ]] || rows=(W1 W2 W3 W4 W5 W6)
 require_predecessor() {
     local prior=$1
     local check=("$client_python" -B "$tp2_dir/cohorts.py" assess "$base/$prior" "$fixtures")
@@ -183,7 +192,7 @@ require_predecessor() {
     jq -e '.passed' "$base/$prior/comparison.json"
 }
 if [[ $mode == measure && $session != "$base" ]]; then
-    for prior in W{1..5}; do
+    for prior in W{1..6}; do
         [[ ! -e $base/$prior ]] || require_predecessor "$prior"
     done
 fi
@@ -193,6 +202,7 @@ for row in "${rows[@]}"; do
             W2) [[ -e $base/W1/comparison.json ]] ;;
             W3) [[ -e $base/W1/comparison.json && -e $base/W2/comparison.json ]] ;;
             W5) [[ -e $base/W4/comparison.json ]] ;;
+            W6) [[ -e $base/W5/comparison.json ]] ;;
         esac
     fi
     arms=(vllm-k4 native-k4)
@@ -205,8 +215,8 @@ for row in "${rows[@]}"; do
         jq -e '.passed' "$base/$row/comparison.json"
     fi
 done
-comparisons=("$base"/W[1-5]/comparison.json)
-if [[ $mode == measure && ${#comparisons[@]} == 5 ]]; then
+comparisons=("$base"/W[1-6]/comparison.json)
+if [[ $mode == measure && ${#comparisons[@]} == 6 ]]; then
     "$client_python" -B "$tp2_dir/cohorts.py" compare "$base" "$fixtures" >"$base/comparison.json"
     jq -e '.passed' "$base/comparison.json"
 fi

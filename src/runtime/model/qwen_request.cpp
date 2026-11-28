@@ -31,7 +31,7 @@ std::array<Mxfp8KvCache, full_attention_layers> allocate_kv(Allocations& memory,
     const auto scales_per_layer = page_count * gqa_scale_bytes_per_page(kv_heads);
     const auto scale_bytes = full_attention_layers * scales_per_layer;
     const auto payload_bytes = full_attention_layers * payload_per_layer;
-    auto* keys = memory.allocate<std::uint8_t>(kv_bytes(page_count, kv_heads));
+    auto* keys = memory.allocate_cache<std::uint8_t>(kv_bytes(page_count, kv_heads));
     auto* values = keys + payload_bytes;
     auto* key_scales = values + payload_bytes;
     auto* val_scales = key_scales + scale_bytes;
@@ -86,6 +86,9 @@ void validate_batch_options(const DecoderBatchOptions& options) {
     if (options.prefix_cache_entries != 0) {
         throw std::invalid_argument("Local prefix cache capacity is unsupported with LMCache");
     }
+    if (options.prefix_gqa_pages < 0 || options.prefix_gdn_slots < 0) {
+        throw std::invalid_argument("Invalid resident prefix pool capacity");
+    }
     if (options.max_num_batched_tokens < 0 ||
         options.max_num_batched_tokens > decoder_batch_max_step_tokens) {
         throw std::invalid_argument("Invalid decoder batch step budget");
@@ -96,80 +99,110 @@ int reserved_verification_rows(int output, int mtp_steps) {
     return mtp_steps && output > 1 ? std::min(mtp_steps + 1, output - 1) : 0;
 }
 
-std::size_t request_resident_bytes(int capacity, int verification_rows, bool draft) {
+namespace {
+
+struct ResidentRequestShape {
+    int capacity;
+    int verification_rows;
+    bool draft;
+    bool pooled;
+};
+
+std::size_t request_resident_bytes(ResidentRequestShape shape) {
     constexpr std::size_t gdn_bytes = gdn_layers *
         (gdn_history_elements * sizeof(Bf16) + gdn_state_elements * sizeof(float));
     constexpr std::size_t workspace_allowance = 16 * 1024 * 1024;
-    const int pages = pages_for(capacity);
-    const auto target = kv_bytes(pages, mxfp8_kv_heads) + (pages * sizeof(std::int32_t)) +
-                        gdn_bytes + ReplayStorage<GdnFull>::bytes;
-    const auto draft_kv = kv_bytes(pages, mxfp8_kv_heads) / full_attention_layers +
-                          pages * sizeof(std::int32_t);
-    const auto verifier = verification_rows * workspace_allowance;
-    return target + workspace_allowance + (draft ? draft_kv + workspace_allowance : 0) + verifier;
+    const int pages = pages_for(shape.capacity);
+    const auto table = pages * sizeof(std::int32_t);
+    const auto target_kv = shape.pooled ? 0 : kv_bytes(pages, mxfp8_kv_heads);
+    const auto target = target_kv + table + gdn_bytes + ReplayStorage<GdnFull>::bytes;
+    const auto draft_kv = (target_kv / full_attention_layers) + table;
+    const auto verifier = shape.verification_rows * workspace_allowance;
+    return target + workspace_allowance + (shape.draft ? draft_kv + workspace_allowance : 0) +
+           verifier;
 }
 
-int limit_resident_output(int prompt, const DecoderOptions& options, std::size_t total_bytes,
-                          std::size_t free_bytes, std::size_t extra_bytes) {
+struct ResidentRequestBudget {
+    std::size_t total;
+    std::size_t free;
+    std::size_t extra;
+};
+
+int limit_resident_output(int prompt, const DecoderOptions& options, ResidentRequestBudget budget,
+                          bool pooled) {
     const auto fits = [&](int output, std::size_t bytes) {
         const bool scoring = options.score_prompt || bool(options.label_token_ids);
-        const auto resident = request_resident_bytes(
+        const auto resident = request_resident_bytes({
             prompt + std::max(output, int(scoring)) - 1,
             reserved_verification_rows(output, options.mtp_steps),
-            options.mtp_steps != 0);
-        return resident + extra_bytes <= bytes;
+            options.mtp_steps != 0,
+            pooled,
+        });
+        return resident + budget.extra <= bytes;
     };
     int output = options.max_new_tokens;
     if (options.incremental_kv) {
         int low = 0;
         while (low < output) {
             const int middle = low + (output - low + 1) / 2;
-            if (fits(middle, total_bytes)) {
+            if (fits(middle, budget.total)) {
                 low = middle;
             } else {
                 output = middle - 1;
             }
         }
     }
-    if ((output == 0 && ((!options.score_prompt && !options.label_token_ids) ||
-                        options.max_new_tokens > 0)) ||
-        !fits(output, total_bytes)) {
+    if ((output == 0 &&
+         ((!options.score_prompt && !options.label_token_ids) || options.max_new_tokens > 0)) ||
+        !fits(output, budget.total)) {
         throw DecoderCapacityError("Prompt and output budget exceed resident decoder capacity",
                                    false);
     }
-    if (!fits(output, free_bytes)) {
+    if (!fits(output, budget.free)) {
         throw DecoderCapacityError("Insufficient free resident decoder memory. Retry later.", true);
     }
     return output;
 }
 
-std::size_t reserve_request_memory(RequestBlockCache& retired, DecoderOptions& request,
-                                   int prompt, std::size_t capacity, std::size_t charged,
-                                   std::size_t extra_bytes) {
+}
+
+std::size_t reserve_request_memory(RequestBlockCache& retired, DecoderOptions& request, int prompt,
+                                   RequestMemoryBudget budget, bool pooled) {
+    const auto capacity = budget.capacity;
     const auto headroom = [&] {
-        return capacity - std::min(capacity, charged + retired.unavailable_bytes());
+        return capacity - std::min(capacity, budget.charged + retired.unavailable_bytes());
     };
     const auto after_reserve = [](std::size_t free) {
         return free - std::min(free, decoder_shared_reserve);
     };
     auto free = available_device_bytes();
     try {
-        request.max_new_tokens = limit_resident_output(
-            prompt, request, capacity, std::min(headroom(), after_reserve(free + retired.bytes())),
-            extra_bytes);
+        request.max_new_tokens =
+            limit_resident_output(prompt, request,
+                                  {
+                                      capacity,
+                                      std::min(headroom(), after_reserve(free + retired.bytes())),
+                                      budget.extra_bytes,
+                                  },
+                                  pooled);
     } catch (const DecoderCapacityError& error) {
-        if (!error.retryable || !retired.pending_bytes()) throw;
+        if (!error.retryable || retired.pending_bytes() == 0)
+            throw;
         retired.clear();
         free = available_device_bytes();
+        const auto free_bytes = std::min(headroom(), after_reserve(free));
         request.max_new_tokens = limit_resident_output(
-            prompt, request, capacity, std::min(headroom(), after_reserve(free)), extra_bytes);
+            prompt, request, {capacity, free_bytes, budget.extra_bytes}, pooled);
     }
     request.min_new_tokens = std::min(request.min_new_tokens, request.max_new_tokens);
     request.incremental_kv = false;
-    const auto reserved = extra_bytes + request_resident_bytes(
+    const auto resident = request_resident_bytes({
         RequestProgress::capacity(prompt, request),
         reserved_verification_rows(request.max_new_tokens, request.mtp_steps),
-        request.mtp_steps != 0);
+        request.mtp_steps != 0,
+        pooled,
+    });
+    const auto reserved = budget.extra_bytes + resident;
     if (reserved > after_reserve(free) || retired.bytes() > headroom() - reserved) {
         retired.clear();
         if (reserved > headroom() || reserved > after_reserve(available_device_bytes())) {
@@ -281,29 +314,26 @@ Request::Request(int device, bool reusable, RequestBlockCache* cache)
       decode_position(reusable ? memory.allocate<int>(2) : nullptr) {}
 
 Request::Request(int device, int capacity, std::shared_ptr<const void> owners, bool reusable,
-                 int maximum_kv)
+                 int kv_limit)
     : Request(device, reusable) {
     memory.open_stream(std::move(owners));
-    initialize(capacity, memory.stream(), maximum_kv);
+    initialize(capacity, memory.stream(), kv_limit);
 }
 
-void Request::initialize(int capacity, cudaStream_t stream, int maximum_kv, int kv_heads) {
+void Request::initialize(int capacity, cudaStream_t stream, int kv_limit) {
+    RequestKvStorage storage;
+    storage.limit = kv_limit;
+    initialize(capacity, stream, std::move(storage));
+}
+
+void Request::initialize(int capacity, cudaStream_t stream, RequestKvStorage storage) {
     cached_gqa_tokens = 0;
-    kv_limit = maximum_kv;
-    cache_kv_heads = kv_heads;
-    const bool rank_local = kv_heads != mxfp8_kv_heads;
+    kv_limit = storage.limit;
+    cache_kv_heads = storage.heads;
+    const bool rank_local = storage.heads != mxfp8_kv_heads;
     gdn_history_stride = rank_local ? gdn_local_history_elements : gdn_history_elements;
     gdn_state_stride = rank_local ? gdn_local_state_elements : gdn_state_elements;
-    const int page_count = pages_for(capacity);
-    const int table_pages = std::max(page_count, pages_for(maximum_kv));
-    auto* table = memory.allocate<std::int32_t>(table_pages);
-    auto& logical_pages = memory.transfers().logical_pages;
-    logical_pages.resize(table_pages);
-    std::iota(logical_pages.begin(), logical_pages.end(), 0);
-    copy_cuda_async(table, logical_pages.data(), table_pages * sizeof(std::int32_t),
-                    cudaMemcpyHostToDevice, stream, "Upload MXFP8 page table");
-    pages = {table, page_count};
-    caches = allocate_kv(memory, page_count, cache_kv_heads);
+    initialize_kv(capacity, stream, std::move(storage));
     allocate_gdn(memory, states, gdn_history_stride, gdn_state_stride);
     if (rank_local) {
         ReplayStorage<GdnLocal>::allocate(*this);
@@ -311,6 +341,40 @@ void Request::initialize(int capacity, cudaStream_t stream, int maximum_kv, int 
         ReplayStorage<GdnFull>::allocate(*this);
     }
     reset_gdn_replay(stream);
+}
+
+void Request::initialize_kv(int capacity, cudaStream_t stream, RequestKvStorage storage) {
+    const int page_count = pages_for(capacity);
+    const int table_pages = std::max(page_count, pages_for(kv_limit));
+    auto* table = memory.allocate<std::int32_t>(table_pages);
+    auto& logical_pages = memory.transfers().logical_pages;
+    logical_pages.resize(table_pages);
+    if (storage.slab != nullptr) {
+        shared_prefix_pages = std::move(storage.pages);
+        for (int page = 0; page < page_count; ++page) {
+            logical_pages[page] = *shared_prefix_pages.at(page);
+        }
+        const auto* reuse = storage.reuse;
+        if (reuse != nullptr && reuse->gqa_private_from % mxfp8_page_size != 0) {
+            const int tail = reuse->gqa_private_from / mxfp8_page_size;
+            storage.slab->copy_tail(storage.rank,
+                                    {
+                                        logical_pages[tail],
+                                        *reuse->gqa.at(tail),
+                                        reuse->gqa_private_from % mxfp8_page_size,
+                                    },
+                                    stream);
+        }
+        for (int layer = 0; layer < full_attention_layers; ++layer) {
+            caches[layer] = storage.slab->cache({storage.rank, layer});
+        }
+    } else {
+        std::iota(logical_pages.begin(), logical_pages.end(), 0);
+        caches = allocate_kv(memory, page_count, cache_kv_heads);
+    }
+    copy_cuda_async(table, logical_pages.data(), table_pages * sizeof(std::int32_t),
+                    cudaMemcpyHostToDevice, stream, "Upload MXFP8 page table");
+    pages = {table, page_count};
 }
 
 void Request::grow_kv(int positions, int written, cudaStream_t stream) {

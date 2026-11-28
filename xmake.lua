@@ -207,8 +207,8 @@ target("sglang_cuda_support")
     set_toolchains("host-pixi")
     set_targetdir("$(builddir)/lib")
     add_includedirs("include", path.join(toolkit, "include"))
-    add_files("src/runtime/backend/cuda_error.cpp", "src/runtime/backend/text_cuda_host.cpp",
-              "src/text/text_dimensions.cpp")
+    add_files("src/runtime/backend/cuda_error.cpp", "src/runtime/backend/device_arena.cpp",
+              "src/runtime/backend/text_cuda_host.cpp", "src/text/text_dimensions.cpp")
 
 target("sglang_json")
     set_kind("static")
@@ -245,7 +245,7 @@ target("sglang_vision")
     add_linkdirs(path.join(toolkit, "lib"), {public = true})
     add_rpathdirs(path.join(toolkit, "lib"), {interface = true})
     add_syslinks("cudart", {public = true})
-    add_deps("sglang_checkpoint")
+    add_deps("sglang_checkpoint", "sglang_cuda_support")
     add_files("src/vision/*.cu")
 
 target("sglang_decoder")
@@ -269,6 +269,7 @@ target("sglang_decoder")
     add_files("src/runtime/model/decoder_batch_lane.cpp",
               "src/runtime/model/qwen_weight_shard.cpp", "src/runtime/model/qwen_weight_upload.cpp",
               "src/runtime/cache/prefix_cache_layout.cpp",
+              "src/runtime/cache/prefix_residency.cpp", "src/runtime/cache/prefix_slab.cpp",
               "src/runtime/execution/batch_admission_order.cpp",
               "src/runtime/execution/decoder_batch_state.cpp",
               "src/runtime/execution/decoder_forward_attention.cpp",
@@ -316,7 +317,6 @@ target("sglang-server")
     add_rpathdirs(path.join(prefix, "lib"), path.join(toolkit, "lib"))
     add_files("apps/sglang-server.cpp", "apps/server/batch_service.cpp",
               "apps/server/batch_cache.cpp",
-              "src/runtime/cache/lmcache_client.cpp", "src/runtime/cache/lmcache_prefix.cpp",
               "apps/server/completions.cpp",
               "apps/server/flush_cache.cpp", "apps/server/http.cpp", "apps/server/loads.cpp",
               "src/runtime/server/single_device_batch_executor.cpp",
@@ -416,7 +416,6 @@ if has_config("gdn-check") then
         add_rpathdirs(path.join(prefix, "lib"), path.join(toolkit, "lib"))
         add_ldflags("-Wl,--wrap=cudaLaunchKernel", {force = true})
         add_files("tests/decoder/gdn_routes.cpp", "tests/prefix/prefix_fixture.cpp")
-        add_files("src/runtime/cache/lmcache_client.cpp", "src/runtime/cache/lmcache_prefix.cpp")
     target_end()
 end
 
@@ -525,13 +524,11 @@ if has_config("long-decode-check") then
         add_deps("sglang_decoder", "sglang_tokenizer")
         add_rpathdirs(path.join(prefix, "lib"), path.join(toolkit, "lib"))
         add_ldflags("-Wl,--wrap=cudaLaunchKernel", {force = true})
-        add_ldflags("-Wl,--wrap=cudaMallocFromPoolAsync", {force = true})
         add_ldflags("-Wl,--wrap=_ZN6sglang7decoder15RequestProgress6selectERNS0_7RequestERNS0_" ..
                     "9WorkspaceERKNS_14DecoderOptionsERKNS0_19ConstraintWorkspaceEPKNS0_" ..
                     "18SamplingParametersEPvP11CUstream_stPKNS0_23AdjustedLogitsWorkspaceE",
                     {force = true})
         add_files("tests/decoder/long_decode_routes.cpp", "tests/prefix/prefix_fixture.cpp")
-        add_files("src/runtime/cache/lmcache_client.cpp", "src/runtime/cache/lmcache_prefix.cpp")
     target_end()
 end
 
@@ -560,7 +557,8 @@ target("sglang_decoder")
     add_ldflags(path.join(nccl_wheel, "lib/libnccl.so.2"), {force = true, public = true})
     add_ldflags("-Wl,-rpath," .. path.join(nccl_wheel, "lib"), {force = true, public = true})
     add_files("src/runtime/backend/tensor_parallel.cpp")
-    add_files("src/runtime/cache/lmcache_group.cpp")
+    add_files("src/runtime/cache/lmcache_group.cpp", "src/runtime/cache/lmcache_client.cpp",
+              "src/runtime/cache/lmcache_prefix.cpp")
     add_files("src/decoder_tp.cpp")
     add_files("src/runtime/execution/decoder_forward_tp.cpp")
     add_files("src/runtime/execution/tp_verify_graph.cpp")

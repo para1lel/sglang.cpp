@@ -8,6 +8,7 @@ import re
 import shlex
 from pathlib import Path
 
+from benchmarks.serial import fixture as serial_fixture
 
 UUID = re.compile(r"GPU-[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", re.I)
 SHA256 = re.compile(r"[0-9a-f]{64}")
@@ -190,6 +191,8 @@ def worker_settings(run, worker, args, group, *, speculative, prefix_cache, max_
     scheduler = worker["scheduler"]
     cap = scheduler["max_num_batched_tokens"]
     context = 2560 if group == "W1-W2" else 132096
+    if group == serial_fixture.NAME:
+        context = serial_fixture.MAX_CONTEXT
     configured = scheduler.get("max_num_scheduled_tokens_configured")
     scheduled_flag = "--max-num-scheduled-tokens"
     if scheduled_flag in args:

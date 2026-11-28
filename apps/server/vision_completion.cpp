@@ -49,7 +49,7 @@ std::optional<std::vector<DecoderMedia>> VisionCompletion::encode(
         const auto elements = vision_feature_rows(grid) * vision_feature_width;
         auto* features = storage->allocate<__nv_bfloat16>(elements);
         Allocations work(device_);
-        work.open_stream();
+        work.open_stream(storage);
         auto* pixels = work.allocate<float>(part.patches.size());
         check(cudaMemcpyAsync(pixels, part.patches.data(), part.patches.size() * sizeof(float),
                               cudaMemcpyHostToDevice, work.stream()), "Upload visual patches");

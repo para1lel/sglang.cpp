@@ -188,7 +188,7 @@ std::vector<Score> generate(DecoderBatch& batch, const LmCacheClient& cache,
 
 void cancelled_boundary(Decoder& model, const LmCacheClient& cache) {
     DecoderBatch batch(model, {.max_lanes = 1, .max_num_batched_tokens = 256});
-    constexpr int end = 385;
+    constexpr int end = 2305;
     const std::vector<int> prompt(end, 198);
     Selection selected{};
     selected[0] = true;
@@ -230,11 +230,13 @@ void cancelled_boundary(Decoder& model, const LmCacheClient& cache) {
         stores->wait();
         const PrefixCacheKeys keys(prompt, salt);
         const auto match = LmCacheGroup(cache).lookup_prefix({&keys}, end, false);
-        const std::vector<int> endpoints{129, 257, end};
+        const std::vector<int> endpoints{end - 2048, end - 1024, end};
         require(match.matched_gqa == end && match.matched_gdn_endpoints == endpoints,
                 "Cancelled completion changed the published prefill endpoints");
-        std::cout << salt << " rows " << rows << " claims " << claims << " prefill stores 129 257 "
-                  << end << '\n';
+        std::cout << salt << " rows " << rows << " claims " << claims << " prefill stores ";
+        for (const int endpoint : endpoints)
+            std::cout << endpoint << ' ';
+        std::cout << '\n';
     }
 }
 

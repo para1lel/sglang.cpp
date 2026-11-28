@@ -19,6 +19,9 @@ LMCACHE_DRAIN = "lmcache-drain"
 LMCACHE_DRAIN_ALIGNED = "lmcache-drain-aligned"
 LMCACHE_DRAIN_SUFFIX = "lmcache-drain-suffix"
 LMCACHE_DRAIN_ENGINES = (LMCACHE_DRAIN, LMCACHE_DRAIN_ALIGNED, LMCACHE_DRAIN_SUFFIX)
+LMCACHE_POOL = "lmcache-hbm-pool"
+LMCACHE_POOL_TP2 = "lmcache-hbm-pool-tp2"
+LMCACHE_POOL_ENGINES = (LMCACHE_POOL, LMCACHE_POOL_TP2)
 PENDING_STORES = "sglang_cpp:lmcache_pending_stores"
 CHECKPOINT_INTERVAL = 8192
 PREFILL_ANCHOR_STORES = "sglang_cpp:lmcache_prefill_anchor_stores_total"
@@ -52,6 +55,16 @@ LMCACHE_READ_ACTIVITY = tuple(f"sglang_cpp:lmcache_{name}_total" for name in (
     "gqa_read_bytes", "gdn_read_bytes", "draft_read_bytes", "restore_nanoseconds"))
 LMCACHE_DRAIN_METRICS = (PENDING_STORES, LMCACHE_STORES, DECLINED_STORES,
                          *LMCACHE_WRITTEN_BYTES, LMCACHE_WRITE_NS, *LMCACHE_READ_ACTIVITY)
+LMCACHE_POOL_READS = (*LMCACHE_REUSE[1:], *LMCACHE_READ_ACTIVITY)
+LMCACHE_RANK_READS = tuple(
+    f"sglang_cpp:lmcache_rank{rank}_{counter}_total"
+    for rank in (0, 1)
+    for counter in ("restores", "gqa_read_bytes", "gdn_read_bytes", "draft_read_bytes")
+)
+LMCACHE_POOL_CAPACITIES = (
+    "sglang_cpp:prefix_gqa_page_capacity",
+    "sglang_cpp:prefix_gdn_slot_capacity",
+)
 NATIVE_METRICS = (
     ENTRIES, PAGES, "sglang_cpp:prefix_cache_device_bytes",
     "sglang_cpp:prefix_cache_hits_total", STORES,
@@ -66,6 +79,17 @@ def metrics(text, engine):
     names = (RUNNING, WAITING, HITS)
     if engine == "native":
         names += NATIVE_METRICS
+    elif engine in LMCACHE_POOL_ENGINES:
+        names += (
+            ENTRIES,
+            PAGES,
+            PENDING_STORES,
+            *LMCACHE_POOL_CAPACITIES,
+            *LMCACHE_REUSE,
+            *LMCACHE_READ_ACTIVITY,
+        )
+        if engine == LMCACHE_POOL_TP2:
+            names += LMCACHE_RANK_READS
     elif engine == "lmcache" or engine in LMCACHE_DRAIN_ENGINES:
         names += (*LMCACHE_METRICS, STORES)
         if engine in LMCACHE_DRAIN_ENGINES:
@@ -135,7 +159,7 @@ def before_cohort(url, engine):
     reset_completed_ns = perf_counter_ns()
     verify_reset(reset)
     cleared = idle_metrics(url, engine)
-    if engine == "native":
+    if engine == "native" or engine in LMCACHE_POOL_ENGINES:
         values = metrics(cleared, engine)
         require(values[ENTRIES] == values[PAGES] == 0, "Native cache is occupied after reset")
     return {"before": before, "reset": reset, "cleared": cleared,
@@ -146,7 +170,7 @@ def before_cohort(url, engine):
 def after_cohort(url, engine, receipt):
     receipt["capture_finished_ns"] = perf_counter_ns()
     receipt["after"] = idle_metrics(url, engine)
-    if engine in LMCACHE_DRAIN_ENGINES:
+    if engine in (*LMCACHE_DRAIN_ENGINES, *LMCACHE_POOL_ENGINES):
         receipt["settled_ns"] = perf_counter_ns()
 
 
@@ -207,7 +231,37 @@ def verify_lmcache_drain(
             "LMCache checkpoint stores did not report all three transfer families")
 
 
-def replay(raw, engine, previous=None):
+def verify_pool(snapshots: dict[str, dict[str, float]], engine: str, *, serial: bool) -> None:
+    before, cleared, after = (snapshots[key] for key in ("before", "cleared", "after"))
+    require(cleared[ENTRIES] == cleared[PAGES] == 0, "Native cache is occupied after reset")
+    require(
+        all(sample[PENDING_STORES] == 0 for sample in snapshots.values()),
+        "Pool receipt includes pending LMCache stores",
+    )
+    require(
+        all(before[name] == cleared[name] == after[name] > 0 for name in LMCACHE_POOL_CAPACITIES),
+        "Invalid startup prefix pool capacities",
+    )
+    reads = LMCACHE_POOL_READS + (LMCACHE_RANK_READS if engine == LMCACHE_POOL_TP2 else ())
+    require(
+        all(before[name] == cleared[name] for name in (HITS, *LMCACHE_REUSE, *reads)),
+        "Prefix reuse counters changed during reset",
+    )
+    require(after[LMCACHE_REUSE[0]] == cleared[LMCACHE_REUSE[0]], "LMCache reported an I/O error")
+    if not serial:
+        require(
+            all(after[name] == cleared[name] for name in reads),
+            "LMCache restored state during a cold cohort",
+        )
+
+
+def replay(
+    raw: dict,
+    engine: str,
+    previous: dict[str, dict[str, float]] | None = None,
+    *,
+    serial: bool = False,
+) -> dict[str, dict[str, float]]:
     receipt = raw.get("cold_cache")
     require(isinstance(receipt, dict), "Missing cold cache control receipt")
     verify_reset(receipt["reset"])
@@ -220,13 +274,16 @@ def replay(raw, engine, previous=None):
                for record in requests)
     times = (receipt["reset_started_ns"], receipt["reset_completed_ns"], receipt["ready_ns"],
              first, last, receipt["capture_finished_ns"])
-    if engine in LMCACHE_DRAIN_ENGINES:
+    if engine in (*LMCACHE_DRAIN_ENGINES, *LMCACHE_POOL_ENGINES):
         times += (receipt.get("settled_ns"),)
     require(all(type(value) is int and value > 0 for value in times)
             and list(times) == sorted(times) and times[2] < first,
             "Reset or metrics snapshot overlaps the timed cohort")
-    require(snapshots["cleared"][HITS] == snapshots["after"][HITS],
-            "Prefix cache hit counter advanced during a cold cohort")
+    if not serial:
+        require(
+            snapshots["cleared"][HITS] == snapshots["after"][HITS],
+            "Prefix cache hit counter advanced during a cold cohort",
+        )
     if engine == "lmcache" or engine in LMCACHE_DRAIN_ENGINES:
         require(all(snapshots["cleared"][name] == snapshots["after"][name]
                     for name in LMCACHE_REUSE),
@@ -236,6 +293,8 @@ def replay(raw, engine, previous=None):
                 "LMCache did not acknowledge any checkpoint stores during the cold cohort")
     if engine in LMCACHE_DRAIN_ENGINES:
         verify_lmcache_drain(snapshots, requests, previous, engine)
+    if engine in LMCACHE_POOL_ENGINES:
+        verify_pool(snapshots, engine, serial=serial)
     if engine == "native":
         require(snapshots["cleared"][ENTRIES] == snapshots["cleared"][PAGES] == 0,
                 "Native cache is occupied after reset")

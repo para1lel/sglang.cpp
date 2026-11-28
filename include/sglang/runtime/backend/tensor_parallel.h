@@ -27,6 +27,7 @@ public:
 
     int rank_count() const noexcept;
     int device(int rank) const;
+    void warm_nccl(__nv_bfloat16* const buffers[], const cudaStream_t streams[], std::size_t count);
 
     TpAllReduceRoute allreduce_bf16(__nv_bfloat16* const buffers[], const cudaStream_t streams[],
                                    std::size_t count);

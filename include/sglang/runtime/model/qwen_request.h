@@ -7,6 +7,7 @@
 #include "sglang/decoder_sampling.h"
 #include "sglang/runtime/backend/cuda_resources.h"
 #include "sglang/runtime/model/qwen_layers.h"
+#include "sglang/runtime/cache/prefix_residency.h"
 #include "sglang/text/gdn/replay_ssm.h"
 
 #include <array>
@@ -94,14 +95,24 @@ void select_constrained(Workspace& work, const ConstraintWorkspace& scratch,
                         const ConstraintCursor& cursor, const SamplingParameters* sampling,
                         int position, void* sampling_workspace, cudaStream_t stream);
 
+struct RequestKvStorage {
+    int limit = 0;
+    int heads = mxfp8_kv_heads;
+    const PrefixSlab* slab = nullptr;
+    int rank = 0;
+    PrefixPages pages;
+    const ResidentPrefixRead* reuse = nullptr;
+};
+
 struct Request {
     explicit Request(int device, bool reusable = false, RequestBlockCache* cache = nullptr);
     Request(int device, int capacity, std::shared_ptr<const void> owners, bool reusable = false,
             int kv_limit = 0);
 
-    void initialize(int capacity, cudaStream_t stream, int kv_limit = 0,
-                    int kv_heads = mxfp8_kv_heads);
+    void initialize(int capacity, cudaStream_t stream, int kv_limit = 0);
+    void initialize(int capacity, cudaStream_t stream, RequestKvStorage storage);
     void grow_kv(int positions, int written, cudaStream_t stream);
+    void initialize_kv(int capacity, cudaStream_t stream, RequestKvStorage storage);
     void reset(cudaStream_t stream);
     void reset();
     void reset_gdn_replay(cudaStream_t stream);
@@ -111,6 +122,7 @@ struct Request {
     ExactGqaWorkspace batch_graph_scores();
 
     std::vector<std::uint32_t> minimum_stop_upload;
+    PrefixPages shared_prefix_pages;
     Allocations memory;
     Workspace work;
     int* decode_position;

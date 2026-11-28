@@ -17,7 +17,13 @@ struct Lane {
     int prefill_endpoint_count = -1;
     std::array<int, prefix_prefill_retention_limit> prefill_captures{};
     int prefill_capture_count = 0;
-    std::shared_ptr<const PrefixCacheRead> prefill_lookup;
+    int resident_target_end = 0;
+    int resident_draft_end = 0;
+    bool resident_prefix = false;
+    PrefixSnapshots desired_gdn{};
+    ResidentPrefixRead restore_fallback{};
+    int desired_gdn_tokens = 0;
+    std::shared_ptr<const PrefixCacheRead> prefill_lookup = nullptr;
     RequestProgress progress{};
     std::unique_ptr<MtpDraftRequest> draft = nullptr;
     std::unique_ptr<TargetVerification> verification = nullptr;

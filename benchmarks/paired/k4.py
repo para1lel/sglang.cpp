@@ -11,17 +11,30 @@ from pathlib import Path
 from unittest.mock import patch
 from urllib.parse import urlsplit
 
-from benchmarks.concurrent import client as concurrent
-from benchmarks.streaming import check_vllm, client as streaming
 import cold_cache
 import default_evidence as defaults
-from driver_health import require_healthy_driver_log
 import workload_suite
-from identity import verify_stream_end
-from makespan import cohort_makespan_ns, compare, makespan_criterion, validate_cohort
-from saved_evidence import check_native_dispatch, command, device, digest, fields, load
-from saved_evidence import native_process, read_native_dispatch, require, saved_worker
+from driver_health import require_healthy_driver_log
+from makespan import compare, makespan_criterion, validate_cohort
+from saved_evidence import (
+    check_native_dispatch,
+    command,
+    device,
+    digest,
+    fields,
+    load,
+    native_process,
+    read_native_dispatch,
+    require,
+    saved_worker,
+)
 
+from benchmarks.concurrent import client as concurrent
+from benchmarks.serial import chain
+from benchmarks.serial import fixture as serial_fixture
+from benchmarks.serial.chain import replay_short
+from benchmarks.streaming import check_vllm
+from benchmarks.streaming import client as streaming
 
 ROWS = (*streaming.SHAPES, *concurrent.ROWS)
 PROTOCOL = "matched-k4-v1"
@@ -88,6 +101,8 @@ def current_campaign(identity):
 def workload_evidence(row, identity, lanes=None):
     gpu_count = len(identity["participating_gpus"])
     geometry = workload_suite.geometry(row, gpu_count)
+    if workload_suite.is_serial(row, identity["protocol"]):
+        return geometry
     if lanes is not None:
         metadata = [lane for lane, _, _ in lanes]
     elif row in workload_suite.CONCURRENT_FIXTURES:
@@ -103,33 +118,6 @@ def verify_request_files(directory, lanes):
     for lane, body, _ in lanes:
         require((directory / f'{lane["lane"]:02d}.request.json').read_bytes() == body,
                 f"{directory}: saved request bytes differ from fixture")
-
-
-def replay_short(record, item):
-    lane, _, case = item
-    require("error" not in record and record["http_status"] == 200
-            and record["request_sha256"] == lane["request_sha256"],
-            f"Invalid HTTP outcome or request identity: {record.get('error')}")
-    require(any(name.lower() == "content-type" and value.split(";")[0].strip()
-                == "text/event-stream" for name, value in record["response_headers"]),
-            "Expected text/event-stream")
-    replay = {key: record[key] for key in ("submit_ns", "headers_ns")}
-    completion = streaming.Completion()
-    concurrent.consume_events(iter(record["events"]), replay, case, completion)
-    concurrent.finish_record(replay, completion)
-    verify_stream_end(record)
-    require(replay["submit_ns"] <= replay["headers_ns"] <= replay["first_ns"]
-            <= replay["last_ns"] <= replay["done_ns"] <= record["response_end"]["ns"],
-            "Request timestamps are out of order")
-    require(all(replay[key] == record[key] for key in ("done_ns", "output_ids",
-                                                      "finish_reason", "usage"))
-            and replay["token_chunks"] == [tuple(chunk) for chunk in record["token_chunks"]]
-            and all(replay["metrics"][key] == record["metrics"][key]
-                    for key in concurrent.LATENCIES), "Saved stream differs from SSE replay")
-    duration = cohort_makespan_ns([replay])
-    return duration, [replay["output_ids"]], {
-        "output_tokens_per_second": len(replay["output_ids"]) * 1e9 / duration,
-        "request_latencies": [replay["metrics"]]}
 
 
 def replay_cohort(raw, row, tag, lanes, policy, binding):
@@ -280,14 +268,15 @@ def native_info(run, identity, *, opt_in):
 def cache_engine(identity, arm):
     if arm == "vllm-k4":
         return "vllm"
-    if identity.get("protocol") == workload_suite.LMCACHE_DRAIN_SUFFIX_PROTOCOL:
-        return cold_cache.LMCACHE_DRAIN_SUFFIX
-    if identity.get("protocol") == workload_suite.LMCACHE_DRAIN_ALIGNED_PROTOCOL:
-        return cold_cache.LMCACHE_DRAIN_ALIGNED
-    if identity.get("protocol") == workload_suite.LMCACHE_DRAIN_PROTOCOL:
-        return cold_cache.LMCACHE_DRAIN
-    if identity.get("protocol") in workload_suite.LMCACHE_PROTOCOLS:
-        return "lmcache"
+    protocol = identity.get("protocol")
+    engines = {
+        workload_suite.LMCACHE_POOL_PROTOCOL: cold_cache.LMCACHE_POOL,
+        workload_suite.LMCACHE_DRAIN_SUFFIX_PROTOCOL: cold_cache.LMCACHE_DRAIN_SUFFIX,
+        workload_suite.LMCACHE_DRAIN_ALIGNED_PROTOCOL: cold_cache.LMCACHE_DRAIN_ALIGNED,
+        workload_suite.LMCACHE_DRAIN_PROTOCOL: cold_cache.LMCACHE_DRAIN,
+    }
+    if protocol in workload_suite.LMCACHE_PROTOCOLS:
+        return engines.get(protocol, "lmcache")
     return "native"
 
 
@@ -300,9 +289,18 @@ def capture(row, arm, endpoint, fixtures, directory, native_control=None):
     row_directory = directory.parent.parent
     selected = campaign(row_directory)
     identity = receipt_identity(row_directory, selected)
-    lanes = fixture(row, fixtures, identity)
     version = receipt_version(identity)
     binding = arm_binding(directory, arm, selected, version)
+    if workload_suite.is_serial(row, identity.get("protocol")):
+        require(
+            arm in ("native-k4", "vllm-k4") and native_control is None,
+            "W6 requires a matched timing arm",
+        )
+        inputs = serial_fixture.load_inputs(fixtures)
+        directory.mkdir()
+        chain.handle(directory, inputs, cache_engine(identity, arm), binding, url=url)
+        return
+    lanes = fixture(row, fixtures, identity)
     expected = None
     warmup_outputs = None
     if default_campaign(selected):
@@ -427,7 +425,7 @@ def check_prior_rows(row, root):
     criterion = makespan_criterion(identity)
     require(criterion is not None, "Prior rows require the current K4 makespan criterion")
     fingerprint = hashlib.sha256(identity_bytes).hexdigest()
-    rows = tuple(workload_suite.ROWS) if current_campaign(identity) else ROWS
+    rows = workload_suite.rows(identity["protocol"]) if current_campaign(identity) else ROWS
     require(row in rows, f"{row} is unavailable in this workload suite")
     if current_campaign(identity):
         workload_suite.validate_identity(identity)
@@ -435,6 +433,8 @@ def check_prior_rows(row, root):
     wide_budget = identity["protocol"] in workload_suite.WIDE_BUDGET_PROTOCOLS
     if wide_budget and row in ("W4", "W5"):
         previous_rows = ("W4",) if row == "W5" else ()
+    if workload_suite.is_serial(row, identity["protocol"]):
+        previous_rows = ("W5",)
     for previous in previous_rows:
         directory = root / previous
         comparison_path = directory / "comparison.json"
@@ -459,12 +459,30 @@ def check_prior_rows(row, root):
             verify_single_round_comparison(previous, comparison, criterion)
 
 
+def verify_measurement(row: str, directory: Path, identity: dict) -> None:
+    protocol = identity.get("protocol")
+    if protocol in defaults.DEFAULT_PROTOCOLS:
+        verify_default_receipts(row, directory, identity)
+    else:
+        verify_arm_receipts(
+            directory,
+            identity,
+            opt_in=protocol == OPT_IN_PROTOCOL,
+            version=receipt_version(identity),
+        )
+    server_log = directory / "server.log"
+    require(server_log.is_file(), f"{directory.name}: missing server log")
+    require_healthy_driver_log(server_log.read_text(), directory.name)
+
+
 def assess(row, fixtures, directory):
     policy = concurrent.reference()["policy"]
     selected = campaign(directory)
     identity = receipt_identity(directory, selected)
     current = current_campaign(identity)
-    lanes = fixture(row, fixtures, identity)
+    serial = workload_suite.is_serial(row, identity.get("protocol"))
+    inputs = serial_fixture.load_inputs(fixtures) if serial else None
+    lanes = None if serial else fixture(row, fixtures, identity)
     criterion = makespan_criterion(identity)
     version = receipt_version(identity)
     use_defaults = default_campaign(selected)
@@ -475,12 +493,10 @@ def assess(row, fixtures, directory):
                 "Saved protocol manifest differs from the default campaign")
     samples = {"native-k4": [], "vllm-k4": []}
     diagnostics = {arm: {} for arm in samples}
-    expected = None
-    exact = None
-    if use_defaults:
-        arms = ARM_ORDER[1:]
-    else:
-        arms = (ARM_ORDER[0], EXACT_CONTROL, *ARM_ORDER[1:]) if selected else ARM_ORDER
+    expected = exact = None
+    arms = ARM_ORDER[1:] if use_defaults else ARM_ORDER
+    if selected and not use_defaults:
+        arms = (ARM_ORDER[0], EXACT_CONTROL, *ARM_ORDER[1:])
     arms = tuple(arm for arm in arms if row == "W1" or arm != "native-k4-trace")
     if single_round(identity):
         require(not any((directory / arm).exists()
@@ -488,15 +504,15 @@ def assess(row, fixtures, directory):
                 "Unexpected arm for this campaign profile")
     for arm in arms:
         measurement = directory / arm / "measurement"
-        if use_defaults:
-            verify_default_receipts(row, measurement.parent, identity)
-        else:
-            verify_arm_receipts(measurement.parent, identity, opt_in=selected is not None,
-                                version=version)
+        verify_measurement(row, measurement.parent, identity)
         binding = arm_binding(measurement, arm, selected, version)
-        server_log = measurement.parent / "server.log"
-        require(server_log.is_file(), f"{arm}: missing server log")
-        require_healthy_driver_log(server_log.read_text(), arm)
+        if serial:
+            engine = cache_engine(identity, arm)
+            timings, cache_receipts[arm] = chain.handle(measurement, inputs, engine, binding)
+            measured = timings[chain.TAGS[1]]
+            diagnostics[arm][chain.TAGS[1]] = measured
+            samples[arm].append(measured["makespan_ns"])
+            continue
         verify_request_files(measurement, lanes)
         tags = schedule(row, arm, identity)
         require({path.name for path in measurement.glob("*.json.gz")}
@@ -623,11 +639,19 @@ def check_vllm_worker(row, run, reservation, checkpoint, *, before_measurement=F
     max_seqs = defaults.serving_capacity(selected[0]) if use_defaults else 32
     lmcache = use_defaults and selected[0]["protocol"] in workload_suite.LMCACHE_PROTOCOLS
     token_budget = defaults.token_budget(selected[0]) if use_defaults else 8192
-    evidence, kernels = vllm_worker_evidence(row, run, reservation, checkpoint,
-                                             before_measurement=before_measurement,
-                                             prefix_cache=cache_on_campaign(selected),
-                                             max_seqs=max_seqs, token_budget=token_budget,
-                                             lmcache=lmcache)
+    if use_defaults and workload_suite.is_serial(row, selected[0]["protocol"]):
+        row = serial_fixture.NAME
+    evidence, kernels = vllm_worker_evidence(
+        row,
+        run,
+        reservation,
+        checkpoint,
+        before_measurement=before_measurement,
+        prefix_cache=cache_on_campaign(selected),
+        max_seqs=max_seqs,
+        token_budget=token_budget,
+        lmcache=lmcache,
+    )
     if before_measurement:
         require(default_campaign(selected), "Expected a native defaults campaign")
         port = defaults.vllm_argv(run, fields(reservation / "cpus.txt"),
@@ -663,13 +687,18 @@ def verify_default_receipts(row, run, identity):
             "vLLM environment changed during use")
     defaults.client(run, identity, port)
     cache_on = identity["protocol"] in defaults.CACHE_ON_PROTOCOLS
-    evidence, kernels = vllm_worker_evidence(row, run, reservation,
-                                             Path(identity["checkpoint_path"]),
-                                             prefix_cache=cache_on,
-                                             max_seqs=defaults.serving_capacity(identity),
-                                             token_budget=token_budget,
-                                             lmcache=identity["protocol"] in
-                                             workload_suite.LMCACHE_PROTOCOLS)
+    if workload_suite.is_serial(row, identity["protocol"]):
+        row = serial_fixture.NAME
+    evidence, kernels = vllm_worker_evidence(
+        row,
+        run,
+        reservation,
+        Path(identity["checkpoint_path"]),
+        prefix_cache=cache_on,
+        max_seqs=defaults.serving_capacity(identity),
+        token_budget=token_budget,
+        lmcache=identity["protocol"] in workload_suite.LMCACHE_PROTOCOLS,
+    )
     require(load(run / "worker-identity.json") == evidence
             and load(run / "attention-kernels.json") == kernels,
             "Saved vLLM worker differs from the resolved receipts")

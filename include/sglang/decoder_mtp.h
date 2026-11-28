@@ -11,6 +11,7 @@ struct PrefixCacheRead;
 struct PrefixCacheLayout;
 class PrefixPrefillSnapshot;
 struct PrefixDeviceTransfer;
+struct PrefixRestoreExtent;
 
 inline constexpr int draft_projection_rows = 16;
 
@@ -54,8 +55,16 @@ private:
 
 class MtpDraftRequest {
 public:
+  struct PrefixStorage {
+      const PrefixSlab* slab = nullptr;
+      PrefixPages pages;
+      const ResidentPrefixRead* reuse = nullptr;
+  };
+
     MtpDraftRequest(std::shared_ptr<const MtpDraftWeights> weights, int capacity,
                     RequestBlockCache* cache = nullptr);
+    MtpDraftRequest(std::shared_ptr<const MtpDraftWeights> weights, int capacity,
+                    RequestBlockCache* cache, PrefixStorage storage);
     ~MtpDraftRequest();
 
     const Bf16* enqueue(int position, int shifted_token, const Bf16* hidden, bool score,
@@ -83,8 +92,11 @@ public:
     void rewind(int valid_tokens);
     std::size_t device_allocation_bytes() const;
     void recycle_after_completion();
+    const PrefixPages& resident_prefix_pages() const;
+    const std::vector<std::int32_t>& prefix_physical_pages() const;
+    void commit_restored_prefix(int rows);
 
-private:
+  private:
     const Bf16* enqueue_impl(int position, int shifted_token, const Bf16* hidden, bool score,
                             cudaStream_t stream, const ConstraintWorkspace* scratch,
                             const ConstraintCandidates* allowed, bool defer_score,
@@ -93,17 +105,19 @@ private:
                                   cudaStream_t stream, bool defer_score, Bf16* packed = nullptr,
                                   bool exact = false);
     friend class PeerDraftRepair;
-    friend PrefixDeviceTransfer restore_prefix_view(Request&, const PrefixCacheRead&,
-                                                    cudaStream_t, MtpDraftRequest*,
-                                                    const PrefixCacheLayout*);
+    friend PrefixDeviceTransfer
+    restore_prefix_view(Request& request, const PrefixCacheRead& read, cudaStream_t initialized,
+                        MtpDraftRequest* draft, const PrefixCacheLayout* layout,
+                        const std::shared_ptr<PrefixPrefillSnapshot>& snapshot,
+                        const PrefixRestoreExtent* extent);
     friend PrefixDeviceTransfer export_prefix_view(const Request&, int, int, int, cudaStream_t,
                                                    const MtpDraftRequest*, const Workspace*, bool,
                                                    const PrefixCacheLayout*,
                                                    const std::shared_ptr<PrefixPrefillSnapshot>&);
-    friend int commit_restored_prefix(Request&, const PrefixDeviceTransfer&, MtpDraftRequest*);
+    friend int commit_restored_prefix(Request& request, const PrefixDeviceTransfer& view,
+                                      MtpDraftRequest* draft, cudaStream_t stream);
     Mxfp8KvCache prefix_cache_view(int rows, bool storing) const;
     const Allocations& prefix_cache_memory() const;
-    void commit_restored_prefix(int rows);
 
     struct State;
     std::unique_ptr<State> state_;

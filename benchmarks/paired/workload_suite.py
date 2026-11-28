@@ -2,9 +2,10 @@
 
 import json
 
-from benchmarks.concurrent import reference
 from saved_evidence import UUID, require
 
+from benchmarks.concurrent import reference
+from benchmarks.serial import fixture as serial_fixture
 
 PROTOCOL = "matched-k4-native-defaults-cache-on-v3"
 PROTOCOL_V4 = "matched-k4-native-defaults-cache-on-v4"
@@ -15,11 +16,14 @@ LMCACHE_GPU_SLC3_PROTOCOL = "matched-k4-native-defaults-lmcache-slc3"
 LMCACHE_DRAIN_PROTOCOL = "matched-k4-native-defaults-lmcache-slc3-drain"
 LMCACHE_DRAIN_ALIGNED_PROTOCOL = "matched-k4-native-defaults-lmcache-slc3-drain-aligned"
 LMCACHE_DRAIN_SUFFIX_PROTOCOL = "matched-k4-native-defaults-lmcache-slc3-drain-suffix"
+LMCACHE_POOL_PROTOCOL = "matched-k4-native-defaults-lmcache-hbm-pool"
+TP2_POOL_PROTOCOL = "tp2-paired-v5"
 LMCACHE_SLC3_PROTOCOLS = (
     LMCACHE_GPU_SLC3_PROTOCOL,
     LMCACHE_DRAIN_PROTOCOL,
     LMCACHE_DRAIN_ALIGNED_PROTOCOL,
     LMCACHE_DRAIN_SUFFIX_PROTOCOL,
+    LMCACHE_POOL_PROTOCOL,
 )
 LMCACHE_GPU_PROTOCOLS = (LMCACHE_GPU_PROTOCOL, *LMCACHE_SLC3_PROTOCOLS)
 LMCACHE_PROTOCOLS = (LMCACHE_PROTOCOL, *LMCACHE_GPU_PROTOCOLS)
@@ -29,6 +33,8 @@ V4_TOKEN_BUDGET = 32768
 LMCACHE_VERSION = "0.5.8"
 LMCACHE_SLC3_READY = "0.5.8+native-v3"
 LMCACHE_NATIVE_READY = "0.5.8+native-v4"
+LMCACHE_POOL_READY = "0.5.8+native-v5"
+HBM_POOL_DEFAULTS = {"gpu_memory_utilization": 0.88, "prefix_gqa_pages": 0, "prefix_gdn_slots": 0}
 ROWS = {
     "W1": (128, 128, 1),
     "W2": (2048, 512, 1),
@@ -44,8 +50,28 @@ def serving_capacity(gpu_count):
     return 8 * gpu_count
 
 
+def rows(protocol: str | None) -> tuple[str, ...]:
+    if protocol in (LMCACHE_POOL_PROTOCOL, TP2_POOL_PROTOCOL):
+        return (*ROWS, serial_fixture.ROW)
+    return tuple(ROWS)
+
+
+def is_serial(row: str, protocol: str | None) -> bool:
+    return row == serial_fixture.ROW and row in rows(protocol)
+
+
+def lmcache_ready_version(protocol: str) -> str:
+    if protocol in (LMCACHE_POOL_PROTOCOL, TP2_POOL_PROTOCOL):
+        return LMCACHE_POOL_READY
+    if protocol == LMCACHE_DRAIN_SUFFIX_PROTOCOL:
+        return LMCACHE_NATIVE_READY
+    return LMCACHE_SLC3_READY
+
+
 def geometry(row, gpu_count):
     serving_capacity(gpu_count)
+    if row == serial_fixture.ROW:
+        return serial_fixture.metadata()
     prompt, output, per_gpu = ROWS[row]
     return {"prompt_tokens": prompt, "output_tokens": output,
             "requests_per_gpu": per_gpu, "concurrent_requests": per_gpu * gpu_count}
@@ -72,11 +98,7 @@ def validate_identity(identity):
                 and identity.get("sampling") == "single-round-v1",
                 "LMCache campaign requires the pinned daemon and single-round sampling")
     if identity["protocol"] in LMCACHE_SLC3_PROTOCOLS:
-        expected = (
-            LMCACHE_NATIVE_READY
-            if identity["protocol"] == LMCACHE_DRAIN_SUFFIX_PROTOCOL
-            else LMCACHE_SLC3_READY
-        )
+        expected = lmcache_ready_version(identity["protocol"])
         require(
             identity.get("lmcache_wire") == "SLC3"
             and identity.get("lmcache_ready_version") == expected,
@@ -91,6 +113,11 @@ def validate_identity(identity):
         require(type(uid) is int and uid >= 0 and type(python) is str and python.startswith("/")
                 and type(identity.get("lmcache_pythonpath")) is str,
                 "Direct GPU LMCache campaign requires the daemon UID and interpreter")
+    if identity["protocol"] == LMCACHE_POOL_PROTOCOL:
+        require(
+            identity.get("serial_fixture_sha256") == serial_fixture.INPUTS_SHA256,
+            "Wrong W6 input fixture identity",
+        )
 
 
 def concurrent_metadata(row, gpu_count):

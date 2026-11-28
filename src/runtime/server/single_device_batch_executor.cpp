@@ -33,6 +33,9 @@ public:
     DecoderPrefixCacheStats prefix_cache_stats() const override {
         return batch_.prefix_cache_stats();
     }
+    bool prefix_backup_pending() const override {
+        return batch_.prefix_backup_pending();
+    }
     void reset_prefix_cache() override { batch_.reset_prefix_cache(); }
 
     std::size_t request_device_allocation_bytes() const override {
@@ -83,9 +86,16 @@ void SingleDeviceBatchExecutor::run(Ready ready, Process process, std::promise<v
     try {
         const auto& config = options();
         session.emplace(decoder_, DecoderBatchOptions{
-            config.cuda_graphs, config.max_active, config.prefix_cache_entries,
-            config.max_num_batched_tokens, std::numeric_limits<std::size_t>::max(),
-            config.tp_verification_graphs});
+                                      config.cuda_graphs,
+                                      config.max_active,
+                                      config.prefix_cache_entries,
+                                      config.max_num_batched_tokens,
+                                      std::numeric_limits<std::size_t>::max(),
+                                      config.tp_verification_graphs,
+                                      config.resident_prefix_cache,
+                                      config.prefix_gqa_pages,
+                                      config.prefix_gdn_slots,
+                                  });
         ready(*session);
     } catch (...) {
         started.set_exception(std::current_exception());

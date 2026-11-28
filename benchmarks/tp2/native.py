@@ -3,13 +3,13 @@
 import argparse
 import csv
 import json
-from pathlib import Path
 import re
+from pathlib import Path
 
 import default_evidence as defaults
 import lmcache_evidence as cache
 from saved_evidence import UUID, command, compute_owners, hash_manifest, load, require
-
+from workload_suite import HBM_POOL_DEFAULTS, TP2_POOL_PROTOCOL
 
 RANK = re.compile(r"tp2 rank=(\d+) device=(\d+) uuid=([0-9a-fA-F-]+) pid=(\d+) nccl=ok "
                   r"weights=(\d+) lm_head=([01]) mtp=([01])")
@@ -168,6 +168,8 @@ def verify(run, completed=False):
                 "prefix_cache_entries": 0,
                 "lmcache_enabled": True, "lmcache_available": True, "port": identity["port"],
                 "host": "127.0.0.1", "model_path": identity["checkpoint_path"]}
+    if identity["protocol"] == TP2_POOL_PROTOCOL:
+        required.update(HBM_POOL_DEFAULTS)
     require(all(type(info.get(k)) is type(v) and info[k] == v for k, v in required.items())
             and info["launch_command"].split() == ["sglang-server", *flags],
             "Unexpected native config")

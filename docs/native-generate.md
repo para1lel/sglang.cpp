@@ -20,7 +20,7 @@ curl --fail-with-body http://127.0.0.1:17384/generate \
 
 For SSE, set `stream: true` and use `-N` with curl. Use `input_ids: [220]` instead of `text` for a token-ID prompt. Indexed requests accept `text: ["A", "B"]` or `input_ids: [[220], [32, 220]]`; broadcast `sampling_params` or supply one per prompt, with optional per-prompt `cache_salt` and `rid`. [Copyable batch JSON and SSE examples](https://github.com/para1lel/sglang.cpp/blob/6debe50edccdeda34ff307235ed38e74b6b8f2ee/docs/native-generate.md#runtime-path)
 
-The worker validates and encodes every item before decoder admission. Multi-item batches submit in input order from lane zero, waiting at `--max-active`. The [shared scheduler](http-server.md#http-admission-and-shutdown) handles request IDs and lane selection. A lone decoding item can use [score-backed attention](singleton-gqa-decode.md). [Lane selection](../apps/server/batch_service.cpp#L498)<!-- prefix: "void BatchSe" -->
+The worker validates and encodes every item before decoder admission. Multi-item batches submit in input order from lane zero, waiting at `--max-active`. The [shared scheduler](http-server.md#http-admission-and-shutdown) handles request IDs and lane selection. A lone decoding item can use [score-backed attention](singleton-gqa-decode.md). [Lane selection](../apps/server/batch_service.cpp#L517)<!-- prefix: "void BatchSe" -->
 
 ### Parallel sampling
 
@@ -28,7 +28,7 @@ The worker validates and encodes every item before decoder admission. Multi-item
 
 ### JSON and SSE
 
-JSON 200 returns an object for scalar `n: 1` and an ordered array for every indexed request. [SSE admission](http-server.md#completion-streams) opens a chunked HTTP 200. Indexed events can interleave and carry zero-based result positions; scalar `n: 1` omits `index`. [Indexed result](../apps/server/native_generate.cpp#L229)<!-- prefix: "std::string " --> · [Batch admission and polling](../apps/server/batch_service.cpp#L640)<!-- prefix: "bool BatchSe" -->
+JSON 200 returns an object for scalar `n: 1` and an ordered array for every indexed request. [SSE admission](http-server.md#completion-streams) opens a chunked HTTP 200. Indexed events can interleave and carry zero-based result positions; scalar `n: 1` omits `index`. [Indexed result](../apps/server/native_generate.cpp#L229)<!-- prefix: "std::string " --> · [Batch admission and polling](../apps/server/batch_service.cpp#L661)<!-- prefix: "bool BatchSe" -->
 
 | Field | Meaning |
 | --- | --- |
@@ -41,7 +41,7 @@ JSON 200 returns an object for scalar `n: 1` and an ordered array for every inde
 | `meta_info.finish_reason` | `null` on intermediate events. The final value records `length`, `stop` with a string or integer `matched`, or an [abort result](native-abort.md#runtime-path). |
 | `meta_info.cached_tokens` | Number of reused prompt IDs. Present on every batch result event and in every final object. Single-prompt intermediate events omit it. |
 
-Replace each item's text and IDs on every event. Text can stay fixed as IDs grow, and cumulative frames can use quadratic bytes. Each item has one terminal object. Budget finish is `{"type":"length","length":N}`, including zero. A token-ID stop returns `{"type":"stop","matched":ID}`, counts that ID, and hides its text by default. Use the shared [end marker, keepalive and TTFT rules](http-server.md#completion-streams). The writer runs outside the scheduler mutex. [Batch result delivery](../apps/server/batch_service.cpp#L585)<!-- prefix: "bool BatchSe" -->
+Replace each item's text and IDs on every event. Text can stay fixed as IDs grow, and cumulative frames can use quadratic bytes. Each item has one terminal object. Budget finish is `{"type":"length","length":N}`, including zero. A token-ID stop returns `{"type":"stop","matched":ID}`, counts that ID, and hides its text by default. Use the shared [end marker, keepalive and TTFT rules](http-server.md#completion-streams). The writer runs outside the scheduler mutex. [Batch result delivery](../apps/server/batch_service.cpp#L606)<!-- prefix: "bool BatchSe" -->
 
 ### Text stops
 
@@ -106,7 +106,7 @@ Null selects sampling defaults except for `max_new_tokens`. Explicit stop IDs ar
 
 Compatibility fields accept `return_routed_experts: false` or null and `lora_path: null`. Unknown fields, including `model`, `messages` and top-level sampling fields, return HTTP 400.
 
-Use the [shared status and SSE rules](http-server.md#completion-streams). A pre-header failure substitutes JSON with `error.message` for the entire result. A tokenizer load failure returns 500. A post-header failure attempts one stream-wide error with no index, `error.message: "Native decoder failed"`, `error.type: "server_error"`, `error.code: 500`, and `error.retryable: false`. Already sent events remain visible. Generation failure, disconnect, or write failure drops unsubmitted items and cancels owned jobs through retirement. Acknowledged cache checkpoints can survive. The [reset exclusion](prefix-cache.md#native-http-controls) covers the complete HTTP claim. [Batch cancellation](../apps/server/batch_service.cpp#L475)<!-- prefix: "void BatchSe" --> · [HTTP error mapping](../apps/server/prefix_controls.cpp#L178)<!-- prefix: "void handle_" --> · [SSE error writer](../apps/server/native_generate.cpp#L240)<!-- prefix: "void write_s" -->
+Use the [shared status and SSE rules](http-server.md#completion-streams). A pre-header failure substitutes JSON with `error.message` for the entire result. A tokenizer load failure returns 500. A post-header failure attempts one stream-wide error with no index, `error.message: "Native decoder failed"`, `error.type: "server_error"`, `error.code: 500`, and `error.retryable: false`. Already sent events remain visible. Generation failure, disconnect, or write failure drops unsubmitted items and cancels owned jobs through retirement. Acknowledged cache checkpoints can survive. The [reset exclusion](prefix-cache.md#native-http-controls) covers the complete HTTP claim. [Batch cancellation](../apps/server/batch_service.cpp#L494)<!-- prefix: "void BatchSe" --> · [HTTP error mapping](../apps/server/prefix_controls.cpp#L178)<!-- prefix: "void handle_" --> · [SSE error writer](../apps/server/native_generate.cpp#L240)<!-- prefix: "void write_s" -->
 
 The route matches the decoded `/generate` path and ignores its query. `/generate/` follows the [shared redirect rules](http-server.md#request-targets-and-redirects). After HTTP parsing, methods other than `POST` and `PUT` return HTTP 405 with `Allow: POST, PUT` and `{"detail":"Method Not Allowed"}`. For `HEAD`, the server sends only the headers. [Native route matcher](../apps/server/http.cpp#L411)<!-- prefix: "GenerateRout" --> · [Method response](../apps/server/http.cpp#L585)<!-- prefix: "void write_m" -->
 

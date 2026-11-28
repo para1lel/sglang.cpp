@@ -16,10 +16,10 @@ Match checkpoint, tokenizer, template, processor, weight precision, sampling, ca
 
 ## Scheduler and reporting policy
 
-Use MTP4, 32,768 tokens per step, eight slots per GPU, and cold prefixes.
+Use MTP4, 32,768 tokens per step, and eight slots per GPU. W1–W5 start each cohort with cold prefixes. W6 starts cold and reuses prefixes inside its measured chain.
 
 - **Pinned vLLM.** Set `--max-num-batched-tokens 32768 --max-num-scheduled-tokens 32768` and enable `--async-scheduling`. Match `--max-num-seqs` to the active capacity. Verify MTP4 and the effective aligned GDN cache settings at the API and worker.
-- **Native.** Use the default direct GPU LMCache path. The paired driver starts a private LMCache 0.5.8 daemon on the selected physical GPU with 64 GiB CPU L1 for TP1. TP2 uses one daemon with both UUIDs and one 128 GiB CPU L1. [TP1 daemon launcher](../benchmarks/paired/lmcache_arm.sh#L36)<!-- prefix: "start_lmcach" -->
+- **Native.** Use the default 0.88 GPU memory utilization and automatic GQA page and GDN checkpoint pool capacities. The private LMCache 0.5.8 daemon uses 64 GiB CPU L1 at TP1 and 128 GiB shared by both UUIDs at TP2. [Campaign defaults](../benchmarks/paired/workload_suite.py#L37)<!-- prefix: "HBM_POOL_DEF" --> · [TP1 daemon launcher](../benchmarks/paired/lmcache_arm.sh#L36)<!-- prefix: "start_lmcach" -->
 
 The pinned vLLM arm uses its local prefix cache. Verify `kv_transfer=false` and `kv_offloading_size=null` in the worker receipt. The same check requires zero CPU weight offload. [Worker receipt check](https://github.com/para1lel/sglang.cpp/blob/03ee22d849e6ef7bca723595a7c8e63c47187749/benchmarks/paired/saved_evidence.py#L223)<!-- prefix: "and worker[\"" -->
 
@@ -35,7 +35,7 @@ Record actual KV format and scale policy, Q dtype and scaling, attention backend
 
 ## Named workloads
 
-Lengths are exact post-template token counts. Scale request counts by GPU count. Use distinct frozen lanes and test normal EOS separately.
+Lengths are exact post-template token counts. Scale W1–W5 request counts by GPU count. Use distinct frozen lanes and test normal EOS separately.
 
 | Workload | Input tokens per request | Output tokens per request | Offered requests per GPU |
 | --- | ---: | ---: | ---: |
@@ -47,13 +47,34 @@ Lengths are exact post-template token counts. Scale request counts by GPU count.
 
 TP1 W4 uses the first eight archived W5 requests. TP1 W5 uses all four archived W6 requests. Use the frozen additive corpus for [TP2](serving/tp2.md#acceptance-target). Give the [warm-prefix diagnostic](../benchmarks/paired/README.md#prefix-reuse-diagnostic) and media variants separate rows.
 
+### W6 serial history
+
+Use `k = 1,024` tokens. Each arm at each width sends one independent warmup with 203,776 input tokens and 1,024 output tokens. Drain and reset prefix state after warmup. The measured chain starts with empty history.
+
+Each arm sends 20 measured requests. For request `i` from 1 through 20, append 9,216 frozen input IDs to that engine's complete history. After its response, append all 1,024 emitted output IDs to the history. Inputs contain `10,240 × i − 1,024` IDs, from 9,216 to 203,776. The final input and output total 204,800 tokens. Both engines use the same frozen added IDs and sampling controls. Each arm carries its own emitted output IDs forward.
+
+Validate final usage and `[DONE]`, then send the next request immediately after HTTP EOF. Keep prefix state between measured requests. Time from the first POST submission to the twentieth HTTP EOF on one monotonic clock, including handoffs. Save warmup separately. Retain added IDs, actual prompt and output IDs, usage, and separate `[DONE]` and EOF timestamps. A missing or invalid response invalidates the chain.
+
+Use the same campaign identity as the passing W5 row at the corresponding width. The [paired driver runbook](../benchmarks/paired/README.md#matched-k4-timing-protocol) supplies common environment and checkpoint controls.
+
+Prepare the W6 fixture once with the checkpoint tokenizer and verify it before reusing it. Use `PAIRED_FIXTURES` as the shared fixture directory. Measure each width in its existing campaign after that width's W5 pass. [Fixture validation](../benchmarks/serial/fixture.py#L45)<!-- prefix: "def load_inp" --> · [Capture and replay](../benchmarks/serial/chain.py#L157)<!-- prefix: "def handle(" -->
+
+```bash
+python -B -m benchmarks.serial.fixture prepare "$CHECKPOINT/tokenizer.json" "$PAIRED_FIXTURES"
+python -B -m benchmarks.serial.fixture verify "$PAIRED_FIXTURES"
+bash benchmarks/paired/run_k4.sh "$NATIVE_BINARY" "$GPU0" "$TP1_CAMPAIGN" W6
+bash benchmarks/tp2/run.sh measure "$GPU0" "$GPU1" W6 "$NATIVE_BINARY" "$TP2_CAMPAIGN"
+```
+
+Keep each engine's `warmup-01.json.gz` and `measured-01.json.gz` with the comparison and cache receipts.
+
 ## Measurement
 
-Require native makespan ≤1.10× pinned vLLM on every W1–W5 row at each TP width. Run one warmup and one measured cohort per row and engine. Apply the gate to the measured cohort and stop at the first miss. W4 can open a campaign. Run W5 only after W4 passes in that campaign. Advance through W1–W3 in order on passes. Verify device, effective controls, stream identities, counts, finish, usage, and drain. Require TP1 measured IDs to match each engine's warmup IDs. TP2 output content is diagnostic. [Matched K4 timing protocol](../benchmarks/paired/README.md#matched-k4-timing-protocol)
+Require native makespan ≤1.10× pinned vLLM on every W1–W6 row independently at each TP width. Use one warmup and one measured cohort or chain per engine. Apply the gate to the measured makespan and stop at the first miss. W4 can open a campaign. Run W5 only after W4 passes in that campaign. Advance through W1–W3 in order on passes. Verify device, effective controls, stream identities, counts, finish, usage, and drain. For W1–W5 at TP1, require measured IDs to match each engine's warmup IDs. TP2 output content is diagnostic. [Matched K4 timing protocol](../benchmarks/paired/README.md#matched-k4-timing-protocol)
 
-Use `benchmarks/tp2/run.sh qualify` separately for readiness and a single native W1-shaped functional request. Use `measure` for full row and rank-cache receipts. W1 includes a separate native trace arm for K4 route activity. [TP2 cohort assessment](../benchmarks/tp2/cohorts.py#L94)<!-- prefix: "def assess(d" -->
+Use `benchmarks/tp2/run.sh qualify` separately for readiness and a single native W1-shaped functional request. Use `measure` for full row and rank-cache receipts. W1 includes a separate native trace arm for K4 route activity. [TP2 cohort assessment](../benchmarks/tp2/cohorts.py#L138)<!-- prefix: "def assess(d" -->
 
-Use one streaming client and monotonic clock from earliest submission to last valid `[DONE]`. Preconnect lanes, release one barrier, and send all bodies within 50 ms and before any completion. Retain submit times, headers, token events, completion times, counts, and failures. Exclude [SSE keepalives](http-server.md#completion-streams) and empty events from token counts.
+For W1–W5, measure from the earliest submission to the last valid `[DONE]` on one monotonic clock. Record each HTTP EOF separately to validate stream completion and place cache accounting after the wire closes. Preconnect lanes, release one barrier, and send all bodies within 50 ms and before any completion. Retain submit times, headers, token events, completion times, counts, and failures. Exclude [SSE keepalives](http-server.md#completion-streams) and empty events from token counts. W6 uses the [first POST through final EOF](#w6-serial-history). [Cohort score](../benchmarks/paired/makespan.py#L21)<!-- prefix: "def cohort_m" --> · [Cache receipt interval](../benchmarks/paired/cold_cache.py#L258)<!-- prefix: "def replay(" -->
 
 Report output tokens/s, TTFT, TPOT, end-to-end latency, and whether every lane starts generating before the first completion for diagnosis.
 
@@ -65,11 +86,30 @@ Report output tokens/s, TTFT, TPOT, end-to-end latency, and whether every lane s
 | End-to-end latency (ms) | Time from request submission to its terminal response. Record stream chunking when multiple tokens arrive together. |
 | Requests/s and aggregate tokens/s | Completed requests per cohort second, and total input plus output tokens per cohort second, respectively. |
 
-Exclude startup, model load, JIT, and graph capture. Drain and acknowledge resets before each cohort. TP2 uses one daemon reset. Require zero cached tokens and unchanged hit counters. The cold native receipt requires acknowledgement of every [planned prompt checkpoint](prefix-cache.md#checkpoint-boundaries) and any distinct terminal store. Require zero resident checkpoints, declines, store failures, restores, read bytes, and I/O errors in the cohort. Short GQA chunks can overlap at different exact endpoints, so check written positions using the receipt's physical transfer bound. At TP2 each rank must acknowledge every store. GQA and GDN write bytes must be positive and equal across ranks. Only rank 0 writes draft bytes. Use settled counters for cache accounting and stream timestamps for timing. [Cold reset](../benchmarks/paired/cold_cache.py#L131)<!-- prefix: "def before_c" --> · [Drain verification](../benchmarks/paired/cold_cache.py#L153)<!-- prefix: "def verify_l" --> · [Rank receipts](../benchmarks/tp2/cache_activity.py#L16)<!-- prefix: "def replay(r" -->
+Exclude startup, model load, JIT, and graph capture. Drain and acknowledge resets before each W1–W5 cohort and before the W6 warmup and measured chain. TP2 resets its shared daemon once. W1–W5 require zero cached tokens and unchanged hit counters. Use settled counters for cache accounting and stream timestamps for timing. [Cold reset](../benchmarks/paired/cold_cache.py#L155)<!-- prefix: "def before_c" -->
+
+Native pool receipts require zero occupied entries and pages after reset and unchanged positive pool capacities. Require no pending stores at settlement and no daemon restores for a cold cohort. W6 can record cache hits and restores inside its measured chain. Report LMCache activity separately from GPU-resident reuse. [Pool receipt](../benchmarks/paired/cold_cache.py#L234)<!-- prefix: "def verify_p" -->
+
+The historical `drain-suffix` receipt requires acknowledgement of every planned prompt checkpoint and distinct terminal store. It checks zero resident checkpoints, declines, store failures, restores, read bytes, and I/O errors. Short GQA chunks can overlap at different endpoints, so validate writes against the physical transfer bound. At TP2, both ranks acknowledge every store. GQA and GDN write bytes must be positive and equal across ranks. Rank 0 alone writes draft bytes. [Drain verification](https://github.com/para1lel/sglang.cpp/blob/3b138b699bdf47b02a7dde8ef5e07142ee699d3f/benchmarks/paired/cold_cache.py#L153)<!-- prefix: "def verify_l" --> · [Rank receipts](https://github.com/para1lel/sglang.cpp/blob/3b138b699bdf47b02a7dde8ef5e07142ee699d3f/benchmarks/tp2/cache_activity.py#L16)<!-- prefix: "def replay(r" -->
 
 Report absolute metrics and successful and attempted requests for each engine, row, and mode. Give the latency sample count and percentile method.
 
-For new offline timing, use `--warmup 1 --repeats 1` and omit `--top-logits`. `load_ms` covers model initialization. `request_ms` includes request allocation and graph capture. Allocation metrics include resident storage on the serial graph path. Keep JSON, invocation, binary hash, and device UUID. [Generator measurement](../apps/sglang-generate.cpp#L247)<!-- prefix: "Measurements" -->
+For new offline timing, use `--warmup 1 --repeats 1` and omit `--top-logits`. `load_ms` covers model initialization. `request_ms` includes request allocation and graph capture. Allocation metrics include resident storage on the serial graph path. Keep JSON, invocation, binary hash, and device UUID. [Generator measurement](../apps/sglang-generate.cpp#L256)<!-- prefix: "Measurements" -->
+
+### GPU pool engineering checks
+
+The TP1 and TP2 pressure fixtures used preview server SHA-256 `8bee22e0c2242d276666e2e74fe41ceb89e27cb321d044d33f6739dfcf094cb0`. Each B200 reported `budget_bytes` of 168,524,838,338 and `capacity_bytes` of 168,522,940,416.
+
+| Width | Completed backups at pressure settlement | Backed evictions | Unbacked evictions | CUDA IPC map and unmap events | Module-static bytes |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| TP1 | 42 | 40 | 0 | 132 | 12 |
+| TP2 | 44 | 42 | 0 | 232 | 41 |
+
+The cold, HBM-only, mixed-tier, and CPU-reload checks all returned greedy ID 17. At TP2, rank 0 completed while the fixture held rank 1's STORE reply. The backup stayed pending until the fixture released the reply.
+
+The Nsight Systems traces cover the server and daemon. From readiness until shutdown started, they recorded zero physical device allocation or free calls and zero corresponding events. IPC maps existing backing. CUDA loads the module-static symbols automatically.
+
+Receipts are in `artifacts/pool-w6/verification/tp1-preview2-a/` and `artifacts/pool-w6/verification/tp2-preview2-a/`. Each contains `routes/run.json`, `api-summary-classified.json`, and `identity.sha256`.
 
 ### Operator qualification
 
@@ -129,7 +169,7 @@ Retain the run manifest, commands, environment, fixture hashes, raw samples, and
 
 ## Matched K4 evidence
 
-Native release `739413015202541bdb4bdabcc1580aceb381e86b` passed the 1.10× gate independently on all five rows at both TP widths. Each native arm used one LMCache daemon with a 64 GiB CPU L1 at TP1 and 128 GiB at TP2. [PR #3 campaign evidence](https://github.com/para1lel/sglang.cpp/pull/3)
+The historical PR #3 campaign covered W1–W5. Native release `739413015202541bdb4bdabcc1580aceb381e86b` passed the 1.10× gate independently on all five rows at both widths. Each native arm used one LMCache daemon with a 64 GiB CPU L1 at TP1 and 128 GiB at TP2. [PR #3 campaign evidence](https://github.com/para1lel/sglang.cpp/pull/3)
 
 | Row | TP1 native (ns) | TP1 vLLM (ns) | TP1 ratio | TP2 native (ns) | TP2 vLLM (ns) | TP2 ratio |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |

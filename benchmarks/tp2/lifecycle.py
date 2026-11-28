@@ -4,23 +4,34 @@ import csv
 import json
 from pathlib import Path
 
-from benchmarks.concurrent import reference
+import native
+import tp2_vllm
 from saved_evidence import command, compute_owners, digest, fields, hash_manifest, load, require
 from tp2_corpus import ADDITIONS_SHA256
-import tp2_vllm
-import native
+from workload_suite import LMCACHE_POOL_READY, TP2_POOL_PROTOCOL
+
+from benchmarks.concurrent import reference
+from benchmarks.serial import fixture as serial_fixture
 
 
 def campaign(base):
     identity = load(base / "identity.json")
     sources = base / "protocol.sha256"
     require(
-        identity["protocol"] in ("tp2-paired-v2", "tp2-paired-v3", "tp2-paired-v4")
+        identity["protocol"]
+        in ("tp2-paired-v2", "tp2-paired-v3", "tp2-paired-v4", TP2_POOL_PROTOCOL)
         and identity["mode"] == "measure"
         and identity["protocol_sha256"] == digest(sources)
         and identity["corpus_sha256"] == ADDITIONS_SHA256,
         "Incorrect campaign protocol",
     )
+    if identity["protocol"] == TP2_POOL_PROTOCOL:
+        require(
+            identity.get("serial_fixture_sha256") == serial_fixture.INPUTS_SHA256
+            and identity.get("lmcache_ready_version") == LMCACHE_POOL_READY
+            and identity.get("lmcache_wire") == "SLC3",
+            "Incorrect W6 HBM pool identity",
+        )
     project = Path(__file__).resolve().parents[2]
     for name, checksum in hash_manifest(sources).items():
         require(digest(project / name) == checksum, f"Protocol source mismatch: {name}")

@@ -63,6 +63,15 @@ DecoderBatch::State::State(const Decoder::Model& owner, DecoderBatchOptions opti
       tp_driver(parallel ? std::make_unique<TpDriver>(owner, *parallel) : nullptr) {
     validate_batch_options(options);
     DeviceScope device(model.device);
+    if (residency.resident() || options.resident_prefix_cache || options.prefix_gqa_pages != 0 ||
+        options.prefix_gdn_slots != 0) {
+        std::vector<int> devices{model.device};
+        if (tp != nullptr)
+            devices.push_back(tp->peer_device);
+        prefix_pool = std::make_unique<PrefixResidency>(
+            devices, options.resident_prefix_cache, model.mtp_weights != nullptr, options.max_lanes,
+            options.prefix_gqa_pages, options.prefix_gdn_slots);
+    }
 
     if (options.cuda_graphs && !tp) storage->verification_graph.emplace(execution);
     if (residency.resident() && model.mtp_weights)
@@ -90,7 +99,14 @@ DecoderBatch::State::State(const Decoder::Model& owner, DecoderBatchOptions opti
     device.restore();
 }
 
+DecoderBatch::State::~State() {
+    if (prefix_pool)
+        disable();
+}
+
 RequestBlockCache* DecoderBatch::State::request_cache(const DecoderOptions& request) {
+    if (prefix_pool)
+        return residency.resident() ? &storage->retired : nullptr;
     if (request.publish_prefix_checkpoints && request.store_prefix) {
         storage->retired.enable_detached_reclamation();
         return &storage->retired;
@@ -111,7 +127,8 @@ void DecoderBatch::State::drain(const char* operation, std::optional<Lane>* lane
     try {
         DeviceScope device(model.device);
         check(cudaStreamSynchronize(execution.stream()), operation);
-        if (lane) retire(*lane, tp_driver.get());
+        if (lane != nullptr)
+            retire(*lane);
     } catch (...) {
         disable();
         throw;
@@ -119,6 +136,8 @@ void DecoderBatch::State::drain(const char* operation, std::optional<Lane>* lane
 }
 
 void DecoderBatch::State::fail_step(bool recoverable) {
+    if (failed)
+        return;
     if (!recoverable || execution.verification_graph_failed()) {
         disable();
         return;
@@ -128,9 +147,11 @@ void DecoderBatch::State::fail_step(bool recoverable) {
         if (lane && lane->prefix && lane->prefix->completion.valid()) {
             lane->prefix->discard = true;
         } else {
-            lane.reset();
+            retire(lane);
         }
     }
+    if (prefix_pool)
+        prefix_pool->notify_released();
 }
 
 std::optional<Lane>& DecoderBatch::State::slot_at(int slot) {
@@ -154,12 +175,18 @@ void DecoderBatch::State::require_ready() {
 }
 
 void DecoderBatch::State::disable() noexcept {
+    if (failed)
+        return;
     failed = true;
-    if (tp_driver) tp_driver->sync_peer_stream();
+    const bool peer_fenced = !tp_driver || tp_driver->sync_peer_stream();
+    if (!peer_fenced && prefix_pool)
+        prefix_pool->quarantine();
     try {
         DeviceScope device(model.device);
         execution.close();
     } catch (...) {
+        if (prefix_pool)
+            prefix_pool->quarantine();
         return;
     }
     storage->slots = {};

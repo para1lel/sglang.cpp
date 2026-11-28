@@ -15,6 +15,7 @@ struct ExactGqaWorkspace;
 struct GeneratedLogprobReadback;
 struct TransferBuffers;
 
+class DeviceArena;
 void check(cudaError_t status, const char* operation);
 struct CudaError : std::runtime_error {
     CudaError(cudaError_t status, const char* operation);
@@ -24,9 +25,6 @@ struct CudaError : std::runtime_error {
 };
 
 std::size_t available_device_bytes();
-
-cudaError_t release_cuda_block(void* pointer, cudaStream_t stream, bool wait_for_release = false,
-                               bool* enqueued = nullptr) noexcept;
 
 void copy_cuda_async(void* destination, const void* source, std::size_t bytes,
                             cudaMemcpyKind kind, cudaStream_t stream, const char* operation);
@@ -57,6 +55,7 @@ struct DeviceBlock {
     void* pointer;
     std::size_t bytes;
     std::shared_ptr<ExportedDeviceBlock> export_owner{};
+    bool cache_storage = false;
 };
 
 class RequestBlockCache;
@@ -72,7 +71,10 @@ public:
     template <typename Element>
     Element* allocate(std::size_t count);
 
+    template <typename Element> Element* allocate_cache(std::size_t count);
+
     void* allocate_elements(std::size_t count, std::size_t element_size);
+    void* allocate_cache_elements(std::size_t count, std::size_t element_size);
     std::size_t bytes() const;
     TransferBuffers& transfers();
     GeneratedLogprobReadback* prepare_generated_logprobs();
@@ -97,7 +99,7 @@ public:
 private:
     friend class RequestBlockCache;
     struct State;
-    void* allocate_bytes(std::size_t bytes);
+    void* allocate_bytes(std::size_t bytes, bool cache_storage);
     bool replay_graph_slot(int index, int width, const std::function<void()>& prepare,
                            const std::function<void()>& capture,
                            const std::function<bool()>& bind, bool target_verify);
@@ -123,7 +125,7 @@ public:
 private:
     friend class Allocations;
     bool accepts(int device) const;
-    void* take(std::size_t bytes);
+    void* take(std::size_t bytes, bool cache_storage);
     bool retain(DeviceBlock block);
     void quarantine(Allocations::State& state);
 
@@ -148,16 +150,13 @@ public:
 
     static std::unique_ptr<RetiredBlockReclaimer> create(int device);
     ~RetiredBlockReclaimer();
-    bool submit(DeviceBlock block, bool detached = false);
-    std::size_t unavailable_bytes() const;
+    bool submit(const DeviceBlock& block);
     std::size_t pending_bytes() const;
-    std::size_t failed_release_bytes() const;
-    void check_releases() const;
     void drain();
 
 private:
     struct State;
-    RetiredBlockReclaimer(int device, cudaStream_t stream);
+    explicit RetiredBlockReclaimer(std::shared_ptr<DeviceArena> arena);
     std::unique_ptr<State> state_;
 };
 

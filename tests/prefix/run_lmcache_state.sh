@@ -29,13 +29,13 @@ for name in "${names[@]}"; do
     extra_sources=()
     args=("$checkpoint")
     if [[ $name == state ]]; then
-        wrap=(-Wl,--wrap="$append" -Wl,--wrap=cudaMemcpyAsync -Wl,--wrap=cudaFreeAsync
-              -Wl,--wrap=cudaFree -Wl,--wrap=cudaMalloc -Wl,--wrap=cudaEventRecord
-              -Wl,--wrap=cudaStreamSynchronize -Wl,--wrap=cudaGetErrorString)
+        wrap=(-Wl,--wrap="$append" -Wl,--wrap=cudaMemcpyAsync -Wl,--wrap=cudaFree
+              -Wl,--wrap=cudaMalloc -Wl,--wrap=cudaEventRecord)
         extra_sources=(apps/server/batch_cache.cpp
                        src/runtime/server/{batch_restore_join,cache_identity}.cpp)
     elif [[ $name == release ]]; then
-        wrap=(-Wl,--wrap=cudaFreeAsync -Wl,--wrap=cudaFree -Wl,--wrap=cudaStreamSynchronize)
+        wrap=(-Wl,--wrap=cudaEventRecord -Wl,--wrap=cudaEventQuery -Wl,--wrap=cudaFree
+              -Wl,--wrap=cudaIpcGetMemHandle)
         args=()
         if [[ $mode == --serving-release-only ]]; then
             args=("$checkpoint")

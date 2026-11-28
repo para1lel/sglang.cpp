@@ -650,7 +650,7 @@ DecoderBatch::DecoderBatch(const Decoder&, DecoderBatchOptions options)
             "Unexpected worker configuration");
 }
 DecoderBatch::~DecoderBatch() = default;
-int DecoderBatch::admit(int slot, std::vector<int> prompt, const DecoderOptions& options) {
+int DecoderBatch::admit(int slot, const std::vector<int>& prompt, const DecoderOptions& options) {
     auto& lane = state_->lanes[slot];
     require((prompt.size() == 1 || fixture->inspect_prefill) && !lane.remaining,
             "Bad or reused live slot");
@@ -671,8 +671,17 @@ int DecoderBatch::admit(int slot, std::vector<int> prompt, const DecoderOptions&
     }
     return 0;
 }
-int DecoderBatch::admit_multimodal(int, std::vector<int>, const DecoderOptions&,
-                                  const std::vector<DecoderMedia>&) { std::abort(); }
+
+int DecoderBatch::admit(int slot, std::vector<int>&& prompt, const DecoderOptions& options) {
+    const auto owned = std::move(prompt);
+    return admit(slot, owned, options);
+}
+int DecoderBatch::admit_multimodal(int slot, std::vector<int>&& prompt,
+                                   const DecoderOptions& options,
+                                   const std::vector<DecoderMedia>& media) {
+    require(media.empty(), "Unexpected multimodal admission");
+    return admit(slot, std::move(prompt), options);
+}
 void DecoderBatch::cancel(int slot) {
     require(std::exchange(state_->lanes[slot].remaining, 0) > 0, "Cancel of a retired slot");
     const std::lock_guard lock(fixture->mutex);

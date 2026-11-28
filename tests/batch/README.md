@@ -135,6 +135,7 @@ mkdir -p "$(dirname "$score_check")"
     -Iinclude -I"$toolkit/include" \
     tests/batch/check_score_slab.cpp src/runtime/backend/cuda_resources.cpp \
     src/runtime/backend/cuda_error.cpp src/runtime/backend/retired_request_blocks.cpp \
+    src/runtime/backend/device_arena.cpp \
     src/runtime/model/qwen_request.cpp src/text/text_dimensions.cpp \
     "$build/lib/libsglang_checkpoint.a" "$build/lib/libsglang_json.a" \
     -L"$toolkit/lib" -Wl,-rpath,"$toolkit/lib" -lcudart -o "$score_check"

@@ -69,15 +69,17 @@ inline constexpr int prefill_chunk_rows = text_embedding_max_rows;
 
 void validate_batch_options(const DecoderBatchOptions& options);
 int reserved_verification_rows(int output, int mtp_steps);
-std::size_t request_resident_bytes(int capacity, int verification_rows, bool draft);
-int limit_resident_output(int prompt, const DecoderOptions& options, std::size_t total_bytes,
-                          std::size_t free_bytes, std::size_t extra_bytes);
 void validate_request(const std::vector<int>& prompt, const DecoderOptions& options,
                       bool allow_mtp = false);
 
-std::size_t reserve_request_memory(RequestBlockCache& retired, DecoderOptions& request,
-                                   int prompt, std::size_t capacity, std::size_t charged,
-                                   std::size_t extra_bytes);
+struct RequestMemoryBudget {
+    std::size_t capacity;
+    std::size_t charged;
+    std::size_t extra_bytes;
+};
+
+std::size_t reserve_request_memory(RequestBlockCache& retired, DecoderOptions& request, int prompt,
+                                   RequestMemoryBudget budget, bool pooled = false);
 
 std::size_t logit_adjustment_bytes(const DecoderOptions& options);
 
@@ -342,21 +344,17 @@ struct Decoder::Model {
 struct Decoder::TpRuntime {
     int device = 0;
     int peer_device = 0;
-    cudaStream_t stream = nullptr;
     cudaStream_t peer_stream = nullptr;
     std::unique_ptr<Decoder::Model> peer;
     std::unique_ptr<decoder::TensorParallel> group;
     decoder::TpPartials partials[2]{};
-    
-    
-    
-    
-    
     std::uint8_t* packed[2] = {};
+    std::array<std::unique_ptr<decoder::Allocations>, 2> staging;
     mutable std::shared_ptr<decoder::tp_verify_graph::Graph> verification_capture;
     mutable cudaStream_t verification_capture_stream = nullptr;
     mutable bool verification_capture_disabled = false;
     ~TpRuntime();
+    void load_peer_and_staging(const std::filesystem::path& checkpoint);
 };
 
 

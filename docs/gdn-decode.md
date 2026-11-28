@@ -14,7 +14,7 @@ Decode reads the checkpoint and committed log, then advances with the current ro
 
 The verifier launches convolution, recurrence and finish in order. Eager groups use single-lane or packed jobs of up to 16 lanes per submission. TP1 and TP2 graphs bind live request state and use the same ReplaySSM transitions. The verifier applies acceptance outside capture. [Dispatch](../src/runtime/execution/decoder_forward_attention.cpp#L75)<!-- prefix: "void run_gdn" --> · [Kernel sequence](../src/text/gdn_replay_ssm.cu#L554)<!-- prefix: "cudaError_t " --> · [TP2 bindings](../src/runtime/execution/tp_verify_graph.cpp#L247)<!-- prefix: "return true;" -->
 
-The replay log stays in the request. Terminal LMCache stores materialize committed GDN into the usual convolution and recurrent spans on each rank. Prefill captures the state at each selected prompt endpoint. [Materialization](../src/runtime/model/qwen_request.cpp#L366)<!-- prefix: "void Request" --> · [Checkpoint boundaries](prefix-cache.md#checkpoint-boundaries)
+The replay log stays in the request. Terminal LMCache stores materialize committed GDN into the usual convolution and recurrent spans on each rank. Prefill captures the state at each selected prompt endpoint. [Materialization](../src/runtime/model/qwen_request.cpp#L430)<!-- prefix: "void Request" --> · [Checkpoint boundaries](prefix-cache.md#checkpoint-boundaries)
 
 ## Constraints and failure behavior
 

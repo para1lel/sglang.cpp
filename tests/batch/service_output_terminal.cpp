@@ -185,7 +185,7 @@ DecoderBatch::DecoderBatch(const Decoder&, DecoderBatchOptions options)
 
 DecoderBatch::~DecoderBatch() = default;
 
-int DecoderBatch::admit(int slot, std::vector<int> prompt, const DecoderOptions& options) {
+int DecoderBatch::admit(int slot, const std::vector<int>& prompt, const DecoderOptions& options) {
     require(!state_->live[slot] && prompt.size() == decoder_batch_max_step_tokens &&
                 prompt.front() == slot, "Unexpected decoder admission");
     state_->live[slot] = true;
@@ -193,9 +193,16 @@ int DecoderBatch::admit(int slot, std::vector<int> prompt, const DecoderOptions&
     return 0;
 }
 
-int DecoderBatch::admit_multimodal(int, std::vector<int>, const DecoderOptions&,
-                                  const std::vector<DecoderMedia>&) {
-    std::abort();
+int DecoderBatch::admit(int slot, std::vector<int>&& prompt, const DecoderOptions& options) {
+    const auto owned = std::move(prompt);
+    return admit(slot, owned, options);
+}
+
+int DecoderBatch::admit_multimodal(int slot, std::vector<int>&& prompt,
+                                   const DecoderOptions& options,
+                                   const std::vector<DecoderMedia>& media) {
+    require(media.empty(), "Unexpected multimodal admission");
+    return admit(slot, std::move(prompt), options);
 }
 
 void DecoderBatch::cancel(int slot) {

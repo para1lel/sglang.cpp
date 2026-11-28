@@ -1,5 +1,6 @@
 #include "sglang/testing/prefix_fixture.h"
 #include "sglang/decoder_internal.h"
+#include "sglang/runtime/backend/device_arena.h"
 #include "sglang/text_ops.h"
 #include "sglang/text/gqa_verify_batch.h"
 #include "sglang/tokenizer/tokenizer.h"
@@ -54,8 +55,6 @@ struct MtpRoutes {
 };
 MtpRoutes* mtp_routes = nullptr;
 int* serial_reads = nullptr;
-bool reject_prefill_arena = false;
-int arena_failures = 0;
 
 void check(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
@@ -371,6 +370,8 @@ void mtp_rank_long() {
     constexpr int kv_heads = gqa_rank_geometry.kv_heads;
     const auto payload = physical_pages * gqa_payload_bytes_per_page(kv_heads);
     const auto scales = physical_pages * gqa_scale_bytes_per_page(kv_heads);
+    const auto arena = DeviceArena::start(0, default_gpu_memory_utilization);
+    arena->commit();
     Allocations memory(0);
     memory.open_stream();
     const auto stream = memory.stream();
@@ -623,16 +624,33 @@ void serial_prefill(const char* checkpoint, const char* fixture) {
         const auto restored = prefix_fixture::wait(batch, 0).restored;
         check(restored == prefix, "Missing restored interior prefix");
         serial_reads = reads;
-        arena_failures = 0;
-        reject_prefill_arena = without_arena;
+        const auto arena = decoder::DeviceArena::current(0);
+        decoder::Allocations held(0);
+        if (without_arena) {
+            std::size_t bytes = 256;
+            while (bytes <= arena->available_bytes() / 2)
+                bytes *= 2;
+            for (; bytes >= 256; bytes /= 2) {
+                for (;;) {
+                    try {
+                        held.allocate<std::byte>(bytes);
+                    } catch (const decoder::CudaError& error) {
+                        if (error.status != cudaErrorMemoryAllocation)
+                            throw;
+                        break;
+                    }
+                }
+            }
+            check(held.bytes() > 0 && arena->available_bytes() == 0,
+                  "Unable to exhaust the committed prefill arena");
+        }
         DecoderBatchStepStats stats;
         const auto step = batch.advance_chunked(selected, &stats)[0];
-        reject_prefill_arena = false;
+        held.close();
         serial_reads = nullptr;
         check(step.token && step.generated_logprobs && stats.prefill_rows[0] == rows,
               "Missing token, scores, or restored prefill rows");
-        check(arena_failures == int(without_arena) &&
-                  (stats.prefill_workspace_bytes == 0) == (without_arena || rows == 1),
+        check((stats.prefill_workspace_bytes == 0) == (without_arena || rows == 1),
               "Unexpected prefill arena outcome");
         check(std::isfinite(step.generated_logprobs->selected.value), "Nonfinite selected score");
         batch.cancel(0);
@@ -701,21 +719,6 @@ void wrap_select(RequestProgress* progress, Request& request, Workspace& work,
 
 extern "C" cudaError_t __real_cudaLaunchKernel(const void*, dim3, dim3, void**, std::size_t,
                                                cudaStream_t);
-
-extern "C" cudaError_t __real_cudaMallocFromPoolAsync(void**, std::size_t, cudaMemPool_t,
-                                                      cudaStream_t);
-extern "C" cudaError_t __wrap_cudaMallocFromPoolAsync(
-    void** output, std::size_t bytes, cudaMemPool_t pool, cudaStream_t stream) {
-    if (reject_prefill_arena) {
-        std::size_t free = 0, total = 0;
-        const auto status = cudaMemGetInfo(&free, &total);
-        if (status != cudaSuccess) return status;
-        bytes = total + (1ull << 30);
-    }
-    const auto status = __real_cudaMallocFromPoolAsync(output, bytes, pool, stream);
-    arena_failures += reject_prefill_arena && status == cudaErrorMemoryAllocation;
-    return status;
-}
 
 static void record_launch(std::string_view symbol, dim3 grid, dim3 block) {
     if (serial_reads) {

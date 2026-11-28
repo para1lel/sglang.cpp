@@ -5,12 +5,14 @@
 #include "sglang/decoder_mtp.h"
 #include "sglang/decoder_sampling.h"
 #include "sglang/decoder_verify.h"
+#include "sglang/runtime/backend/device_arena.h"
 #include "sglang/runtime/backend/tensor_parallel.h"
 #include "sglang/prefill_fp8.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <mutex>
 #include <random>
 
 #include <unistd.h>
@@ -487,10 +489,12 @@ Decoder::Decoder(const std::filesystem::path& checkpoint, int cuda_device, bool 
     : Decoder(checkpoint, cuda_device, enable_mtp, 1) {}
 
 Decoder::Decoder(const std::filesystem::path& checkpoint, int cuda_device, bool enable_mtp,
-                 int tensor_parallel)
-    : model_(std::make_unique<Model>(
-          checkpoint, cuda_device,
-          decoder::WeightSharding{0, check_tensor_parallel(tensor_parallel)})) {
+                 int tensor_parallel, DecoderMemoryOptions memory) {
+    check_tensor_parallel(tensor_parallel);
+    static std::mutex startup_mutex;
+    const std::scoped_lock startup_lock(startup_mutex);
+    const auto root_arena = decoder::DeviceArena::start(cuda_device, memory.gpu_memory_utilization);
+    std::shared_ptr<decoder::DeviceArena> peer_arena;
     if (tensor_parallel == 2) {
         int device_count = 0;
         check(cudaGetDeviceCount(&device_count), "Count CUDA devices for tensor parallel");
@@ -500,33 +504,15 @@ Decoder::Decoder(const std::filesystem::path& checkpoint, int cuda_device, bool 
         tp_ = std::make_unique<TpRuntime>();
         tp_->device = cuda_device;
         tp_->peer_device = cuda_device + 1;
+        peer_arena = decoder::DeviceArena::start(tp_->peer_device, memory.gpu_memory_utilization);
         tp_->group = decoder::TensorParallel::create({cuda_device, tp_->peer_device});
-        const std::size_t slab = std::size_t(decoder::tp_max_forward_lanes) * hidden_size *
-                                 sizeof(Bf16);
-        const std::size_t packed_bytes =
-            std::size_t(decoder::max_wide_mtp_rows) * intermediate_size;
-        {
-            decoder::DeviceScope peer_scope(tp_->peer_device);
-            tp_->peer = std::make_unique<Model>(checkpoint, tp_->peer_device,
-                                                decoder::WeightSharding{1, 2});
-            check(cudaStreamCreate(&tp_->peer_stream), "Create rank-1 stream");
-            check(cudaMalloc(reinterpret_cast<void**>(&tp_->partials[1].attention), slab),
-                  "Allocate rank-1 attention slab");
-            check(cudaMalloc(reinterpret_cast<void**>(&tp_->partials[1].hidden), slab),
-                  "Allocate rank-1 hidden slab");
-            check(cudaMalloc(reinterpret_cast<void**>(&tp_->packed[1]), packed_bytes),
-                  "Allocate rank-1 packed activation staging");
-        }
-        {
-            decoder::DeviceScope scope(cuda_device);
-            check(cudaMalloc(reinterpret_cast<void**>(&tp_->partials[0].attention), slab),
-                  "Allocate rank-0 attention slab");
-            check(cudaMalloc(reinterpret_cast<void**>(&tp_->partials[0].hidden), slab),
-                  "Allocate rank-0 hidden slab");
-            check(cudaMalloc(reinterpret_cast<void**>(&tp_->packed[0]), packed_bytes),
-                  "Allocate rank-0 packed activation staging");
-        }
-        tp_->stream = model_->memory->stream();
+        root_arena->enable_peer_access(tp_->peer_device);
+        peer_arena->enable_peer_access(cuda_device);
+    }
+    model_ = std::make_unique<Model>(checkpoint, cuda_device,
+                                     decoder::WeightSharding{0, tensor_parallel});
+    if (tp_) {
+        tp_->load_peer_and_staging(checkpoint);
         model_->tp = tp_.get();
         tp_->peer->tp = tp_.get();
     }
@@ -536,10 +522,18 @@ Decoder::Decoder(const std::filesystem::path& checkpoint, int cuda_device, bool 
             model_->backend.draft);
         model_->tc_vocab = model_->mtp_weights->shared_vocab();
     }
+    const auto commit = [](decoder::DeviceArena& arena) {
+        if (arena.committed())
+            return;
+        constexpr auto min_workspace = std::size_t{12} * 1024 * 1024 * 1024;
+        const auto remaining = arena.startup_remaining_bytes();
+        const auto workspace = std::max(remaining / 3, std::min(min_workspace, remaining / 2));
+        arena.commit(remaining - workspace);
+    };
+    commit(*root_arena);
+    if (peer_arena)
+        commit(*peer_arena);
     if (tensor_parallel == 2) {
-        
-        
-        
         auto fill = [this](int rank, int device) {
             const Model& model = rank == 0 ? *model_ : *tp_->peer;
             auto& entry = tp_info_.ranks[rank];
@@ -563,11 +557,39 @@ Decoder::Decoder(const std::filesystem::path& checkpoint, int cuda_device, bool 
     }
 }
 
-Decoder::TpRuntime::~TpRuntime() {
-    if (stream) {
-        decoder::DeviceScope scope(device);
-        synchronize_cuda(stream, "Fence rank-0 stream for tensor-parallel teardown");
+void Decoder::TpRuntime::load_peer_and_staging(const std::filesystem::path& checkpoint) {
+    constexpr auto rows = static_cast<std::size_t>(decoder::tp_max_forward_lanes) * hidden_size;
+    constexpr auto packed_bytes =
+        static_cast<std::size_t>(decoder::max_wide_mtp_rows) * intermediate_size;
+    {
+        const decoder::DeviceScope peer_scope(peer_device);
+        peer = std::make_unique<Model>(checkpoint, peer_device, decoder::WeightSharding{1, 2});
     }
+    for (int rank = 0; rank < 2; ++rank) {
+        const int rank_device = rank == 0 ? device : peer_device;
+        const decoder::DeviceScope scope(rank_device);
+        auto& blocks = staging[rank];
+        blocks = std::make_unique<decoder::Allocations>(rank_device);
+        partials[rank].attention = blocks->allocate<Bf16>(rows);
+        partials[rank].hidden = blocks->allocate<Bf16>(rows);
+        packed[rank] = blocks->allocate<std::uint8_t>(packed_bytes);
+        blocks->open_stream();
+        zero_cuda_async(partials[rank].attention, rows * sizeof(Bf16), blocks->stream(),
+                        "Initialize NCCL staging");
+    }
+    Bf16* const buffers[] = {partials[0].attention, partials[1].attention};
+    const cudaStream_t streams[] = {staging[0]->stream(), staging[1]->stream()};
+    group->warm_nccl(buffers, streams, rows);
+    {
+        const decoder::DeviceScope scope(device);
+        staging[0]->close_stream();
+    }
+    const decoder::DeviceScope peer_scope(peer_device);
+    staging[1]->close_stream();
+    check(cudaStreamCreate(&peer_stream), "Create rank-1 stream");
+}
+
+Decoder::TpRuntime::~TpRuntime() {
     if (peer_stream) {
         decoder::DeviceScope peer_scope(peer_device);
         synchronize_cuda(peer_stream, "Fence rank-1 stream for tensor-parallel teardown");
@@ -575,32 +597,9 @@ Decoder::TpRuntime::~TpRuntime() {
     verification_capture.reset();
     group.reset();
     peer.reset();
-    if (partials[1].attention || partials[1].hidden || peer_stream || packed[1]) {
+    if (peer_stream != nullptr) {
         decoder::DeviceScope peer_scope(peer_device);
-        if (partials[1].attention) {
-            check(cudaFree(partials[1].attention), "Free rank-1 attention slab");
-        }
-        if (partials[1].hidden) {
-            check(cudaFree(partials[1].hidden), "Free rank-1 hidden slab");
-        }
-        if (packed[1]) {
-            check(cudaFree(packed[1]), "Free rank-1 packed activation staging");
-        }
-        if (peer_stream) {
-            check(cudaStreamDestroy(peer_stream), "Destroy rank-1 stream");
-        }
-    }
-    if (partials[0].attention || partials[0].hidden || packed[0]) {
-        decoder::DeviceScope scope(device);
-        if (partials[0].attention) {
-            check(cudaFree(partials[0].attention), "Free rank-0 attention slab");
-        }
-        if (partials[0].hidden) {
-            check(cudaFree(partials[0].hidden), "Free rank-0 hidden slab");
-        }
-        if (packed[0]) {
-            check(cudaFree(packed[0]), "Free rank-0 packed activation staging");
-        }
+        check(cudaStreamDestroy(peer_stream), "Destroy rank-1 stream");
     }
 }
 

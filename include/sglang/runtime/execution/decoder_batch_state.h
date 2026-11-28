@@ -58,6 +58,7 @@ using namespace decoder::batch_detail;
 struct DecoderBatch::State {
     State(const Decoder::Model& owner, DecoderBatchOptions options,
           Decoder::TpRuntime* parallel = nullptr);
+    ~State();
 
     struct PrefillCheckpointBatch;
 
@@ -89,7 +90,9 @@ struct DecoderBatch::State {
                  const PrefillCheckpointBatch& checkpoints);
     void publish_checkpoint(Lane& lane, DecoderBatchStep& result, const Workspace* row,
                             bool& publishing);
-    static void retire(std::optional<Lane>& lane, const TpDriver* tp_driver = nullptr);
+    void retire(std::optional<Lane>& lane) const;
+    void finish_lane(std::optional<Lane>& lane, DecoderBatchStep& result, const Workspace* row,
+                     bool& publishing);
     bool submit_checkpoint(Lane& lane);
     void store_checkpoint(Lane& lane, int end, const Workspace* row, bool terminal,
                           std::shared_ptr<void> reservation,
@@ -98,6 +101,17 @@ struct DecoderBatch::State {
     void plan_prefill_checkpoints(Lane& lane);
     void publish_prefill_checkpoint(Lane& lane, const PrefillCheckpoint& local,
                                     const PrefillCheckpoint* peer);
+    ResidentPrefixRead prepare_resident_read(const Lane& lane) const;
+    void apply_resident_read(Lane& lane, const ResidentPrefixRead& hit);
+    bool stage_resident_restore(Lane& lane, ResidentPrefixRead& resident,
+                                const std::shared_ptr<const PrefixCacheRead>& cpu) const;
+    void finish_resident_restore(Lane& lane, bool transferred);
+    void repair_resident_restore(Lane& lane, const PrefixDeviceLayout& layout,
+                                 bool target_transferred, bool draft_transferred) const;
+    void restore_resident_checkpoint(Lane& lane, const PrefixSnapshots& snapshots) const;
+    void publish_resident_pages(Lane& lane, int target_rows, int draft_rows, bool include_tail,
+                                const PrefixRestoreExtent* backed = nullptr) const;
+    void publish_resident_terminal(Lane& lane, const Workspace* row) const;
     void publish_prefill_checkpoint_at(Lane& lane, const PrefillCheckpointBatch& batch, int slot,
                                        int end);
     struct PrefillCheckpointBatch {
@@ -107,11 +121,13 @@ struct DecoderBatch::State {
         const PrefixPrefillPool* blocked_pool = nullptr;
         std::size_t blocked_capacity = 0;
         std::size_t blocked_count = 0;
+        bool blocked_resident = false;
         bool require(const PrefixPrefillPool& pool, std::size_t capacity, std::size_t count);
     };
+    void publish_resident_prefill(const PrefillRows& rows, PrefillCheckpointBatch& entries);
     PrefillCheckpointBatch prepare_prefill_checkpoints(PrefillRows& rows);
     bool prepare_lane_checkpoints(const Lane& lane, int slot, PrefillCheckpointBatch& batch,
-                                  int rows);
+                                  int& rows);
     void acquire_prefill_checkpoint(PrefillCheckpointBatch& batch, int slot, int end,
                                     std::size_t capacity);
     void finish_restore(Lane& lane, int restored);
@@ -134,7 +150,13 @@ struct DecoderBatch::State {
     std::size_t reserve(DecoderOptions& request, int prompt, std::size_t extra_bytes) const;
     RequestBlockCache* request_cache(const DecoderOptions& request);
     RequestBlockCache* peer_request_cache(const Lane& lane);
-    void initialize(Lane& lane, int slot);
+    void validate_admission(DecoderOptions& options, const std::vector<int>& prompt,
+                            bool multimodal) const;
+    void prepare_admission(Lane& lane, int slot);
+    [[noreturn]] void fail_admission(const CudaError& error, std::optional<Lane>& lane);
+    void initialize(Lane& lane, int slot, ResidentPrefixRead& reuse);
+    void initialize_request_workspace(Lane& lane, int slot);
+    void initialize_prefix(Lane& lane, ResidentPrefixRead& reuse);
     void drain(const char* operation, std::optional<Lane>* lane = nullptr);
     void fail_step(bool recoverable);
     std::optional<Lane>& slot_at(int slot);
@@ -146,6 +168,7 @@ struct DecoderBatch::State {
     const Decoder::Model& model;
     const DecoderBatchOptions options;
     KvResidencyPolicy residency;
+    std::unique_ptr<PrefixResidency> prefix_pool;
     std::shared_ptr<BatchStorage> storage;
     Allocations execution;
     Decoder::TpRuntime* tp = nullptr;

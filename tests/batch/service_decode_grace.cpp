@@ -230,15 +230,23 @@ DecoderBatch::~DecoderBatch() = default;
 
 std::string_view Tokenizer::piece(TokenId, bool) const { std::abort(); }
 
-int DecoderBatch::admit(int slot, std::vector<int> prompt, const DecoderOptions& options) {
-    require(prompt == std::vector{slot} && options.max_new_tokens == 2 && options.mtp_steps == 0,
+int DecoderBatch::admit(int slot, const std::vector<int>& prompt, const DecoderOptions& options) {
+    require(state_ != nullptr && prompt == std::vector{slot} && options.max_new_tokens == 2 &&
+                options.mtp_steps == 0,
             "Unexpected native admission");
     return 0;
 }
 
-int DecoderBatch::admit_multimodal(int, std::vector<int>, const DecoderOptions&,
-                                  const std::vector<DecoderMedia>&) {
-    std::abort();
+int DecoderBatch::admit(int slot, std::vector<int>&& prompt, const DecoderOptions& options) {
+    const auto owned = std::move(prompt);
+    return admit(slot, owned, options);
+}
+
+int DecoderBatch::admit_multimodal(int slot, std::vector<int>&& prompt,
+                                   const DecoderOptions& options,
+                                   const std::vector<DecoderMedia>& media) {
+    require(media.empty(), "Unexpected multimodal admission");
+    return admit(slot, std::move(prompt), options);
 }
 
 void DecoderBatch::cancel(int) { std::abort(); }

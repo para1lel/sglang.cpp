@@ -146,13 +146,26 @@ PrefixCacheKeys::PrefixCacheKeys(const std::vector<int>& prompt, std::string_vie
     }
 }
 
+PrefixCacheKeys::PrefixCacheKeys(std::shared_ptr<const PrefixCacheKeys> prefix)
+    : prefix_(std::move(prefix)), prefix_size_(prefix_->cacheable_tokens() + 1),
+      tokens_(prefix_->tokens_), next_position_(prefix_->next_position_),
+      world_size_(prefix_->world_size_), rank_(prefix_->rank_) {
+}
+
+const tokenizer::Sha256Digest& PrefixCacheKeys::digest(int end) const {
+    const auto* keys = this;
+    while (end < keys->prefix_size_)
+        keys = keys->prefix_.get();
+    return keys->keys_[end - keys->prefix_size_];
+}
+
 bool PrefixCacheKeys::matches_rank(int world_size, int rank) const {
     return world_size_ == world_size && rank_ == rank;
 }
 
 std::string PrefixCacheKeys::key(int end) const {
     if (end < 0 || end > cacheable_tokens()) return {};
-    return tokenizer::format_sha256(keys_[end]);
+    return tokenizer::format_sha256(digest(end));
 }
 
 void PrefixCacheKeys::append(int token) {
@@ -167,7 +180,8 @@ void PrefixCacheKeys::append_row(int token, MropePosition position, std::string_
                                   int feature_row) {
     constexpr std::size_t fixed = tokenizer::Sha256Digest{}.size() + 5 * 4;
     std::array<char, fixed + 64> input;
-    char* out = std::copy(keys_.back().begin(), keys_.back().end(), input.begin());
+    const auto& previous = digest(cacheable_tokens());
+    char* out = std::copy(previous.begin(), previous.end(), input.begin());
     encode_integer(out, token);
     encode_integer(out, position.temporal);
     encode_integer(out, position.height);
@@ -184,6 +198,7 @@ namespace sglang::decoder {
 
 int PrefixCacheKeys::tokens() const { return tokens_; }
 
-int PrefixCacheKeys::cacheable_tokens() const { return static_cast<int>(keys_.size()) - 1; }
-
+int PrefixCacheKeys::cacheable_tokens() const {
+    return prefix_size_ + static_cast<int>(keys_.size()) - 1;
+}
 }

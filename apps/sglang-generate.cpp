@@ -1,5 +1,6 @@
 #include "sglang/decoder.h"
 #include "sglang/runtime/backend/cuda_backend_policy.h"
+#include "sglang/runtime/backend/device_arena.h"
 
 #include <algorithm>
 #include <charconv>
@@ -50,6 +51,7 @@ struct Arguments {
     int device = 0;
     int warmup = 0;
     int tensor_parallel = 1;
+    double gpu_memory_utilization = sglang::decoder::default_gpu_memory_utilization;
     int repeats = 1;
     bool help = false;
 };
@@ -62,6 +64,7 @@ void usage(std::ostream& output) {
            << "                       [--min-p P] [--seed INTEGER]\n"
            << "                       [--warmup N] [--repeats N] [--checkpoint DIR] [--device N]\n"
            << "                       [--tp N] (1 or 2; default 1)\n"
+           << "                       [--gpu-memory-utilization FRACTION] (default 0.88)\n"
            << "The checkpoint defaults to /data0/shared/Qwen3.8-27B-FP8. "
               "Device is a CUDA ordinal.\n"
            << "Prompt IDs may be separated by commas or whitespace. Results are written as JSON.\n";
@@ -188,6 +191,12 @@ Arguments parse_arguments(int argc, char** argv) {
             arguments.tensor_parallel = positive_or_zero(value, option);
             if (arguments.tensor_parallel == 0 || arguments.tensor_parallel > 2) {
                 throw std::invalid_argument("Expected --tp in [1, 2]");
+            }
+        } else if (option == "--gpu-memory-utilization") {
+            arguments.gpu_memory_utilization = number<double>(value, option);
+            if (!std::isfinite(arguments.gpu_memory_utilization) ||
+                arguments.gpu_memory_utilization <= 0.0 || arguments.gpu_memory_utilization > 1.0) {
+                throw std::invalid_argument("Expected --gpu-memory-utilization in (0, 1]");
             }
         } else if (!parse_sampling(option, value, arguments.options)) {
             throw std::invalid_argument("Unknown option " + std::string(option));
@@ -320,8 +329,8 @@ int main(int argc, char** argv) {
         }
         const auto start = Clock::now();
         const sglang::Decoder decoder(arguments.checkpoint, arguments.device,
-                                      arguments.options.mtp_steps != 0,
-                                      arguments.tensor_parallel);
+                                      arguments.options.mtp_steps != 0, arguments.tensor_parallel,
+                                      {arguments.gpu_memory_utilization});
         print_tp_receipt(decoder);
         const double load_ms = milliseconds(Clock::now() - start);
         const auto measured = measure(decoder, arguments);

@@ -38,6 +38,7 @@ struct LmCacheEndpointCoverage {
 struct LmCachePrefixDetail {
     int gqa = 0;
     std::vector<LmCacheEndpointCoverage> endpoints;
+    int draft = 0;
 };
 
 struct LmCacheReceipt {
@@ -68,8 +69,8 @@ public:
 
     LmCacheStatus store(const PrefixCacheKeys& keys, const PrefixDeviceTransfer& transfer,
                         LmCacheReceipt* receipt = nullptr) const;
-    LmCacheStatus store_prepared(std::string_view metadata,
-                                 LmCacheReceipt* receipt = nullptr) const;
+    LmCacheStatus store_prepared(std::string_view metadata, LmCacheReceipt* receipt = nullptr,
+                                 int stop_fd = -1) const;
     LmCacheStatus retrieve(const PrefixCacheKeys& keys, const PrefixDeviceTransfer& transfer,
                            LmCacheReceipt* receipt = nullptr, int stop_fd = -1) const;
     void reset() const;

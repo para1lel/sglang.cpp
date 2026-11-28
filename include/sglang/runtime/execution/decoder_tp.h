@@ -24,15 +24,18 @@ struct DecoderBatch::TpDriver {
     TpDriver(const Decoder::Model& owner, Decoder::TpRuntime& runtime);
 
     void create_peer_request(decoder::Lane& lane, decoder::RequestBlockCache* retired) const;
-    void initialize_peer(decoder::Lane& lane, int request_capacity, int resident_limit) const;
+    void initialize_peer(decoder::Lane& lane, int request_capacity, int resident_limit,
+                         const decoder::PrefixSlab* slab,
+                         const decoder::ResidentPrefixRead& reuse) const;
     void grow_peer_kv(decoder::Lane& lane, int positions, int written) const;
-    void sync_peer_stream() const noexcept;
+    bool sync_peer_stream() const noexcept;
     void drain_peer(const decoder::Lane& lane) const;
     void reset_peer_cold(decoder::Lane& lane) const;
 
-    void register_prefix_restore(
-        decoder::Lane& lane, const std::shared_ptr<const decoder::PrefixCacheRead>& read,
-        cudaStream_t stream) const;
+    void register_prefix_restore(decoder::Lane& lane,
+                                 const std::shared_ptr<const decoder::PrefixCacheRead>& read,
+                                 cudaStream_t stream, const decoder::PrefixSnapshots& snapshots,
+                                 const decoder::PrefixRestoreExtent* extent = nullptr) const;
     void finish_peer_restore(decoder::Lane& lane) const;
 
     static decoder::ForwardLane mirror_lane(decoder::ForwardLane lane,

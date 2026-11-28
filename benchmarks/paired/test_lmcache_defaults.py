@@ -9,14 +9,13 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-import pytest
-
 import cold_cache
 import default_evidence
 import k4
 import lmcache_evidence
+import pytest
 import workload_suite as suite
-
+from makespan import cohort_makespan_ns
 
 GPU = "GPU-00000000-0000-0000-0000-000000000000"
 IDENTITY = {"protocol": suite.LMCACHE_PROTOCOL, "gpu_uuid": GPU, "participating_gpus": [GPU],
@@ -100,10 +99,11 @@ def drain_receipt(**changes):
 
 
 def test_native_drain_checks_settled_writes_without_extending_wire_makespan():
+    wire_makespan_ns = 9
     raw = drain_receipt()
     snapshots = cold_cache.replay(raw, cold_cache.LMCACHE_DRAIN)
     assert snapshots["after"][cold_cache.LMCACHE_STORES] == 3
-    assert k4.cohort_makespan_ns(raw["requests"]) == 9
+    assert cohort_makespan_ns(raw["requests"]) == wire_makespan_ns
     with pytest.raises(ValueError, match="between settled cohorts"):
         cold_cache.replay(raw, cold_cache.LMCACHE_DRAIN, snapshots)
 
@@ -204,7 +204,8 @@ def test_lmcache_evidence_binds_native_environment_and_own_daemon(tmp_path):
         ("SLC2", b"SLC2", b"0.5.8", True),
         ("SLC2", b"SLC1", b"0.5.8", False),
         ("SLC2", b"SLC3", b"0.5.8+native-v4", False),
-        ("SLC3", b"SLC3", b"0.5.8+native-v4", True),
+        ("SLC3", b"SLC3", b"0.5.8+native-v4", False),
+        ("SLC3", b"SLC3", b"0.5.8+native-v5", True),
         ("SLC3", b"SLC2", b"0.5.8", False),
         ("SLC3", b"SLC3", b"0.5.8", False),
     ],

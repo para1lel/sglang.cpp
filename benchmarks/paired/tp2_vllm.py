@@ -12,13 +12,24 @@ import json
 import subprocess
 from pathlib import Path
 
-from benchmarks.concurrent import reference
-from benchmarks.streaming.client import json_bytes, request_body
 import default_evidence as defaults
 import k4
 import workload_suite as suite
-from saved_evidence import UUID, arg, command, compute_owners, digest, fields, load, require
-from saved_evidence import worker_settings
+from saved_evidence import (
+    UUID,
+    arg,
+    command,
+    compute_owners,
+    digest,
+    fields,
+    load,
+    require,
+    worker_settings,
+)
+
+from benchmarks.concurrent import reference
+from benchmarks.serial import fixture as serial_fixture
+from benchmarks.streaming.client import json_bytes, request_body
 
 
 def rank_identities(workers, devices, inventories):
@@ -104,6 +115,8 @@ def verify(run, reservation, devices, row, checkpoint, vllm_root, ready_only):
     defaults.require_vllm_local_apc(config, argv)
     budget = suite.V4_TOKEN_BUDGET
     group = "W1-W2" if row in ("W1", "W2") else row
+    if row == serial_fixture.ROW:
+        group = serial_fixture.NAME
     for worker in workers:
         require(Path(worker["vllm_file"]).resolve().is_relative_to(vllm_root / "venv"),
                 "Worker vLLM module outside pinned environment")

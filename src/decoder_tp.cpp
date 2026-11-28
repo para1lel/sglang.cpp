@@ -30,10 +30,18 @@ void DecoderBatch::TpDriver::create_peer_request(decoder::Lane& lane,
 }
 
 void DecoderBatch::TpDriver::initialize_peer(decoder::Lane& lane, int request_capacity,
-                                             int resident_limit) const {
+                                             int resident_limit, const decoder::PrefixSlab* slab,
+                                             const decoder::ResidentPrefixRead& reuse) const {
     decoder::DeviceScope peer(tp.peer_device);
-    lane.peer_request->initialize(request_capacity, tp.peer_stream, resident_limit,
-                                  gqa_rank_geometry.kv_heads);
+    lane.peer_request->initialize(request_capacity, tp.peer_stream,
+                                  decoder::RequestKvStorage{
+                                      resident_limit,
+                                      gqa_rank_geometry.kv_heads,
+                                      slab,
+                                      1,
+                                      lane.request->shared_prefix_pages,
+                                      &reuse,
+                                  });
     lane.peer_request->prefix_checkpoint_outputs = lane.checkpoints();
     lane.peer_request->reset(tp.peer_stream);
     decoder::check(cudaStreamSynchronize(tp.peer_stream), "Initialize peer decoder batch slot");
@@ -45,18 +53,19 @@ void DecoderBatch::TpDriver::grow_peer_kv(decoder::Lane& lane, int positions,
     lane.peer_request->grow_kv(positions, written, tp.peer_stream);
 }
 
-void DecoderBatch::TpDriver::sync_peer_stream() const noexcept {
+bool DecoderBatch::TpDriver::sync_peer_stream() const noexcept {
     try {
         const decoder::DeviceScope peer(tp.peer_device);
         decoder::synchronize_cuda(tp.peer_stream, "Drain peer decoder stream");
+        return true;
     } catch (const decoder::CudaError& error) {
         std::cerr << "sglang decoder: drain peer stream: " << error.what() << '\n';
     }
+    return false;
 }
 
 void DecoderBatch::TpDriver::drain_peer(const decoder::Lane& lane) const {
     if (!lane.peer_request) return;
-    
     decoder::DeviceScope peer(tp.peer_device);
     decoder::check(cudaStreamSynchronize(tp.peer_stream), "Drain peer decoder lane");
 }
@@ -71,30 +80,27 @@ void DecoderBatch::TpDriver::reset_peer_cold(decoder::Lane& lane) const {
 
 void DecoderBatch::TpDriver::register_prefix_restore(
     decoder::Lane& lane, const std::shared_ptr<const decoder::PrefixCacheRead>& read,
-    cudaStream_t stream) const {
-    auto view = decoder::restore_prefix_view(*lane.request, *read, stream, lane.draft.get(),
-                                             &decoder::tp2_prefix_layouts()[0]);
-    
+    cudaStream_t stream, const decoder::PrefixSnapshots& snapshots,
+    const decoder::PrefixRestoreExtent* extent) const {
+    auto view =
+        decoder::restore_prefix_view(*lane.request, *read, stream, lane.draft.get(),
+                                     &decoder::tp2_prefix_layouts()[0], snapshots[0], extent);
+
     auto peer_read = std::make_shared<decoder::PrefixCacheRead>(*read);
     peer_read->usable_draft = 0;
     std::optional<decoder::PendingBatchPrefix> peer;
     {
         decoder::DeviceScope peer_scope(tp.peer_device);
         peer.emplace(decoder::restore_prefix_view(*lane.peer_request, *peer_read, tp.peer_stream,
-                                                  nullptr,
-                                                  &decoder::tp2_prefix_layouts()[1]));
+                                                  nullptr, &decoder::tp2_prefix_layouts()[1],
+                                                  snapshots[1], extent));
     }
-    
-    
-    
     lane.prefix = std::make_unique<decoder::PendingBatchPrefix>(std::move(view));
     lane.peer_prefix = std::make_unique<decoder::PendingBatchPrefix>(std::move(*peer));
     lane.prefix->completion = lane.options.restore_prefix(lane.prefix->command);
     try {
         lane.peer_prefix->completion = lane.options.restore_prefix(lane.peer_prefix->command);
     } catch (...) {
-        
-        
         lane.prefix.reset();
         lane.peer_prefix.reset();
         throw;
@@ -107,7 +113,8 @@ void DecoderBatch::TpDriver::finish_peer_restore(decoder::Lane& lane) const {
     if (lane.peer_prefix->command.attention_only_restore &&
         *lane.peer_prefix->command.attention_only_restore)
         lane.peer_request->reset(tp.peer_stream);
-    decoder::commit_restored_prefix(*lane.peer_request, lane.peer_prefix->command, nullptr);
+    decoder::commit_restored_prefix(*lane.peer_request, lane.peer_prefix->command, nullptr,
+                                    tp.peer_stream);
 }
 
 decoder::ForwardLane DecoderBatch::TpDriver::mirror_lane(decoder::ForwardLane lane,
@@ -184,10 +191,6 @@ void DecoderBatch::TpDriver::verify(decoder::MtpRound* rounds, decoder::MtpRound
                                     std::byte* logprob_workspace,
                                     const decoder::TcVocabScratch* vocabulary, bool capture,
                                     bool allow_peer_repair) const {
-    
-    
-    
-    
     std::uint8_t* const primary_packed =
         count > decoder_batch_max_mtp_lanes ? tp.packed[0] : nullptr;
     std::uint8_t* const peer_packed =

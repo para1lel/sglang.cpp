@@ -56,6 +56,7 @@ start_reference() {
     local run=$1 row=$2
     local native_defaults=true cache_on=true context=132096 kv_bytes=137438953472
     if [[ $row == W1 || $row == W2 ]]; then context=2560; kv_bytes=10737418240; fi
+    if [[ $row == W6 ]]; then context=204800; fi
     local seed_cache=${PAIRED_VLLM_SEED_CACHE:-$host_root/cache/vllm-81a8cb063e62}
     local python=$vllm_root/venv/bin/python uv token_budget=32768 max_seqs=16
     uv=$(realpath -e -- "$(type -P uv)")

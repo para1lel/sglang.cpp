@@ -64,7 +64,8 @@ struct DraftWorkspace {
 };
 
 struct MtpDraftRequest::State {
-    State(std::shared_ptr<const MtpDraftWeights> weights, int capacity, RequestBlockCache* cache);
+    State(std::shared_ptr<const MtpDraftWeights> weights, int capacity, RequestBlockCache* cache,
+          PrefixStorage storage);
     void validate(int position, int token, const Bf16* hidden) const;
     void embed(int shifted_token, const Bf16* hidden, cudaStream_t stream,
                const Bf16* feature = nullptr);
@@ -86,6 +87,7 @@ struct MtpDraftRequest::State {
     static void select_wave(State* const* batch, int count, cudaStream_t stream);
 
     std::shared_ptr<const MtpDraftWeights> weights;
+    PrefixPages resident_pages;
     Allocations memory;
     DraftWorkspace work;
     int capacity;

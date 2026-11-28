@@ -6,7 +6,8 @@
 namespace sglang::decoder {
 
 bool Lane::checkpoints() const {
-    return options.publish_prefix_checkpoints && bool(options.store_prefix);
+    return resident_prefix ||
+           (options.publish_prefix_checkpoints && options.store_prefix != nullptr);
 }
 
 int Lane::remaining_prompt() const { return progress.remaining_prompt(prompt_size); }

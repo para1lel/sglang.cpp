@@ -24,9 +24,11 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 constexpr std::string_view magic = "SLC3";
-constexpr std::string_view daemon_version = "0.5.8+native-v4";
+constexpr std::string_view daemon_version = "0.5.8+native-v5";
 constexpr int max_native_tokens = QwenTextModel::max_position_embeddings;
 constexpr std::size_t max_record = std::size_t{1} << 30;
+constexpr std::uint64_t max_allocation = std::uint64_t{1} << 40;
+constexpr std::uint32_t mapped_pages_flag = std::uint32_t{1} << 31;
 constexpr std::size_t max_metadata = std::size_t{64} << 20;
 constexpr std::size_t max_keys = std::size_t{1} << 20;
 constexpr std::size_t max_error = 1024;
@@ -274,24 +276,39 @@ void append_address(std::string& output, const PrefixDeviceAddress& address) {
 void append_mxfp8(std::string& output, const PrefixCacheKeys& keys, const PrefixDeviceMxfp8& view,
                   int layers, bool draft) {
     constexpr int chunk = prefix_gqa_chunk_tokens;
+    const auto& page_map = view.physical_pages;
+    const int last_page = view.end > 0 ? 1 + ((view.end - 1) / mxfp8_page_size) : 0;
+    const int mapped_count = last_page - (view.begin / mxfp8_page_size);
     const bool valid_shape = view.end == 0 ||
         (view.begin < view.end && view.layers == layers && view.page_count > 0 &&
-         view.page_count <= max_native_tokens / mxfp8_page_size &&
-         view.end <= view.page_count * mxfp8_page_size &&
          view.kv_heads > 0 && view.kv_heads <= 128);
+    const bool valid_map =
+        page_map.empty()
+            ? view.end == 0 || (view.page_count >= last_page &&
+                                view.page_count <= max_native_tokens / mxfp8_page_size)
+            : mapped_count > 0 && page_map.size() == static_cast<std::size_t>(mapped_count);
     if (view.begin < 0 || view.begin > view.end || view.end > max_native_tokens ||
-        view.begin % chunk != 0 || !valid_shape ||
+        view.begin % chunk != 0 || !valid_shape || !valid_map ||
         (view.end != 0 && view.end > keys.cacheable_tokens() - static_cast<int>(draft))) {
         throw std::invalid_argument("Invalid native MXFP8 transfer extent");
     }
     append_number(output, 4, view.begin);
     append_number(output, 4, view.end);
-    if (!view.end) return;
+    if (view.end == 0)
+        return;
     append_number(output, 4, view.kv_heads);
-    append_number(output, 4, view.page_count);
+    append_number(output, 4,
+                  static_cast<std::uint32_t>(view.page_count) |
+                      (page_map.empty() ? 0 : mapped_pages_flag));
     for (const auto& plane : view.planes) append_address(output, plane);
+    for (const auto page : page_map) {
+        if (page < 0 || page >= view.page_count) {
+            throw std::invalid_argument("Invalid native MXFP8 physical page");
+        }
+        append_number(output, 4, static_cast<std::uint32_t>(page));
+    }
     for (int begin = view.begin; begin < view.end; begin += chunk) {
-        output += keys.key(std::min(begin + chunk, view.end) + draft);
+        output += keys.key(std::min(begin + chunk, view.end) + static_cast<int>(draft));
     }
 }
 
@@ -337,7 +354,9 @@ std::string encode_transfer(const LmCacheConfig& config, const PrefixCacheKeys& 
     append_bytes(output, transfer.ready_event);
     append_number(output, 4, transfer.allocations.size());
     for (const auto& allocation : transfer.allocations) {
-        if (allocation.bytes == 0) throw std::invalid_argument("Empty GPU allocation");
+        if (allocation.bytes == 0 || allocation.bytes > max_allocation) {
+            throw std::invalid_argument("Invalid GPU allocation size");
+        }
         append_bytes(output, allocation.handle);
         append_number(output, 8, allocation.bytes);
     }
@@ -520,7 +539,7 @@ LmCachePrefixDetail LmCacheClient::lookup_prefix(std::string_view digests, bool 
     const Connection connection(config_);
     connection.request(Operation::lookup_prefix, metadata);
     const auto [status, size] = connection.response_header();
-    constexpr std::size_t lead = 8;
+    constexpr std::size_t lead = 12;
     constexpr std::size_t entry = 5;
     const auto count = digests.size() / 64;
     if (status != 0 || size < lead || (size - lead) % entry != 0 || (size - lead) / entry > count) {
@@ -530,11 +549,13 @@ LmCachePrefixDetail LmCacheClient::lookup_prefix(std::string_view digests, bool 
     connection.read_all(raw.data(), raw.size());
     const std::string_view frame(raw.data(), raw.size());
     const auto gqa = decode_number(frame.substr(0, 4));
-    const auto listed = decode_number(frame.substr(4, 4));
-    if (gqa > count || listed != (frame.size() - lead) / entry) {
+    const auto draft_rows = decode_number(frame.substr(4, 4));
+    const auto listed = decode_number(frame.substr(8, 4));
+    if (gqa > count || (draft_rows != 0 && (!draft || draft_rows >= count)) ||
+        listed != (frame.size() - lead) / entry) {
         transport_error("invalid prefix coverage inventory");
     }
-    LmCachePrefixDetail detail{static_cast<int>(gqa), {}};
+    LmCachePrefixDetail detail{static_cast<int>(gqa), {}, static_cast<int>(draft_rows)};
     detail.endpoints.reserve(listed);
     auto previous = count + 1;
     for (std::size_t index = 0; index < listed; ++index) {
@@ -564,9 +585,9 @@ LmCacheStatus LmCacheClient::store(const PrefixCacheKeys& keys,
     return store_prepared(prepare_store(keys, transfer), receipt);
 }
 
-LmCacheStatus LmCacheClient::store_prepared(std::string_view metadata,
-                                           LmCacheReceipt* receipt) const {
-    return transfer_records(config_, Operation::store, metadata, receipt);
+LmCacheStatus LmCacheClient::store_prepared(std::string_view metadata, LmCacheReceipt* receipt,
+                                            int stop_fd) const {
+    return transfer_records(config_, Operation::store, metadata, receipt, stop_fd);
 }
 
 LmCacheStatus LmCacheClient::retrieve(const PrefixCacheKeys& keys,

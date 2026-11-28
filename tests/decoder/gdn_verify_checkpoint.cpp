@@ -1,5 +1,6 @@
 #include "sglang/decoder_prefill.h"
 #include "sglang/decoder_verify.h"
+#include "sglang/runtime/backend/device_arena.h"
 
 #include <algorithm>
 #include <array>
@@ -237,7 +238,9 @@ int main(int argc, char** argv) {
             prompts[lane] = ids(argv[lane + 2]);
             require(prompts[lane].size() >= 145, "short prompt fixture");
         }
+        const auto arena = DeviceArena::start(0, default_gpu_memory_utilization);
         const DecoderModel model(argv[1], 0);
+        arena->commit(arena->startup_remaining_bytes() / 2);
         for (int cut = 0; cut <= rows; ++cut) {
             test(model, prompts, cut, cut % 2 != 0);
         }

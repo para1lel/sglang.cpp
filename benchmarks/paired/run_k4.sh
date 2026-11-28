@@ -3,14 +3,14 @@ set -euo pipefail
 
 usage() {
     echo "Usage: bash benchmarks/paired/run_k4.sh NATIVE_BINARY GPU_INDEX CAMPAIGN_DIR ROW"
-    echo "Current rows are W1, W2, W3, W4, and W5. GPU_INDEX selects the single participating B200."
+    echo "Current rows are W1 through W6. GPU_INDEX selects the single participating B200."
     echo "Set PAIRED_CHECKPOINT_MANIFEST, PAIRED_NATIVE_SOURCE and PAIRED_NATIVE_SHA256."
     echo "For direct LMCache, set PAIRED_LMCACHE_PYTHON," \
         "PAIRED_LMCACHE_PYTHONPATH and PAIRED_LMCACHE_WHEEL."
-    echo "The default profile, server-defaults, uses matched 32768-token cold-cache K4."
-    echo "Native uses direct GPU LMCache 0.5.8. Pinned vLLM uses local APC without KV offload."
-    echo "W4 can start a fresh campaign. W5 requires a passing W4 in the same campaign."
-    echo "Every live timing arm runs one warmup and one measured cohort. Controls remain untimed."
+    echo "The default profile uses matched 32768-token chunked prefill and native HBM caching."
+    echo "Native backs up under pressure. Pinned vLLM uses local APC without KV offload."
+    echo "W4 can start a fresh campaign. W5 requires W4 to pass, and W6 requires W5 to pass."
+    echo "W1–W5 use a cold warmup and measured cohort. W6 uses a warmup and 20 serial turns."
     echo "Each row passes when the measured native makespan is at most 110% of pinned vLLM."
     echo "Historical PAIRED_K4_NATIVE_PROFILE values require compatible older releases:"
     echo "  server-defaults-cache-on-v5, server-defaults-cache-on-v3,"
@@ -76,8 +76,8 @@ if [[ ! $index =~ ^[0-9]+$ ]]; then
     echo "Specify exactly one participating GPU index." >&2
     exit 2
 fi
-if [[ $current == true && $row == W6 ]]; then
-    echo "W6 is an archived row. The current suite ends at W5." >&2
+if [[ $row == W6 && $current == true && $lmcache == false ]]; then
+    echo "The serial W6 row requires the current server-defaults profile." >&2
     exit 2
 fi
 case "$index" in
@@ -157,6 +157,7 @@ protocol_hash=$(cd -- "$project" && sha256sum \
     benchmarks/paired/driver_health.py \
     benchmarks/paired/{identity.py,makespan.py} \
     benchmarks/paired/{measure_concurrent.py,vllm_worker.py} \
+    benchmarks/serial/{fixture.py,chain.py} \
     benchmarks/streaming/{client.py,check_vllm.py,vllm_observer.py,W1.json,W2.json} \
     benchmarks/concurrent/{client.py,reference.py,freeze_prompts.py,fixture-manifest.json} \
     benchmarks/concurrent/gpu2-reference.json \
@@ -175,6 +176,11 @@ if [[ $lmcache == true ]]; then
     lmcache_protocol_hash=$(cd -- "$project" && sha256sum \
         benchmarks/paired/{lmcache_arm.sh,lmcache_evidence.py} "${lmcache_sources[@]#"$project/"}")
     protocol_hash+=$'\n'"$lmcache_protocol_hash"
+fi
+serial_sha=
+if [[ $lmcache == true ]]; then
+    serial_sha=$(PYTHONPATH="$project" "$client_python" -B -c \
+        'from benchmarks.serial.fixture import INPUTS_SHA256; print(INPUTS_SHA256)')
 fi
 protocol_sha=$(printf '%s\n' "$protocol_hash" | sha256sum)
 identity=$(jq -nc --arg source "$native_source" --arg binary "$native_sha" \
@@ -202,6 +208,7 @@ if [[ $native_profile != exact ]]; then
             --argjson lmcache "$lmcache" --arg lmcache_port "${lmcache_port:-}" \
             --arg lmcache_python "${lmcache_python:-}" --argjson lmcache_uid "$EUID" \
             --arg lmcache_pythonpath "${lmcache_pythonpath:-}" \
+            --arg serial_sha "$serial_sha" \
             '. + {protocol:"matched-k4-native-defaults-v1",campaign_id:$campaign_id,
                   native_profile:"server-defaults",checkpoint_path:$model,port:$port}
              | if $cache_on then . + {protocol:"matched-k4-native-defaults-cache-on-v2",
@@ -211,9 +218,10 @@ if [[ $native_profile != exact ]]; then
              | if $wide_budget then . + {protocol:"matched-k4-native-defaults-cache-on-v5",
                  max_num_batched_tokens:$token_budget} else . end
              | if $lmcache then . + {
-                 protocol:"matched-k4-native-defaults-lmcache-slc3-drain-suffix",
+                 protocol:"matched-k4-native-defaults-lmcache-hbm-pool",
+                 serial_fixture_sha256:$serial_sha,
                  lmcache_version:"0.5.8",lmcache_wire:"SLC3",
-                 lmcache_ready_version:"0.5.8+native-v4",lmcache_port:($lmcache_port | tonumber),
+                 lmcache_ready_version:"0.5.8+native-v5",lmcache_port:($lmcache_port | tonumber),
                  lmcache_capacity_bytes:68719476736,lmcache_python:$lmcache_python,
                  lmcache_uid:$lmcache_uid,lmcache_pythonpath:$lmcache_pythonpath} else . end' \
             <<<"$identity")
@@ -288,6 +296,17 @@ if [[ $row == W1 || $row == W2 ]]; then
     fixtures=$directory
     context=2560
     kv_bytes=10737418240
+elif [[ $row == W6 && $lmcache == true ]]; then
+    fixtures=$(realpath -m -- "${PAIRED_FIXTURES:-$directory/fixtures}")
+    if [[ -z ${PAIRED_FIXTURES:-} ]]; then
+        (cd -- "$project" && "$python" -B -m benchmarks.serial.fixture prepare \
+            "$checkpoint/tokenizer.json" "$fixtures") >"$directory/serial-inputs.json"
+    else
+        (cd -- "$project" && "$client_python" -B -m benchmarks.serial.fixture verify \
+            "$fixtures") >"$directory/serial-inputs.json"
+    fi
+    context=204800
+    kv_bytes=137438953472
 else
     prepare_fixtures
     context=132096

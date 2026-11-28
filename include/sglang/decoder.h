@@ -23,6 +23,8 @@ namespace decoder {
 struct CudaBackendPolicy;
 struct PrefixCacheRead;
 struct PrefixDeviceTransfer;
+class PrefixCacheKeys;
+class LmCacheGroup;
 struct TpRuntimeInfo;
 struct TpArCounters;
 
@@ -89,6 +91,8 @@ struct DecoderOptions {
     std::function<void(decoder::PrefixDeviceTransfer&&, const int*, int,
                        std::shared_ptr<void>, std::shared_ptr<std::atomic_uint64_t>)> store_prefix;
     bool publish_prefix_checkpoints = true;
+    std::vector<std::shared_ptr<decoder::PrefixCacheKeys>> prefix_cache_keys;
+    std::shared_ptr<const decoder::LmCacheGroup> prefix_cache_backing;
 
     bool samples() const;
     bool has_output_penalties() const;
@@ -167,12 +171,16 @@ struct DecoderResult {
     std::shared_ptr<const std::vector<double>> label_logprobs = nullptr;
 };
 
+struct DecoderMemoryOptions {
+    double gpu_memory_utilization = 0.88;
+};
+
 class Decoder {
 public:
     explicit Decoder(const std::filesystem::path& checkpoint, int cuda_device = 0);
     Decoder(const std::filesystem::path& checkpoint, int cuda_device, bool enable_mtp);
     Decoder(const std::filesystem::path& checkpoint, int cuda_device, bool enable_mtp,
-            int tensor_parallel);
+            int tensor_parallel, DecoderMemoryOptions memory = DecoderMemoryOptions());
     ~Decoder();
 
     Decoder(const Decoder&) = delete;

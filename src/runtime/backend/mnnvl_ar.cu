@@ -1,4 +1,5 @@
 #include "sglang/runtime/backend/mnnvl_ar.h"
+#include "sglang/runtime/backend/device_arena.h"
 #include "sglang/runtime/backend/mnnvl_rms_quantize.h"
 #include "sglang/text/quantization/rms_quantize.cuh"
 #include "sglang/runtime/execution/tp_verify_graph.h"
@@ -45,6 +46,9 @@ struct alignas(16) LamportState {
     uint2 dirty_bytes;
     std::uint32_t arrivals;
 };
+
+static_assert(kSignalPad >= kBufferAlignment + sizeof(LamportState));
+static_assert(kBufferAlignment % alignof(LamportState) == 0);
 
 template <int Stages>
 struct LamportBuffer {
@@ -270,8 +274,11 @@ private:
     int saved_ = 0;
 };
 
-__global__ void fill_sentinel_kernel(std::uint32_t* target, std::size_t count) {
-    std::size_t index = blockIdx.x * blockDim.x + threadIdx.x;
+__global__ void init_lamport_kernel(std::uint32_t* target, std::size_t count, LamportState* flags,
+                                    std::uint32_t buffer_size) {
+    const std::size_t index = (blockIdx.x * blockDim.x) + threadIdx.x;
+    if (index == 0)
+        *flags = LamportState{{0, 2, buffer_size, 0}, {0, 0}, 0};
     std::size_t stride = gridDim.x * blockDim.x;
     for (std::size_t i = index; i < count; i += stride) target[i] = kLamportSentinel;
 }
@@ -424,6 +431,7 @@ struct MnnvlAllReduce::State {
     std::uint64_t* wide_device_word = nullptr;
     std::uint64_t wide_epoch = 0;
 
+    std::array<std::shared_ptr<DeviceArena>, kRanks> charged_arenas{};
     CUmemGenericAllocationHandle physical[kRanks]{};
     CUmemGenericAllocationHandle multicast{};
     CUdeviceptr uc_base = 0;           
@@ -501,49 +509,55 @@ bool MnnvlAllReduce::State::map_wide_submission() {
 void MnnvlAllReduce::State::release() {
     CallerDevice device_scope;
     for (int r = 0; r < kRanks; ++r) {
-        if (flags[r] != nullptr) {
-            cudaSetDevice(devices[r]);
-            cudaFree(flags[r]);
-            flags[r] = nullptr;
+        if (flags[r] == nullptr)
+            continue;
+        cudaError_t status = cudaSetDevice(devices[r]);
+        if (status == cudaSuccess)
+            status = cudaDeviceSynchronize();
+        if (status != cudaSuccess) {
+            (void)std::fputs("MNNVL teardown could not fence a rank; retaining its workspace\n",
+                             stderr);
+            return;
         }
     }
-    if (wide_rejected != nullptr) {
-        (void)cudaFreeHost(wide_rejected);
-        wide_rejected = nullptr;
-    }
-    if (mapped_mc) {
-        (void)cuMemUnmap(mc_va, allocation_size);
+    if (mapped_mc && cuMemUnmap(mc_va, allocation_size) == CUDA_SUCCESS) {
         mapped_mc = false;
     }
-    if (reserved_mc) {
+    if (reserved_mc && !mapped_mc) {
         (void)cuMemAddressFree(mc_va, allocation_size);
         reserved_mc = false;
     }
     for (int r = kRanks - 1; r >= 0; --r) {
-        if (mapped_uc[r]) {
-            (void)cuMemUnmap(uc_ptrs[r], allocation_size);
+        if (mapped_uc[r] && cuMemUnmap(uc_ptrs[r], allocation_size) == CUDA_SUCCESS) {
             mapped_uc[r] = false;
         }
     }
-    if (reserved_uc) {
+    if (reserved_uc && !mapped_uc[0] && !mapped_uc[1]) {
         (void)cuMemAddressFree(uc_base, allocation_size * kRanks);
         reserved_uc = false;
     }
     for (int r = kRanks - 1; r >= 0; --r) {
-        if (bound_multicast[r]) {
-            (void)cuMulticastUnbind(multicast, devices[r], 0, allocation_size);
+        if (bound_multicast[r] &&
+            cuMulticastUnbind(multicast, devices[r], 0, allocation_size) == CUDA_SUCCESS) {
             bound_multicast[r] = false;
         }
     }
     for (int r = kRanks - 1; r >= 0; --r) {
-        if (created_physical[r]) {
-            (void)cuMemRelease(physical[r]);
+        if (created_physical[r] && !mapped_uc[r] && !bound_multicast[r] &&
+            cuMemRelease(physical[r]) == CUDA_SUCCESS) {
             created_physical[r] = false;
         }
+        if (charged_arenas[r] && !created_physical[r]) {
+            charged_arenas[r]->refund_startup_bytes(allocation_size);
+        }
     }
-    if (created_multicast) {
+    if (created_multicast && !mapped_mc && !bound_multicast[0] && !bound_multicast[1]) {
         (void)cuMemRelease(multicast);
         created_multicast = false;
+    }
+    if (wide_rejected != nullptr) {
+        (void)cudaFreeHost(wide_rejected);
+        wide_rejected = nullptr;
     }
 }
 
@@ -610,6 +624,14 @@ void MnnvlAllReduce::create_physical(State& state) {
     mc_prop.flags = 0;
 
     for (int r = 0; r < kRanks; ++r) {
+        if (!DeviceArena::active(state.devices[r]))
+            continue;
+        auto arena = DeviceArena::current(state.devices[r]);
+        arena->charge_startup_bytes(state.allocation_size);
+        state.charged_arenas[r] = std::move(arena);
+    }
+
+    for (int r = 0; r < kRanks; ++r) {
         device_scope.select(state.devices[r], "Select a rank device");
         alloc_prop.location.id = state.devices[r];
         require_cu(cuMemCreate(&state.physical[r], state.allocation_size, &alloc_prop, 0),
@@ -671,26 +693,18 @@ void MnnvlAllReduce::init_lamport(State& state) {
     state.buffer_size_bytes = static_cast<std::uint32_t>(per_buffer);
     state.twoshot_supported = per_buffer >= kTwoshotBufferBytes;
 
+    const std::uint64_t flags_offset = round_up(usable, kBufferAlignment);
     CallerDevice device_scope;
     for (int r = 0; r < kRanks; ++r) {
         device_scope.select(state.devices[r], "Select a rank device");
-        cudaError_t status = cudaMalloc(&state.flags[r], sizeof(LamportState));
+        const CUdeviceptr local = state.uc_ptrs[r];
+        state.flags[r] = reinterpret_cast<LamportState*>(local + flags_offset);
+        init_lamport_kernel<<<256, 256, 0, nullptr>>>(reinterpret_cast<std::uint32_t*>(local),
+                                                      usable / sizeof(std::uint32_t),
+                                                      state.flags[r], state.buffer_size_bytes);
+        cudaError_t status = cudaGetLastError();
         if (status != cudaSuccess) {
-            throw std::runtime_error(std::string("Allocate the Lamport flags: ") +
-                                     cudaGetErrorString(status));
-        }
-        const LamportState flag_host{{0, 2, state.buffer_size_bytes, 0}, {0, 0}, 0};
-        status = cudaMemcpy(state.flags[r], &flag_host, sizeof(flag_host), cudaMemcpyHostToDevice);
-        if (status != cudaSuccess) {
-            throw std::runtime_error(std::string("Initialize the Lamport flags: ") +
-                                     cudaGetErrorString(status));
-        }
-        fill_sentinel_kernel<<<256, 256, 0, 0>>>(
-            reinterpret_cast<std::uint32_t*>(state.uc_ptrs[r]),
-            (state.allocation_size - kSignalPad) / sizeof(std::uint32_t));
-        status = cudaGetLastError();
-        if (status != cudaSuccess) {
-            throw std::runtime_error(std::string("Pre-dirty the Lamport buffers: ") +
+            throw std::runtime_error(std::string("Initialize the Lamport workspace: ") +
                                      cudaGetErrorString(status));
         }
     }

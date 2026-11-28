@@ -14,6 +14,9 @@ public:
         int prefix_cache_entries;
         int max_num_batched_tokens;
         bool tp_verification_graphs = false;
+        bool resident_prefix_cache = false;
+        int prefix_gqa_pages = 0;
+        int prefix_gdn_slots = 0;
     };
 
     using Ready = std::function<void(BatchSession&)>;

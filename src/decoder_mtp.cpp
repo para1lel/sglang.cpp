@@ -132,22 +132,39 @@ MtpDraftWeights::State::State(const std::filesystem::path& directory, int device
 }
 
 MtpDraftRequest::State::State(std::shared_ptr<const MtpDraftWeights> weights, int capacity,
-                              RequestBlockCache* block_cache)
-    : weights(std::move(weights)), memory(this->weights->state_->device, block_cache), work(memory),
-      capacity(capacity) {
+                              RequestBlockCache* block_cache, PrefixStorage storage)
+    : weights(std::move(weights)), resident_pages(std::move(storage.pages)),
+      memory(this->weights->state_->device, block_cache), work(memory), capacity(capacity) {
     const int page_count = (capacity + mxfp8_page_size - 1) / mxfp8_page_size;
-    const auto payload = page_count * mxfp8_payload_bytes_per_page;
-    const auto scales = page_count * mxfp8_scale_bytes_per_page;
-    cache = {
-        memory.allocate<std::uint8_t>(payload), memory.allocate<std::uint8_t>(payload),
-        memory.allocate<std::uint8_t>(scales), memory.allocate<std::uint8_t>(scales), page_count,
-    };
     auto* table = memory.allocate<std::int32_t>(page_count);
     pages = {table, page_count};
     auto& host_pages = memory.transfers().logical_pages;
     host_pages.resize(page_count);
-    std::iota(host_pages.begin(), host_pages.end(), 0);
     memory.open_stream();
+    if (storage.slab != nullptr) {
+        cache = storage.slab->cache({0});
+        for (int index = 0; index < page_count; ++index) {
+            host_pages[index] = *resident_pages.at(index);
+        }
+        const int reusable = storage.reuse->draft_private_from;
+        if (reusable % mxfp8_page_size != 0) {
+            const int tail = reusable / mxfp8_page_size;
+            storage.slab->copy_tail(0,
+                                    {
+                                        host_pages[tail],
+                                        *storage.reuse->draft.at(tail),
+                                        reusable % mxfp8_page_size,
+                                    },
+                                    memory.stream());
+        }
+    } else {
+        const auto payload = page_count * mxfp8_payload_bytes_per_page;
+        const auto scales = page_count * mxfp8_scale_bytes_per_page;
+        auto* base = memory.allocate_cache<std::uint8_t>(2 * (payload + scales));
+        auto* key_scales = base + (2 * payload);
+        cache = {base, base + payload, key_scales, key_scales + scales, page_count};
+        std::iota(host_pages.begin(), host_pages.end(), 0);
+    }
     copy_cuda_async(table, host_pages.data(), host_pages.size() * sizeof(std::int32_t),
                     cudaMemcpyHostToDevice, memory.stream(), "Upload MTP KV page table");
     memory.close_stream();
@@ -356,12 +373,17 @@ std::shared_ptr<const TcVocabWeights> MtpDraftWeights::shared_vocab() const {
 }
 
 MtpDraftRequest::MtpDraftRequest(std::shared_ptr<const MtpDraftWeights> weights, int capacity,
-                                 RequestBlockCache* cache) {
+                                 RequestBlockCache* cache)
+    : MtpDraftRequest(std::move(weights), capacity, cache, {}) {
+}
+
+MtpDraftRequest::MtpDraftRequest(std::shared_ptr<const MtpDraftWeights> weights, int capacity,
+                                 RequestBlockCache* cache, PrefixStorage storage) {
     if (!weights || capacity < 1 || capacity > text_attention_max_tokens) {
         throw std::invalid_argument("Invalid MTP draft weights or capacity");
     }
     DeviceScope selected_device(weights->state_->device);
-    state_ = std::make_unique<State>(std::move(weights), capacity, cache);
+    state_ = std::make_unique<State>(std::move(weights), capacity, cache, std::move(storage));
     selected_device.restore();
 }
 
@@ -691,17 +713,28 @@ void MtpDraftRequest::repair_wave(const DraftRepairs* repairs, int count, Bf16* 
 
 void MtpDraftRequest::seed_prefill(int position, const int* shifted_tokens, const Bf16* hidden,
                                    const Bf16* residual, const Bf16* final_norm,
-                                   const PrefillProjections& projections,
-                                   MtpPrefillBuffers buffers, const MediaPrefill* media) {
+                                   const PrefillProjections& full, MtpPrefillBuffers buffers,
+                                   const MediaPrefill* media) {
     auto& request = *state_;
     if (request.failed) {
         throw std::logic_error("MTP draft request failed");
     }
-    const int rows = projections.rows;
-    if (position != request.prefix || rows <= 0 || rows > request.capacity - position ||
-        !shifted_tokens || !hidden || !residual || !final_norm) {
+    if (position < 0 || full.rows <= 0 || full.rows > request.capacity - position ||
+        position > request.prefix || shifted_tokens == nullptr || hidden == nullptr ||
+        residual == nullptr || final_norm == nullptr) {
         throw std::invalid_argument("Invalid MTP draft prefill input");
     }
+    const int reused = request.prefix - position;
+    if (reused >= full.rows)
+        return;
+    auto projections = full;
+    projections.rows -= reused;
+    position += reused;
+    shifted_tokens += reused;
+    const auto reused_elements = static_cast<std::size_t>(reused) * hidden_size;
+    hidden += reused_elements;
+    residual += reused_elements;
+    const int rows = projections.rows;
     const auto& model = *request.weights->state_;
     const auto stream = projections.stream;
     const bool paired = model.capabilities.paired_seed_kv && rows > 1;
@@ -824,6 +857,14 @@ bool MtpDraftRequest::retry_invalid_int8(cudaStream_t stream) {
 }
 
 int MtpDraftRequest::valid_prefix() const { return state_->prefix; }
+
+const PrefixPages& MtpDraftRequest::resident_prefix_pages() const {
+    return state_->resident_pages;
+}
+
+const std::vector<std::int32_t>& MtpDraftRequest::prefix_physical_pages() const {
+    return state_->memory.transfers().logical_pages;
+}
 
 Mxfp8KvCache MtpDraftRequest::prefix_cache_view(int rows, bool storing) const {
     if (state_->failed || rows < 0 || rows >= state_->capacity ||

@@ -12,7 +12,7 @@ namespace sglang::decoder {
 inline constexpr int batch_prefill_tile_rows = 1024;
 inline constexpr int min_partial_prefill_rows = 256;
 
-struct PrefillPool;
+class DeviceArena;
 
 void reclaim_prefill_workspaces(int device);
 
@@ -77,28 +77,23 @@ struct PrefillProjections {
 
 class PrefillWorkspace {
 public:
-    enum class Retention { existing, transient };
+  PrefillWorkspace(cudaStream_t stream, int capacity, int staged_visible = 0);
+  ~PrefillWorkspace();
+  PrefillWorkspace(const PrefillWorkspace&) = delete;
+  PrefillWorkspace& operator=(const PrefillWorkspace&) = delete;
 
-    PrefillWorkspace(cudaStream_t stream, int capacity);
-    PrefillWorkspace(cudaStream_t stream, int capacity, int staged_visible);
-    PrefillWorkspace(cudaStream_t stream, int capacity, Retention retention);
-    ~PrefillWorkspace();
-    PrefillWorkspace(const PrefillWorkspace&) = delete;
-    PrefillWorkspace& operator=(const PrefillWorkspace&) = delete;
+  std::size_t bytes() const;
+  std::size_t layout_bytes() const;
+  void close();
 
-    std::size_t bytes() const;
-    std::size_t layout_bytes() const;
-    void close();
-
-    cudaStream_t stream() const;
-    int capacity() const;
-    void* data() const;
-    PairedPrefillScratch long_gqa_staging() const;
+  cudaStream_t stream() const;
+  int capacity() const;
+  void* data() const;
+  PairedPrefillScratch long_gqa_staging() const;
 
 private:
     friend class PrefillPeerNorm;
     bool allow_peer_access(int peer_device);
-    PrefillWorkspace(cudaStream_t stream, int capacity, Retention retention, int staged_visible);
     cudaError_t release() noexcept;
 
     cudaStream_t stream_;
@@ -108,7 +103,7 @@ private:
     std::size_t layout_bytes_ = 0;
     PairedPrefillScratch staging_{};
     cudaError_t release_status_ = cudaSuccess;
-    std::unique_ptr<PrefillPool> pool_;
+    std::shared_ptr<DeviceArena> arena_;
 };
 
 class PrefillPeerNorm {

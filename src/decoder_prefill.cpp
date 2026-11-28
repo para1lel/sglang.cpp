@@ -843,12 +843,10 @@ bool try_prefill_paired_tiles_tp(const DecoderModel& model, const DecoderModel& 
     if (!can_pack_paired_tiles(grants, count) || !can_pack_paired_tiles(peer_grants, count)) {
         return false;
     }
-    constexpr auto retention = PrefillWorkspace::Retention::transient;
-    PrefillWorkspace workspace(stream, paired_tile_group.rows, retention);
+    PrefillWorkspace workspace(stream, paired_tile_group.rows);
     if (!workspace.data()) return false;
-    auto peer_workspace = on_device(peer.device, [&] {
-        return PrefillWorkspace(peer_stream, paired_tile_group.rows, retention);
-    });
+    auto peer_workspace = on_device(
+        peer.device, [&] { return PrefillWorkspace(peer_stream, paired_tile_group.rows); });
     if (!peer_workspace.data()) {
         workspace.close();
         check(cudaStreamSynchronize(stream), "Release provisional TP prefill workspace");

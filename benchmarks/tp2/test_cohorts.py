@@ -4,13 +4,14 @@ import gzip
 import json
 from copy import deepcopy
 
+import cache_activity
+import cohorts
+import cold_cache
 import pytest
 
-import cache_activity
-import cold_cache
-import cohorts
 from benchmarks.concurrent.client import capture_cohort
 from benchmarks.concurrent.reference import reference
+from benchmarks.paired.test_driver_health import ORDINARY_LOG
 from benchmarks.paired.test_lmcache_defaults import drain_metric_text
 from tests.test_concurrent_baseline import loopback, mutate_payload, wire_fixture
 
@@ -37,10 +38,11 @@ def timing_row(tmp_path, monkeypatch):
     with loopback(lanes) as (url, _):
         sample = capture_cohort(url, "W1", lanes, "warmup-01", reference()["policy"])
     monkeypatch.setattr(cohorts, "load_lanes", lambda *_: lanes)
-    monkeypatch.setattr(cohorts.lifecycle, "campaign", lambda *_: {})
+    identity = {"protocol": "tp2-paired-v2"}
+    monkeypatch.setattr(cohorts.lifecycle, "campaign", lambda *_: identity)
     monkeypatch.setattr(cohorts.lifecycle, "verify_arm", lambda *_: None)
     monkeypatch.setattr(cohorts.k4, "read_activity", lambda *_, **__: None)
-    (tmp_path / "identity.json").write_text("{}")
+    (tmp_path / "identity.json").write_text(json.dumps(identity))
     row = tmp_path / "W1"
     records = sample["requests"]
     start = min(r["submit_ns"] for r in records)
@@ -53,6 +55,7 @@ def timing_row(tmp_path, monkeypatch):
         run = row / arm
         run.mkdir(parents=True)
         (run / "ready.json").write_text("{}")
+        (run / "server.log").write_text(ORDINARY_LOG)
         binding = cohorts.binding(run)
         (run / "completed.json").write_text(json.dumps({"retired": True, "binding": binding}))
         tags = ["trace"] if arm.endswith("-trace") else ["warmup-01", "measured-01"]

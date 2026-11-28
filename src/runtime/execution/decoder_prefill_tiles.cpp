@@ -632,6 +632,8 @@ using namespace decoder;
 void Decoder::Model::seed_draft(Workspace& work, MtpDraftRequest& draft, int position,
                                 int shifted_token, cudaStream_t stream,
                                 const MediaPrefill* media) const {
+    if (position < draft.valid_prefix())
+        return;
     normalize_final(work, stream);
     draft.enqueue(position, shifted_token, work.normalized, false, stream, nullptr, nullptr,
                   media ? media->positions + position : nullptr, -1,

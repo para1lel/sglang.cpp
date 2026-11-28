@@ -11,6 +11,10 @@
 #include <stdexcept>
 #include <vector>
 
+namespace sglang::decoder {
+class LmCacheGroup;
+}
+
 namespace sglang::server {
 
 struct LmCacheMetrics {
@@ -85,6 +89,7 @@ public:
     ~BatchCache();
 
     int world_size() const;
+    std::shared_ptr<const decoder::LmCacheGroup> backing() const;
 
     void lookup(Keys keys, int score_start, bool draft, Cancel cancelled, ReadDone done);
 

@@ -99,6 +99,8 @@ def native(run, identity):
         expected.update(lmcache_enabled=True, lmcache_available=True, prefix_cache_entries=0)
     else:
         expected["prefix_cache_entries"] = 4 if identity["protocol"] in CACHE_ON_PROTOCOLS else 0
+    if identity["protocol"] == workload_suite.LMCACHE_POOL_PROTOCOL:
+        expected.update(workload_suite.HBM_POOL_DEFAULTS)
     port = info["port"]
     require(all(type(info.get(key)) is type(value) and info[key] == value
                 for key, value in expected.items()) and type(port) is int and 1 <= port <= 65535,

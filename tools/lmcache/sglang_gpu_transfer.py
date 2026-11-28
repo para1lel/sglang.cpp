@@ -4,6 +4,8 @@ import os
 import re
 from contextlib import ExitStack
 from dataclasses import dataclass
+from itertools import pairwise
+from threading import Lock
 from typing import TYPE_CHECKING, Protocol
 
 import torch
@@ -16,9 +18,12 @@ from lmcache.v1.platform.base.event_ipc import get_event_ipc_backend
 from lmcache.v1.platform.devices.cuda.utils import cuda_ipc_handle_from_bytes
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterator
 
     from lmcache.v1.distributed.api import ObjectKey
+
+    Allocation = tuple[bytes, int]
+    Span = tuple[int, int, int]
 
     RecordKey = Callable[[int, bytes, int], ObjectKey]
 
@@ -26,6 +31,10 @@ if TYPE_CHECKING:
 MAX_RECORD = 1 << 30
 MAX_ALLOCATION = 1 << 40
 MAX_TOKENS = 1 << 18
+PAGE_TOKENS = 128
+MAX_KV_HEADS = 128
+PAYLOAD_PLANES = 2
+MAPPED_PAGES_FLAG = 1 << 31
 PREFIX_CHUNK = 256
 DIGEST_BYTES = 64
 DRAFT_FAMILY = 3
@@ -41,6 +50,19 @@ class TransferReader(Protocol):
     def number(self, width: int) -> int: ...
 
     def end(self) -> None: ...
+
+
+def plane_span(allocations: list[Allocation], allocation: int, offset: int, size: int) -> Span:
+    if allocation >= len(allocations) or not size or offset + size > allocations[allocation][1]:
+        raise ValueError("native CUDA plane exceeds allocation")
+    return allocation, offset, offset + size
+
+
+def validate_disjoint(spans: list[Span]) -> None:
+    spans.sort()
+    for (allocation, _, end), (next_allocation, start, _) in pairwise(spans):
+        if allocation == next_allocation and end > start:
+            raise ValueError("overlapping native CUDA operands")
 
 
 @dataclass(frozen=True)
@@ -66,7 +88,13 @@ class GdnRecord:
         return self.key.extra_attributes[GDN_END]
 
     @classmethod
-    def parse(cls, request, allocations, key):
+    def parse(
+        cls,
+        request: TransferReader,
+        allocations: list[Allocation],
+        key: RecordKey,
+        spans: list[Span],
+    ) -> GdnRecord | None:
         endpoint = request.number(4)
         if not endpoint:
             return None
@@ -77,9 +105,7 @@ class GdnRecord:
         regions = []
         for _ in range(4):
             allocation, offset, width = (request.number(4), request.number(8), request.number(8))
-            if allocation >= len(allocations) or not width or \
-                    offset + width > allocations[allocation][1]:
-                raise ValueError("native GDN plane exceeds allocation")
+            spans.append(plane_span(allocations, allocation, offset, width))
             regions.append(Region(allocation, offset, width, size, width, width, 1))
             size += width
         if size > MAX_RECORD:
@@ -93,36 +119,54 @@ class NativeMxfp8:
     pages: int
     planes: tuple
     kv_heads: int
+    physical_pages: tuple[int, ...] = ()
+    first_page: int = 0
 
     @classmethod
     def parse_records(
         cls,
         request: TransferReader,
-        allocations: list[tuple[bytes, int]],
+        allocations: list[Allocation],
         family: int,
         key: RecordKey,
+        spans: list[Span],
     ) -> list[NativeRecord]:
         begin, end = request.number(4), request.number(4)
         if begin == end == 0:
             return []
         kv_heads = request.number(4)
-        pages = request.number(4)
+        encoded_pages = request.number(4)
+        mapped = bool(encoded_pages & MAPPED_PAGES_FLAG)
+        pages = encoded_pages & (MAPPED_PAGES_FLAG - 1)
         planes = tuple((request.number(4), request.number(8)) for _ in range(4))
         layers = 16 if family == 1 else 1
         if (
             not begin < end <= MAX_TOKENS - (family == DRAFT_FAMILY)
             or begin % PREFIX_CHUNK
-            or end > pages * 128
+            or (not mapped and end > pages * PAGE_TOKENS)
         ):
             raise ValueError("invalid native MXFP8 extent")
-        if not 0 < pages <= MAX_TOKENS // 128 or not 0 < kv_heads <= 128:
+        if (
+            not pages
+            or (not mapped and pages > MAX_TOKENS // PAGE_TOKENS)
+            or not 0 < kv_heads <= MAX_KV_HEADS
+        ):
             raise ValueError("invalid native MXFP8 geometry")
         row_bytes = (kv_heads * 256, kv_heads * 256, kv_heads * 8, kv_heads * 8)
         for (allocation, offset), plane_bytes in zip(planes, row_bytes, strict=True):
-            if allocation >= len(allocations) or \
-                    offset + layers * pages * 128 * plane_bytes > allocations[allocation][1]:
-                raise ValueError("native MXFP8 plane exceeds allocation")
-        view = cls(layers, pages, planes, kv_heads)
+            spans.append(
+                plane_span(
+                    allocations, allocation, offset, layers * pages * PAGE_TOKENS * plane_bytes
+                )
+            )
+        first_page = begin // PAGE_TOKENS
+        count = (end + PAGE_TOKENS - 1) // PAGE_TOKENS - first_page
+        if mapped and count > pages:
+            raise ValueError("native MXFP8 physical page map exceeds allocation")
+        physical = tuple(request.number(4) for _ in range(count)) if mapped else ()
+        if mapped and (max(physical) >= pages or len(set(physical)) != count):
+            raise ValueError("invalid native MXFP8 physical page map")
+        view = cls(layers, pages, planes, kv_heads, physical, first_page)
         return [
             NativeRecord(
                 key(family, request.read(DIGEST_BYTES), 0),
@@ -133,32 +177,65 @@ class NativeMxfp8:
             for start in range(begin, end, PREFIX_CHUNK)
         ]
 
-    def regions(self, begin, rows):
+    def page_runs(self, begin: int, rows: int) -> tuple[tuple[int, int, int], ...]:
+        if not self.physical_pages:
+            return ((0, begin, rows),)
+        page = begin // PAGE_TOKENS - self.first_page
+        first = self.physical_pages[page]
+        if rows <= PAGE_TOKENS or self.physical_pages[page + 1] == first + 1:
+            return ((0, first * PAGE_TOKENS, rows),)
+        second = self.physical_pages[page + 1]
+        return (
+            (0, first * PAGE_TOKENS, PAGE_TOKENS),
+            (PAGE_TOKENS, second * PAGE_TOKENS, rows - PAGE_TOKENS),
+        )
+
+    def regions(self, begin: int, rows: int) -> Iterator[Region]:
         offset = 0
+        runs = self.page_runs(begin, rows)
         for index, (allocation, address) in enumerate(self.planes):
-            row_bytes = self.kv_heads * 256 if index < 2 else self.kv_heads * 8
+            payload = index < PAYLOAD_PLANES
+            row_bytes = self.kv_heads * (256 if payload else 8)
             width = rows * row_bytes
-            pitch = self.pages * 128 * row_bytes
-            origin = address + begin * row_bytes
-            full = width if index < 2 else rows // 128 * 128 * self.kv_heads * 8
-            if full:
-                yield Region(allocation, origin, pitch, offset, width, full, self.layers)
-            if full < width:
-                for layer in range(self.layers):
-                    device = origin + layer * pitch + full
-                    record = offset + layer * width + full
-                    complete = (rows % 128) // 32 * 8
-                    tail = rows % 32
-                    if complete:
-                        yield Region(allocation, device, 32, record, complete, complete,
-                                     self.kv_heads * 32)
-                        record += complete * self.kv_heads * 32
-                    if tail:
-                        for head in range(self.kv_heads):
-                            yield Region(allocation, device + head * 1024 + complete,
-                                         32, record, 8, 8, tail)
-                            record += tail * 8
+            pitch = self.pages * PAGE_TOKENS * row_bytes
+            for logical, physical, count in runs:
+                origin = address + physical * row_bytes
+                target = offset + logical * row_bytes
+                full = count if payload else count // PAGE_TOKENS * PAGE_TOKENS
+                if full:
+                    yield Region(
+                        allocation, origin, pitch, target, width, full * row_bytes, self.layers
+                    )
+                if full < count:
+                    shift = full * row_bytes
+                    tail = Region(
+                        allocation,
+                        origin + shift,
+                        pitch,
+                        target + shift,
+                        width,
+                        (count - full) * row_bytes,
+                        self.layers,
+                    )
+                    yield from self.tail_regions(tail, count - full)
             offset += width * self.layers
+
+    def tail_regions(self, region: Region, rows: int) -> Iterator[Region]:
+        complete = rows // 32 * 8
+        tail = rows % 32
+        lanes = self.kv_heads * 32
+        for layer in range(region.rows):
+            device = region.device_offset + layer * region.device_pitch
+            record = region.record_offset + layer * region.record_pitch
+            if complete:
+                yield Region(region.allocation, device, 32, record, complete, complete, lanes)
+                record += complete * lanes
+            if tail:
+                for head in range(self.kv_heads):
+                    yield Region(
+                        region.allocation, device + head * 1024 + complete, 32, record, 8, 8, tail
+                    )
+                    record += tail * 8
 
 
 @dataclass(frozen=True)
@@ -272,11 +349,13 @@ class Transfer:
         if len({handle for handle, _ in allocations}) != count:
             raise ValueError("duplicate CUDA IPC allocation")
         records: list[NativeRecord | GdnRecord] = []
-        records.extend(NativeMxfp8.parse_records(request, allocations, 1, key))
-        records.extend(NativeMxfp8.parse_records(request, allocations, DRAFT_FAMILY, key))
-        gdn = GdnRecord.parse(request, allocations, key)
+        spans: list[tuple[int, int, int]] = []
+        records.extend(NativeMxfp8.parse_records(request, allocations, 1, key, spans))
+        records.extend(NativeMxfp8.parse_records(request, allocations, DRAFT_FAMILY, key, spans))
+        gdn = GdnRecord.parse(request, allocations, key, spans)
         if gdn:
             records.append(gdn)
+        validate_disjoint(spans)
         retention = Retention.parse(request, key, records, gdn) if store else None
         request.end()
         if not records or len({record.key for record in records}) != len(records):
@@ -367,12 +446,11 @@ def build_rectangles(records, objects, pointers, store):
     return copies
 
 
-def independent_destinations(records, pointers):
-    spans = sorted((pointers[region.allocation] + region.device_offset + row * region.device_pitch,
-                    region.width) for record in records for region in record.regions
-                   for row in range(region.rows))
-    return all(start + size <= next_start for (start, size), (next_start, _) in
-               zip(spans, spans[1:]))
+@dataclass
+class MappedAllocation:
+    address: int
+    span: int
+    users: int = 0
 
 
 class DeviceCopies:
@@ -385,6 +463,8 @@ class DeviceCopies:
         device_ops.BatchStep([], [])
         self.batched = device_ops.batch_memcpy_supported()
         self.devices = {}
+        self.mapping_lock = Lock()
+        self.mappings: dict[tuple[int, bytes], MappedAllocation] = {}
         for ordinal in range(count):
             (uuid,) = cuda_check(driver.cuDeviceGetUuid(ordinal), "read daemon CUDA UUID")
             self.devices[bytes(uuid.bytes)] = torch.device("cuda", ordinal)
@@ -407,7 +487,7 @@ class DeviceCopies:
             pointers = self.map_allocations(cleanup, transfer.allocations, device.index)
             event = backend.import_event(transfer.event, device)
             stream = torch.cuda.Stream(device=device)
-            batched = self.batched and (store or independent_destinations(records, pointers))
+            batched = self.batched
             build = build_rectangles if batched else build_copies
             copies = build(records, objects, pointers, store)
             direction = TransferDirection.D2H if store else TransferDirection.H2D
@@ -438,23 +518,65 @@ class DeviceCopies:
     ) -> list[int]:
         pointers = []
         for handle, size in allocations:
-            (address,) = cuda_check(runtime.cudaIpcOpenMemHandle(
-                cuda_ipc_handle_from_bytes(handle), runtime.cudaIpcMemLazyEnablePeerAccess),
-                "import CUDA IPC allocation")
-            cleanup.callback(self.unmap_allocation, address)
-            (attributes,) = cuda_check(
-                runtime.cudaPointerGetAttributes(address), "inspect CUDA IPC allocation device"
-            )
-            if attributes.device != ordinal:
-                raise ValueError("CUDA IPC allocation does not belong to the requested GPU UUID")
-            base, span = cuda_check(driver.cuMemGetAddressRange(address), "validate CUDA IPC span")
-            if int(base) != address or span < size:
-                raise ValueError("CUDA IPC view exceeds mapped allocation")
-            pointers.append(address)
+            key = ordinal, handle
+            mapping = self.retain_mapping(key, size)
+            cleanup.callback(self.release_mapping, key)
+            pointers.append(mapping.address)
+        validate_disjoint(
+            [
+                (0, address, address + size)
+                for address, (_, size) in zip(pointers, allocations, strict=True)
+            ]
+        )
         return pointers
 
+    def retain_mapping(self, key: tuple[int, bytes], size: int) -> MappedAllocation:
+        with self.mapping_lock:
+            mapping = self.mappings.get(key)
+            if mapping is None:
+                mapping = self.import_allocation(key, size)
+                self.mappings[key] = mapping
+            if size > mapping.span:
+                raise ValueError("CUDA IPC view exceeds mapped allocation")
+            mapping.users += 1
+            return mapping
+
+    def release_mapping(self, key: tuple[int, bytes]) -> None:
+        with self.mapping_lock:
+            mapping = self.mappings[key]
+            mapping.users -= 1
+            if mapping.users == 0:
+                self.unmap_allocation(mapping.address)
+                del self.mappings[key]
+
+    def import_allocation(self, key: tuple[int, bytes], size: int) -> MappedAllocation:
+        ordinal, handle = key
+        (address,) = cuda_check(
+            runtime.cudaIpcOpenMemHandle(
+                cuda_ipc_handle_from_bytes(handle), runtime.cudaIpcMemLazyEnablePeerAccess
+            ),
+            "import CUDA IPC allocation",
+        )
+        try:
+            return self.validate_mapping(address, ordinal, size)
+        except BaseException:
+            self.unmap_allocation(address)
+            raise
+
     @staticmethod
-    def unmap_allocation(address):
+    def validate_mapping(address: int, ordinal: int, size: int) -> MappedAllocation:
+        (attributes,) = cuda_check(
+            runtime.cudaPointerGetAttributes(address), "inspect CUDA IPC allocation device"
+        )
+        if attributes.device != ordinal:
+            raise ValueError("CUDA IPC allocation does not belong to the requested GPU UUID")
+        base, span = cuda_check(driver.cuMemGetAddressRange(address), "validate CUDA IPC span")
+        if int(base) != address or span < size:
+            raise ValueError("CUDA IPC view exceeds mapped allocation")
+        return MappedAllocation(address, span)
+
+    @staticmethod
+    def unmap_allocation(address: int) -> None:
         try:
             cuda_check(runtime.cudaIpcCloseMemHandle(address), "unmap CUDA IPC allocation")
         except Exception:

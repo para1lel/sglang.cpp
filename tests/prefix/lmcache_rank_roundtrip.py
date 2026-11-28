@@ -17,6 +17,8 @@ from unittest.mock import MagicMock, Mock, call, patch
 from lmcache_relay import (
     DRAFT,
     GDN,
+    GQA,
+    PAGE_TOKENS,
     PREFIX_DETAIL,
     RANK_GET,
     RANK_PUT,
@@ -35,6 +37,7 @@ lmcache = import_module("sglang_lmcache")
 RankCall = Callable[..., str]
 REJECTED = 2
 RANK0_ANCHOR, RANK_SHARED_ANCHOR = 65, 193
+PLANE_OFFSET = 128
 
 
 class DeviceStartupTest(unittest.TestCase):
@@ -148,15 +151,18 @@ class HostRecords:
         for record in transfer.records:
             family = record.key.object_group_id
             tally[family - 1] += record.size
-            if family == 2:
+            if family == GDN:
                 widths = [region.width for region in record.regions]
                 assert widths == [2949120 // self.world, 150994944 // self.world, 10240, 10240]
             else:
-                heads = 4 // self.world if family == 1 else 4
-                assert family == 1 or rank == 0
+                heads = 4 // self.world if family == GQA else 4
+                layers = 16 if family == GQA else 1
+                assert family == GQA or rank == 0
                 assert record.view.kv_heads == heads
-                assert record.size == record.tokens * heads * 528 * (16 if family == 1 else 1)
-        tokens = sum(r.tokens for r in transfer.records if r.key.object_group_id == 1)
+                assert record.size == record.tokens * heads * 528 * layers
+                assert len({allocation for allocation, _ in record.view.planes}) == 1
+                assert record.view.planes[0][1] == PLANE_OFFSET
+        tokens = sum(r.tokens for r in transfer.records if r.key.object_group_id == GQA)
         return 0, RECEIPT.pack(*tally, tokens)
 
     def store(self, request, transfer):
@@ -178,12 +184,14 @@ class HostRecords:
 
 
 def check_scales():
+    key_scale_plane = 2
     for heads in (2, 4):
         for count in (1, 31, 32, 33, 65, 96, 127, 128, 129, 225, 256):
-            view = NativeMxfp8(layers=2, pages=4, planes=tuple((i, 0) for i in range(4)),
-                               kv_heads=heads)
+            view = NativeMxfp8(
+                layers=2, pages=4, planes=tuple((i, 0) for i in range(4)), kv_heads=heads
+            )
             for begin in (0, 256):
-                regions = [r for r in view.regions(begin, count) if r.allocation == 2]
+                regions = [r for r in view.regions(begin, count) if r.allocation == key_scale_plane]
                 actual, packed = set(), set()
                 for r in regions:
                     for row in range(r.rows):
@@ -219,15 +227,57 @@ def reject_old_put(path: Path, uuid: bytes) -> None:
     assert reply
 
 
+def check_draft_only(call: RankCall, relay: Relay, world: int) -> None:
+    offset = len(relay.since())
+    call("store-draft", 65)
+    assert call("draft-coverage") == "0 0 64"
+    assert call("draft-coverage", draft=False) == "0 0 0"
+    store, *queries = [
+        event for event in relay.since(offset) if event["opcode"] in (RANK_PUT, PREFIX_DETAIL)
+    ]
+    assert store["opcode"] == RANK_PUT
+    assert [record["family"] for record in store["records"]] == [DRAFT]
+    expected = [(1, 64)] + [(0, 0)] * (2 * world - 1)
+    assert len(queries) == len(expected)
+    for event, (requested, rows) in zip(queries, expected, strict=True):
+        assert event["coverage_query"]["draft"] == requested
+        assert event["coverage"] == {"gqa": 0, "draft": rows, "checkpoints": []}
+
+
+def check_draft_tail(call: RankCall, relay: Relay, records: HostRecords) -> None:
+    (tail,) = (
+        key
+        for key, record in records.records.items()
+        if key.object_group_id == DRAFT and record.tokens == RANK0_ANCHOR - 1
+    )
+    del records.records[tail]
+    del records.owners[tail]
+    draft_rows = 2 * PAGE_TOKENS
+    prompt_end = draft_rows + 1
+    call("store-draft", prompt_end)
+    for exact_tail_present in (False, True):
+        if exact_tail_present:
+            call("store-draft", RANK0_ANCHOR)
+        offset = len(relay.since())
+        assert call("draft-coverage", prompt_end).split()[-1] == str(draft_rows)
+        inventory = call("draft-inventory", prompt_end).split()
+        assert (str(RANK0_ANCHOR) in inventory) == exact_tail_present
+        queries = [event for event in relay.since(offset) if event["opcode"] == PREFIX_DETAIL]
+        assert len(queries) == 2 * records.world
+        for event in queries[:: records.world]:
+            assert event["coverage"]["draft"] == draft_rows
+            assert dict(event["coverage"]["checkpoints"])[RANK0_ANCHOR] == exact_tail_present
+
+
 def check_tp2_inventory(call: RankCall, relay: Relay, records: HostRecords) -> None:
     before_lookup = len(relay.since())
     assert call("lookup", 160) == "193 211 193 65 64 65 193 211"
     inventory = [event for event in relay.since(before_lookup) if event["opcode"] == PREFIX_DETAIL]
-    assert [event["coverage_query"]["count"] for event in inventory] == [225, 225]
+    assert [event["coverage_query"]["count"] for event in inventory] == [257, 257]
     assert [event["coverage_query"]["draft"] for event in inventory] == [1, 0]
     assert [event["coverage"] for event in inventory] == [
-        {"gqa": 193, "checkpoints": [(211, 0), (193, 1), (65, 1)]},
-        {"gqa": 225, "checkpoints": [(225, 0), (211, 0), (193, 0), (161, 0), (65, 0)]},
+        {"gqa": 193, "draft": 192, "checkpoints": [(211, 0), (193, 1), (65, 1)]},
+        {"gqa": 225, "draft": 0, "checkpoints": [(225, 0), (211, 0), (193, 0), (161, 0), (65, 0)]},
     ]
     assert call("draft-inventory", 160) == "65 193"
     (key,) = (
@@ -323,14 +373,41 @@ def check_transfers(relay: Relay, records: HostRecords, gdn_bytes: int) -> None:
             assert not any(family == DRAFT for event in transfers for family, _ in event["keys"])
 
 
+def check_mapped(relay: Relay, call: RankCall, records: HostRecords) -> None:
+    prior = relay.since()
+    for event in prior:
+        if event["opcode"] in (RANK_GET, RANK_PUT):
+            families = {r["family"] for r in event["records"] if r.get("end", 0) > PAGE_TOKENS}
+            assert event.get("page_maps", {}) == dict.fromkeys(families, (2, 0))
+    for rank in range(records.world):
+        call("store-tail", rank=rank, draft=False)
+    tails = relay.since(len(prior))
+    assert len(tails) == records.world
+    for event, device in zip(tails, records.devices, strict=True):
+        assert event["device"] == device.hex()
+        assert event["opcode"] == RANK_PUT
+        assert event["status"] == 0
+        assert event["page_maps"] == {GQA: (1,)}
+        assert event["allocations"] == 1
+        assert [(r["begin"], r["end"]) for r in event["records"]] == [(256, 321)]
+        assert event["receipt"] == (65 * 33792 // records.world, 0, 0, 65)
+        assert event["armed_ns"] <= event["reply_ns"]
+
+
 def exercise(binary: str, runtime: Path, world: int) -> None:
     def call(
         op: str, end: int = 225, *, rank: int = 0, draft: bool = True, swap: bool = False
     ) -> str:
         operation, expected = ("ready", REJECTED) if op == "old-ready" else (op, 0)
         args = [binary, operation, world, rank, end, int(draft), int(swap)]
-        result = subprocess.run(list(map(str, args)), capture_output=True, text=True, timeout=8,
-                                env={**os.environ, "XDG_RUNTIME_DIR": str(runtime)})
+        result = subprocess.run(
+            list(map(str, args)),
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=8,
+            env={**os.environ, "XDG_RUNTIME_DIR": str(runtime)},
+        )
         assert result.returncode == expected, (result.args, result.stderr)
         return result.stdout.strip()
 
@@ -353,7 +430,7 @@ def exercise(binary: str, runtime: Path, world: int) -> None:
         assert readiness["devices"] == (
             [device.hex() for device in records.devices] if world > 1 else []
         )
-        old_version = "0.5.8+native-v3"
+        old_version = "0.5.8+native-v4"
         with patch.object(lmcache, "WIRE_VERSION", old_version):
             devices = b"" if world == 1 else b"".join(records.devices)
             assert control(upstream, "sglang", READY, devices) == (0, old_version.encode())
@@ -363,6 +440,7 @@ def exercise(binary: str, runtime: Path, world: int) -> None:
             assert control(upstream, "sglang", obsolete) == (2, b"unknown LMCache operation")
         reject_old_put(upstream, records.devices[0])
         assert call("lookup") == "0 0 0 0 0"
+        check_draft_only(call, relay, world)
         call("store", 65)
         gdn_bytes = 153964544 if world == 1 else 2 * 76992512
         if world == 1:
@@ -377,6 +455,8 @@ def exercise(binary: str, runtime: Path, world: int) -> None:
         assert call("get-gdn", gdn_end) == f"0 {gdn_bytes} 0 0"
         check_retention(relay, call, records)
         check_transfers(relay, records, gdn_bytes)
+        check_mapped(relay, call, records)
+        check_draft_tail(call, relay, records)
 
 
 if __name__ == "__main__":
@@ -387,4 +467,4 @@ if __name__ == "__main__":
     for world_size in (1, 2):
         with TemporaryDirectory(prefix="sglang-ranks-") as work:
             exercise(sys.argv[1], Path(work), world_size)
-    print("TP1 and TP2 daemon framing, rank-local geometry, common endpoints and joint GET passed")
+    print("TP1 and TP2 daemon framing, rank-local geometry, draft coverage and joint GET passed")

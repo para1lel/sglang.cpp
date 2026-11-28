@@ -1,6 +1,6 @@
 # Paired serving benchmarks
 
-Use the [matched K4 driver](#matched-k4-timing-protocol) for the current W1–W5 suite. For the [K0 control](#observe-and-compare), run pinned vLLM, then native on the same reserved B200. Match CPU placement and use new output directories.
+Use the [matched K4 driver](#matched-k4-timing-protocol) for the current W1–W6 suite. For the [K0 control](#observe-and-compare), run pinned vLLM, then native on the same reserved B200. Match CPU placement and use new output directories.
 
 ```bash
 export PAIRED_CHECKPOINT_MANIFEST="$PWD/artifacts/test-bench-baseline/checkpoint.sha256"
@@ -28,13 +28,13 @@ checks the fixture and request bytes. Both arms record resolved settings before 
 | `PAIRED_SERVER_CPUS` / `PAIRED_CLIENT_CPUS` | `24-33` / `34-35`, both with `numactl --localalloc`. Matched K4 chooses defaults by GPU index. Set both to use coordinated, disjoint physical cores on the GPU's NUMA node. |
 | `PAIRED_PORT` | `17393` |
 | `PAIRED_PROTOCOL_ROOT` | Repository root. Use a frozen export for a paired comparison. |
-| `PAIRED_FIXTURES` | Generate W3–W6 requests from the checkpoint tokenizer with pinned vLLM Python. Set a directory to reuse them. |
+| `PAIRED_FIXTURES` | Directory with the matching cohort fixtures. Older drivers can generate archived W3–W6 fixtures with pinned vLLM Python. Prepare the current W6 serial fixture separately in this directory. |
 | `PAIRED_WARMUPS` / `PAIRED_MEASURED` | `1` / `1` for new depth-zero captures. |
 | `PAIRED_MAX_NUM_BATCHED_TOKENS` | `8192`. Any other explicit cap is exploratory or historical. The native range is 1–32768. With 32 sequences vLLM requires 32–32768. |
 | `PAIRED_VLLM_SEED_CACHE` | `$PAIRED_HOST_ROOT/cache/vllm-81a8cb063e62`, copied into each vLLM group's private cache. |
 | `PAIRED_VLLM_HTTP_PROXY` | Unset. Set to `http://127.0.0.1:7890` for comparator cubin downloads in matched K4 TP1 and TP2 runs. Local requests bypass the proxy. |
 | `PAIRED_VLLM_RESULTS` | Unset. Set the saved vLLM evidence root to request a verified same-device comparison. |
-| `PAIRED_COMPARISON_MODE` | `matched` when saved results are supplied. Use `frozen` with W3–W6 and no saved results for the published GPU2 reference. |
+| `PAIRED_COMPARISON_MODE` | `matched` when saved results are supplied. For the archived GPU2 reference, use `frozen` with its W3–W6 fixtures and omit saved results. |
 | `PAIRED_CHECKPOINT_MANIFEST` | The saved `checkpoint.sha256` or `meta/checkpoint.sha256` in matched mode. Supply the published manifest explicitly in frozen mode. |
 | `PAIRED_ALLOW_COUNT_MISMATCH` | `0`. Set to `1` to label an otherwise verified comparison exploratory when cohort counts differ. |
 
@@ -49,13 +49,15 @@ export PAIRED_NATIVE_SHA256='verified-64-character-binary-digest'
 bash benchmarks/paired/run_k4.sh /path/to/sglang-server 2 artifacts/paired-k4-110 W4
 ```
 
-W4 can start a fresh campaign. W5 requires W4 to pass in that campaign. Start fresh servers for each row, with vLLM first on W1, W3 and W5. Follow the [campaign order, matching controls and SSE timing](../../docs/performance.md#measurement). The driver defaults to loopback port 17424 and holds the campaign, port and GPU coordination locks.
+W4 can start a fresh campaign. W5 requires W4 to pass. W6 requires W5 to pass at the same width and under the same campaign identity. Start fresh servers for each row. Run vLLM first on W1, W3, and W5. Follow the [campaign order, matching controls and SSE timing](../../docs/performance.md#measurement). The TP1 driver defaults to loopback port 17424 and holds the campaign, port, and GPU coordination locks.
 
-The TP1 launcher selects one physical B200 with `GPU_INDEX`. The default `PAIRED_K4_NATIVE_PROFILE=server-defaults` uses private 64 GiB LMCache 0.5.8 over SLC3. The campaign records `matched-k4-native-defaults-lmcache-slc3-drain-suffix` and `sampling: single-round-v1`. Pinned vLLM uses local prefix caching without KV offload. Set `PAIRED_LMCACHE_PYTHON` and `PAIRED_LMCACHE_WHEEL` to the interpreter and official wheel. `PAIRED_LMCACHE_PYTHONPATH` is optional. The daemon uses a separate loopback port selected by `PAIRED_LMCACHE_PORT` (17524 for TP1). [LMCache inputs](run_k4.sh#L114-L122)<!-- prefix: "lmcache_pyth" --> · [Protocol identity](run_k4.sh#L213-L217)<!-- prefix: "| if $lmcach" -->
+The TP1 launcher selects one physical B200 with `GPU_INDEX`. The default `PAIRED_K4_NATIVE_PROFILE=server-defaults` uses a private 64 GiB LMCache 0.5.8 daemon. The campaign records `matched-k4-native-defaults-lmcache-hbm-pool` and `sampling: single-round-v1`. Native uses its [default GPU pools](../../docs/serving/request-memory.md). Pinned vLLM uses local prefix caching with KV offload disabled. Set `PAIRED_LMCACHE_PYTHON` and `PAIRED_LMCACHE_WHEEL` to the interpreter and official wheel. `PAIRED_LMCACHE_PYTHONPATH` is optional. `PAIRED_LMCACHE_PORT` selects a separate daemon port (17524 for TP1). [LMCache inputs](run_k4.sh#L114-L122)<!-- prefix: "lmcache_pyth" --> · [Protocol identity](run_k4.sh#L220-L226)<!-- prefix: "| if $lmcach" -->
 
-For TP2, use [`benchmarks/tp2/run.sh` and its acceptance checks](../../docs/serving/tp2.md#acceptance-target). Use a fresh `tp2-paired-v4` root. Set `PAIRED_LMCACHE_PORT` to override its loopback daemon port (17655). The campaign identity records `daemon_port`, `lmcache_capacity_bytes` and the SLC3 `0.5.8+native-v4` handshake. Readiness and completion record one `daemon_pid` and both ranks. The `daemon/` receipts bind both UUIDs, the socket peer and process configuration. Replay `tp2-paired-v1` at its pinned revision with the original evidence. [Campaign identity](../../benchmarks/tp2/run.sh#L75)<!-- prefix: "'{protocol:\"" --> · [Daemon receipts](../../benchmarks/tp2/native.py#L88)<!-- prefix: "def verify_d" --> · [Historical two-daemon protocol](https://github.com/para1lel/sglang.cpp/blob/57ac5fbbdf20a5a80c5bc079b49073a44c06680f/benchmarks/tp2/run.sh#L73)
+For TP2, use [`benchmarks/tp2/run.sh` and its acceptance checks](../../docs/serving/tp2.md#acceptance-target). Use a fresh `tp2-paired-v5` root. Set `PAIRED_LMCACHE_PORT` to override the daemon port (17655). The campaign records one 128 GiB daemon and the SLC3 `0.5.8+native-v5` handshake. Readiness and completion bind one daemon PID to both ranks. The `daemon/` receipts bind both UUIDs, the socket peer, and process configuration. Replay archived campaigns at their original revisions. [Campaign identity](../../benchmarks/tp2/run.sh#L83)<!-- prefix: "'{protocol:\"" --> · [Daemon receipts](../../benchmarks/tp2/native.py#L88)<!-- prefix: "def verify_d" --> · [Historical two-daemon protocol](https://github.com/para1lel/sglang.cpp/blob/57ac5fbbdf20a5a80c5bc079b49073a44c06680f/benchmarks/tp2/run.sh#L73)
 
 Use the [named workloads](../../docs/performance.md#named-workloads). For TP1 W4/W5, point `PAIRED_FIXTURES` at the original corpus with its archived directory names. The driver checks request digests.
+
+For W6, [prepare and verify the serial fixture](../../docs/performance.md#w6-serial-history) under `$PAIRED_FIXTURES` before starting the campaign. After W5 passes, run `run_k4.sh` with row `W6` at TP1 or `run.sh measure` with row `W6` at TP2. Keep the raw `warmup-01.json.gz` and `measured-01.json.gz` for each engine. The measured clock spans the first POST to the final HTTP EOF. W1–W5 score the earliest submission through the last valid `[DONE]`.
 
 The TP1 native timing arm supplies only `--port` and disables tracing. A separate untimed native W1 trace checks active draft depth. The driver checks launch settings against API and worker receipts and records vLLM verification counters. Follow the [scheduler controls](../../docs/performance.md#scheduler-and-reporting-policy) and [wire, ID and cold-cache gates](../../docs/performance.md#measurement). Require an acknowledged `POST /reset_prefix_cache` with `{}` after drain before each cohort. Replay checks the reset response, metrics and control timestamps.
 
@@ -67,7 +69,7 @@ process arguments, vLLM activity counters, and client exit status. The saved
 identity selects the profile and cohort schedule. Captures without the sampling
 field retain their original sample counts, controls, and verdicts.
 
-TP1 `drain-suffix` and TP2 `tp2-paired-v4` receipts require every planned prefill checkpoint and each distinct terminal checkpoint to be acknowledged. The saved identity selects its original receipt checks for prior campaign versions. [Cold cache controls](../../docs/performance.md#measurement)
+Current receipts check the drained, empty GPU pools after each reset, positive pool capacities, and settled backup counters. W1–W5 require zero reuse. W6 can reuse GPU and CPU state inside its measured chain. Historical `drain-suffix` and `tp2-paired-v4` receipts retain their original per-checkpoint acknowledgement checks. [Cold cache controls](../../docs/performance.md#measurement)
 
 ### Driver health
 

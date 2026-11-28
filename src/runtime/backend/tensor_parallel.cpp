@@ -432,6 +432,13 @@ void TensorParallel::ensure_healthy() {
     }
 }
 
+void TensorParallel::warm_nccl(__nv_bfloat16* const buffers[], const cudaStream_t streams[],
+                               std::size_t count) {
+    ensure_healthy();
+    state_->enqueue_nccl_allreduce(buffers, streams, 1);
+    state_->enqueue_nccl_allreduce(buffers, streams, count);
+}
+
 TpAllReduceRoute TensorParallel::allreduce_bf16(
     __nv_bfloat16* const buffers[], const cudaStream_t streams[], std::size_t count) {
     const std::size_t ranks = state_->devices.size();

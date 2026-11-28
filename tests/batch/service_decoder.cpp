@@ -14,6 +14,10 @@ const decoder::TpRuntimeInfo* Decoder::tensor_parallel_info() const { return nul
 #endif
 Decoder::Decoder(const std::filesystem::path&, int) {}
 Decoder::Decoder(const std::filesystem::path&, int, bool) {}
+Decoder::Decoder([[maybe_unused]] const std::filesystem::path& checkpoint,
+                 [[maybe_unused]] int kv_limit, [[maybe_unused]] bool mtp,
+                 [[maybe_unused]] int tp_size, [[maybe_unused]] DecoderMemoryOptions options) {
+}
 Decoder::~Decoder() = default;
 decoder::TpArCounters Decoder::tp_ar_counters() const { return {}; }
 

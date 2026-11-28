@@ -27,7 +27,7 @@ Rank-local GDN prefill uses the native BF16 or FP8 path. [Frozen former opt-in a
 
 ## Grouped target verification
 
-Grouped target verification projects GDN inputs for each lane, then hands ordered rows to [ReplaySSM decode](gdn-decode.md#packed-eager-and-captured-verification). That path owns tentative history and commits each lane separately. Prefill builds the exact recurrent state for each needed prompt checkpoint. [Forward](../src/runtime/execution/decoder_forward_attention.cpp#L631)<!-- prefix: "void run_gdn" --> · [Capture](../src/runtime/execution/decoder_prefill_tiles.cpp#L519)<!-- prefix: "void capture" -->
+Grouped target verification projects GDN inputs for each lane, then hands ordered rows to [ReplaySSM decode](gdn-decode.md#packed-eager-and-captured-verification). That path owns tentative history and commits each lane separately. Prefill builds the exact recurrent state for each needed prompt checkpoint. [Forward](../src/runtime/execution/decoder_forward_attention.cpp#L744)<!-- prefix: "void run_gdn" --> · [Capture](../src/runtime/execution/decoder_prefill_tiles.cpp#L519)<!-- prefix: "void capture" -->
 
 Use the [batched target GDN check](../tests/decoder/README.md#batched-target-gdn) against scalar decode for zero through five consumed rows and a replacement. Compare compact against four-lane controls on identical verification inputs. Match BF16 scores, normalized output and raw history, FP32 carry and scales, and FP8 bytes. Check decline, error propagation, and reuse.
 

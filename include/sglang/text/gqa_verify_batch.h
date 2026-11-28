@@ -66,7 +66,8 @@ bool try_gqa_verify_batch(const GqaLayer& layer, const VerificationRow* rows, in
                           cudaStream_t stream);
 
 bool try_gqa_verify_short(const GqaLayer& layer, const VerificationRow* rows, int count,
-                          int cache_index, bool vector_attention, cudaStream_t stream);
+                          int cache_index, bool vector_attention, cudaStream_t stream,
+                          bool share_kv = false);
 
 using GqaVerifySelection = std::array<bool, max_wide_mtp_rows>;
 

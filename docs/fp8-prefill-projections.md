@@ -12,7 +12,7 @@ Exact SIMT tries eight-row projection at ≥64 rows and >1,024 output channels. 
 
 ### Tensor-core projections
 
-B200 packed Tensor Core FP8 includes eligible media and scoring rows. Swap-AB covers 1–5 rows. Multi-row TMA reads row-major E4M3 and FP32 activation/BF16 weight scales into BF16 slices. Fused quantizers or projection packing supply activations; GDN QKV/Z, GQA QKV and gate/up share packing. Split reductions can change scores. [Verification dispatch](../src/runtime/execution/decoder_forward_attention.cpp#L88)<!-- prefix: "void project" -->
+B200 packed Tensor Core FP8 includes eligible media and scoring rows. Swap-AB covers 1–5 rows. Multi-row TMA reads row-major E4M3 and FP32 activation/BF16 weight scales into BF16 slices. Fused quantizers or projection packing supply activations; GDN QKV/Z, GQA QKV and gate/up share packing. Split reductions can change scores. [Verification dispatch](../src/runtime/execution/decoder_forward_attention.cpp#L90)<!-- prefix: "void project" -->
 
 Eligible packed GDN verification fuses BF16 B/A with separate-path arithmetic. See [packet sizes and fallback](gdn-decode.md#packed-eager-and-captured-verification).
 

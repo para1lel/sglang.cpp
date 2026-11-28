@@ -44,7 +44,7 @@ Compare well-conditioned, query-range, and weighted-value cases with FP64. The f
 
 ## L007 · Singleton route parity
 
-Singleton graph attention diverged from eager when capture used a different operator. Keep the same singleton route before and after eligible launch rejection. The correction recovered all 352 fixed-history decode rows bitwise. [Bound attention](../src/runtime/execution/decoder_forward_attention.cpp#L265)<!-- prefix: "void attend_" --> · [Frozen candidate and control results](https://github.com/para1lel/sglang.cpp/blob/6debe50edccdeda34ff307235ed38e74b6b8f2ee/docs/lessons.md#l007--singleton-route-parity)
+Singleton graph attention diverged from eager when capture used a different operator. Keep the same singleton route before and after eligible launch rejection. The correction recovered all 352 fixed-history decode rows bitwise. [Bound attention](../src/runtime/execution/decoder_forward_attention.cpp#L267)<!-- prefix: "void attend_" --> · [Frozen candidate and control results](https://github.com/para1lel/sglang.cpp/blob/6debe50edccdeda34ff307235ed38e74b6b8f2ee/docs/lessons.md#l007--singleton-route-parity)
 
 Build using the [batch graph runbook](../tests/batch/README.md). Set `out` to the Release build directory, `checkpoint` to the local checkpoint, and `GPU_UUID` to a reserved B200. Use a fresh `$out/singleton` directory.
 

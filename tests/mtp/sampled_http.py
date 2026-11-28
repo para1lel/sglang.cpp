@@ -1,32 +1,30 @@
 """Compare sampled HTTP output and stop behavior against native K0."""
 
 import argparse
-from base64 import b64encode
-from concurrent.futures import ThreadPoolExecutor
-from contextlib import ExitStack, closing, contextmanager
 import http.client
 import json
 import os
-from pathlib import Path
 import re
 import subprocess
 import sys
-from threading import Barrier
 import time
+from base64 import b64encode
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack, closing, contextmanager
+from pathlib import Path
+from threading import Barrier
 from uuid import uuid4
-
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from batch.run_native import Stream, choose_port, require, stop_server, wait_until_ready, write_json
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "prefix"))
-from live_controls import STORES, Controls
-
+from live_controls import GDN_ENTRIES, Controls
 
 CHECKPOINT = Path("/data0/shared/Qwen3.8-27B-FP8")
 TOKEN_BUDGET = 32768
 CACHE_BOUNDARY = 8192
-NO_DEVICE = "Get current CUDA device: no CUDA-capable device is detected"
+NO_DEVICE = "Select device for CUDA arena startup: no CUDA-capable device is detected"
 TEXT = "/v1/completions"
 CHAT = "/v1/chat/completions"
 COMMON = {"model": "Qwen3.8-27B-FP8", "return_token_ids": True}
@@ -354,10 +352,10 @@ def check_queue_and_reset(args):
     with server(args, output, 2, 0, flags=flags, token_budget=CACHE_BOUNDARY) as (port, _):
         controls = Controls(port, output)
         body = LONG | {"prompt": checkpoint_prompt(), "cache_salt": uuid4().hex}
-        baseline = controls.metrics("before-cold")[STORES]
+        baseline = controls.idle("before-cold")[GDN_ENTRIES]
         wanted = transcript(post(port, TEXT, body))
         require(wanted["usage"]["prompt_tokens_details"] == {"cached_tokens": 0}, wanted)
-        controls.wait_for("cold-stored", 0, 0, stores=baseline + 1)
+        require(controls.idle("cold-resident")[GDN_ENTRIES] > baseline, "Cold prefix missing")
         with ExitStack() as streams:
             active = [streams.enter_context(sampled_stream(port, body | {"max_tokens": 4096}))
                       for _ in range(2)]
@@ -376,13 +374,13 @@ def check_queue_and_reset(args):
                 stream.reset()
             replay = finish_stream(survivor)
             records = [stream.evidence() for stream in [*active, queued, survivor]]
-        before = controls.wait_for("retired", 0, 0, stores=baseline + 1)
+        before = controls.idle("retired")
         controls.reset("idle-reset")
         after = controls.metrics("after-reset")
         replay_after_reset = transcript(post(port, TEXT, body))
         write_json(output / "wire.json", {"streams": records, "cold": wanted, "survivor": replay,
                                         "after_reset": replay_after_reset})
-        require(before[STORES] == after[STORES] and before[STORES] > 0, (before, after))
+        require(before[GDN_ENTRIES] > 0 and after[GDN_ENTRIES] == 0, (before, after))
         for key in ("prompt", "tokens", "text", "finish"):
             require(replay[key] == wanted[key] == replay_after_reset[key], key)
         warm_cache = replay["usage"]["prompt_tokens_details"]["cached_tokens"]
@@ -398,13 +396,15 @@ def check_eager_cache(args):
     prime = body | {"prompt": prompt, "max_tokens": 1}
     with server(args, output, 1, 4, flags=flags, token_budget=CACHE_BOUNDARY) as (port, log):
         controls = Controls(port, output)
-        baseline = controls.metrics("before-cold")[STORES]
+        baseline = controls.idle("before-cold")[GDN_ENTRIES]
         cold_wire = post(port, TEXT, body | {"cache_salt": uuid4().hex})
         cold = transcript(cold_wire)
         offset = log.stat().st_size
-        baseline = controls.wait_for("cold-stored", 0, 0, stores=baseline + 1)[STORES]
+        cold_entries = controls.idle("cold-resident")[GDN_ENTRIES]
+        require(cold_entries > baseline, (baseline, cold_entries))
         prime_wire = post(port, TEXT, prime)
-        controls.wait_for("prime-stored", 0, 0, stores=baseline + 1)
+        prime_entries = controls.idle("prime-resident")[GDN_ENTRIES]
+        require(prime_entries > cold_entries, (cold_entries, prime_entries))
         warm_begin = log.stat().st_size
         warm_wire = post(port, TEXT, body)
         warm = transcript(warm_wire)

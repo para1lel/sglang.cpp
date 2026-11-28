@@ -1,15 +1,14 @@
 """Compare seeded EBNF output on fresh exact-prefill and cache-enabled batch servers."""
 
 import argparse
-from concurrent.futures import ThreadPoolExecutor
 import json
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Barrier
 from uuid import uuid4
 
-from live_controls import STORES, Controls
+from live_controls import GDN_ENTRIES, Controls
 from routes import MODEL, Routes
-
 
 TEXT = "/v1/completions"
 CHAT = "/v1/chat/completions"
@@ -81,14 +80,6 @@ def warm(routes, cases, reference):
     controls = Controls(routes.port, routes.directory)
     salts = {name: uuid4().hex for name in ("text", "chat", "unseen")}
 
-    def prime(case, domain):
-        route, body, _ = cases[case]
-        request = {key: value for key, value in body.items() if key != "ebnf"}
-        request.update(max_tokens=1, cache_salt=salts[domain])
-        baseline = controls.wait_for(f"{domain}-cold-idle", 0, 0, stores=0)[STORES]
-        routes.raw(f"prime-{domain}", request, route=route)
-        controls.wait_for(f"{domain}-prime-stored", 0, 0, stores=baseline + 1)
-
     def verify(name, case, hit, salt, stream=False):
         actual = check(routes, name, cases[case], hit, salts[salt], stream)
         assert actual == reference[case], (name, actual, reference[case])
@@ -96,12 +87,12 @@ def warm(routes, cases, reference):
 
     text_hit = reference["exact"]["prompt"]
     chat_hit = reference["chat"]["prompt"]
-    verify("cold-exact", "exact", 0, "text")
-    prime("exact", "text")
-    verify("warm-exact", "exact", text_hit, "text", True)
-    verify("cold-chat", "chat", 0, "chat")
-    prime("chat", "chat")
-    verify("warm-chat", "chat", chat_hit, "chat", True)
+    for case, domain, hit in (("exact", "text", text_hit), ("chat", "chat", chat_hit)):
+        before = controls.idle(f"before-{domain}")[GDN_ENTRIES]
+        verify(f"cold-{case}", case, 0, domain)
+        resident = controls.idle(f"resident-{domain}")[GDN_ENTRIES]
+        assert resident > before, (before, resident)
+        verify(f"warm-{case}", case, hit, domain, stream=True)
     route, body, _ = cases["exact"]
     invalid = body | {"cache_salt": salts["text"], "ebnf": "root ::= [a-z]"}
     routes.raw("invalid-grammar", invalid, code=400, route=route)

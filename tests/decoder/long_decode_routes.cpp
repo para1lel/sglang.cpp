@@ -581,15 +581,15 @@ void mtp_mixed(const char* checkpoint, const char* fixture) {
 }
 
 void serial_prefill(const char* checkpoint, const char* fixture) {
-    constexpr int seed_rows = 8320;
-    constexpr int prefix = seed_rows - 128;
+    constexpr int seed_rows = 9216;
+    constexpr int prefix = seed_rows - 1024;
     const Decoder decoder(checkpoint, 0, false);
     check(decoder.uses_b200_operators(), "Serial prefill route check requires a B200");
     DecoderBatch batch(decoder, {.max_lanes = 1});
     const auto cache = prefix_fixture::client();
     constexpr auto salt = "serial-prefill";
     const auto tokens = read_prompt(fixture);
-    check(tokens.size() >= seed_rows, "Expected at least 8320 prompt IDs");
+    check(tokens.size() >= seed_rows, "Expected at least 9216 prompt IDs");
     DecoderOptions options;
     options.max_new_tokens = 2;
     options.generated_top_logprobs = 2;

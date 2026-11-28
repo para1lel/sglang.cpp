@@ -91,7 +91,7 @@ Compare W4 M80 and W5 M40 winners, acceptance, both rank states, and scoring-ran
 
 ### Scratch-free attention checks
 
-Build both binaries with the [long decode runbook](../tests/decoder/README.md#wide-long-context-decode). Set `serial_ids` to a whitespace-delimited file of at least 8,320 valid checkpoint token IDs. Keep the reserved B200 and the `out` and `checkpoint` settings from that runbook. For the checkpoint fixture, start an isolated [LMCache daemon](serving/lmcache.md#start-the-daemon) on the same GPU with namespace `sglang`.
+Build both binaries with the [long decode runbook](../tests/decoder/README.md#wide-long-context-decode). Set `serial_ids` to a whitespace-delimited file of at least 9,216 valid checkpoint token IDs. Keep the reserved B200 and the `out` and `checkpoint` settings from that runbook. For the checkpoint fixture, start an isolated [LMCache daemon](serving/lmcache.md#start-the-daemon) on the same GPU with namespace `sglang`.
 
 ```bash
 CUDA_VISIBLE_DEVICES="$GPU_UUID" "$out/bin/long-decode-check" serial
@@ -99,6 +99,6 @@ CUDA_VISIBLE_DEVICES="$GPU_UUID" LMCACHE_SOCKET="$LMCACHE_SOCKET" \
     "$out/bin/long-decode-routes" "$checkpoint" --serial-prefill "$serial_ids"
 ```
 
-The operator fixture compares eager output against a single captured node while changing the device position. The checkpoint fixture primes 8,320 tokens and restores the exact suffix checkpoint at 8,192 (`8,320 − 128`). That position is the lower bound of the scratch-free serial route. After restore, the fixture checks a one-row tail and forces arena allocation failure for a three-row tail. It counts tiled reader launches and checks that a subsequent unforced request recovers. [Operator fixture](../tests/decoder/long_decode_check.cu#L470)<!-- prefix: "void check_s" --> · [Checkpoint fixture](../tests/decoder/long_decode_routes.cpp#L583)<!-- prefix: "void serial_" -->
+The operator fixture compares eager output against a single captured node while changing the device position. The checkpoint fixture primes 9,216 tokens and restores the exact suffix checkpoint at 8,192 (`9,216 − 1,024`). That position is the lower bound of the scratch-free serial route. After restore, the fixture checks a one-row tail and forces arena allocation failure for a three-row tail. It counts tiled reader launches and checks that a subsequent unforced request recovers. [Operator fixture](../tests/decoder/long_decode_check.cu#L470)<!-- prefix: "void check_s" --> · [Checkpoint fixture](../tests/decoder/long_decode_routes.cpp#L583)<!-- prefix: "void serial_" -->
 
 The earlier packed-runtime notes and historical probes remain in the [archived guide](https://github.com/para1lel/sglang.cpp/blob/2676f3320cbfbe0f09f5d1193f67ec5abcf67639/docs/singleton-gqa-decode.md).

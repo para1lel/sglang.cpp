@@ -42,9 +42,17 @@ busy replies, reader responsiveness, and separate reset acknowledgements after t
 
 ## LMCache route checks
 
-Use the [real-daemon route procedure](../../docs/prefix-cache.md#verification) with a Release server and pinned checkpoint. It checks selective GQA and GDN coverage, shifted draft continuation, reuse across worker restarts, cancellation, and peer progress during held requests.
+Use a Release server, the frozen W3 fixtures, and a private LMCache 0.5.8 daemon with at least 4 GiB on the same GPUs. Set `TP` to `1` or `2` and pass a fresh evidence directory. Add `--alternate-checkpoint` with a compatible checkpoint containing different weights to check weight isolation.
 
-At exactly 8,192 prompt tokens, the length and text-stop routes each publish one terminal state. The graph fixture gives cancellation the terminal claim at the same endpoint and checks that both exit paths leave the daemon empty for that request.
+```bash
+PYTHONPATH="$PWD" python3 -B tests/prefix/lmcache_routes.py \
+    "$SGLANG_SERVER" "$CHECKPOINT" "$W3_FIXTURES" "$LMCACHE_SOCKET" "$EVIDENCE" \
+    --tp "$TP"
+```
+
+Require an empty `failures` object in `summary.json`. The fixture checks resident repeats, suffix forks, cache salt isolation, selective misses across cache families, failed GET recovery, and CPU-backed reuse after the writer exits. TP1 also checks image identity. TP2 checks that the chosen recurrent checkpoint is present on both ranks when their deeper endpoints differ. Keep `relay.json` and the metric scrapes as evidence of the CPU backups and reloads induced by ordinary pool pressure.
+
+The [pool verification procedure](../../docs/prefix-cache.md#verification) covers backup overlap with an active peer, cancellation, reset, and anchor retention. The [archived direct-STORE procedure](https://github.com/para1lel/sglang.cpp/blob/bdaec36dbb985edd57e54b3565315ba321290a23/docs/prefix-cache.md#verification) contains the held IPC, eager publication, aligned terminal STORE order, and wide eager checkpoint cases for that release.
 
 ## Device state and graph controls
 

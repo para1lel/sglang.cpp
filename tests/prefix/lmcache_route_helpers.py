@@ -15,8 +15,8 @@ from time import monotonic, perf_counter_ns, sleep
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, TypeVar, cast
 
-from cold_cache import LMCACHE_DRAIN, LMCACHE_METRICS, PENDING_STORES, metrics
-from lmcache_relay import DRAFT, ERASE, GDN, GQA, LOOKUP, RANK_PUT, RESET, control, key_body
+from cold_cache import LMCACHE_METRICS, PENDING_STORES, RUNNING, WAITING, metrics, parse_metrics
+from lmcache_relay import ERASE, LOOKUP, RANK_PUT, RESET, control, key_body
 
 from media import http_routes as http
 
@@ -31,6 +31,9 @@ NativeResult = tuple[list[int], str, dict[str, object]]
 _T = TypeVar("_T")
 NAMESPACE = "sglang"
 LOGGER = logging.getLogger(__name__)
+CACHE_PAGES = 16
+CHECKPOINT_SLOTS = 8
+PAGE_ROWS = 128
 
 
 class Witness:
@@ -49,7 +52,7 @@ class Witness:
         return raw
 
     def pending_stores(self) -> int:
-        return metrics(self.get("/metrics").decode(), LMCACHE_DRAIN)[PENDING_STORES]
+        return parse_metrics(self.get("/metrics").decode(), (PENDING_STORES,))[PENDING_STORES]
 
     def drain(self) -> None:
         wait_until(lambda: self.pending_stores() == 0, "LMCache stores did not settle")
@@ -82,20 +85,6 @@ class Witness:
             SimpleNamespace(evidence=self.evidence), label, self.port, http.GENERATE, body
         )
 
-    def stores(self, label: str, prompt: list[int]) -> tuple[dict[str, object], set[Key]]:
-        begin = len(self.relay.since())
-        response = self.generate(label, prompt)
-        assert len(response["output_ids"]) == 1
-        keys = self.published_keys(begin)
-        assert {family for family, _ in keys} == {GQA, GDN, DRAFT}, (label, keys)
-        return response, keys
-
-    def published_keys(self, begin: int) -> set[Key]:
-        self.drain()
-        entries = [entry for entry in self.relay.since(begin) if entry["opcode"] == RANK_PUT]
-        assert all(entry["status"] == 0 for entry in entries), entries
-        return {key for entry in entries for key in entry["keys"]}
-
     def changes(
         self,
         label: str,
@@ -124,6 +113,38 @@ class Witness:
         for key in keys:
             assert self.action(ERASE, key_body(key)) == (0, b""), key
         self.lookup(list(keys), [0] * len(keys))
+
+
+def backup_under_pressure(
+    witness: Witness, label: str, pressure_prompt: list[int]
+) -> list[dict[str, object]]:
+    """Replace resident state and page entries through ordinary, disjoint requests."""
+    names = (PENDING_STORES, RUNNING, WAITING)
+
+    def idle() -> bool:
+        values = parse_metrics(witness.get("/metrics").decode(), names)
+        return not any(values.values())
+
+    wait_until(idle, f"{label}: initial pressure drain did not settle")
+    offset = len(witness.relay.since())
+    pressure_rows = CACHE_PAGES // 2 * PAGE_ROWS - 1
+    assert len(pressure_prompt) >= pressure_rows
+    requested = pressure_prompt[:1]
+    for index in range(CHECKPOINT_SLOTS):
+        name = f"{label}-checkpoint-pressure-{index}"
+        result = witness.generate(name, requested, cache_salt=name)
+        http.native_result(result, requested, 1, 0)
+        wait_until(idle, f"{name}: checkpoint pressure did not settle")
+    requested = pressure_prompt[:pressure_rows]
+    for index in range(3):
+        name = f"{label}-page-pressure-{index}"
+        result = witness.generate(name, requested, cache_salt=name)
+        http.native_result(result, requested, 1, 0)
+        wait_until(idle, f"{name}: page pressure did not settle")
+    events = [entry for entry in witness.relay.since(offset) if entry["opcode"] == RANK_PUT]
+    assert events, label
+    assert all(entry["status"] == 0 and entry["forwarded"] for entry in events), events
+    return events
 
 
 def transfer_records(

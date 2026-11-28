@@ -174,7 +174,10 @@ cancellation releases all request bytes.
 
 The row-accounting cases use explicit cache-off controls. For the separate eager K4
 case, pass `--case eager-cache --lmcache-socket "$LMCACHE_SOCKET"` to `run_admission.py`
-with an isolated, ready [daemon on the same GPU](../../docs/serving/lmcache.md#start-the-daemon). Each run uses separate salts for the cold and primed requests. The runner waits for checkpoint publication before checking the 8,192-token hit. It also checks deterministic output, draft activity, and zero graph replays.
+with an isolated, ready [daemon on the same GPU](../../docs/serving/lmcache.md#start-the-daemon).
+Separate salts distinguish the cold and primed requests. The runner checks resident
+checkpoint publication, an 8,192-token hit, deterministic output, draft activity, and
+zero graph replays.
 
 Run `run_admission.py --case pressure` separately for 32 requests with
 32,769 prompt IDs in total. The trace records actual work per iteration, which
@@ -193,21 +196,18 @@ CUDA_VISIBLE_DEVICES="${GPU_UUID:?Set the reserved B200 UUID}" CUDA_DEVICE_ORDER
 ```
 
 The runner replays the recorded XMake link and verifies the unmodified
-executable byte for byte. A second link wraps CUDA allocation, release and
-stream synchronization.
-The server runs with its default limits. A four-token prompt and a 1,021-token
-output budget reserve eight KV pages. The probe allows the 32-byte page table
-allocation, then fails the combined 34,603,008-byte GQA key, value, and scale
-allocation while a peer is decoding.
+executable byte for byte. A second link wraps arena leases, arena returns, and
+stream synchronization. The server runs with its default limits and cache disabled.
+A four-token prompt and a 1,149-token output budget require nine KV pages. The
+The probe allows the 36-byte page table lease for the shared GQA pages, then
+fails the 2,949,120-byte GDN history lease while a peer is decoding.
 
-A capacity failure must return HTTP 503, queue the page table for recycling,
-and let the peer decode and a fresh request complete. The runner cancels the
-peer, checks that request bytes return to zero, and verifies a new stream succeeds.
-Once the active lanes retire, the runner requires confirmed release of that page table on the GPU.
-A successful synchronous free suffices. An asynchronous free must also complete on its owning stream.
-One terminal control injects the CUDA illegal-address
-status at the same allocation. The other injects a memory allocation
-failure there, then reports an illegal address during stream synchronization.
+A capacity failure must return HTTP 503 and let the peer decode and a fresh
+request complete. The runner cancels the peer, checks that request bytes return
+to zero, confirms the partially acquired table returns to the arena, and verifies
+a new stream succeeds. One terminal control injects CUDA illegal-address status
+on the history lease. The other injects capacity exhaustion on that lease and reports
+illegal-address status during stream synchronization.
 Both require HTTP 500 for the triggering and fresh requests and an SSE
 error for the active peer.
 
@@ -226,17 +226,18 @@ CUDA_VISIBLE_DEVICES="${GPU_UUID:?Set the reserved B200 UUID}" CUDA_DEVICE_ORDER
 ```
 
 The runner checks LMCache availability, K4, and the default 32,768-row budget.
-It compares successful STORE counts after running and waiting requests and pending stores reach zero.
-The saved HTTP metrics must show zero LMCache I/O errors and zero declined stores.
-Batch traces show K4 verification, the one-row decode at a crossed boundary, and terminal retirement.
-A daemon STORE receipt can arrive after retirement.
+The runner checks exact resident GDN counts after active requests and pending backups
+drain. It requires zero CPU stores, backup starts, I/O errors, and declined anchors.
+Batch traces show K4 verification, the one-row decode at a crossed boundary, and
+terminal retirement.
 
-- W1 saves one terminal checkpoint at 255 processed tokens. Two session branches restore 255 target rows and 254 draft rows.
-  Both must emit the same token IDs as their cold controls.
-  Replaying W1 must acknowledge one duplicate STORE with zero new GQA tokens and zero bytes written for GQA, GDN, or draft data.
-- The periodic cases probe the terminal endpoint and every 8,192-token boundary reached in prefill or decode. Divergent prompts probe the deepest boundary first.
-- An abort leaves no terminal checkpoint. A disconnect after the first boundary preserves its periodic checkpoint.
-  Both interrupted turns are ineligible as session parents.
+- W1 retains the prefill checkpoint at 128 and the terminal checkpoint at 255.
+  Two session branches restore 255 target rows and 254 draft rows and match cold
+  output IDs. Replaying W1 hits the 128-token entry and leaves the entry count unchanged.
+- For each prompt length `b`, the sparse cases probe the exact prefill endpoint `b`,
+  each positive `b−2^k` for `k≥10`, and the final committed cursor after generation.
+- Abort and disconnect preserve published prefill checkpoints. The interrupted
+  turns remain ineligible as session parents and publish no terminal checkpoint.
 - Reversing two stop strings selects different endpoints in one K4 packet. Each continuation restores the selected endpoint and matches cold output IDs.
 
 The evidence directory contains the server arguments, requests, responses, raw SSE, scheduler traces, and cache metrics.

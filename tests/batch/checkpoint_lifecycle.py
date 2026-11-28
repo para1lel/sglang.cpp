@@ -1,27 +1,25 @@
-"""Exercise public checkpoint cadence and real K4 session continuation on a reserved B200."""
+"""Exercise resident checkpoint anchors and real K4 session continuation on a reserved B200."""
 
 import argparse
-from contextlib import closing
-from http.client import HTTPConnection
 import json
 import os
-from pathlib import Path
 import re
 import socket
 import struct
 import sys
+from contextlib import closing
+from http.client import HTTPConnection
+from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "prefix"))
+from live_controls import GDN_ENTRIES, STORES, Controls
+
 from media import http_routes as http
-from live_controls import Controls, STORES
 
-
-STEP = 8192
+FIRST_ANCHOR_DISTANCE = 1024
+SESSION_CAPACITY = 24576
 DRAFT_ROWS = "sglang_cpp:lmcache_draft_restored_rows_total"
-WRITTEN = ("sglang_cpp:lmcache_gqa_written_tokens_total",
-           "sglang_cpp:lmcache_gqa_written_bytes_total",
-           "sglang_cpp:lmcache_gdn_written_bytes_total",
-           "sglang_cpp:lmcache_draft_written_bytes_total")
 PREFILL = re.compile(rb"(?m)^batch prefill_rows=([\d,]+) workspace_bytes=")
 PACKET = re.compile(rb"(?m)^batch mtp slot=\d+ drafted=(\d+) accepted=(\d+) verified=(\d+)")
 ROOT = Path(__file__).resolve().parents[2]
@@ -32,11 +30,13 @@ def fixture(row):
 
 
 def settled(cache, label, expected=None):
-    metrics = cache.wait_for(label, 0, 0, stores=0 if expected is None else expected)
+    metrics = cache.idle(label)
     if expected is not None:
-        assert metrics[STORES] == expected, (label, expected, metrics)
+        assert metrics[GDN_ENTRIES] == expected, (label, expected, metrics)
+    assert metrics[STORES] == 0, (label, metrics)
+    assert metrics["sglang_cpp:prefix_backups_started_total"] == 0, (label, metrics)
     assert metrics["sglang_cpp:lmcache_io_errors_total"] == 0, (label, metrics)
-    assert metrics["sglang_cpp:lmcache_declined_stores_total"] == 0, (label, metrics)
+    assert metrics["sglang_cpp:lmcache_prefill_checkpoints_declined_total"] == 0, (label, metrics)
     return metrics
 
 
@@ -63,8 +63,13 @@ def snapshot_steps(args, log, label, offset):
 
 
 def open_session(args, port, session):
-    reply = http.capture(args, f"open-{session}", port, "/open_session",
-                         {"session_id": session, "capacity_of_str_len": STEP * 3})
+    reply = http.capture(
+        args,
+        f"open-{session}",
+        port,
+        "/open_session",
+        {"session_id": session, "capacity_of_str_len": SESSION_CAPACITY},
+    )
     assert reply == session, reply
 
 
@@ -81,21 +86,18 @@ def test_w1(args, cache, log, prompt):
     port = cache.port
     reset(cache, "w1")
     open_session(args, port, "w1")
-    before = settled(cache, "w1-before")[STORES]
+    before = settled(cache, "w1-before")[GDN_ENTRIES]
     start = log.stat().st_size
     w1 = generate(args, port, "w1-parent", turn(prompt, "w1", "w1-parent", 128, stream=True))
     output, _, _ = http.native_result(w1, prompt, 128, 0)
-    stored = settled(cache, "w1-after-done", before + 1)
+    resident = settled(cache, "w1-after-done", before + 2)
     trace = snapshot_steps(args, log, "w1-parent", start)
     assert b"batch width=1 decode=1 request_bytes=0\n" in trace, trace
     assert any(int(draft) == 4 and int(rows) == 5 for draft, _, rows in PACKET.findall(trace))
     replay = generate(args, port, "w1-raw-replay", http.native_text(prompt, 128))
-    replay_ids, _, _ = http.native_result(replay, prompt, 128, 0)
+    replay_ids, _, _ = http.native_result(replay, prompt, 128, len(prompt))
     assert replay_ids == output, (replay_ids, output)
-    replayed = settled(cache, "w1-after-replay", stored[STORES] + 1)
-    # LMCache acknowledges the duplicate terminal PUT with no new immutable records.
-    for key in WRITTEN:
-        assert replayed[key] == stored[key], (key, stored[key], replayed[key])
+    settled(cache, "w1-after-replay", resident[GDN_ENTRIES])
     for branch, suffix in (("a", [13, 220, 32]), ("b", [11, 220, 33])):
         body = turn(suffix, "w1", f"w1-branch-{branch}", 8, "w1-parent", stream=branch == "a")
         assembled = prompt + output + suffix
@@ -113,43 +115,50 @@ def test_w1(args, cache, log, prompt):
         assert resumed_ids == cold["output_ids"], (resumed_ids, cold["output_ids"])
 
 
-def periodic(args, cache, log, base):
+def prefill_anchors(rows: int) -> list[int]:
+    distances = (1 << k for k in range(10, rows.bit_length()))
+    return [rows, *(rows - distance for distance in distances if distance < rows)]
+
+
+def sparse_prefill(args: argparse.Namespace, cache: Controls, base: list[int]) -> None:
+    branch_token = 31
     port = cache.port
-    for p, g, count in ((STEP - 1, 1, 1), (STEP, 1, 1), (STEP + 1, 1, 2),
-                        (STEP - 1, 8, 2), (STEP * 2 + 1, 1, 3)):
-        label = f"period-{p}-{g}"
+    for p, g in (
+        (FIRST_ANCHOR_DISTANCE, 1),
+        (FIRST_ANCHOR_DISTANCE + 1, 1),
+        (3137, 8),
+        (8193, 1),
+        (16385, 1),
+    ):
+        label = f"anchors-{p}-{g}"
         reset(cache, label)
         open_session(args, port, label)
-        before = settled(cache, f"{label}-before")[STORES]
-        offset = log.stat().st_size
+        before = settled(cache, f"{label}-before")[GDN_ENTRIES]
         prompt = base[:p]
         parent = generate(args, port, label, turn(prompt, label, label, g))
         output, _, _ = http.native_result(parent, prompt, g, 0)
-        settled(cache, f"{label}-after", before + count)
-        trace = snapshot_steps(args, log, label, offset)
-        if g > 1:
-            packets = PACKET.findall(trace)
-            assert packets[0] == (b"0", b"0", b"1"), (label, packets)
-            assert any(draft == b"4" and rows == b"5" for draft, _, rows in packets), packets
-            assert b"batch width=1 decode=1 request_bytes=0\n" in trace, trace
-        suffix = [31] if output[-1] != 31 else [32]
-        child = generate(args, port, f"{label}-child", turn(suffix, label, label + "-child", 1,
-                                                          label))
+        anchors = prefill_anchors(p)
+        settled(cache, f"{label}-after", before + len(anchors) + (g > 1))
+        suffix = [branch_token if output[-1] != branch_token else 32]
+        child = generate(
+            args, port, f"{label}-child", turn(suffix, label, label + "-child", 1, label)
+        )
         http.native_result(child, prompt + output + suffix, 1, p + g - 1)
-        processed = prompt + output[:-1]
-        # Probe deepest first so a probe cannot create a missing shallower checkpoint.
-        for cutoff in reversed(range(STEP, len(processed), STEP)):
-            off_branch = processed[:cutoff] + [31 if processed[cutoff] != 31 else 32]
-            branch = generate(args, port, f"{label}-boundary-{cutoff}",
-                              http.native_text(off_branch, 1))
+        for cutoff in anchors[1:]:
+            off_branch = [*prompt[:cutoff], branch_token if prompt[cutoff] != branch_token else 32]
+            branch = generate(
+                args, port, f"{label}-boundary-{cutoff}", http.native_text(off_branch, 1)
+            )
             http.native_result(branch, off_branch, 1, cutoff)
 
 
-def abort_turn(args, cache, log, prompt, *, disconnect, retained=0):
+def abort_turn(
+    args: argparse.Namespace, cache: Controls, log: Path, prompt: list[int], *, disconnect: bool
+) -> None:
     port = cache.port
     key = "disconnect" if disconnect else "abort"
     open_session(args, port, key)
-    before = settled(cache, f"{key}-before")[STORES]
+    before = settled(cache, f"{key}-before")[GDN_ENTRIES]
     job = turn(prompt, key, key, 1024, stream=True) | {"cache_salt": key}
     with closing(HTTPConnection("127.0.0.1", port, timeout=90)) as connection:
         connection.connect()
@@ -176,13 +185,13 @@ def abort_turn(args, cache, log, prompt, *, disconnect, retained=0):
                 (args.evidence / "abort-terminal.sse").write_bytes(raw)
                 assert http.stream_frames(raw)[-1]["meta_info"]["finish_reason"]["type"] == "abort"
     http.wait_retired(log, offset)
-    settled(cache, f"{key}-after", before + bool(retained))
+    settled(cache, f"{key}-after", before + len(prefill_anchors(len(prompt))))
     child = turn([31], key, f"{key}-child", 1, key)
     error = http.capture(args, f"{key}-unusable-parent", port, http.GENERATE, child, 400)
     assert "Invalid request session id" in error["error"]["message"], error
     probe = http.native_text(prompt + frame["output_ids"] + [31], 1) | {"cache_salt": key}
     reply = generate(args, port, f"{key}-unusable-checkpoint", probe)
-    http.native_result(reply, probe["input_ids"], 1, retained)
+    http.native_result(reply, probe["input_ids"], 1, len(prompt))
 
 
 def mid_packet_stop(args, cache, log, prompt):
@@ -207,7 +216,7 @@ def mid_packet_stop(args, cache, log, prompt):
         session = f"stop-{count}"
         stop = matches[count]
         open_session(args, port, session)
-        before = settled(cache, f"{session}-before")[STORES]
+        before = settled(cache, f"{session}-before")[GDN_ENTRIES]
         offset = log.stat().st_size
         parent = turn(prompt, session, f"{session}-parent", 12, stream=True,
                       stop=[stop, matches[other]]) | {"cache_salt": session}
@@ -217,7 +226,7 @@ def mid_packet_stop(args, cache, log, prompt):
         visible = prefixes[count - 1].split(stop, 1)[0]
         assert final["text"] == visible, final
         assert final["meta_info"]["completion_tokens"] == count, final
-        settled(cache, f"{session}-after", before + 1)
+        settled(cache, f"{session}-after", before + 2)
         trace = snapshot_steps(args, log, f"{session}-mid-packet", offset)
         packet, = PACKET.findall(trace)
         assert tuple(map(int, packet)) == (4, count - 1, 5), trace
@@ -260,12 +269,12 @@ def main():
         http.server_policy(args, port, "default", True)
         cache = Controls(port, args.evidence)
         test_w1(args, cache, log, prompt)
-        periodic(args, cache, log, fixture("W2") * 9)
+        sparse_prefill(args, cache, fixture("W2") * 9)
         abort_turn(args, cache, log, prompt, disconnect=False)
-        abort_turn(args, cache, log, fixture("W2") * 4 + [31], disconnect=True, retained=STEP)
+        abort_turn(args, cache, log, fixture("W2") * 4 + [31], disconnect=True)
         mid_packet_stop(args, cache, log, prompt)
         settled(cache, "lifecycle-complete")
-    print("Public GDN checkpoint cadence, cancellation, and K4 continuation passed.")
+    print("Exact resident GDN anchors, cancellation, and K4 session continuation passed.")
 
 
 if __name__ == "__main__":

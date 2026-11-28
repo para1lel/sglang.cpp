@@ -15,7 +15,7 @@ from http_contract import (SAMPLED, arguments, assert_piece_text, body, media_gu
 from token_oracle import checkpoint_bytes
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "prefix"))
-from live_controls import STORES, Controls
+from live_controls import GDN_ENTRIES, Controls
 
 
 def grammars():
@@ -122,12 +122,11 @@ def check_prefix(http, fields, validate):
 
         salt = uuid4().hex
         cold = request(spec, salt)
+        before = controls.idle(f"{field}-before-cold")[GDN_ENTRIES]
         initial = http.call(f"{field}-cold", "text", cold)
         assert initial["usage"]["prompt_tokens"] == 128
-        baseline = controls.wait_for(f"{field}-cold-idle", 0, 0, stores=0)[STORES]
-        prime = body("text", 1, prompt=prompt, cache_salt=salt)
-        http.call(f"{field}-prime", "text", prime)
-        controls.wait_for(f"{field}-prime-stored", 0, 0, stores=baseline + 1)
+        resident = controls.idle(f"{field}-cold-resident")[GDN_ENTRIES]
+        assert resident > before, (before, resident)
         warm = http.call(f"{field}-warm", "text", cold, stream=True)
         assert normalize_cache(initial, 0) == normalize_cache(warm, 128)
         validate(field, cold, warm)

@@ -36,11 +36,13 @@ python tests/media/http_routes.py build/bin/sglang-server "$checkpoint" /tmp/med
 In the saved `/server_info` responses, require `prefix_cache_entries` to equal zero in
 both modes. `lmcache_enabled` and `lmcache_available` must both be true for the daemon
 worker and false for the explicit cache-off control. The test verifies K4, the
-32,768-row budget, cold text, and checkpoint hits. It compares ordered label scores
-and exact prompt and output logprobs with cache-off workers using matched prefill grants.
-Decoded image and video branches reuse the first
-8,192 processed tokens and return identical IDs over JSON and SSE. Changing
-pixels, grid geometry, video positions, or a binary cache salt prevents reuse.
+32,768-row budget, cold text, and checkpoint hits. Ordered label scores and
+aligned prompt and output logprobs are compared with cache-off workers using
+matched prefill grants. The unaligned score replay checks JSON and SSE against
+the same resident GQA schedule with zero usable GDN rows.
+Decoded image and video branches reuse the exact `b−1,024` checkpoint and return
+identical IDs over JSON and SSE. Changing pixels, grid geometry, video positions,
+or a binary cache salt prevents reuse.
 The test also cancels a live media stream and checks that a replacement succeeds.
 The evidence directory contains the requests and responses.
 

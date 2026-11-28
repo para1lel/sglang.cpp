@@ -2,7 +2,7 @@
 
 ## Responsibilities and sources of truth
 
-The decoder lends arena spans to singleton and grouped GQA. Attention dispatch selects staged, raw grouped, or per-lane work. The paired launcher checks eligibility and submits on the workspace stream. [Tile layout](../src/runtime/execution/decoder_prefill_tiles.cpp#L72)<!-- prefix: "TileBuffers:" --> · [Scratch view](../src/runtime/execution/decoder_prefill_tiles.cpp#L97)<!-- prefix: "PairedPrefil" --> · [Singleton selection](../src/text/gqa/ordered_prefill.cu#L282)<!-- prefix: "std::optiona" --> · [Grouped dispatch](../src/decoder_prefill.cpp#L401)<!-- prefix: "void prefill" --> · [Staged launch](../src/text/gqa/tmem_staged.cu#L450)<!-- prefix: "std::optiona" -->
+The decoder lends arena spans to singleton and grouped GQA. Attention dispatch selects staged, raw grouped, or per-lane work. The paired launcher checks eligibility and submits on the workspace stream. [Tile layout](../src/runtime/execution/decoder_prefill_tiles.cpp#L72)<!-- prefix: "TileBuffers:" --> · [Scratch view](../src/runtime/execution/decoder_prefill_tiles.cpp#L97)<!-- prefix: "PairedPrefil" --> · [Singleton selection](../src/text/gqa/ordered_prefill.cu#L301)<!-- prefix: "std::optiona" --> · [Grouped dispatch](../src/decoder_prefill.cpp#L401)<!-- prefix: "void prefill" --> · [Staged launch](../src/text/gqa/tmem_staged.cu#L450)<!-- prefix: "std::optiona" -->
 
 ## Runtime path
 

@@ -248,35 +248,54 @@ __device__ int tile_attention(OrderedTile<float, Heads>& shared, Attention reque
     return invalid;
 }
 
-template <int Rows, int Blocks, bool Staged = false>
-__launch_bounds__(channels, Blocks)
-__global__ void multirow_prefill_attention(Attention request, int rows) {
-    __shared__ OrderedTile<float, Rows * ordered_heads> shared;
-    __shared__ OrderedScratch fallback;
-    const int tile = blockIdx.x;
-    const int full_tiles = rows / Rows;
-    const int head = blockIdx.y * ordered_heads;
-    if (tile >= full_tiles) {
-        protected_attention(fallback, request, full_tiles * Rows + tile - full_tiles, head);
-        return;
-    }
-    const int row = tile * Rows;
-    PrefillPayload<keys_per_tile>* stages = nullptr;
-    if constexpr (Staged) {
-        __shared__ PrefillPayload<keys_per_tile> storage[2];
-        stages = storage;
-    }
-    const int invalid = tile_attention<Rows * ordered_heads, Staged>(
-        shared, request, row, head, stages);
+template <int Rows, bool Staged>
+__device__ __forceinline__ void
+run_ordered_tile(OrderedTile<float, Rows * ordered_heads>& shared, OrderedScratch& fallback,
+                 Attention request, int row, int head, PrefillPayload<keys_per_tile>* stages) {
+    const int invalid =
+        tile_attention<Rows * ordered_heads, Staged>(shared, request, row, head, stages);
     if (__syncthreads_or(invalid != 0)) {
-        constexpr int mask = (1 << ordered_heads) - 1;
+        constexpr unsigned mask = (1U << static_cast<unsigned>(ordered_heads)) - 1U;
         for (int offset = 0; offset < Rows; ++offset) {
-            const int failed = (invalid >> (offset * ordered_heads)) & mask;
+            const auto shift = static_cast<unsigned>(offset * ordered_heads);
+            const int failed = static_cast<int>((static_cast<unsigned>(invalid) >> shift) & mask);
             if (__syncthreads_or(failed != 0)) {
                 recover_wide(fallback.wide, request, row + offset, head, failed);
             }
         }
     }
+}
+
+template <int Rows, int Blocks, bool Staged = false, bool PairTail = false>
+__launch_bounds__(channels, Blocks)
+    __global__ void multirow_prefill_attention(Attention request, int rows) {
+    __shared__ OrderedTile<float, Rows * ordered_heads> shared;
+    __shared__ OrderedScratch fallback;
+    const int tile = static_cast<int>(blockIdx.x);
+    const int full_tiles = rows / Rows;
+    const int head = static_cast<int>(blockIdx.y) * ordered_heads;
+    PrefillPayload<keys_per_tile>* stages = nullptr;
+    if constexpr (Staged) {
+        __shared__ PrefillPayload<keys_per_tile> storage[2];
+        stages = storage;
+    }
+    if (tile < full_tiles) {
+        run_ordered_tile<Rows, Staged>(shared, fallback, request, tile * Rows, head, stages);
+        return;
+    }
+    int tail = (full_tiles * Rows) + (tile - full_tiles);
+    if constexpr (PairTail) {
+        if (rows % Rows >= paired_rows) {
+            if (tile == full_tiles) {
+                __shared__ OrderedTile<float, paired_rows * ordered_heads> paired;
+                run_ordered_tile<paired_rows, Staged>(paired, fallback, request, tail, head,
+                                                      stages);
+                return;
+            }
+            ++tail;
+        }
+    }
+    protected_attention(fallback, request, tail, head);
 }
 
 std::optional<cudaError_t> try_paired_prefill(const Attention& request, Mxfp8PageTable pages,
@@ -315,12 +334,14 @@ std::optional<cudaError_t> try_ragged_prefill(const Attention& request, Mxfp8Pag
     return launch_tmem_prefill(cache, pages, position, queries, output, stream, rows);
 }
 
-template <int Rows, int Blocks, bool Staged = false>
+template <int Rows, int Blocks, bool Staged = false, bool PairTail = false>
 cudaError_t launch_ordered_tiles(Attention request, int rows, cudaStream_t stream) {
     void* args[] = {&request, &rows};
-    const dim3 blocks((rows / Rows) + (rows % Rows), gqa_head_pairs(request.cache));
-    return cudaLaunchKernel(multirow_prefill_attention<Rows, Blocks, Staged>, blocks, channels,
-                            args, 0, stream);
+    const int tail = rows % Rows;
+    const int extra_tiles = PairTail ? (tail / paired_rows) + (tail % paired_rows) : tail;
+    const dim3 blocks((rows / Rows) + extra_tiles, gqa_head_pairs(request.cache));
+    return cudaLaunchKernel(multirow_prefill_attention<Rows, Blocks, Staged, PairTail>, blocks,
+                            channels, args, 0, stream);
 }
 
 cudaError_t launch_ordered_prefill(Attention request, int rows, int visible, bool stage_payloads,
@@ -329,6 +350,15 @@ cudaError_t launch_ordered_prefill(Attention request, int rows, int visible, boo
     constexpr int min_staged_visible = 8192;
     constexpr int min_wide_tail_rows = 32;
     constexpr int min_paired_tail_rows = 12;
+    constexpr int min_paired_rows = 64;
+    constexpr int min_wide_rows = 128;
+    constexpr int min_cooperative_position = 4 * mxfp8_page_size;
+    if (stage_payloads && rows >= min_paired_rows && rows < min_flash_rows &&
+        request.position >= min_cooperative_position && visible < min_staged_visible) {
+        return rows < min_wide_rows
+                   ? launch_ordered_tiles<wide_rows, 2, true, true>(request, rows, stream)
+                   : launch_ordered_tiles<wide_rows, 2, true>(request, rows, stream);
+    }
     if (stage_payloads && rows >= 2 && rows < min_flash_rows && visible >= min_staged_visible) {
         if (rows >= min_wide_tail_rows) {
             return launch_ordered_tiles<wide_rows, 2, true>(request, rows, stream);
@@ -338,13 +368,11 @@ cudaError_t launch_ordered_prefill(Attention request, int rows, int visible, boo
         }
         return launch_ordered_tiles<1, 4, true>(request, rows, stream);
     }
-    constexpr int min_paired_rows = 64;
     if (rows < min_paired_rows || visible > max_multirow_visible_tokens) {
         void* args[] = {&request};
         return cudaLaunchKernel(protected_prefill_attention, dim3(rows, head_pairs), channels, args,
                                 0, stream);
     }
-    constexpr int min_wide_rows = 128;
     return rows >= min_wide_rows ? launch_ordered_tiles<wide_rows, 2>(request, rows, stream)
                                  : launch_ordered_tiles<paired_rows, 3>(request, rows, stream);
 }

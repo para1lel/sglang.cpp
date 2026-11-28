@@ -74,6 +74,9 @@ inline constexpr unsigned fp8_instruction =
 template <int Columns>
 inline constexpr unsigned bf16_instruction = fp8_instruction<Columns> | (1u << 10) | (1u << 7);
 
+__device__ void allocate_tmem(unsigned* address, int columns);
+__device__ void free_tmem(const unsigned* address, int columns);
+
 template <int Columns, int Accumulators = 0, int Slots>
 __device__ void allocate_tmem(DecodePipeline<Slots>& pipe);
 

@@ -11,7 +11,7 @@ Pass the patches to the [standalone vision encoder](vision-encoder.md) to produc
 | Part | Responsibility | Source |
 | --- | --- | --- |
 | Caller | Decode media to RGB8 and provide displayed dimensions and source video metadata. | [Input view](../include/sglang/media_preprocess.h#L10)<!-- prefix: "struct Decod" --> · [Video metadata](../include/sglang/media_preprocess.h#L20)<!-- prefix: "struct Video" --> |
-| Preprocessor | Select frames, resize, normalize, and pack patches. | [Public functions](../include/sglang/media_preprocess.h#L35)<!-- prefix: "std::vector<" --> · [Library target](../xmake.lua#L474)<!-- prefix: "target(\"sgla" --> |
+| Preprocessor | Select frames, resize, normalize, and pack patches. | [Public functions](../include/sglang/media_preprocess.h#L35)<!-- prefix: "std::vector<" --> · [Library target](../xmake.lua#L475)<!-- prefix: "target(\"sgla" --> |
 | Consumer | Read the owned patch buffer, grid, and video metadata. | [Result](../include/sglang/media_preprocess.h#L26)<!-- prefix: "struct Media" --> |
 
 ## Runtime path
@@ -104,7 +104,7 @@ build_dir="$PWD/build/media-preprocess"
 
 Expect sample indices `0 2 4 7`. To build only the library, select the target `sglang_media_preprocess`.
 The CPU targets link the C++ runtime. The project uses the provisioned Pixi environment for XMake configuration.
-[Check target](../xmake.lua#L488)<!-- prefix: "target(\"medi" --> · [Check driver](../tests/media/preprocess_check.cpp#L98)<!-- prefix: "void check(i" -->
+[Check target](../xmake.lua#L489)<!-- prefix: "target(\"medi" --> · [Check driver](../tests/media/preprocess_check.cpp#L98)<!-- prefix: "void check(i" -->
 
 For the numerical oracle, set `ORACLE_PYTHON` to an absolute interpreter path.
 Use a reference environment with CPU-capable PyTorch, torchvision, NumPy, and Transformers 5.19.0.

@@ -541,6 +541,21 @@ __global__ void batched_ragged_tmem_attention(const __grid_constant__ TmemAttent
                           batch.tiles.row(tile, index, flash_rows));
 }
 
+constexpr int max_physical_pages = INT_MAX / mxfp8_page_size + 1;
+
+std::optional<cudaError_t> ragged_device(cudaDeviceProp& properties) {
+    int device = 0;
+    if (const auto status = cudaGetDevice(&device); status != cudaSuccess) {
+        return status;
+    }
+    if (const auto status = cudaGetDeviceProperties(&properties, device); status != cudaSuccess) {
+        return status;
+    }
+    if (properties.major != 10 || properties.minor != 0 || properties.multiProcessorCount != 148) {
+        return std::nullopt;
+    }
+    return cudaPeekAtLastError();
+}
 }
 
 namespace gqa_prefill::tmem {
@@ -635,7 +650,6 @@ std::optional<cudaError_t> launch_tmem_prefill(Mxfp8KvCache cache, Mxfp8PageTabl
                                                int position, const Bf16* queries, Bf16* output,
                                                cudaStream_t stream, int rows) {
     constexpr auto dynamic_shared = sizeof(TmemFlashTile);
-    constexpr int max_physical_pages = INT_MAX / mxfp8_page_size + 1;
     if (position < 0 || rows < 1 || rows > flash_chunk || position > INT_MAX - rows) {
         return cudaErrorInvalidValue;
     }
@@ -651,19 +665,9 @@ std::optional<cudaError_t> launch_tmem_prefill(Mxfp8KvCache cache, Mxfp8PageTabl
         reinterpret_cast<std::uintptr_t>(cache.value_payload) % alignof(uint4)) {
         return std::nullopt;
     }
-    int device = 0;
-    if (auto status = cudaGetDevice(&device); status != cudaSuccess) {
-        return status;
-    }
     cudaDeviceProp properties{};
-    if (auto status = cudaGetDeviceProperties(&properties, device); status != cudaSuccess) {
+    if (const auto status = ragged_device(properties); !status || *status != cudaSuccess) {
         return status;
-    }
-    if (properties.major != 10 || properties.minor != 0 || properties.multiProcessorCount != 148) {
-        return std::nullopt;
-    }
-    if (const auto pending = cudaPeekAtLastError(); pending != cudaSuccess) {
-        return pending;
     }
     const bool tune_pipeline = visible <= max_multirow_visible_tokens;
     const bool before_flash = tune_pipeline && raw_pipeline_before_flash(cache, rows, visible);
@@ -733,37 +737,15 @@ std::optional<cudaError_t> launch_paired_tmem_prefill(
 
 std::optional<cudaError_t> decoder::launch_batched_ragged_tmem(
     const PagedPrefillSequence* sequences, int count, cudaStream_t stream) {
-    int device = 0;
-    auto status = cudaGetDevice(&device);
-    if (status != cudaSuccess) {
-        return status;
-    }
     cudaDeviceProp properties{};
-    status = cudaGetDeviceProperties(&properties, device);
-    if (status != cudaSuccess) {
+    if (const auto status = ragged_device(properties); !status || *status != cudaSuccess) {
         return status;
-    }
-    if (properties.major != 10 || properties.minor != 0 || properties.multiProcessorCount != 148) {
-        return std::nullopt;
-    }
-    if (const auto pending = cudaPeekAtLastError(); pending != cudaSuccess) {
-        return pending;
     }
     constexpr auto dynamic_shared = sizeof(TmemFlashTile);
-    const auto kernel = batched_ragged_tmem_attention;
-    cudaFuncAttributes attributes{};
-    status = cudaFuncGetAttributes(&attributes, kernel);
-    if (status != cudaSuccess) {
-        return flash_setup_error(status, paired_kernel_unavailable(status));
-    }
-    if (properties.sharedMemPerBlockOptin < dynamic_shared + attributes.sharedSizeBytes) {
-        return std::nullopt;
-    }
-    status = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                  dynamic_shared);
-    if (status != cudaSuccess) {
-        return flash_setup_error(status,
-            status == cudaErrorInvalidValue || paired_kernel_unavailable(status));
+    const auto* const kernel = reinterpret_cast<const void*>(batched_ragged_tmem_attention);
+    const auto prepared = prepare_flash_kernel(kernel, dynamic_shared, properties, true);
+    if (!prepared || *prepared != cudaSuccess) {
+        return prepared;
     }
     TmemAttentionBatch batch{};
     batch.tiles.count = count;
@@ -771,7 +753,6 @@ std::optional<cudaError_t> decoder::launch_batched_ragged_tmem(
     int tiles = 0;
     for (int index = 0; index < count; ++index) {
         const auto& sequence = sequences[index];
-        constexpr int max_physical_pages = INT_MAX / mxfp8_page_size + 1;
         if (sequence.cache.kv_heads != first_cache.kv_heads ||
             sequence.cache.page_count > max_physical_pages) {
             return std::nullopt;

@@ -216,15 +216,26 @@ std::optional<cudaError_t> prepare_gate_cluster(const void* kernel, const Launch
 CUresult encode_map(const LaunchTarget& target, CUtensorMap& map, const void* data,
                     CUtensorMapDataType type, int element_bytes, int rows, int width,
                     int box_rows) {
-    const cuuint64_t dimensions[] = {static_cast<cuuint64_t>(width), static_cast<cuuint64_t>(rows)};
-    const cuuint64_t stride[] = {static_cast<cuuint64_t>(width) * element_bytes};
-    const cuuint32_t box[] = {static_cast<cuuint32_t>(128 / element_bytes),
-                              static_cast<cuuint32_t>(box_rows)};
+    return encode_tiled_map(target.encode, map, data, {type, element_bytes, rows, width, box_rows},
+                            CU_TENSOR_MAP_L2_PROMOTION_L2_256B);
+}
+
+CUresult encode_tiled_map(PFN_cuTensorMapEncodeTiled_v12000 encode, CUtensorMap& map,
+                          const void* data, TiledMapShape shape, CUtensorMapL2promotion promotion) {
+    const cuuint64_t dimensions[] = {
+        static_cast<cuuint64_t>(shape.width),
+        static_cast<cuuint64_t>(shape.rows),
+    };
+    const cuuint64_t stride[] = {static_cast<cuuint64_t>(shape.width) * shape.element_bytes};
+    const cuuint32_t box[] = {
+        static_cast<cuuint32_t>(128 / shape.element_bytes),
+        static_cast<cuuint32_t>(shape.box_rows),
+    };
     const cuuint32_t element_stride[] = {1, 1};
-    return target.encode(&map, type, 2, const_cast<void*>(data), dimensions, stride, box,
-                         element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE,
-                         CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
-                         CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+    const auto address = reinterpret_cast<CUdeviceptr>(data);
+    return encode(&map, shape.type, 2, reinterpret_cast<void*>(address), dimensions, stride, box,
+                  element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
+                  promotion, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
 }
 
 cudaError_t launch_split(const void* kernel, dim3 grid, int shared_bytes, void** args,

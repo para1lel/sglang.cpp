@@ -63,28 +63,6 @@ void decoder::reclaim_prefill_workspaces(int device) {
     DeviceArena::current(device)->reclaim();
 }
 
-bool decoder::full_tile_prefill_grants(const PrefillGrant* grants, int count) {
-    if (count < 2 || grants[0].rows < batch_prefill_tile_rows) {
-        return false;
-    }
-    for (int index = 0; index < count; ++index) {
-        const auto& grant = grants[index];
-        if (grant.tile_rows != batch_prefill_tile_rows || grant.rows != grants[0].rows ||
-            grant.rows % batch_prefill_tile_rows != 0) {
-            return false;
-        }
-    }
-    return true;
-}
-
-PrefillGrant decoder::prefill_tile(PrefillGrant grant, int offset) {
-    grant.tokens += offset;
-    grant.position += offset;
-    grant.prompt_remaining -= offset;
-    grant.rows = batch_prefill_tile_rows;
-    return grant;
-}
-
 PrefillWorkspace::PrefillWorkspace(cudaStream_t stream, int capacity, GqaGeometry staged_geometry,
                                    int staged_visible, bool resident_staging)
     : stream_(stream), capacity_(capacity) {
@@ -132,7 +110,6 @@ PrefillWorkspace::PrefillWorkspace(cudaStream_t stream, int capacity, GqaGeometr
     }
     data_ = data;
     bytes_ = bytes;
-    layout_bytes_ = base;
     if (bytes != base) {
         auto* keys = static_cast<std::byte*>(data) + offset;
         staging_ = {keys, plane, keys + plane, values};
@@ -141,7 +118,6 @@ PrefillWorkspace::PrefillWorkspace(cudaStream_t stream, int capacity, GqaGeometr
 }
 
 std::size_t PrefillWorkspace::bytes() const { return bytes_; }
-std::size_t PrefillWorkspace::layout_bytes() const { return layout_bytes_; }
 cudaStream_t PrefillWorkspace::stream() const { return stream_; }
 int PrefillWorkspace::capacity() const { return capacity_; }
 void* PrefillWorkspace::data() const { return data_; }

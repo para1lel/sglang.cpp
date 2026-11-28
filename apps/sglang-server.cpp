@@ -60,8 +60,9 @@ struct Arguments {
     bool trace_batches = false;
     bool enable_response_store = false;
 
-    bool enable_batch_cuda_graphs() const { return !eager && tensor_parallel == 1; }
-
+    bool enable_batch_cuda_graphs() const {
+        return !eager;
+    }
 };
 
 void print_tp_receipt(const sglang::Decoder& decoder) {
@@ -82,6 +83,10 @@ void print_tp_receipt(const sglang::Decoder& decoder) {
                   << " weights=" << entry.weight_bytes
                   << " lm_head=" << (entry.lm_head ? 1 : 0)
                   << " mtp=" << (entry.mtp ? 1 : 0) << '\n';
+        std::cerr << "tp2 draft rank=" << rank << " bytes=" << entry.draft_weight_bytes
+                  << " vocab_begin=" << entry.draft_vocab_begin
+                  << " vocab_rows=" << entry.draft_vocab_rows
+                  << " kv_heads=" << entry.draft_kv_heads << '\n';
     }
     std::cerr << "tp2 world=" << info->world_size << " ranks="
               << info->world_size << '\n';
@@ -387,8 +392,7 @@ void print_usage() {
               << " by default, range 1-32768.\n"
                  "MTP steps: 4 by default, range 0-4. --mtp-k is an alias.\n"
                  "Tensor parallel: 1 by default. --tp 2 shards the model across\n"
-                 "the device and its successor; MTP drafting stays on rank 0 and\n"
-                 "decode runs eager (no CUDA graphs) under tensor parallel.\n"
+                 "the device and its successor.\n"
                  "Eligible greedy output logprobs use the configured MTP depth.\n"
                  "Batch graphs: enabled by default for eligible decode steps.\n"
                  "Eager decode: disable graph replay.\n"

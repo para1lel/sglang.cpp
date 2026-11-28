@@ -11,7 +11,7 @@ The CUDA backend accepts `sm_100` devices. The exact `NVIDIA B200` name enables 
 | --- | --- | --- |
 | Model | `QwenTextModel` defines checkpoint identity, geometry, and layers. | [Model descriptor](../include/sglang/runtime/model/qwen_text_model.h#L7)<!-- prefix: "struct QwenT" --> |
 | Backend | `CudaBackendPolicy` resolves device capabilities. The CUDA backend owns allocation, stream, graph, and deferred cleanup primitives. `DecoderExecutionPolicy` selects operators within request limits. | [Backend capabilities](../include/sglang/runtime/backend/cuda_backend_policy.h#L22)<!-- prefix: "struct CudaB" --> · [Execution policy](../include/sglang/runtime/execution/decoder_execution_policy.h#L7)<!-- prefix: "struct Decod" --> |
-| Service | Startup supplies the executor to the scheduler. The scheduler owns admission and output publication. The executor owns the worker session and reports topology. | [Executor contract](../include/sglang/runtime/server/batch_executor.h#L9)<!-- prefix: "class BatchE" --> · [Session contract](../include/sglang/runtime/server/batch_session.h#L17)<!-- prefix: "class BatchS" --> · [Topology](../include/sglang/server/batch_service.h#L128)<!-- prefix: "BatchTopolog" --> |
+| Service | Startup supplies the executor to the scheduler. The scheduler owns admission and output publication. The executor owns the worker session and reports topology. | [Executor contract](../include/sglang/runtime/server/batch_executor.h#L9)<!-- prefix: "class BatchE" --> · [Session contract](../include/sglang/runtime/server/batch_session.h#L17)<!-- prefix: "class BatchS" --> · [Topology](../include/sglang/server/batch_service.h#L129)<!-- prefix: "BatchTopolog" --> |
 | HTTP | The Qwen serving profile selects the tokenizer, templates, parser, and tool constraints. The scheduler's state, trace serialization, and output mailbox are private to HTTP. | [Serving profile](../apps/server/qwen/qwen_serving_profile.cpp#L134)<!-- prefix: "const Servin" --> · [Service state](../include/sglang/server/detail/batch_service_state.h#L88)<!-- prefix: "struct Batch" --> |
 | Prefix cache | `KvResidencyPolicy` accounts for request reservations. `PrefixResidency` manages separate GQA pages and GDN checkpoints. LMCache stores pressure backups and restores them on demand. | [Prefix cache](prefix-cache.md) · [Request residency](../include/sglang/runtime/cache/kv_residency_policy.h#L15)<!-- prefix: "class KvResi" --> · [GPU pools](serving/request-memory.md) |
 | Build | Use XMake, default Pixi, user CUDA 13.4 compatibility libraries, and the host driver. Use private output and cache directories for concurrent work. | [Host build](../README.md#build-on-the-project-host) · [Isolated XMake builds](serving/isolated-builds.md) |
@@ -71,9 +71,9 @@ static_assert(geometry.query_heads == sglang::mxfp8_queries_per_kv_head * geomet
 
 Link `sglang_cuda`. Apply RoPE to Q and K. Append contiguous BF16 K and V `[tokens, 4, 256]`. Pass the ready prefix length and first query position to `mxfp8_gqa_attention`. BF16 Q and output are `[queries, 24, 256]`. Row `r` sees through `first_query_position + r` inclusive. Check launch status. Retain storage through stream completion. [Library](../xmake.lua#L136)<!-- prefix: "target(\"sgla" --> · [Append](../include/sglang/mxfp8_gqa.h#L45)<!-- prefix: "cudaError_t " --> · [Attention](../include/sglang/mxfp8_gqa.h#L50)<!-- prefix: "cudaError_t " -->
 
-For group maximum magnitude `amax`, clamp `ceil(log2(max(amax, 1e-30) / 448)) + 127` to `[0, 254]`. See the [scratch-free reader](singleton-gqa-decode.md#scratch-free-ordered-attention) for direct attention. [Scale calculation](../src/text/gqa/kv_append.cu#L15)<!-- prefix: "__device__ i" -->
+For group maximum magnitude `amax`, clamp `ceil(log2(max(amax, 1e-30) / 448)) + 127` to `[0, 254]`. See the [scratch-free reader](singleton-gqa-decode.md#scratch-free-ordered-attention) for direct attention. [Scale calculation](../src/text/gqa/kv_append.cu#L14)<!-- prefix: "__device__ i" -->
 
-Exact scoring reduces eight groups in FP32, sums in group order, and scales by `1/16`. Ordered replay uses token-ordered FMAs and divides in FP32 before BF16 rounding. [Score](../src/mxfp8_gqa.cu#L52)<!-- prefix: "__device__ _" --> · [Replay](../src/mxfp8_gqa.cu#L230)<!-- prefix: "__device__ v" -->
+Exact scoring reduces eight groups in FP32, sums in group order, and scales by `1/16`. Ordered replay uses token-ordered FMAs and divides in FP32 before BF16 rounding. [Score](../src/mxfp8_gqa.cu#L51)<!-- prefix: "__device__ _" --> · [Replay](../src/mxfp8_gqa.cu#L229)<!-- prefix: "__device__ v" -->
 
 See [singleton and grouped split decode](singleton-gqa-decode.md) for current routes, and [archived packed decode](long-paged-decode.md#fused-packed-gqa) for the former K0 implementation.
 
@@ -112,9 +112,9 @@ The [checkpoint loader](../include/sglang/checkpoint.h#L24)<!-- prefix: "class C
 
 ### Runtime path
 
-The shared layer loop uses the model layout to select each layer's KV or GDN bank. Tile and row adapters supply buffers and operator dispatch. The outer paths own embedding, draft seeding, and scoring. [Layer mapping](../src/runtime/model/qwen_text_model.cpp#L13)<!-- prefix: "QwenTextMode" --> · [Execution bank selection](../src/decoder_prefill.cpp#L32)<!-- prefix: "const auto r" --> · [Tile adapter](../src/decoder_prefill.cpp#L649)<!-- prefix: "run_layers(" --> · [Row adapter](../src/decoder_forward.cpp#L75)<!-- prefix: "void Decoder" -->
+The shared layer loop uses the model layout to select each layer's KV or GDN bank. Tile and row adapters supply buffers and operator dispatch. The outer paths own embedding, draft seeding, and scoring. [Layer mapping](../src/runtime/model/qwen_text_model.cpp#L13)<!-- prefix: "QwenTextMode" --> · [Execution bank selection](../src/decoder_prefill.cpp#L29)<!-- prefix: "const auto r" --> · [Tile adapter](../src/decoder_prefill.cpp#L416)<!-- prefix: "model.backen" --> · [Row adapter](../src/decoder_forward.cpp#L77)<!-- prefix: "void Decoder" -->
 
-Serial K0 reuses its stream and grows storage on demand. Prefill rebuilds [MXFP8 pages](#p2-gqa-cache-contract) with an identity page table. Reset clears BF16 convolution history and FP32 recurrent state across the GDN layers. The final prompt row supplies the initial logits. Overlapping calls use private eager storage. [Generation loop](../src/decoder.cpp#L720)<!-- prefix: "void Decoder" --> · [State reset](../src/runtime/model/qwen_request.cpp#L416)<!-- prefix: "void Request" -->
+Serial K0 reuses its stream and grows storage on demand. Prefill rebuilds [MXFP8 pages](#p2-gqa-cache-contract) with an identity page table. Reset clears BF16 convolution history and FP32 recurrent state across the GDN layers. The final prompt row supplies the initial logits. Overlapping calls use private eager storage. [Generation loop](../src/decoder.cpp#L741)<!-- prefix: "void Decoder" --> · [State reset](../src/runtime/model/qwen_request.cpp#L421)<!-- prefix: "void Request" -->
 
 Use the feature contracts for dispatch and numerical details.
 
@@ -133,7 +133,7 @@ The decoder retains CUDA resources and transfer buffers while completion is unce
 
 Workspace sizing, row-wise fallback, and pool retention are documented with the prefill allocation contract. [Prefill workspace](native-prefill-workspace.md#constraints-and-failure-behavior)
 
-Use `--top-logits N` for raw scores sorted by descending score then ascending ID. [Logit output](../apps/sglang-generate.cpp#L282)<!-- prefix: "void write_r" -->
+Use `--top-logits N` for raw scores sorted by descending score then ascending ID. [Logit output](../apps/sglang-generate.cpp#L286)<!-- prefix: "void write_r" -->
 
 ### Verification
 
@@ -163,9 +163,9 @@ Run the [prefill checks](../tests/prefill/README.md). Compare exact scoring and 
 
 ## Native streaming server
 
-Use `--max-active` for the 1–32 HTTP lane limit and `--max-num-batched-tokens` for the 1–32,768 aggregate step budget. `--gpu-memory-utilization` sets the arena’s startup HBM fraction and defaults to `0.88`. `--prefix-gqa-pages` and `--prefix-gdn-slots` default to automatic sizing. Verify caps at `/health` and resolved settings at `/server_info`. [CLI limits](../apps/sglang-server.cpp#L202)<!-- prefix: "} else if (o" --> · [HTTP transport](http-server.md) · [Server information](native-model-info.md#server-information)
+Use `--max-active` for the 1–32 HTTP lane limit and `--max-num-batched-tokens` for the 1–32,768 aggregate step budget. `--gpu-memory-utilization` sets the arena’s startup HBM fraction and defaults to `0.88`. `--prefix-gqa-pages` and `--prefix-gdn-slots` default to automatic sizing. Verify caps at `/health` and resolved settings at `/server_info`. [CLI limits](../apps/sglang-server.cpp#L207)<!-- prefix: "} else if (o" --> · [HTTP transport](http-server.md) · [Server information](native-model-info.md#server-information)
 
-Startup injects the Qwen serving profile and a batch executor into `BatchService`. The worker owns the batch and topology. Startup waits for the first cache snapshot. Shutdown closes the queue and wakes the worker before joining. [Composition](../apps/sglang-server.cpp#L408)<!-- prefix: "auto executo" --> · [Executor lifecycle](../src/runtime/server/single_device_batch_executor.cpp#L84)<!-- prefix: "void SingleD" --> · [Startup handshake](../apps/server/batch_service.cpp#L41)<!-- prefix: "void BatchSe" -->
+Startup injects the Qwen serving profile and a batch executor into `BatchService`. The worker owns the batch and topology. Startup waits for the first cache snapshot. Shutdown closes the queue and wakes the worker before joining. [Composition](../apps/sglang-server.cpp#L412)<!-- prefix: "auto executo" --> · [Executor lifecycle](../src/runtime/server/single_device_batch_executor.cpp#L84)<!-- prefix: "void SingleD" --> · [Startup handshake](../apps/server/batch_service.cpp#L41)<!-- prefix: "void BatchSe" -->
 
 The scheduler uses the session for admission, cancellation, and whole batch steps. The [batch planner](batch-graphs.md#runtime-path) allocates rows. Operator dispatch runs within each planned step. Lanes share device weights and own request KV, GDN state, and output. The [resident-memory limit](batch-graphs.md#resident-memory-admission) applies separately from row and lane limits. [Scheduler loop](../apps/server/batch_service.cpp#L295)<!-- prefix: "void BatchSe" -->
 

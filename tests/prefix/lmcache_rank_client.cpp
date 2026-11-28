@@ -8,6 +8,8 @@
 #include <string_view>
 #include <vector>
 
+#include <unistd.h>
+
 using namespace sglang::decoder;
 
 namespace {
@@ -57,7 +59,7 @@ PrefixDeviceTransfer transfer(const PrefixCacheLayout& layout, int end, bool dra
     if (parts == Parts::all)
         planes(view.layout.gqa, {end, 16, layout.kv_heads});
     if (parts != Parts::gdn && draft && layout.draft_lane && end > 1)
-        planes(view.layout.draft, {end - 1, 1, 4});
+        planes(view.layout.draft, {end - 1, 1, layout.kv_heads});
     if (parts == Parts::draft)
         return view;
     view.layout.gdn.end = end;
@@ -72,9 +74,10 @@ struct Rank {
     PrefixCacheLayout layout;
     PrefixCacheKeys keys;
 
-    Rank(int world, int rank) : layout(world == 1 ? tp1_prefix_cache_layout
-                                                 : tp2_prefix_cache_layout(rank)),
-        keys(std::vector<int>(prompt_rows, 42), "cpu-rank-test", nullptr, &layout) {}
+    Rank(int world, int rank)
+        : layout(world == 1 ? tp1_prefix_cache_layout : tp2_prefix_cache_layout(rank)),
+          keys(std::vector<int>(prompt_rows, 42), "cpu-rank-test", nullptr, &layout) {
+    }
 };
 
 void print_lookup(const PrefixCacheRead& match, std::string_view op) {
@@ -92,18 +95,38 @@ void print_lookup(const PrefixCacheRead& match, std::string_view op) {
     std::cout << '\n';
 }
 
-void get(const LmCacheGroup& group, const std::vector<const PrefixCacheKeys*>& keys,
-         const std::vector<const PrefixDeviceTransfer*>& transfers) {
-    LmCacheReceipt receipt;
-    const auto status = group.retrieve(keys, transfers, &receipt);
+void report_transfer(LmCacheStatus status, const LmCacheReceipt& receipt) {
     if (status == LmCacheStatus::miss) {
+        if (receipt.gqa_written_tokens != 0)
+            throw std::runtime_error("ranked miss reported written GQA");
         std::cout << "miss\n";
     } else if (status == LmCacheStatus::complete) {
         std::cout << receipt.bytes[0] << ' ' << receipt.bytes[1] << ' ' << receipt.bytes[2] << ' '
                   << receipt.gqa_written_tokens << '\n';
     } else {
-        throw std::runtime_error("ranked GET declined");
+        throw std::runtime_error("ranked transfer declined");
     }
+}
+
+void transfer_joint(const LmCacheGroup& group, const Rank& first, const Rank& second, int end,
+                    bool draft, std::string_view op) {
+    auto parts = op == "get" ? Parts::all : Parts::draft;
+    if (op == "get-gdn")
+        parts = Parts::gdn;
+    const auto a = transfer(first.layout, end, draft, parts);
+    const auto b = transfer(second.layout, end, draft && op != "get-no-peer", parts);
+    std::vector<const PrefixCacheKeys*> keys{&first.keys};
+    std::vector<const PrefixDeviceTransfer*> transfers{&a};
+    if (first.layout.world_size == 2) {
+        keys.push_back(&second.keys);
+        transfers.push_back(&b);
+    }
+    LmCacheReceipt receipt;
+    const auto status = op == "store-joint-draft"
+                            ? group.store(keys, transfers, &receipt)
+                            : group.retrieve(keys, transfers, &receipt, nullptr,
+                                             op == "get-cancel" ? STDIN_FILENO : -1);
+    report_transfer(status, receipt);
 }
 
 void store_tail(const LmCacheGroup& group, const Rank& lane, int rank) {
@@ -162,14 +185,9 @@ int run(int argc, const char* const* argv) {
         keys.push_back(&second.keys);
     if (op == "lookup" || op == "draft-inventory" || op == "draft-coverage") {
         print_lookup(group.lookup_prefix(keys, end, draft), op);
-    } else if (op == "get" || op == "get-gdn") {
-        const auto parts = op == "get-gdn" ? Parts::gdn : Parts::all;
-        const auto a = transfer(first.layout, end, draft, parts);
-        const auto b = transfer(second.layout, end, draft, parts);
-        std::vector<const PrefixDeviceTransfer*> transfers{&a};
-        if (world == 2)
-            transfers.push_back(&b);
-        get(group, keys, transfers);
+    } else if (op == "get" || op == "get-gdn" || op == "get-draft" || op == "get-no-peer" ||
+               op == "get-cancel" || op == "store-joint-draft") {
+        transfer_joint(group, first, second, end, draft, op);
     } else if (op == "store-tail") {
         store_tail(group, lane, rank);
     } else if (op == "store" || op == "store-gdn" || op == "store-draft" ||

@@ -1,28 +1,40 @@
 """Check native parallel sampling with the scripted CPU decoder."""
 
-from contextlib import closing
-import http.client
+from __future__ import annotations
+
 import json
 import time
 import unittest
+from contextlib import closing
+from typing import TYPE_CHECKING
 from unittest.mock import patch
 from uuid import UUID
 
 from test_native_generate_cpu import (
-    ABORTED, ABORT_REQUEST, GENERATE, abort, batch_frame, generate_client, named,
+    ABORT_REQUEST,
+    ABORTED,
+    GENERATE,
+    abort,
+    batch_frame,
+    generate_client,
+    named,
+    raw_response,
 )
-from test_sampling_routes_cpu import receipts, run_cpu_suite, send, server
+from test_native_generated_logprobs_cpu import scripted_server
+from test_sampling_routes_cpu import receipts, run_cpu_suite, send, server, wire
+
+if TYPE_CHECKING:
+    from http.client import HTTPResponse
 
 
 class NativeParallelSampling(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        scripted = cls.output / "token-ids.txt"
-        scripted.write_text("-41 32 33\n-42 34 35\n")
-        cls.enterClassContext(patch.dict("os.environ", SGLANG_TEST_CHAT_OUTPUT_IDS=str(scripted)))
+        scripts = {-41: [32, 33], -42: [34, 35]}
         cls.log = cls.output / "parallel.log"
-        cls.port = cls.enterClassContext(server(cls.binary, cls.checkpoint, cls.log,
-                                               "--max-active", "1"))
+        cls.port = cls.enterClassContext(
+            scripted_server(cls, "token-ids.txt", scripts, cls.log, "--max-active", "1")
+        )
 
     def generate(self, payload, *, port=None):
         status, result = send(self.port if port is None else port, GENERATE, payload)
@@ -37,6 +49,24 @@ class NativeParallelSampling(unittest.TestCase):
             self.assertEqual(parsed.hex, rid)
             self.assertEqual(parsed.version, 4)
         return ids
+
+    def first_two_samples(self, stream: HTTPResponse) -> list[dict[str, object]]:
+        self.assertEqual(stream.status, 200)
+        frames = sorted((batch_frame(stream), batch_frame(stream)), key=lambda item: item["index"])
+        self.assertEqual([item["index"] for item in frames], [0, 1])
+        self.assertTrue(all(item["meta_info"]["finish_reason"] is None for item in frames))
+        return frames
+
+    def check_cancelled_sample(self, stream: HTTPResponse, rid: str) -> None:
+        terminal = batch_frame(stream)
+        self.assertEqual(terminal["meta_info"]["id"], rid)
+        self.assertEqual(terminal["meta_info"]["finish_reason"], ABORTED)
+        self.assertEqual(terminal["output_ids"], [32])
+
+    def check_id_conflict(self, port: int, payload: dict[str, object], rid: str) -> None:
+        status, result = send(port, GENERATE, payload)
+        self.assertEqual(status, 400, result)
+        self.assertIn(f"Duplicate request ID detected: {rid}", result["error"]["message"])
 
     def test_scalar_results_and_n_one(self):
         params = {"n": 2, "max_new_tokens": 2, "sampling_seed": -41}
@@ -152,15 +182,9 @@ class NativeParallelSampling(unittest.TestCase):
         gate.with_suffix(".0").touch()
         with patch.dict("os.environ", SGLANG_TEST_BATCH_STEP_GATE=str(gate)), \
              server(self.binary, self.checkpoint, log, "--max-active", "2") as port:
-            with closing(generate_client(port, payload)) as client, \
-                 http.client.HTTPResponse(client) as stream:
-                stream.begin()
-                self.assertEqual(stream.status, 200)
-                first = sorted((batch_frame(stream), batch_frame(stream)),
-                               key=lambda item: item["index"])
-                self.assertEqual([item["index"] for item in first], [0, 1])
+            with closing(generate_client(port, payload)) as client, raw_response(client) as stream:
+                first = self.first_two_samples(stream)
                 self.assertTrue(all(item["output_ids"] == [32] for item in first))
-                self.assertTrue(all(item["meta_info"]["finish_reason"] is None for item in first))
                 admitted = [line for line in log.read_text().splitlines()
                             if line.startswith("cpu admit ")]
                 self.assertEqual(admitted, ["cpu admit slot=0 prompt=1 budget=2",
@@ -196,30 +220,31 @@ class NativeParallelSampling(unittest.TestCase):
             self.check_disconnect(port, payload, log)
 
     def abort_id(self, port, rid):
-        with closing(http.client.HTTPConnection("127.0.0.1", port, timeout=5)) as client:
-            client.request("POST", ABORT_REQUEST, json.dumps({"rid": rid}),
-                           {"Content-Type": "application/json"})
-            with client.getresponse() as response:
-                self.assertEqual(response.status, 200)
-                self.assertEqual(response.read(), b"")
+        status, _, body = wire(
+            port,
+            "POST",
+            ABORT_REQUEST,
+            json.dumps({"rid": rid}),
+            {"Content-Type": "application/json"},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body, b"")
 
     def test_normalized_ids_checked_against_live_requests(self):
         gate = self.output / "duplicate-step"
         gate.with_suffix(".0").touch()
         log = self.output / "duplicate.log"
         active = named(["collision_2"]) | {"input_ids": [[32]]}
-        with patch.dict("os.environ", SGLANG_TEST_BATCH_STEP_GATE=str(gate)), \
-             server(self.binary, self.checkpoint, log, "--max-active", "2") as port, \
-             closing(generate_client(port, active)) as client, \
-             http.client.HTTPResponse(client) as stream:
-            stream.begin()
+        with (
+            patch.dict("os.environ", SGLANG_TEST_BATCH_STEP_GATE=str(gate)),
+            server(self.binary, self.checkpoint, log, "--max-active", "2") as port,
+            closing(generate_client(port, active)) as client,
+            raw_response(client) as stream,
+        ):
             self.assertEqual(batch_frame(stream)["meta_info"]["id"], "collision_2")
             parallel = {"text": "A", "sampling_params": {"n": 3, "max_new_tokens": 0}}
             for rid in ("collision", ["collision_2"]):
-                status, result = send(port, GENERATE, parallel | {"rid": rid})
-                self.assertEqual(status, 400, result)
-                self.assertIn("Duplicate request ID detected: collision_2",
-                              result["error"]["message"])
+                self.check_id_conflict(port, parallel | {"rid": rid}, "collision_2")
             self.assertEqual(len(receipts(log)), 1)
             result = self.generate(parallel | {"rid": "collision_2"}, port=port)
             self.assertEqual(len(result), 3)
@@ -234,56 +259,44 @@ class NativeParallelSampling(unittest.TestCase):
         log = self.output / "terminal-parent.log"
         active = named("owner", budget=41)
         active["sampling_params"]["n"] = 2
-        with patch.dict("os.environ", SGLANG_TEST_BATCH_STEP_GATE=str(gate)), \
-             server(self.binary, self.checkpoint, log, "--max-active", "3") as port, \
-             closing(generate_client(port, active)) as client, \
-             http.client.HTTPResponse(client) as stream:
-            stream.begin()
-            self.assertEqual(stream.status, 200)
-            first = sorted((batch_frame(stream), batch_frame(stream)),
-                           key=lambda item: item["index"])
-            self.assertEqual([item["index"] for item in first], [0, 1])
-            self.assertTrue(all(item["meta_info"]["finish_reason"] is None for item in first))
+        with (
+            patch.dict("os.environ", SGLANG_TEST_BATCH_STEP_GATE=str(gate)),
+            server(self.binary, self.checkpoint, log, "--max-active", "3") as port,
+            closing(generate_client(port, active)) as client,
+            raw_response(client) as stream,
+        ):
+            first = self.first_two_samples(stream)
             old_ids = self.sample_ids(first)
             retired, sibling = (item["meta_info"]["id"] for item in first)
             parallel = {"input_ids": [[32], [32]], "rid": [retired, "unowned"],
                         "sampling_params": {"n": 2, "max_new_tokens": 0}}
             admitted = len(receipts(log))
-            status, error = send(port, GENERATE, parallel)
-            self.assertEqual(status, 400, error)
-            self.assertIn(f"Duplicate request ID detected: {retired}", error["error"]["message"])
+            self.check_id_conflict(port, parallel, retired)
             self.assertEqual(len(receipts(log)), admitted)
 
             self.abort_id(port, retired)
-            terminal = batch_frame(stream)
-            self.assertEqual(terminal["meta_info"]["id"], retired)
-            self.assertEqual(terminal["meta_info"]["finish_reason"], ABORTED)
-            self.assertEqual(terminal["output_ids"], [32])
+            self.check_cancelled_sample(stream, retired)
             self.abort_id(port, retired)
             result = self.generate(parallel, port=port)
             self.assertEqual(len(result), 4)
             self.assertTrue(self.sample_ids(result).isdisjoint(old_ids | {"unowned"}))
             self.assertTrue(all(item["output_ids"] == [] for item in result))
-            status, error = send(port, GENERATE, parallel | {"rid": [retired, sibling]})
-            self.assertEqual(status, 400, error)
-            self.assertIn(f"Duplicate request ID detected: {sibling}", error["error"]["message"])
+            self.check_id_conflict(port, parallel | {"rid": [retired, sibling]}, sibling)
 
             replacement = {"input_ids": [[32], [32]], "rid": [retired, "companion"],
                            "sampling_params": [{"max_new_tokens": 42, "sampling_seed": -41},
                                                {"max_new_tokens": 0}], "stream": True}
-            with closing(generate_client(port, replacement)) as other, \
-                 http.client.HTTPResponse(other) as new_stream:
-                new_stream.begin()
+            with (
+                closing(generate_client(port, replacement)) as other,
+                raw_response(other) as new_stream,
+            ):
                 self.assertEqual(new_stream.status, 200)
                 first_replacement = batch_frame(new_stream)
                 self.assertEqual(first_replacement["index"], 0)
                 self.assertEqual(first_replacement["meta_info"]["id"], retired)
                 self.assertIsNone(first_replacement["meta_info"]["finish_reason"])
                 self.abort_id(port, sibling)
-                old_terminal = batch_frame(stream)
-                self.assertEqual(old_terminal["meta_info"]["id"], sibling)
-                self.assertEqual(old_terminal["meta_info"]["finish_reason"], ABORTED)
-                self.assertEqual(old_terminal["output_ids"], [32])
+                self.check_cancelled_sample(stream, sibling)
                 self.assertEqual(batch_frame(stream), "[DONE]")
                 self.assertIsNone(batch_frame(stream))
                 companion = batch_frame(new_stream)
@@ -292,17 +305,13 @@ class NativeParallelSampling(unittest.TestCase):
                 self.assertEqual(status, 400, error)
                 self.assertIn("Duplicate request ID", error["error"]["message"])
                 self.abort_id(port, retired)
-                terminal = batch_frame(new_stream)
-                self.assertEqual(terminal["meta_info"]["id"], retired)
-                self.assertEqual(terminal["meta_info"]["finish_reason"], ABORTED)
-                self.assertEqual(terminal["output_ids"], [32])
+                self.check_cancelled_sample(new_stream, retired)
                 self.assertEqual(batch_frame(new_stream), "[DONE]")
                 self.assertIsNone(batch_frame(new_stream))
 
     def check_disconnect(self, port, payload, log):
         with closing(generate_client(port, payload)) as client:
-            with http.client.HTTPResponse(client) as stream:
-                stream.begin()
+            with raw_response(client) as stream:
                 self.assertEqual(stream.status, 200)
                 self.assertEqual({batch_frame(stream)["index"] for _ in range(2)}, {0, 1})
             abort(client)

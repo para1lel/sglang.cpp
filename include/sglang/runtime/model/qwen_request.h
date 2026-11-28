@@ -119,7 +119,6 @@ struct Request {
     void materialize_gdn(cudaStream_t stream);
     void prepare_minimum_stops(const DecoderOptions& options, cudaStream_t stream);
     void prepare_logit_adjustments(const DecoderOptions& options, cudaStream_t stream);
-    ExactGqaWorkspace batch_graph_scores();
 
     std::vector<std::uint32_t> minimum_stop_upload;
     PrefixPages shared_prefix_pages;
@@ -136,7 +135,6 @@ struct Request {
     bool prefix_checkpoint_outputs = false;
     GdnBank states;
     GdnReplayBank gdn_replay{};
-    std::optional<ExactGqaWorkspace> long_graph_scores;
     std::byte* sampling_workspace = nullptr;
     ConstraintWorkspace constraint_workspace;
     const DecoderLogitBias* logit_bias = nullptr;

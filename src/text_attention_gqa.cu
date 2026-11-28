@@ -4,7 +4,6 @@
 #include "sglang/text/gqa_verify_batch.h"
 #include "sglang/text/mtp/draft_batch_ops.h"
 #include "sglang/text/quantization/quantize_warp.cuh"
-#include "sglang/runtime/execution/tp_verify_graph.h"
 
 #include <cuda_runtime.h>
 
@@ -124,10 +123,12 @@ __global__ void gqa_verify_preprocess_kernel(
                         row.q_gate, row.keys, q_norm, k_norm, row.rope_queries, row.rope_keys);
 }
 
-__global__ void live_preprocess(
-    const __grid_constant__ decoder::GqaVerifyRows<decoder::GqaVerifyPreprocessRow> batch,
-    const int* rotary, int query_heads, int kv_heads,
-    const __nv_bfloat16* q_norm, const __nv_bfloat16* k_norm) {
+__global__ void
+live_preprocess(const __grid_constant__ decoder::GqaVerifyRows<decoder::GqaVerifyPreprocessRow,
+                                                               decoder::max_wide_mtp_rows>
+                    batch,
+                const int* rotary, int query_heads, int kv_heads, const __nv_bfloat16* q_norm,
+                const __nv_bfloat16* k_norm) {
     const auto& row = batch.rows[blockIdx.x];
     gqa_preprocess_head(rotary[blockIdx.x], 0, blockIdx.y, query_heads, kv_heads,
                         row.q_gate, row.keys, q_norm, k_norm, row.rope_queries, row.rope_keys);
@@ -529,19 +530,24 @@ cudaError_t decoder::gqa_verify_preprocess(
                             mxfp8_head_dim, arguments, 0, stream);
 }
 
-cudaError_t decoder::tp_verify_graph::preprocess(
-    const GqaVerifyRows<GqaVerifyPreprocessRow>& batch, const int* rotary, GqaGeometry geometry,
-    const Bf16* q_norm, const Bf16* k_norm, cudaStream_t stream) {
+cudaError_t decoder::gqa_verify_preprocess_bound(
+    const GqaVerifyRows<GqaVerifyPreprocessRow, max_wide_mtp_rows>& batch, int rows,
+    const int* rotary, GqaGeometry geometry, const Bf16* q_norm, const Bf16* k_norm,
+    cudaStream_t stream) {
     live_preprocess<<<dim3(rows, geometry.query_heads + geometry.kv_heads),
                       mxfp8_head_dim, 0, stream>>>(
         batch, rotary, geometry.query_heads, geometry.kv_heads, q_norm, k_norm);
     return cudaPeekAtLastError();
 }
 
-cudaError_t decoder::draft_verify_preprocess_keys(
-    const GqaVerifyRows<GqaVerifyPreprocessRow>& batch, int count,
-    const __nv_bfloat16* k_norm, cudaStream_t stream) {
-    if (count <= 0 || count > target_split_eager_max_rows || !k_norm) {
+cudaError_t
+decoder::draft_verify_preprocess_keys(const GqaVerifyRows<GqaVerifyPreprocessRow>& batch, int count,
+                                      const __nv_bfloat16* k_norm, cudaStream_t stream,
+                                      GqaGeometry geometry) {
+    int query_heads = 0;
+    int kv_heads = 0;
+    if (count <= 0 || count > target_split_eager_max_rows || k_norm == nullptr ||
+        !gqa_heads(geometry, query_heads, kv_heads)) {
         return cudaErrorInvalidValue;
     }
     for (int index = 0; index < count; ++index) {
@@ -549,8 +555,7 @@ cudaError_t decoder::draft_verify_preprocess_keys(
         if (row.position < 0 || row.position >= text_attention_max_tokens ||
             !row.keys || !row.rope_keys) return cudaErrorInvalidValue;
     }
-    int query_heads = 0;
-    int kv_heads = mxfp8_kv_heads;
+    query_heads = 0;
     const __nv_bfloat16* q_norm = nullptr;
     void* args[] = {const_cast<GqaVerifyRows<GqaVerifyPreprocessRow>*>(&batch), &query_heads,
                     &kv_heads, &q_norm, &k_norm};

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "sglang/multimodal_prompt.h"
+#include "sglang/runtime/model/qwen_text_model.h"
 #include "sglang/text/gqa/geometry.cuh"
 #include "sglang/text_attention.h"
 #include "sglang/text_ops.h"
@@ -44,9 +45,9 @@ cudaError_t decode_bf16_lm_head(const __nv_bfloat16* weight, const __nv_bfloat16
 cudaError_t quantize_draft_head_int8(const __nv_bfloat16* input, int rows,
                                     std::uint8_t* values, float* maxima, cudaStream_t stream);
 cudaError_t decode_draft_head_int8(const std::uint8_t* weight, const float* weight_maxima,
-                                  const __nv_bfloat16* input, std::uint8_t* input_values,
-                                  float* input_maximum,
-                                  __nv_bfloat16* output, cudaStream_t stream);
+                                   const __nv_bfloat16* input, std::uint8_t* input_values,
+                                   float* input_maximum, __nv_bfloat16* output, cudaStream_t stream,
+                                   int vocabulary_rows = qwen_text_model.vocab_size);
 struct DraftInt8Projection {
     const __nv_bfloat16* input;
     std::uint8_t* values;
@@ -67,8 +68,9 @@ struct DraftArgmaxRows {
 cudaError_t draft_argmax_wave(DraftArgmaxRows rows, int count, int width, bool finite,
                               cudaStream_t stream);
 cudaError_t decode_draft_head_int8_batch(const std::uint8_t* weight, const float* weight_maxima,
-                                        const DraftInt8Projection* rows, int count,
-                                        cudaStream_t stream);
+                                         const DraftInt8Projection* rows, int count,
+                                         cudaStream_t stream,
+                                         int vocabulary_rows = qwen_text_model.vocab_size);
 using DecodeHeadProjections = std::array<TextBf16Projection, 4>;
 cudaError_t decode_bf16_lm_head_batch(const __nv_bfloat16* weight, int rows, int width,
                                      const DecodeHeadProjections& projections,

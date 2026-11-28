@@ -50,6 +50,8 @@ SCALE_PLANE = 2
 ARMED = 4
 REJECTED = 2
 SLAB_COUNT = 2
+MISS = 1
+REPLAY_SEED = 1000
 Handles = list[tuple[bytes, int]]
 GdnPlanes = tuple[tuple[int, int, int], ...]
 
@@ -109,13 +111,28 @@ class Cache:
                         ]
 
 
+@dataclass(frozen=True)
+class Layout:
+    views: tuple[Cache, Cache]
+    gdn: GdnPlanes
+    sizes: list[int]
+
+    def receipt(self, *, store: bool) -> tuple[int, int, int, int]:
+        gqa, draft = self.views
+        gqa_rows = gqa.end - gqa.begin
+        return (
+            gqa_rows * gqa.heads * 528 * gqa.layers,
+            sum(width for _, _, width in self.gdn),
+            (draft.end - draft.begin) * draft.heads * 528 * draft.layers,
+            gqa_rows if store else 0,
+        )
+
+
 def digest(identity: int, family: int, start: int) -> bytes:
     return f"{identity:016x}{family:016x}{start:032x}".encode("ascii")
 
 
-def layout(
-    rank: int, *, source: bool, tail: bool
-) -> tuple[tuple[Cache, Cache], GdnPlanes, list[int]]:
+def layout(*, source: bool, tail: bool) -> Layout:
     offsets = [41, 109]
 
     def plane(owner: int, span: int) -> tuple[int, int]:
@@ -134,9 +151,9 @@ def layout(
         return Cache(family, layers, heads, pages, physical, 256 if tail else 0, end, planes)
 
     target = view(GQA, 16, 4 // WORLD, 321)
-    draft = view(DRAFT, 1, 4, 320 if rank == 0 else 0)
+    draft = view(DRAFT, 1, 4 // WORLD, 320)
     gdn = tuple((1, plane(1, width)[1], width) for width in (19, 103, 67, 31))
-    return (target, draft), gdn, offsets
+    return Layout((target, draft), gdn, offsets)
 
 
 class Slabs:
@@ -181,14 +198,21 @@ class Wire:
     identity: int
 
     def payload(
-        self, handles: Handles, views: tuple[Cache, Cache], gdn: GdnPlanes, *, store: bool
+        self,
+        handles: Handles,
+        views: tuple[Cache, Cache],
+        gdn: GdnPlanes,
+        *,
+        store: bool,
+        draft_identity: int | None = None,
     ) -> bytes:
         return (
             self.uuid
             + self.event
             + struct.pack("!I", len(handles))
             + b"".join(struct.pack("!64sQ", *handle) for handle in handles)
-            + b"".join(view.wire(self.identity) for view in views)
+            + views[0].wire(self.identity)
+            + views[1].wire(self.identity if draft_identity is None else draft_identity)
             + struct.pack("!I64s", 321, digest(self.identity, GDN, 321))
             + b"".join(struct.pack("!IQQ", *plane) for plane in gdn)
             + (bytes(2) if store else b"")
@@ -208,6 +232,20 @@ class Wire:
             response = receive(sock, size)
             assert control(self.upstream, NAMESPACE, LEASE, admission[:32]) == (0, b"")
             return status, response
+
+    def cancel_unarmed(self, body: bytes) -> None:
+        with socket.socket(socket.AF_UNIX) as sock:
+            sock.settimeout(TIMEOUT)
+            sock.connect(str(self.upstream))
+            assert send(sock, NAMESPACE, RANK_GET, body) == (ARMED, ADMISSION.size)
+            admission = receive(sock, ADMISSION.size)
+            assert control(self.upstream, NAMESPACE, LEASE, admission[:32]) == (ARMED, b"")
+        deadline = monotonic() + TIMEOUT
+        while monotonic() < deadline:
+            if control(self.upstream, NAMESPACE, LEASE, admission[:32]) == (0, b""):
+                return
+            sleep(0.01)
+        raise TimeoutError("unarmed draft restore lease remained active")
 
 
 def rejected(path: Path, body: bytes, detail: bytes) -> None:
@@ -235,53 +273,75 @@ def invalid_views(wire: Wire, slabs: Slabs, views: tuple[Cache, Cache], gdn: Gdn
     assert b"exceeds mapped allocation" in detail, detail
 
 
+def reference_bytes(
+    target: Layout, source: Layout, destination: list[bytes], source_bytes: list[bytes]
+) -> list[bytearray]:
+    expected = [bytearray(data) for data in destination]
+    for view, old in zip(target.views, source.views, strict=True):
+        view.copy_reference(old, expected, source_bytes)
+    for (src_owner, src_base, width), (dst_owner, dst_base, _) in zip(
+        source.gdn, target.gdn, strict=True
+    ):
+        expected[dst_owner][dst_base : dst_base + width] = source_bytes[src_owner][
+            src_base : src_base + width
+        ]
+    return expected
+
+
+def assert_transfer(relay: Relay, wire: Wire, slabs: Slabs, buffers: Layout, opcode: int) -> None:
+    store = opcode == RANK_PUT
+    receipt = buffers.receipt(store=store)
+    body = wire.payload(slabs.handles, buffers.views, buffers.gdn, store=store)
+    status, reply = wire.transfer(Path(relay.server_address), opcode, body)
+    assert status == 0, (status, reply)
+    assert RECEIPT.unpack(reply) == receipt
+    entry = relay.since()[-1]
+    assert entry["opcode"] == opcode
+    assert entry["device"] == wire.uuid.hex()
+    assert entry["status"] == 0
+    assert entry["receipt"] == receipt
+    assert entry["allocations"] == SLAB_COUNT
+    assert entry["page_maps"] == {v.family: v.physical for v in buffers.views if v.end}
+    assert entry["armed_ns"] <= entry["reply_ns"]
+
+
 def roundtrip(relay: Relay, uuid: bytes, rank: int, pid: int, *, tail: bool) -> None:
     identity = 100 + rank + 10 * tail
-    source, src_gdn, source_sizes = layout(rank, source=True, tail=tail)
-    target, dst_gdn, target_sizes = layout(rank, source=False, tail=tail)
+    source = layout(source=True, tail=tail)
+    target = layout(source=False, tail=tail)
     with torch.cuda.device(rank), ExitStack() as cleanup:
-        src = Slabs(cleanup, source_sizes, identity)
-        dst = Slabs(cleanup, target_sizes, identity + 100)
+        src = Slabs(cleanup, source.sizes, identity)
+        dst = Slabs(cleanup, target.sizes, identity + 100)
         event = torch.cuda.Event(interprocess=True)
         event.record(torch.cuda.current_stream())
         wire = Wire(relay.upstream, pid, uuid, event.ipc_handle(), identity)
-        counts = [(v.end - v.begin) * v.heads * 528 * v.layers for v in target]
-        gdn_bytes = sum(width for _, _, width in dst_gdn)
-        expected = [bytearray(data) for data in dst.contents]
-        for view, old in zip(target, source, strict=True):
-            view.copy_reference(old, expected, src.contents)
-        for (src_owner, src_base, width), (dst_owner, dst_base, _) in zip(
-            src_gdn, dst_gdn, strict=True
-        ):
-            expected[dst_owner][dst_base : dst_base + width] = src.contents[src_owner][
-                src_base : src_base + width
-            ]
-        for opcode, slabs, views, gdn in (
-            (RANK_PUT, src, source, src_gdn),
-            (RANK_GET, dst, target, dst_gdn),
-        ):
-            store = opcode == RANK_PUT
-            body = wire.payload(slabs.handles, views, gdn, store=store)
-            rows = target[0].end - target[0].begin if store else 0
-            receipt = (counts[0], gdn_bytes, counts[1], rows)
-            status, reply = wire.transfer(Path(relay.server_address), opcode, body)
-            assert status == 0, (status, reply)
-            assert RECEIPT.unpack(reply) == receipt
-            entry = relay.since()[-1]
-            assert entry["opcode"] == opcode
-            assert entry["device"] == uuid.hex()
-            assert entry["status"] == 0
-            assert entry["receipt"] == receipt
-            assert entry["allocations"] == SLAB_COUNT
-            assert entry["page_maps"] == {v.family: v.physical for v in views if v.end}
-            assert entry["armed_ns"] <= entry["reply_ns"]
+        assert_transfer(relay, wire, src, source, RANK_PUT)
+        assert_transfer(relay, wire, dst, target, RANK_GET)
+        expected = reference_bytes(target, source, dst.contents, src.contents)
         assert src.download() == src.contents, (rank, tail, "store changed source bytes")
         if not tail:
-            invalid_views(wire, dst, target, dst_gdn)
+            invalid_views(wire, dst, target.views, target.gdn)
         assert dst.download() == expected, (rank, tail, "restored bytes or untouched guard differ")
+        rerun = Slabs(cleanup, target.sizes, identity + REPLAY_SEED)
+        absent = wire.payload(
+            rerun.handles,
+            target.views,
+            target.gdn,
+            store=False,
+            draft_identity=identity + REPLAY_SEED,
+        )
+        assert wire.transfer(wire.upstream, RANK_GET, absent) == (MISS, b"")
+        assert rerun.download() == rerun.contents
+        body = wire.payload(rerun.handles, target.views, target.gdn, store=False)
+        wire.cancel_unarmed(body)
+        assert rerun.download() == rerun.contents
+        assert_transfer(relay, wire, rerun, target, RANK_GET)
+        rerun_expected = reference_bytes(target, source, rerun.contents, src.contents)
+        assert rerun.download() == rerun_expected
+    gqa_bytes, gdn_bytes, draft_bytes, _ = target.receipt(store=False)
     print(
         f"rank={rank} tail={tail} GPU={uuid.hex()} "
-        f"GQA={counts[0]} GDN={gdn_bytes} draft={counts[1]}"
+        f"GQA={gqa_bytes} GDN={gdn_bytes} draft={draft_bytes}"
     )
 
 

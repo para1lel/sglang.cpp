@@ -91,7 +91,9 @@ class PrefixResidency {
     ResidentPrefixRead lookup(const PrefixRankKeys& keys, int max_restore, bool draft);
     PrefixPages reserve_pages(const ResidentPrefixRead& read, int capacity, bool draft);
     PrefixSnapshots lookup_checkpoint(const PrefixRankKeys& keys, int maximum, int& end);
-    void commit_lookup(const ResidentPrefixRead& result);
+    PrefixSnapshots find_checkpoint(const PrefixRankKeys& keys, int end);
+    void commit_lookup(const ResidentPrefixRead& result, const PrefixRankKeys& keys,
+                       int resident_gdn);
     void notify_released();
     PrefixSnapshots reserve_checkpoint(bool* transfer_pending = nullptr);
     void wait_for_checkpoint();

@@ -25,8 +25,9 @@ struct DecoderBatch::TpDriver {
 
     void create_peer_request(decoder::Lane& lane, decoder::RequestBlockCache* retired) const;
     void initialize_peer(decoder::Lane& lane, int request_capacity, int resident_limit,
-                         const decoder::PrefixSlab* slab,
-                         const decoder::ResidentPrefixRead& reuse) const;
+                         const decoder::PrefixSlab* slab, const decoder::ResidentPrefixRead& reuse,
+                         const decoder::PrefixSlab* draft_slab,
+                         decoder::RequestBlockCache* draft_cache) const;
     void grow_peer_kv(decoder::Lane& lane, int positions, int written) const;
     bool sync_peer_stream() const noexcept;
     void drain_peer(const decoder::Lane& lane) const;
@@ -41,7 +42,7 @@ struct DecoderBatch::TpDriver {
     static decoder::ForwardLane mirror_lane(decoder::ForwardLane lane,
                                             decoder::Request* peer_request);
     void forward_decode(decoder::ForwardLane* work, decoder::ForwardLane* peer_work, int count,
-                        cudaStream_t stream, bool regular_graph,
+                        cudaStream_t stream, bool regular_graph, bool capture,
                         decoder::DecodeRun& run) const;
     void forward_single(decoder::ForwardLane* single, decoder::ForwardLane* peer_single,
                         int count, cudaStream_t stream) const;
@@ -50,19 +51,21 @@ struct DecoderBatch::TpDriver {
 
     void prepare_peer_verification(decoder::Lane& lane, int capacity) const;
     static decoder::MtpRound peer_round(const decoder::Lane& lane, int rows);
-    bool prepare_peer_repair(const decoder::MtpRound* rounds, int count);
-    void verify(decoder::MtpRound* rounds, decoder::MtpRound* peer_rounds, int count,
+    bool propose(decoder::MtpRound* rounds, decoder::MtpRound* peer_rounds, int count,
+                 cudaStream_t stream, const decoder::ConstraintWorkspace& scratch,
+                 const std::function<bool()>& cancel) const;
+    void repair(const decoder::MtpRound* rounds, const decoder::DraftRepairs* repairs,
+                const decoder::MtpRound* peer_rounds, int count, cudaStream_t stream) const;
+    void seed_draft(decoder::Lane& lane, int position, int token, cudaStream_t stream) const;
+    bool verify(decoder::MtpRound* rounds, decoder::MtpRound* peer_rounds, int count,
                 cudaStream_t stream, decoder::ConstraintWorkspace& constraints,
                 std::byte* sampling_workspace, std::byte* logprob_workspace,
-                const decoder::TcVocabScratch* vocabulary, bool capture,
-                bool allow_peer_repair) const;
+                const decoder::TcVocabScratch* vocabulary, bool capture) const;
     void commit_peer_round(decoder::Lane& lane, const decoder::MtpRound& round,
                            const decoder::Workspace* const* saved) const;
 
     const Decoder::Model& model;
     Decoder::TpRuntime& tp;
-    std::unique_ptr<decoder::PeerDraftRepair> peer_repair;
-    bool peer_repair_prepared = false;
 };
 
 }

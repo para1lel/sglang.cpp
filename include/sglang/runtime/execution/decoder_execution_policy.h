@@ -6,7 +6,6 @@ struct CudaBackendPolicy;
 
 struct DecoderExecutionPolicy {
     struct Limits {
-        int ordered_graph_lanes;
         int tensor_prefill_rows;
         int fallback_prefill_rows;
     };
@@ -23,7 +22,6 @@ struct DecoderExecutionPolicy {
     bool tensor_core_prefill;
     int tensor_prefill_rows;
     int fallback_prefill_rows;
-    int ordered_graph_lanes;
     int target_split_end;
 };
 

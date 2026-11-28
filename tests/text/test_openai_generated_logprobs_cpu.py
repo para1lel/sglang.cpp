@@ -1,26 +1,29 @@
 """Exercise generated logprobs through the OpenAI routes with a scripted decoder."""
 
-from collections import defaultdict
-import os
 import unittest
-from unittest.mock import patch
+from collections import defaultdict
 
+from test_native_generated_logprobs_cpu import ReplyChecks, checked_exchange, scripted_server
 from test_native_text import legacy, stream_options
-from test_sampling_routes_cpu import (
-    CHAT, TEXT, body, checked_body, post_response, run_cpu_suite, server, sse_frames,
-)
+from test_sampling_routes_cpu import CHAT, TEXT, body, run_cpu_suite, server
 
 
 class OpenAILogprobs(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        scripts = cls.output / "scripted-scores.txt"
-        scripts.write_text("11 32 33 34 35 36\n12 172 254 106 115 5513\n", encoding="ascii")
-        cls.enterClassContext(patch.dict(os.environ, SGLANG_TEST_CHAT_OUTPUT_IDS=str(scripts),
-                                         SGLANG_TEST_SCRIPTED_MTP="1"))
-        cls.port = cls.enterClassContext(server(cls.binary, cls.checkpoint,
-                                               cls.output / "scores.log", "--max-active", "4",
-                                               "--mtp-steps", "0", sampling=False))
+        scripts = {11: [32, 33, 34, 35, 36], 12: [172, 254, 106, 115, 5513]}
+        flags = ("--max-active", "4", "--mtp-steps", "0")
+        log = cls.output / "scores.log"
+        with_script = scripted_server(
+            cls,
+            "scripted-scores.txt",
+            scripts,
+            log,
+            *flags,
+            sampling=False,
+            SGLANG_TEST_SCRIPTED_MTP="1",
+        )
+        cls.port = cls.enterClassContext(with_script)
 
     def payload(self, route, top=3, **options):
         score = {"logprobs": top} if route == TEXT else {
@@ -30,10 +33,8 @@ class OpenAILogprobs(unittest.TestCase):
         return body(route, **(defaults | score | options))
 
     def exchange(self, route, payload, port=None, status=200):
-        with post_response(port or self.port, route, payload) as response:
-            self.assertEqual(response.status, status, (route, payload))
-            frames = sse_frames(response) if status == 200 and payload.get("stream") else None
-            return checked_body(self, response, frames)
+        checks = ReplyChecks(status=status)
+        return checked_exchange(self, route, payload, self.port if port is None else port, checks)
 
     def pair(self, route, payload, port=None):
         answer = self.exchange(route, payload, port)
@@ -217,15 +218,22 @@ class OpenAILogprobs(unittest.TestCase):
         self.assertEqual(answer["usage"]["completion_tokens"], 0)
 
     def test_validation_opt_out_and_frozen_legacy(self):
-        for route, invalid in (
-            (TEXT, ({"logprobs": False}, {"logprobs": -1}, {"logprobs": 21},
-                    {"logprobs": 1.5}, {"echo": "true"}, {"n": 0}, {"n": 5}, {"regex": "A+"},
-                    {"temperature": .5})),
-            (CHAT, ({"logprobs": 1}, {"top_logprobs": -1}, {"top_logprobs": 21},
-                    {"top_logprobs": 1.5}, {"n": 0}, {"n": 5}, {"regex": "A+"},
-                    {"temperature": .5})),
-        ):
-            for options in invalid:
+        common = ({"n": 0}, {"n": 5}, {"regex": "A+"}, {"temperature": 0.5})
+        invalid_text = (
+            {"logprobs": False},
+            {"logprobs": -1},
+            {"logprobs": 21},
+            {"logprobs": 1.5},
+            {"echo": "true"},
+        )
+        invalid_chat = (
+            {"logprobs": 1},
+            {"top_logprobs": -1},
+            {"top_logprobs": 21},
+            {"top_logprobs": 1.5},
+        )
+        for route, invalid in ((TEXT, invalid_text), (CHAT, invalid_chat)):
+            for options in (*invalid, *common):
                 with self.subTest(route=route, options=options):
                     answer = self.exchange(route, self.payload(route, stream=True, **options),
                                            status=400)

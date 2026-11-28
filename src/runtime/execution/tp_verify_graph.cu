@@ -26,9 +26,8 @@ __global__ void row_exchange(const DeviceBinding* table, bool output) {
 
 }
 
-cudaError_t exchange_rows(const DeviceBinding* table, bool output, cudaStream_t stream) {
+cudaError_t exchange_rows(const DeviceBinding* table, int rows, bool output, cudaStream_t stream) {
     row_exchange<<<rows, 128, 0, stream>>>(table, output);
     return cudaPeekAtLastError();
 }
-
 }

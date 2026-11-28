@@ -48,7 +48,7 @@ void PrefillDims::validate() const {
     const auto local_gdn = gdn_heads == GdnLocal::value_heads;
     if (q_gate_width != 2 * q_width || q_width <= 0 ||
         !gqa_geometry_valid(GqaGeometry{q_width / mxfp8_head_dim, kv_width / mxfp8_head_dim}) ||
-        gdn_heads != text_gdn_value_heads && !local_gdn ||
+        (gdn_heads != text_gdn_value_heads && !local_gdn) ||
         gdn_qkv_width != (local_gdn ? GdnLocal::qkv_width : text_gdn_qkv_width) ||
         gdn_value_width != (local_gdn ? GdnLocal::value_width : text_gdn_value_width) ||
         intermediate <= 0 || intermediate % text_fp8_group_size != 0) {
@@ -67,18 +67,6 @@ GqaGeometry PrefillDims::gqa_geometry() const {
 std::size_t PrefillDims::gdn_workspace_bytes(int rows) const {
     return is_local_gdn() ? text_gdn_local_workspace_bytes(rows)
                           : text_gdn_workspace_bytes(rows);
-}
-
-std::size_t seed_scratch_bytes(int concat_rows, int kv_rows) {
-    return std::size_t(concat_rows) * 2 * hidden_size * sizeof(Bf16) +
-           std::size_t(kv_rows) * 3 * text_gqa_kv_width * sizeof(Bf16);
-}
-
-SeedScratch make_seed_scratch(Bf16* memory, int concat_rows, int kv_rows) {
-    const auto concatenated = std::size_t(concat_rows) * 2 * hidden_size;
-    const auto stride = std::size_t(kv_rows) * text_gqa_kv_width;
-    return {memory, memory + concatenated, memory + concatenated + stride,
-            memory + concatenated + 2 * stride};
 }
 
 TileBuffers::TileBuffers(ScratchLayout& layout, int rows, const PrefillDims& tile_dims)
@@ -145,31 +133,23 @@ bool Chunk::project_packed(TextFp8ActivationView input,
 }
 
 void Chunk::seed_draft(MtpDraftRequest& draft, const int* shifted_tokens, int seed_rows,
-                const Bf16* final_norm, bool wmma, const MediaPrefill* media,
-                const SeedScratch* seed) const {
-    Bf16* concatenated = work.mlp_gate;
-    Bf16* layer_input = work.attention;
-    Bf16* keys = work.keys;
-    Bf16* values = work.values;
-    Bf16* rope_keys = work.rope_keys;
-    if (seed) {
-        concatenated = seed->concatenated;
-        layer_input = work.mlp_gate;
-        keys = seed->keys;
-        values = seed->values;
-        rope_keys = seed->rope_keys;
-    } else if (work.dims.intermediate < 2 * hidden_size ||
-               work.dims.attention_width() < hidden_size ||
-               work.dims.kv_width < text_gqa_kv_width) {
-        throw std::logic_error("Prefill tile buffers too narrow for MTP draft seeding");
-    }
-    if (work.dims.intermediate < hidden_size) {
+                       const Bf16* final_norm, bool wmma, const MediaPrefill* media) const {
+    if (work.dims.intermediate < 2 * hidden_size || work.dims.attention_width() < hidden_size ||
+        work.dims.kv_width < text_gqa_kv_width) {
         throw std::logic_error("Prefill tile buffers too narrow for MTP draft seeding");
     }
     const PrefillProjections projections{activation, seed_rows, stream, false, false, wmma};
     draft.seed_prefill(position, shifted_tokens, work.hidden, work.residual, final_norm,
-                       projections, {work.normalized, work.projected_attention, concatenated,
-                                     layer_input, keys, values, rope_keys},
+                       projections,
+                       {
+                           work.normalized,
+                           work.projected_attention,
+                           work.mlp_gate,
+                           work.attention,
+                           work.keys,
+                           work.values,
+                           work.rope_keys,
+                       },
                        media);
 }
 
@@ -345,9 +325,12 @@ void Chunk::gqa_read(Mxfp8KvCache cache, Mxfp8PageTable pages, PairedPrefillScra
         const PagedPrefillSequence sequence{
             cache, pages, position, rows, work.rope_queries, work.attention,
         };
-        staged = long_staging.resident
-                     ? try_resident_staged_paged_prefill(sequence, stream, long_staging.scratch)
-                     : try_long_serial_staged_paged_prefill(sequence, stream, long_staging.scratch);
+        if (long_staging.resident && mrope == nullptr &&
+            wants_resident_gqa_staging(cached_gqa_tokens, position, rows)) {
+            staged = try_resident_staged_paged_prefill(sequence, stream, long_staging.scratch);
+        } else {
+            staged = try_long_serial_staged_paged_prefill(sequence, stream, long_staging.scratch);
+        }
     }
     if (!staged) {
         staged = tensor_core_fp8 ? tensor_core_multirow_prefill_gqa(cache, pages, position, rows,
@@ -457,23 +440,66 @@ PrefillCheckpoints prefill_checkpoints(const PrefillGrant& grant) {
     return points;
 }
 
-void seed_ranked_prefill_draft(const DecoderModel& model, const PrefillGrant& grant,
-                               const Chunk& chunk, ScratchLayout& layout,
-                               std::size_t layout_bytes) {
+void seed_ranked_prefill_draft(const std::array<const DecoderModel*, 2>& models,
+                               const std::array<const PrefillGrant*, 2>& grants,
+                               const std::array<const Chunk*, 2>& chunks, int offset,
+                               TensorParallel& group) {
+    const auto& grant = *grants[0];
     if (grant.draft == nullptr || grant.prompt_remaining <= 1)
         return;
-    const bool wmma = chunk.tensor_core_fp8 && model.backend.draft.wmma_seed_fc &&
-                      grant.position + grant.prompt_remaining >= wmma_seed_min_prompt_tokens;
     const int rows = std::min(grant.rows, grant.prompt_remaining - 1);
-    const int concat_rows = std::min(rows, prefill_chunk_rows);
-    const auto bytes = seed_scratch_bytes(concat_rows, rows);
-    if (bytes > layout_bytes - layout.bytes) {
-        throw std::runtime_error("Prefill workspace too small for the MTP draft seed scratch");
+    const Bf16* hidden[2];
+    const Bf16* residual[2];
+    const Bf16* final_norm[2];
+    PrefillProjections projections[2];
+    MtpPrefillBuffers buffers[2];
+    for (int rank = 0; rank < 2; ++rank) {
+        const auto& model = *models[rank];
+        const auto& chunk = *chunks[rank];
+        const auto& work = chunk.work;
+        const auto scratch = work.gqa_scratch();
+        const auto row_bytes = static_cast<std::size_t>(rows) * hidden_size * sizeof(Bf16);
+        const auto concat_bytes = static_cast<std::size_t>(std::min(rows, prefill_chunk_rows)) * 2 *
+                                  hidden_size * sizeof(Bf16);
+        if (scratch.key_bytes < 2 * row_bytes || scratch.value_bytes < concat_bytes) {
+            throw std::logic_error("Prefill tile buffers too narrow for TP draft seeding");
+        }
+        const bool wmma = chunk.tensor_core_fp8 && model.backend.draft.wmma_seed_fc &&
+                          grant.position + grant.prompt_remaining >= wmma_seed_min_prompt_tokens;
+        const auto hidden_offset = static_cast<std::size_t>(offset) * hidden_size;
+        hidden[rank] = work.hidden + hidden_offset;
+        residual[rank] = work.residual + hidden_offset;
+        final_norm[rank] = model.final_norm;
+        projections[rank] = {chunk.activation, rows, chunk.stream, false, false, wmma};
+        buffers[rank] = {
+            work.normalized, work.projected_attention, work.gdn_qkv, work.mlp_gate, work.keys,
+            work.values,     work.rope_keys,
+        };
     }
-    const auto scratch =
-        make_seed_scratch(layout.take_bf16(bytes / sizeof(Bf16)), concat_rows, rows);
-    chunk.seed_draft(*grant.draft, grant.tokens + 1, rows, model.final_norm, wmma, nullptr,
-                     &scratch);
+    MtpDraftRequest::seed_prefill_tp(*grant.draft, *grants[1]->draft, grant.position,
+                                     grant.tokens + 1, hidden, residual, final_norm, projections,
+                                     buffers, group);
+}
+
+void seed_scalar_prefill_draft_tp(const DecoderModel& model, const DecoderModel& peer,
+                                  const PrefillGrant& grant, const PrefillGrant& peer_grant,
+                                  cudaStream_t stream, cudaStream_t peer_stream,
+                                  TensorParallel& group) {
+    if (grant.draft == nullptr || grant.prompt_remaining <= 1 ||
+        (grant.position < grant.draft->valid_prefix() &&
+         grant.position < peer_grant.draft->valid_prefix()))
+        return;
+    auto& work = grant.request->work;
+    auto& peer_work = peer_grant.request->work;
+    model.normalize_final(work, stream);
+    {
+        const DeviceScope scope(peer.device);
+        peer.normalize_final(peer_work, peer_stream);
+    }
+    MtpDraftRequest::seed_tp(
+        {grant.draft, grant.position, grant.tokens[1], work.normalized},
+        {peer_grant.draft, peer_grant.position, peer_grant.tokens[1], peer_work.normalized}, group,
+        stream, peer_stream);
 }
 
 GdnPrefillCheckpoints::GdnPrefillCheckpoints() = default;
@@ -535,33 +561,10 @@ void capture_prefill_scores(const DecoderModel& model, const PrefillGrant& grant
     }
 }
 
-namespace {
-
-int aligned_layerwise_rows(int rows) {
-    return (rows + layerwise_row_alignment - 1) / layerwise_row_alignment *
-        layerwise_row_alignment;
-}
-
-}
-
-PrefillGroup prefill_group(const PrefillGrant* grants, int count) {
-    PrefillGroup group{0, 0};
-    for (int index = 0; index < count; ++index) {
-        const auto& grant = grants[index];
-        if (grant.rows < 256 || grant.rows != grant.tile_rows ||
-            aligned_layerwise_rows(grant.rows) != grant.rows ||
-            grant.rows > max_layerwise_rows - group.rows) {
-            break;
-        }
-        ++group.grants;
-        group.rows += grant.rows;
-    }
-    return group.grants > 1 ? group : PrefillGroup{1, 0};
-}
 
 Chunk prefill_attention_segment(const Chunk& chunk, const PrefillGrant& grant, int offset) {
     return Chunk{
-        {{}, grant.rows, chunk.stream, true},
+        {{}, grant.rows, chunk.stream, chunk.tensor_core_fp8},
         chunk.work.attention_segment(offset),
         grant.position,
         grant.media != nullptr ? grant.media->positions + grant.position : nullptr,

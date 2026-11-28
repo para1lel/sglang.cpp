@@ -56,7 +56,17 @@ __device__ __inline_hint__ decoder::PagedDecodeLane resolve(const LongBatch& bat
     const int row = blockIdx.z % long_rows;
     return row < request.count ? request.lane(row) : decoder::PagedDecodeLane{{}, {}, -1, {}};
 }
-#endif
+
+__device__ __inline_hint__ decoder::PagedDecodeLane resolve(const BoundLongBatch& batch) {
+    const auto& request = batch.requests[blockIdx.z / long_rows]->request;
+    const auto row = static_cast<int>(blockIdx.z % long_rows);
+    if (row < request.count)
+        return request.lane(row);
+    decoder::PagedDecodeLane inactive{};
+    inactive.position = -1;
+    return inactive;
+}
+    #endif
 
 template SGLANG_GQA_HOST_DEVICE Partial* partials<max_splits>(void*, int);
 template SGLANG_GQA_HOST_DEVICE Partial* partials<long_rank_wide_splits>(void*, int);

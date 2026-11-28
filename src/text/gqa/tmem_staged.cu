@@ -22,53 +22,70 @@ cudaError_t consume_prefill_submission(cudaError_t status) {
     return status;
 }
 
+namespace {
+
+template <typename Function>
+cudaError_t load_driver_entry(const char* name, unsigned version, Function& function,
+                              cudaDriverEntryPointQueryResult* query) {
+    void* address = nullptr;
+    const auto status =
+        cudaGetDriverEntryPointByVersion(name, &address, version, cudaEnableDefault, query);
+    if (status == cudaSuccess && (query == nullptr || *query == cudaDriverEntryPointSuccess)) {
+        function = reinterpret_cast<Function>(address);
+    }
+    return status;
+}
+
+template <std::size_t Rank>
+CUresult encode_tile(PFN_cuTensorMapEncodeTiled_v12000 encode, CUtensorMap& map, void* source,
+                     CUtensorMapDataType type, const cuuint64_t (&shape)[Rank],
+                     const cuuint64_t (&strides)[Rank - 1], const cuuint32_t (&box)[Rank],
+                     CUtensorMapSwizzle swizzle = CU_TENSOR_MAP_SWIZZLE_NONE) {
+    constexpr cuuint32_t elements[] = {1, 1, 1};
+    return encode(&map, type, static_cast<unsigned>(Rank), source, shape, strides, box, elements,
+                  CU_TENSOR_MAP_INTERLEAVE_NONE, swizzle, CU_TENSOR_MAP_L2_PROMOTION_NONE,
+                  CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+}
+
+}
+
 std::optional<cudaError_t> encode_pair_maps(Mxfp8KvCache cache, PairMaps& maps) {
-    void* entry = nullptr;
+    PFN_cuTensorMapEncodeTiled_v12000 encode = nullptr;
     cudaDriverEntryPointQueryResult query{};
-    const auto status = cudaGetDriverEntryPointByVersion(
-        "cuTensorMapEncodeTiled", &entry, 12000, cudaEnableDefault, &query);
+    const auto status = load_driver_entry("cuTensorMapEncodeTiled", 12000, encode, &query);
     if (status == cudaErrorNotSupported || status == cudaErrorSymbolNotFound) {
         return std::nullopt;
     }
     if (status != cudaSuccess) {
         return status;
     }
-    if (!entry || query != cudaDriverEntryPointSuccess) {
+    if (encode == nullptr) {
         return std::nullopt;
     }
-    const auto encode = reinterpret_cast<PFN_cuTensorMapEncodeTiled_v12000>(entry);
     const cuuint64_t width = static_cast<cuuint64_t>(cache.kv_heads) * channels;
     const cuuint64_t strides[] = {width, width * flash_keys};
     const cuuint64_t shape[] = {width, flash_keys,
                                static_cast<cuuint64_t>(cache.page_count) * pair_page_halves};
-    constexpr cuuint32_t elements[] = {1, 1, 1};
     constexpr cuuint32_t key_box[] = {channels, pair_key_rows, pair_page_halves};
     constexpr cuuint32_t value_box[] = {pair_value_channels, flash_keys, pair_page_halves};
     constexpr cuuint64_t scale_stride[] = {pair_scale_bytes};
     const cuuint64_t scale_shape[] = {pair_scale_bytes / 4,
                                     static_cast<cuuint64_t>(cache.page_count) * cache.kv_heads};
     constexpr cuuint32_t scale_box[] = {pair_scale_bytes / 4, 1};
-    const auto encode_map = [&](CUtensorMap& map, void* source, CUtensorMapDataType type,
-                                unsigned rank, const cuuint64_t* dimensions,
-                                const cuuint64_t* steps, const cuuint32_t* box,
-                                CUtensorMapSwizzle swizzle = CU_TENSOR_MAP_SWIZZLE_NONE) {
-        return encode(&map, type, rank, source, dimensions, steps, box, elements,
-                      CU_TENSOR_MAP_INTERLEAVE_NONE, swizzle,
-                      CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-    };
-    auto result = encode_map(maps.keys, cache.key_payload, CU_TENSOR_MAP_DATA_TYPE_UINT8,
-                             3, shape, strides, key_box);
+    auto result = encode_tile(encode, maps.keys, cache.key_payload, CU_TENSOR_MAP_DATA_TYPE_UINT8,
+                              shape, strides, key_box);
     if (result == CUDA_SUCCESS) {
-        result = encode_map(maps.values, cache.value_payload, CU_TENSOR_MAP_DATA_TYPE_UINT8,
-                            3, shape, strides, value_box, CU_TENSOR_MAP_SWIZZLE_128B);
+        result =
+            encode_tile(encode, maps.values, cache.value_payload, CU_TENSOR_MAP_DATA_TYPE_UINT8,
+                        shape, strides, value_box, CU_TENSOR_MAP_SWIZZLE_128B);
     }
     if (result == CUDA_SUCCESS) {
-        result = encode_map(maps.key_scales, cache.key_scales, CU_TENSOR_MAP_DATA_TYPE_UINT32,
-                            2, scale_shape, scale_stride, scale_box);
+        result = encode_tile(encode, maps.key_scales, cache.key_scales,
+                             CU_TENSOR_MAP_DATA_TYPE_UINT32, scale_shape, scale_stride, scale_box);
     }
     if (result == CUDA_SUCCESS) {
-        result = encode_map(maps.value_scales, cache.value_scales, CU_TENSOR_MAP_DATA_TYPE_UINT32,
-                            2, scale_shape, scale_stride, scale_box);
+        result = encode_tile(encode, maps.value_scales, cache.value_scales,
+                             CU_TENSOR_MAP_DATA_TYPE_UINT32, scale_shape, scale_stride, scale_box);
     }
     if (result == CUDA_ERROR_INVALID_VALUE || result == CUDA_ERROR_NOT_SUPPORTED) {
         return std::nullopt;
@@ -78,25 +95,20 @@ std::optional<cudaError_t> encode_pair_maps(Mxfp8KvCache cache, PairMaps& maps) 
 
 std::optional<cudaError_t> encode_flash_maps(Mxfp8KvCache cache, CUtensorMap& key_map,
                                              CUtensorMap& value_map, bool automatic) {
-    void* entry = nullptr;
-    const auto status = cudaGetDriverEntryPointByVersion("cuTensorMapEncodeTiled", &entry, 12000,
-                                                         cudaEnableDefault, nullptr);
+    PFN_cuTensorMapEncodeTiled_v12000 encode = nullptr;
+    const auto status = load_driver_entry("cuTensorMapEncodeTiled", 12000, encode, nullptr);
     if (status != cudaSuccess) {
         return flash_setup_error(status, automatic && status == cudaErrorNotSupported);
     }
-    if (!entry) {
+    if (encode == nullptr) {
         return std::nullopt;
     }
-    const auto encode = reinterpret_cast<PFN_cuTensorMapEncodeTiled_v12000>(entry);
     constexpr cuuint32_t tile[] = {channels, flash_keys};
-    constexpr cuuint32_t elements[] = {1, 1};
     const cuuint64_t stride[] = {static_cast<cuuint64_t>(cache.kv_heads) * channels};
     const cuuint64_t shape[] = {
         stride[0], static_cast<cuuint64_t>(cache.page_count) * mxfp8_page_size};
     const auto encode_payload = [&](CUtensorMap& map, std::uint8_t* data) {
-        return encode(&map, CU_TENSOR_MAP_DATA_TYPE_UINT8, 2, data, shape, stride, tile,
-                      elements, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE,
-                      CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+        return encode_tile(encode, map, data, CU_TENSOR_MAP_DATA_TYPE_UINT8, shape, stride, tile);
     };
     auto result = encode_payload(key_map, cache.key_payload);
     if (result == CUDA_SUCCESS) {
@@ -192,19 +204,13 @@ bool valid_staged_ranges(const decoder::PagedPrefillSequence* sequences,
 template <typename Function>
 std::optional<cudaError_t> staged_driver_entry(const char* name, unsigned version,
                                               Function& function) {
-    void* address = nullptr;
     cudaDriverEntryPointQueryResult query{};
-    const auto status = cudaGetDriverEntryPointByVersion(
-        name, &address, version, cudaEnableDefault, &query);
+    const auto status = load_driver_entry(name, version, function, &query);
     if (status != cudaSuccess) {
         return flash_setup_error(
             status, status == cudaErrorNotSupported || status == cudaErrorSymbolNotFound);
     }
-    if (!address || query != cudaDriverEntryPointSuccess) {
-        return std::nullopt;
-    }
-    function = reinterpret_cast<Function>(address);
-    return cudaSuccess;
+    return function != nullptr ? std::optional{cudaSuccess} : std::nullopt;
 }
 
 std::optional<cudaError_t> staged_stream_context(cudaStream_t stream) {
@@ -259,16 +265,14 @@ std::optional<cudaError_t> encode_staged_maps(int full_pages, int kv_heads,
     constexpr cuuint64_t strides[] = {width_bytes, width_bytes * mxfp8_page_size};
     const cuuint64_t shape[] = {tmem_swizzle, mxfp8_page_size,
         static_cast<cuuint64_t>(full_pages) * kv_heads * staged_planes};
-    constexpr cuuint32_t elements[] = {1, 1, 1};
     const cuuint32_t key_rows = page ? mxfp8_page_size : (single ? flash_keys : pair_key_rows);
     const cuuint32_t key_box[] = {tmem_swizzle, key_rows, staged_planes};
     const cuuint32_t value_box[] = {
         tmem_swizzle, flash_keys,
         static_cast<cuuint32_t>(single ? staged_planes : staged_planes / 2)};
-    const auto encode_map = [&](CUtensorMap& map, void* source, const cuuint32_t* box) {
-        return encode(&map, CU_TENSOR_MAP_DATA_TYPE_UINT16, 3, source, shape, strides,
-                      box, elements, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
-                      CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+    const auto encode_map = [&](CUtensorMap& map, void* source, const auto& box) {
+        return encode_tile(encode, map, source, CU_TENSOR_MAP_DATA_TYPE_UINT16, shape, strides, box,
+                           CU_TENSOR_MAP_SWIZZLE_128B);
     };
     auto result = encode_map(maps.keys, keys, key_box);
     if (result == CUDA_SUCCESS) {
@@ -430,22 +434,16 @@ std::optional<cudaError_t> submit_staged_requests(StagedRequests<Count>& request
     const auto decoded = cudaLaunchKernel(pair_predecode<Count, Partial>,
         dim3(full_pages, requests.items[0].cache.kv_heads, Count),
             channels, decode_args, 0, stream);
-    if constexpr (LongPage) {
-        if (single) {
-            if (const auto status = consume_prefill_submission(decoded); status != cudaSuccess) {
-                return status;
-            }
-            void* args[] = {&requests, &maps, &invalid};
-            return consume_prefill_submission(cudaLaunchKernel(kernel, config.gridDim,
-                config.blockDim, args, config.dynamicSmemBytes, stream));
-        }
-    }
-    if (decoded != cudaSuccess) {
-        return staged_submission(decoded);
+    const bool strict = LongPage && single;
+    const auto decode_status = strict ? consume_prefill_submission(decoded) : decoded;
+    if (decode_status != cudaSuccess) {
+        return strict ? std::optional{decode_status} : staged_submission(decode_status);
     }
     void* args[] = {&requests, &maps, &invalid};
-    return staged_submission(cudaLaunchKernel(kernel, config.gridDim, config.blockDim, args,
-                                              config.dynamicSmemBytes, stream));
+    const auto submitted = cudaLaunchKernel(kernel, config.gridDim, config.blockDim, args,
+                                            config.dynamicSmemBytes, stream);
+    return strict ? std::optional{consume_prefill_submission(submitted)}
+                  : staged_submission(submitted);
 }
 
 template <int Count, bool Partial = false, bool CausalGroup = false, bool LongPage = false>

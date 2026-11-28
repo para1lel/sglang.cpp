@@ -110,7 +110,7 @@ The archived replay payloads omitted temperature, top-k, and top-p. Native used 
 
 At TP1, each engine used one GPU for the target and MTP draft. At TP2, native split the target across both ranks and ran the MTP draft on rank 0. The pinned vLLM TP2 configuration recorded tensor parallel size 2 for both the target and draft.
 
-Across warmup, profiling, and drain, native reused 58,096,283 coherent target prompt tokens at TP1 and 84,306,125 at TP2. Read-only GQA reuse extended beyond the coherent span by 3,607,563 rows at TP1 and 4,106,343 at TP2. Both widths read GDN data from LMCache and recorded zero I/O errors.
+Across warmup, profiling, and drain, native reused 58,096,283 coherent target prompt tokens at TP1 and 84,306,125 at TP2. Read-only GQA reuse extended beyond the coherent span by 3,607,563 rows at TP1 and 4,106,343 at TP2. In these archived runs, each width read zero GQA and zero draft payload bytes from LMCache. Both widths wrote GQA and draft payloads, read GDN payloads, and recorded zero cache I/O errors. At TP2 the GQA and draft read-byte counters were zero on each rank. [Counter receipts](#run-receipts)
 
 Both vLLM widths used four-token Qwen MTP, FlashInfer attention, FP8 E4M3 KV, and `SimpleCPUOffloadConnector`. GPU KV capacity was 112 GiB at TP1 and 128 GiB per rank at TP2. Both arms recorded CPU stores with zero external hits. All measured vLLM cache hits came from GPUs.
 
@@ -119,6 +119,8 @@ Both vLLM widths used four-token Qwen MTP, FlashInfer attention, FP8 E4M3 KV, an
 The native runs are under `artifacts/agentx-256k/b0596c25/campaign/runs/attempt-02/`. The independent reconciliation is `artifacts/agentx-256k/b0596c25/verification/audit-b0596c25.json`, SHA-256 `20d0bf903909acada7d494f63170805311bf2f556fe35a05009fe93da1cc81bc`. The vLLM receipts under `artifacts/agentx-256k/runs/` are from the previously measured runs.
 
 The native run directories each contain `server-command.sh` and `lmcache-command.sh`. Each vLLM run directory contains `server/server-command.sh` and `server/live-argv.bin`.
+
+For each native width, `measurement-counter-deltas.json` records the measured-window byte deltas. `sglang_cpp:lmcache_gqa_read_bytes_total` and `sglang_cpp:lmcache_draft_read_bytes_total` are zero in both files. `sglang_cpp:lmcache_gdn_read_bytes_total` is 13,548,879,872 at TP1 and 15,860,457,472 at TP2.
 
 | Run directory | `score.json` SHA-256 | `run.sha256` SHA-256 |
 | --- | --- | --- |

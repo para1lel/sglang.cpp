@@ -12,12 +12,20 @@ constexpr int row_bytes = qwen_text_model.hidden_size * sizeof(__nv_bfloat16);
 constexpr int vectors_per_row = row_bytes / sizeof(uint4);
 static_assert(row_bytes % (threads * sizeof(uint4)) == 0);
 
-__global__ void gather_embeddings(const uint4* weight,
-                                  const __grid_constant__ VerificationEmbeddingTokens tokens,
+__device__ int embedding_token(const VerificationEmbeddingTokens& tokens, int row) {
+    return tokens.id[row];
+}
+
+__device__ int embedding_token(const int* tokens, int row) {
+    return tokens[row];
+}
+
+template <typename Tokens>
+__global__ void gather_embeddings(const uint4* weight, const __grid_constant__ Tokens tokens,
                                   const __grid_constant__ VerificationCopyRows output) {
     const int row = blockIdx.x;
     const int column = blockIdx.y * blockDim.x + threadIdx.x;
-    const auto token = static_cast<std::size_t>(tokens.id[row]);
+    const auto token = static_cast<std::size_t>(embedding_token(tokens, row));
     auto* destination = reinterpret_cast<uint4*>(output.destination[row]);
     destination[column] = weight[token * vectors_per_row + column];
 }
@@ -46,6 +54,18 @@ cudaError_t gather_verification_embeddings(const __nv_bfloat16* weight, int voca
     }
     gather_embeddings<<<dim3(count, vectors_per_row / threads), threads, 0, stream>>>(
         reinterpret_cast<const uint4*>(weight), tokens, output);
+    return cudaGetLastError();
+}
+
+cudaError_t gather_verification_embeddings(const __nv_bfloat16* weight, const int* device_tokens,
+                                           const VerificationCopyRows& output, int count,
+                                           cudaStream_t stream) {
+    if (weight == nullptr || device_tokens == nullptr || count < 1 ||
+        count > VerificationCopyRows::capacity) {
+        return cudaErrorInvalidValue;
+    }
+    gather_embeddings<<<dim3(count, vectors_per_row / threads), threads, 0, stream>>>(
+        reinterpret_cast<const uint4*>(weight), device_tokens, output);
     return cudaGetLastError();
 }
 

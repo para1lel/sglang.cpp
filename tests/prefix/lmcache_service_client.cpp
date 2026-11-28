@@ -47,7 +47,9 @@ BatchCacheRead lookup(BatchCache& cache, const Keys& keys) {
 void readiness_case(BatchCache& cache, const Keys& keys) {
     require(!cache.metrics().available, "startup accepted a daemon missing a configured UUID");
     const auto cold = lookup(cache, keys);
-    require(cold.keys.empty() && cold.match.usable_gdn == 0 && !cache.metrics().available,
+    require(cold.keys == keys, "unavailable daemon discarded resident prefix keys");
+    require(cold.match.usable_gqa == 0 && cold.match.usable_gdn == 0 &&
+                cold.match.usable_draft == 0 && !cache.metrics().available,
             "missing GPU UUID enabled ranked cache lookup");
     cache.reset();
     require(!cache.metrics().available, "namespace reset bypassed ranked readiness");

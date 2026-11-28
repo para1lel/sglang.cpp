@@ -38,9 +38,12 @@ StepPlan plan_step(const BatchStorage& storage, const Selection& selected, int l
         if (wide && work[slot].decode && lane->draft && lane->remaining_output() > 1) {
             const auto bit = std::uint32_t{1} << slot;
             wide->speculative |= bit;
+            if (storage.verification_graph && !lane->options.eager)
+                wide->replay |= bit;
             if (work[slot].proposals == decoder_batch_max_mtp_steps &&
-                lane->remaining_output() >= target_verify_max_rows &&
-                !lane->options.constraint && !lane->sampling && !lane->options.top_logits &&
+                lane->remaining_output() >= target_verify_max_rows && !lane->options.constraint &&
+                !lane->sampling && lane->options.top_logits == 0 &&
+                lane->progress.generated >= lane->options.min_new_tokens &&
                 (!tensor_parallel || lane->options.generated_top_logprobs < 0)) {
                 wide->eligible |= bit;
                 ++wide->eligible_count;
@@ -192,6 +195,101 @@ void DecoderBatch::State::disable() noexcept {
     storage->slots = {};
     storage->decode_graphs = {};
     storage->verification_graph.reset();
+}
+
+namespace {
+
+Lane& require_lane(std::optional<Lane>& entry) {
+    if (!entry.has_value())
+        throw std::bad_optional_access{};
+    return *entry;
+}
+
+}
+
+int DecoderBatch::State::collect_rounds(const PrefillRows& verification_rows, int& next_slot,
+                                        std::array<MtpRound, max_wide_mtp_lanes>& rounds,
+                                        std::array<int, max_wide_mtp_lanes>& slots,
+                                        std::array<MtpRound, max_wide_mtp_lanes>& peer_rounds,
+                                        const WideMtpGroups& wide_groups) {
+    auto* const stream = execution.stream();
+    constexpr int packet = decoder_batch_max_mtp_lanes;
+    int limit = packet;
+    int count = 0;
+    while (next_slot < options.max_lanes && count < limit) {
+        const int slot = next_slot++;
+        const int rows = verification_rows[slot];
+        if (rows == 0)
+            continue;
+        if (count == 0)
+            limit = std::max(packet, static_cast<int>(wide_groups.width[slot]));
+        auto& lane = require_lane(storage->slots[slot]);
+        const int capacity = lane.proposals() + 1;
+        if (!lane.verification) {
+            lane.verification = std::make_unique<TargetVerification>(
+                *lane.request, lane.capacity(), lane.progress.position, capacity,
+                lane.options.top_logits > 0, stream, nullptr, lane.options.generated_top_logprobs,
+                tp != nullptr);
+        }
+        if (tp_driver)
+            tp_driver->prepare_peer_verification(lane, capacity);
+        if (lane.options.constraint) {
+            if (!lane.constraint_round) {
+                lane.constraint_round.emplace(*lane.request, *lane.options.constraint, capacity);
+            }
+            lane.constraint_round->begin(lane.progress.constraint, lane.remaining_output());
+        }
+        rounds[count] = {
+            lane.draft.get(),
+            lane.verification.get(),
+            lane.request.get(),
+            lane.constraint_round ? &*lane.constraint_round : nullptr,
+            lane.sampling ? &*lane.sampling : nullptr,
+            {lane.progress.last_token},
+            lane.progress.position,
+            lane.progress.generated,
+            lane.remaining_output(),
+            rows - 1,
+        };
+        rounds[count].media = lane.media ? &lane.media_prefill : nullptr;
+        if (lane.progress.generated < lane.options.min_new_tokens) {
+            rounds[count].minimum_options = &lane.options;
+            rounds[count].adjustment = &adjusted_workspace;
+        }
+        if (tp_driver)
+            peer_rounds[count] = TpDriver::peer_round(lane, rows - 1);
+        slots[count++] = slot;
+    }
+    return count;
+}
+
+void DecoderBatch::State::commit_verification(MtpRound* rounds, const int* slots,
+                                              MtpRound* peer_rounds, int size, Steps& results,
+                                              DecoderBatchStepStats& stats,
+                                              CheckpointRows* checkpoint_rows, cudaStream_t stream,
+                                              const MtpRound::Cancel& cancel) {
+    std::array<DraftRepairs, draft_projection_rows> repairs{};
+    for (int index = 0; index < size; ++index) {
+        auto& round = rounds[index];
+        const int slot = slots[index];
+        stats.verification_rows += round.rows();
+        auto* repair = tp_driver || (size > 1 && round.constraint == nullptr)
+                           ? repairs[index].data()
+                           : nullptr;
+        auto& lane = require_lane(storage->slots[slot]);
+        auto* saved =
+            checkpoint_rows != nullptr && lane.checkpoints() ? &(*checkpoint_rows)[slot] : nullptr;
+        lane.finish_round(round, results[slot], stream, output, cancel, repair, saved);
+        if (tp_driver) {
+            tp_driver->commit_peer_round(lane, round, saved);
+        }
+    }
+    if (tp_driver) {
+        tp_driver->repair(rounds, repairs.data(), peer_rounds, size, stream);
+    } else {
+        repair_verification_group(repairs.data(), size, stream);
+    }
+    stats.verification_lanes += size;
 }
 
 const MtpRound::Cancel& DecoderBatch::State::cancel_probe() const {

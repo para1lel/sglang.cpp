@@ -106,8 +106,17 @@ bool LayerBatch<Lane>::single_decode() const {
     }
 }
 
-template <typename Lane>
-bool LayerBatch<Lane>::fuse_verify_activation() const {
+template <typename Lane> bool LayerBatch<Lane>::batch_decode() const {
+    if (count < 2 || count > decoder_batch_max_lanes)
+        return false;
+    if constexpr (std::is_same_v<Lane, ForwardLane>) {
+        return std::all_of(lanes, lanes + count,
+                           [](const auto& lane) { return lane.mode == TextGdnMode::decode; });
+    }
+    return std::is_same_v<Lane, BatchGraphLane>;
+}
+
+template <typename Lane> bool LayerBatch<Lane>::fuse_verify_activation() const {
     return std::is_same_v<Lane, VerificationRow> &&
            (count == fused_verify_rows || singleton_verify_activation);
 }
@@ -213,6 +222,15 @@ void LayerBatch<Lane>::quantize(Bf16* Workspace::* source, int width) const {
                   "Quantize decode projection input");
             return;
         }
+    }
+    if (batch_decode()) {
+        TextFp8QuantizeRow rows[decoder_batch_max_lanes];
+        for (int index = 0; index < count; ++index) {
+            const auto& work = workspace(lanes[index]);
+            rows[index] = {work.*source, work.activation};
+        }
+        check(text_quantize_fp8(rows, count, width, stream), "Quantize decode projection inputs");
+        return;
     }
     for (int index = 0; index < count; ++index) {
         auto& work = workspace(lanes[index]);
@@ -391,6 +409,7 @@ bool LayerBatch<Lane>::project_target_chunk(std::initializer_list<LayerProjectio
 template <typename Lane>
 void LayerBatch<Lane>::project_target(std::initializer_list<LayerProjection> layers) const {
     constexpr bool verification = std::is_same_v<Lane, VerificationRow>;
+    int first = 0;
     if constexpr (verification) {
         if (packed_activation) {
             if (project_target_chunk<max_wide_mtp_rows>(layers, 0, count, false)) return;
@@ -406,8 +425,18 @@ void LayerBatch<Lane>::project_target(std::initializer_list<LayerProjection> lay
             }
             return;
         }
+    } else if (batch_decode()) {
+        constexpr int capacity = text_target_fp8_single_tile_rows;
+        const int groups = (count + capacity - 1) / capacity;
+        const int group_rows = count / groups;
+        const int larger_groups = count % groups;
+        for (int group = 0; group < groups; ++group) {
+            const int rows = group < larger_groups ? group_rows + 1 : group_rows;
+            if (!project_target_chunk<capacity>(layers, first, rows, false))
+                break;
+            first += rows;
+        }
     }
-    int first = 0;
     if constexpr (verification) {
         const int groups = (count - 1) / text_target_fp8_max_rows + 1;
         for (int group = 0; group < groups && count > text_fp8_max_batch; ++group) {

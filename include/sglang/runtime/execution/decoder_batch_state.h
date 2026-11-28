@@ -118,6 +118,7 @@ struct DecoderBatch::State {
         std::array<PrefillCheckpointList, decoder_batch_max_lanes> local;
         std::array<PrefillCheckpointList, decoder_batch_max_lanes> peer;
         std::array<int, decoder_batch_max_lanes> counts{};
+        std::array<int, decoder_batch_max_lanes> retained{};
         const PrefixPrefillPool* blocked_pool = nullptr;
         std::size_t blocked_capacity = 0;
         std::size_t blocked_count = 0;
@@ -135,13 +136,16 @@ struct DecoderBatch::State {
     void speculate_group(const PrefillRows& verification_rows, int& next_slot, Steps& results,
                          DecoderBatchStepStats& stats, const WideMtpGroups& wide_groups,
                          CheckpointRows* checkpoint_rows);
-    bool prepare_peer_repair(const MtpRound* rounds, int count);
+    void commit_verification(MtpRound* rounds, const int* slots, MtpRound* peer_rounds, int size,
+                             Steps& results, DecoderBatchStepStats& stats,
+                             CheckpointRows* checkpoint_rows, cudaStream_t stream,
+                             const MtpRound::Cancel& cancel);
     void repair_verification_group(const DraftRepairs* repairs, int count, cudaStream_t stream);
     int collect_rounds(const PrefillRows& verification_rows, int& next_slot,
-                       const WideMtpGroups& wide_groups,
                        std::array<MtpRound, max_wide_mtp_lanes>& rounds,
+                       std::array<int, max_wide_mtp_lanes>& slots,
                        std::array<MtpRound, max_wide_mtp_lanes>& peer_rounds,
-                       std::array<int, max_wide_mtp_lanes>& slots);
+                       const WideMtpGroups& wide_groups);
     bool prepare_wide_mtp(int lanes);
     WideMtpGroups prepare_wide_groups(const PrefillRows& decode,
                                      const WideMtpCandidates& candidates, bool& contains_mtp);

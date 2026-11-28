@@ -81,6 +81,8 @@ NVCC_HINT_WARNING = (
     "clang-diagnostic-unknown-attributes",
     "unknown attribute 'nv_inline_hint' ignored",
 )
+MUTABLE_GLOBAL = "cppcoreguidelines-avoid-non-const-global-variables"
+GLOBAL_NAME = re.compile(r"variable '([A-Za-z_]\w*)' is non-const and globally accessible,")
 
 LineSelection = dict[str, list[tuple[int, int]] | None]
 IncludeParents = defaultdict[str, set[str]]
@@ -304,6 +306,57 @@ def findings(root: Path, output: str) -> list[Finding]:
     return results
 
 
+def cuda_shared_locations(root: Path, output: str, name: str) -> set[tuple[str, int, int]]:
+    declarations = {}
+    decoder = json.JSONDecoder()
+    while output := output.lstrip():
+        node, end = decoder.raw_decode(output)
+        output = output[end:]
+        if node.get("kind") != "VarDecl" or node.get("name") != name:
+            continue
+        location = node.get("loc", {})
+        if not {"file", "line", "col"} <= location.keys():
+            continue
+        key = project_path(root, location["file"]), location["line"], location["col"]
+        dynamic = (
+            node.get("storageClass") == "extern"
+            and node.get("type", {}).get("qualType", "").endswith("[]")
+            and any(attr.get("kind") == "CUDASharedAttr" for attr in node.get("inner", ()))
+        )
+        declarations[key] = declarations.get(key, True) and dynamic
+    return {key for key, dynamic in declarations.items() if dynamic}
+
+
+def filter_cuda_shared(root: Path, flags: list[str], diagnostics: list[Finding]) -> list[Finding]:
+    known = {}
+    kept = []
+    for item in diagnostics:
+        match = GLOBAL_NAME.match(item.message) if item.check == MUTABLE_GLOBAL else None
+        if match is None or Path(item.path).is_absolute():
+            kept.append(item)
+            continue
+        name = match[1]
+        if name not in known:
+            command = [
+                "clang++",
+                *flags,
+                "-fsyntax-only",
+                "-Xclang",
+                "-ast-dump=json",
+                "-Xclang",
+                "-ast-dump-filter",
+                "-Xclang",
+                name,
+            ]
+            result = invoke_tool(command, root, timeout=120)
+            known[name] = set()
+            if result.returncode == 0:
+                known[name] = cuda_shared_locations(root, result.stdout.decode(), name)
+        if (item.path, item.line, item.column) not in known[name]:
+            kept.append(item)
+    return kept
+
+
 class ClangTidy:
     def __init__(
         self,
@@ -360,6 +413,9 @@ class ClangTidy:
             if status not in {0, 1} or TOOL_ERROR.search(output) or (status and not observed):
                 message = f"clang-tidy failed for {name} (exit {status})"
                 raise RuntimeError(f"{message}\n{output.rstrip()}")
+            if "cuda" in variant:
+                compile_flags = [str(path), *variant, *options, *(self.cutlass or [])]
+                observed = filter_cuda_shared(root, compile_flags, observed)
             diagnostics.extend(observed)
             if trace:
                 included.update(project_path(root, entry) for entry in TRACE.findall(output))

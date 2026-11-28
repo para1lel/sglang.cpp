@@ -1,4 +1,5 @@
 #include "sglang/runtime/cache/lmcache_group.h"
+#include "sglang/runtime/cache/prefix_cache_layout.h"
 
 #include <algorithm>
 #include <chrono>
@@ -11,24 +12,26 @@
 namespace sglang::decoder {
 namespace {
 
-constexpr int draft_rank = 0;
-
-int common_gqa(const LmCacheClient& client, const std::vector<const PrefixCacheKeys*>& keys,
-               const std::vector<LmCachePrefixDetail>& details) {
-    auto [lowest, highest] = std::minmax_element(
+int common_kv(const LmCacheClient& client, const std::vector<const PrefixCacheKeys*>& keys,
+              const std::vector<LmCachePrefixDetail>& details, bool draft) {
+    const auto coverage = [draft](const LmCachePrefixDetail& detail) {
+        return draft ? detail.draft : detail.gqa;
+    };
+    const auto [lowest, highest] = std::minmax_element(
         details.begin(), details.end(),
-        [](const auto& left, const auto& right) { return left.gqa < right.gqa; });
-    const int limit = lowest->gqa;
+        [&](const auto& left, const auto& right) { return coverage(left) < coverage(right); });
+    const int limit = coverage(*lowest);
     const int tail = limit % prefix_gqa_chunk_tokens;
-    if (tail == 0 || limit == highest->gqa)
+    if (tail == 0 || limit == coverage(*highest))
         return limit;
 
     const int base = limit - tail;
+    const auto family = draft ? LmCacheFamily::draft : LmCacheFamily::gqa;
     std::vector<bool> common(tail, true);
     std::vector<LmCacheKey> candidates(tail);
     for (const auto* rank : keys) {
         for (int index = 0; index < tail; ++index) {
-            candidates[index] = {LmCacheFamily::gqa, rank->key(limit - index)};
+            candidates[index] = {family, rank->key(limit - index + static_cast<int>(draft))};
         }
         const auto present = client.lookup(candidates);
         for (int index = 0; index < tail; ++index)
@@ -38,13 +41,23 @@ int common_gqa(const LmCacheClient& client, const std::vector<const PrefixCacheK
     return first == common.end() ? base : limit - static_cast<int>(first - common.begin());
 }
 
-bool valid_rank_layout(const PrefixDeviceTransfer* transfer, const PrefixDeviceLayout& lead,
-                       bool draft_only) {
-    if (transfer == nullptr)
-        return draft_only;
-    const auto& layout = transfer->layout;
-    return layout.draft.end == 0 && layout.gqa.begin == lead.gqa.begin &&
-           layout.gqa.end == lead.gqa.end && layout.gdn.end == lead.gdn.end;
+bool valid_draft_geometry(const PrefixDeviceLayout& layout, int world, int rank) {
+    return world != 2 || layout.draft.end == 0 ||
+           layout.draft.kv_heads == tp2_prefix_cache_layout(rank).kv_heads;
+}
+
+bool same_rank_extent(const PrefixDeviceLayout& layout, const PrefixDeviceLayout& lead) {
+    return layout.gqa.begin == lead.gqa.begin && layout.gqa.end == lead.gqa.end &&
+           layout.draft.begin == lead.draft.begin && layout.draft.end == lead.draft.end &&
+           layout.gdn.end == lead.gdn.end;
+}
+
+const LmCacheEndpointCoverage* find_endpoint(const LmCachePrefixDetail& detail, int end) {
+    const auto& endpoints = detail.endpoints;
+    const auto found =
+        std::lower_bound(endpoints.begin(), endpoints.end(), end,
+                         [](const auto& item, int value) { return item.end > value; });
+    return found != endpoints.end() && found->end == end ? &*found : nullptr;
 }
 
 struct RankTransferResult {
@@ -143,29 +156,29 @@ PrefixCacheRead LmCacheGroup::lookup_prefix(const std::vector<const PrefixCacheK
     }
     std::vector<LmCachePrefixDetail> details(world);
     for (std::size_t rank = 0; rank < world; ++rank) {
-        details[rank] = client_.lookup_prefix(*keys[rank], draft && rank == draft_rank);
+        details[rank] = client_.lookup_prefix(*keys[rank], draft);
     }
     PrefixCacheRead read;
-    read.matched_gqa = common_gqa(client_, keys, details);
-    read.matched_draft = details[draft_rank].draft;
+    read.matched_gqa = common_kv(client_, keys, details, false);
+    if (draft)
+        read.matched_draft = common_kv(client_, keys, details, true);
     read.usable_gqa = read.matched_gqa;
     const int maximum = std::min(max_restore, read.usable_gqa);
-    for (const auto& candidate : details[draft_rank].endpoints) {
+    for (const auto& candidate : details.front().endpoints) {
+        bool draft_ready = candidate.draft;
         const auto contains = [&](const LmCachePrefixDetail& detail) {
-            const auto& endpoints = detail.endpoints;
-            const auto found =
-                std::lower_bound(endpoints.begin(), endpoints.end(), candidate.end,
-                                 [](const auto& item, int end) { return item.end > end; });
-            return found != endpoints.end() && found->end == candidate.end;
+            const auto* endpoint = find_endpoint(detail, candidate.end);
+            draft_ready = draft_ready && endpoint != nullptr && endpoint->draft;
+            return endpoint != nullptr;
         };
         if (!std::all_of(details.begin() + 1, details.end(), contains))
             continue;
         if (read.matched_gdn == 0)
             read.matched_gdn = candidate.end;
         read.matched_gdn_endpoints.push_back(candidate.end);
-        if (candidate.draft)
+        if (draft_ready)
             read.draft_ready_gdn_endpoints.push_back(candidate.end);
-        if (read.usable_gdn == 0 && candidate.end <= maximum && (!draft || candidate.draft)) {
+        if (read.usable_gdn == 0 && candidate.end <= maximum && (!draft || draft_ready)) {
             read.usable_gdn = candidate.end;
             read.usable_draft = draft ? candidate.end - 1 : 0;
         }
@@ -178,7 +191,7 @@ PrefixCacheRead LmCacheGroup::lookup_prefix(const std::vector<const PrefixCacheK
 std::string LmCacheGroup::prepare_store(int rank, const PrefixCacheKeys& keys,
                                         const PrefixDeviceTransfer& transfer) const {
     if (rank < 0 || rank >= world_size_ || !keys.matches_rank(world_size_, rank) ||
-        (rank != draft_rank && transfer.layout.draft.end != 0)) {
+        !valid_draft_geometry(transfer.layout, world_size_, rank)) {
         throw std::invalid_argument("Invalid LMCache rank store");
     }
     return client_.prepare_store(keys, transfer);
@@ -265,11 +278,9 @@ LmCacheGroup::transfer_ranked(const std::vector<const PrefixCacheKeys*>& keys,
     if (keys.size() != world || transfers.size() != world) {
         throw std::invalid_argument("LMCache rank transfer count mismatch");
     }
-    const auto* lead = transfers[draft_rank];
-    if (lead == nullptr)
+    if (transfers.front() == nullptr)
         throw std::invalid_argument("Missing LMCache lead transfer");
-    const auto& layout = lead->layout;
-    const bool only_draft = layout.draft.end != 0 && layout.gqa.end == 0 && layout.gdn.end == 0;
+    const auto& layout = transfers.front()->layout;
     if (receipt != nullptr)
         *receipt = {};
     if (per_rank != nullptr)
@@ -281,20 +292,21 @@ LmCacheGroup::transfer_ranked(const std::vector<const PrefixCacheKeys*>& keys,
         if (!keys[rank]->matches_rank(world_size_, rank)) {
             return incompatible;
         }
-        if (rank != draft_rank && !valid_rank_layout(transfers[rank], layout, only_draft)) {
-            throw std::invalid_argument("LMCache target transfer differs across ranks");
+        if (transfers[rank] == nullptr || !same_rank_extent(transfers[rank]->layout, layout) ||
+            !valid_draft_geometry(transfers[rank]->layout, world_size_, rank)) {
+            throw std::invalid_argument("LMCache transfer extent or draft geometry mismatch");
         }
     }
     const auto transfer_rank = [&](std::size_t rank, LmCacheReceipt* sink) {
         return transfer_one(rank, *keys[rank], *transfers[rank], *sink, stop_fd, store);
     };
-    if (only_draft || world == 1) {
+    if (world == 1) {
         LmCacheReceipt local;
-        const auto status = transfer_rank(draft_rank, &local);
+        const auto status = transfer_rank(0, &local);
         if (receipt != nullptr)
             *receipt = local;
         if (per_rank != nullptr)
-            (*per_rank)[draft_rank] = local;
+            per_rank->front() = local;
         return status;
     }
     return finish_ranks(run_ranks(world, transfer_rank), receipt, per_rank);

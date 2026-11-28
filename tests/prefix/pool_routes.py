@@ -159,7 +159,7 @@ def rank_receipt(entry: Event, world: int, *, exact: bool = True) -> list[int]:
         if family == GDN:
             size = (76992512 - 20480) * (2 // world) + 20480
         else:
-            size = record["tokens"] * (33792 // world if family == GQA else 2112)
+            size = record["tokens"] * ((33792 if family == GQA else 2112) // world)
         assert record["bytes"] == size, record
         expected[family - 1] += size
         if family == GQA and entry["opcode"] == RANK_PUT:
@@ -360,9 +360,9 @@ def pressure(witness: Witness, mark: Callable[[str], None], world: int) -> dict[
     assert delta(before, after, "prefix_unbacked_evictions_total") == 0, after
     written = transfer(witness.relay.since(start), RANK_PUT)
     families = record_families(written)
-    assert set(families) == (
-        {(device, family) for device in devices for family in (GQA, GDN)} | {(devices[0], DRAFT)}
-    ), families
+    assert set(families) == {(device, family) for device in devices for family in FAMILIES}, (
+        families
+    )
     for event in written:
         rank_receipt(event, world, exact=False)
     replacements = [

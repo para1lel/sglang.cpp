@@ -10,7 +10,7 @@ prompt for the configured Qwen checkpoint.
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| HTTP transport | Match the routes, validate the media type, and enqueue requests on the CPU FIFO. | [Route aliases](../apps/server/http.cpp#L419)<!-- prefix: "Tokenization" --> · [Media type](../apps/server/http.cpp#L208)<!-- prefix: "if ((tokeniz" --> · [Queue admission](../apps/server/prefix_controls.cpp#L722)<!-- prefix: "void Connect" --> |
+| HTTP transport | Match the routes, validate the media type, and enqueue requests on the CPU FIFO. | [Route aliases](../apps/server/http.cpp#L419)<!-- prefix: "Tokenization" --> · [Media type](../apps/server/http.cpp#L208)<!-- prefix: "if ((tokeniz" --> · [Queue admission](../apps/server/prefix_controls.cpp#L724)<!-- prefix: "void Connect" --> |
 | Tokenization worker | Validate inputs and encode or decode with the checkpoint tokenizer. | [Request handler](../apps/server/tokenization.cpp#L858)<!-- prefix: "void serve_t" --> · [Tokenizer load](../apps/server/text_completion.cpp#L22)<!-- prefix: "const Tokeni" --> |
 | Chat renderer | Render the Qwen3.8 checkpoint format before encoding chat. | [Chat tokenization](../apps/server/tokenization.cpp#L593)<!-- prefix: "std::vector\u003c" --> · [Renderer](../apps/server/qwen/qwen_chat_template.cpp#L555)<!-- prefix: "std::string " --> |
 
@@ -18,7 +18,7 @@ prompt for the configured Qwen checkpoint.
 
 Send a JSON object with `Content-Type: application/json`. If you include
 `model` on the encode or decode routes, use a string.
-Tokenization shares a [bounded CPU FIFO](http-server.md#http-admission-and-shutdown) with Anthropic token counting and the standalone parser routes. One CPU worker performs the conversion without a decoder slot. Cache flush can proceed while tokenization waits or runs. [CPU worker](../apps/server/prefix_controls.cpp#L794)<!-- prefix: "void Connect" --> · [Cache reset guard](../apps/server/prefix_controls.cpp#L284)<!-- prefix: "bool Connect" -->
+Tokenization shares a [bounded CPU FIFO](http-server.md#http-admission-and-shutdown) with Anthropic token counting and the standalone parser routes. One CPU worker performs the conversion without a decoder slot. Cache flush can proceed while tokenization waits or runs. [CPU worker](../apps/server/prefix_controls.cpp#L796)<!-- prefix: "void Connect" --> · [Cache reset guard](../apps/server/prefix_controls.cpp#L286)<!-- prefix: "bool Connect" -->
 Each route returns one JSON response with HTTP 200 on success.
 
 ### Encode text
@@ -167,7 +167,7 @@ the trailing-slash form receives HTTP 307. Other methods on the canonical
 path receive HTTP 405 with `Allow: POST`. Malformed content or invalid fields
 receive HTTP 400 with an `invalid_request_error`. For example, omit `model`
 to receive this body.
-[Method check](../apps/server/prefix_controls.cpp#L624)<!-- prefix: "if ((count \u007c" --> ·
+[Method check](../apps/server/prefix_controls.cpp#L626)<!-- prefix: "if ((count \u007c" --> ·
 [Anthropic error body](../apps/server/http.cpp#L681)<!-- prefix: "void write_a" -->
 
 ```json

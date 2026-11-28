@@ -237,6 +237,13 @@ def check_mtp(args):
             if entry["verified"] == 2
         }
         assert len(verified_slots) == 2, steps
+        assert any(step["verification_graph_slots"] for step in steps), steps
+        for step in steps:
+            verified = sum(
+                1 << slot for slot, entry in step.get("mtp_slots", {}).items() if entry["verified"]
+            )
+            assert step["verification_graph_slots"] & ~verified == 0, step
+            assert step["graph_slots"] & step["verification_graph_slots"] == 0, step
         assert sum(sum(step["prefill"]) for step in steps) == 2 * len(fixture["prompt"]), steps
 
 
@@ -286,7 +293,24 @@ def check_eager_cache(args):
         media.capture(evidence, "prime", port, media.TEXT, prime)
         after_prime = controls.idle("prime-resident")[GDN_ENTRIES]
         assert after_prime > after_cold, (after_cold, after_prime)
+        controls.control(
+            "profile-start",
+            "/start_profile",
+            json.dumps(
+                {
+                    "profile_prefix": "forced-eager",
+                    "max_iterations": 16,
+                    "profiler_kwargs": {"with_stack": False},
+                }
+            ).encode(),
+        )
         warm = media.capture(evidence, "warm", port, media.TEXT, body)
+        profile = json.loads(controls.control("profile-stop", "/stop_profile", b""))
+        assert any(step["decode_lanes"] for step in profile["steps"]), profile
+        assert all(
+            step["graph_slots"] == step["verification_graph_slots"] == 0
+            for step in profile["steps"]
+        ), profile
         assert cold["usage"]["prompt_tokens_details"]["cached_tokens"] == 0, cold
         assert warm["usage"]["prompt_tokens_details"]["cached_tokens"] == CACHE_BOUNDARY, warm
         for reply in (cold, warm):
@@ -296,6 +320,7 @@ def check_eager_cache(args):
         native.await_retirement(log, 0, 4)
         trace = log.read_bytes()
         assert b"batch graph_slots=" not in trace, log
+        assert b"batch verification_graph_slots=" not in trace, log
         assert re.search(rb"batch mtp .* drafted=[1-9]\d* accepted=", trace), log
 
 

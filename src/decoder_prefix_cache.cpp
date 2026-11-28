@@ -172,16 +172,20 @@ public:
         return {index, exported.offset};
     }
 
-    PrefixDeviceMxfp8 mxfp8(Mxfp8KvCache cache, int layers, int begin, int end, int kv_heads,
+    PrefixDeviceMxfp8 mxfp8(Mxfp8KvCache cache, int layers, int begin, int end,
                             const Allocations* memory = nullptr,
                             const std::int32_t* mapped = nullptr) {
         if (begin == end)
             return {};
-        PrefixDeviceMxfp8 result{begin, end, layers, cache.page_count};
-        result.kv_heads = kv_heads;
+        PrefixDeviceMxfp8 result;
+        result.begin = begin;
+        result.end = end;
+        result.layers = layers;
+        result.page_count = cache.page_count;
+        result.kv_heads = cache.kv_heads;
         const auto page_count = static_cast<std::size_t>(layers) * cache.page_count;
-        const auto payload = page_count * gqa_payload_bytes_per_page(kv_heads);
-        const auto scales = page_count * gqa_scale_bytes_per_page(kv_heads);
+        const auto payload = page_count * gqa_payload_bytes_per_page(cache.kv_heads);
+        const auto scales = page_count * gqa_scale_bytes_per_page(cache.kv_heads);
         result.planes = {
             allocation(cache.key_payload, payload, memory),
             allocation(cache.value_payload, payload),
@@ -236,8 +240,7 @@ public:
         if (range.pages == nullptr || range.end <= range.begin) {
             return {};
         }
-        const auto cache = slab.cache({rank});
-        auto result = mxfp8(cache, slab.layers(), range.begin, range.end, cache.kv_heads);
+        auto result = mxfp8(slab.cache({rank}), slab.layers(), range.begin, range.end);
         const int end = (range.end + mxfp8_page_size - 1) / mxfp8_page_size;
         const int count = end - (range.begin / mxfp8_page_size);
         result.physical_pages.reserve(count);
@@ -437,7 +440,6 @@ PrefixDeviceTransfer restore_prefix_view(Request& request, const PrefixCacheRead
     if (draft && layout && !layout->draft_lane) {
         throw std::logic_error("Restore a draft decoder prefix on a non-draft lane");
     }
-    const int kv_heads = layout != nullptr ? layout->kv_heads : mxfp8_kv_heads;
     const int coherent = has_extent ? extent->gdn_end : read.usable_gdn;
     const int gqa_begin = has_extent ? extent->gqa_begin : 0;
     const int gqa_end = has_extent ? extent->gqa_end : read.usable_gqa;
@@ -462,16 +464,16 @@ PrefixDeviceTransfer restore_prefix_view(Request& request, const PrefixCacheRead
     const auto* target_map = request.shared_prefix_pages.empty()
                                  ? nullptr
                                  : request.memory.transfers().logical_pages.data();
-    payload.gqa = view.mxfp8(
-        request.caches.front(), full_attention_layers, gqa_begin, gqa_end, kv_heads, nullptr,
-        target_map != nullptr ? target_map + (gqa_begin / mxfp8_page_size) : nullptr);
+    payload.gqa =
+        view.mxfp8(request.caches.front(), full_attention_layers, gqa_begin, gqa_end, nullptr,
+                   target_map != nullptr ? target_map + (gqa_begin / mxfp8_page_size) : nullptr);
     if (draft != nullptr && draft_rows > draft_begin) {
         const auto* draft_map =
             draft->resident_prefix_pages().empty()
                 ? nullptr
                 : draft->prefix_physical_pages().data() + (draft_begin / mxfp8_page_size);
         payload.draft = view.mxfp8(draft->prefix_cache_view(draft_rows, false), 1, draft_begin,
-                                   draft_rows, mxfp8_kv_heads, nullptr, draft_map);
+                                   draft_rows, nullptr, draft_map);
     }
     if (coherent != 0) {
         const auto storage = snapshot ? snapshot : std::make_shared<PrefixPrefillSnapshot>(layout);
@@ -492,18 +494,17 @@ PrefixDeviceTransfer export_prefix_view(const Request& request, int gqa_begin, i
     if (draft && layout && !layout->draft_lane) {
         throw std::logic_error("Export a draft decoder prefix from a non-draft lane");
     }
-    const int kv_heads = layout ? layout->kv_heads : mxfp8_kv_heads;
     if (end <= 0 || end > capacity(request) || gqa_begin < 0 || gqa_begin > end ||
         draft_begin < 0 || draft_begin > (draft ? end - 1 : 0)) {
         throw std::logic_error("Invalid decoder prefix checkpoint extent");
     }
     PrefixViewBuilder view(layout, true);
     PrefixDeviceLayout payload;
-    payload.gqa = view.mxfp8(request.caches.front(), full_attention_layers, gqa_begin, end,
-                             kv_heads, &request.memory);
+    payload.gqa =
+        view.mxfp8(request.caches.front(), full_attention_layers, gqa_begin, end, &request.memory);
     if (draft && draft_begin < end - 1) {
-        payload.draft = view.mxfp8(draft->prefix_cache_view(end - 1, true), 1, draft_begin,
-                                   end - 1, mxfp8_kv_heads, &draft->prefix_cache_memory());
+        payload.draft = view.mxfp8(draft->prefix_cache_view(end - 1, true), 1, draft_begin, end - 1,
+                                   &draft->prefix_cache_memory());
     }
     payload.gdn = snapshot ? view.gdn(snapshot, end)
                            : view.gdn(request.states.front(), row != nullptr ? *row : request.work,

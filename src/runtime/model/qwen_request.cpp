@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <numeric>
+#include <new>
 #include <utility>
 
 namespace sglang::decoder {
@@ -265,38 +266,33 @@ BatchDecodeBinding* Allocations::allocate<BatchDecodeBinding>(std::size_t count)
 }
 
 BatchGraphScratch::BatchGraphScratch(int device)
-    : memory(device), device_bindings(memory.allocate<BatchDecodeBinding>(work.size())) {
-    for (auto& workspace : work) {
-        workspace.emplace(memory);
-    }
+    : memory(device), device_bindings(static_cast<BatchGraphBindings*>(
+                          memory.allocate_elements(1, sizeof(BatchGraphBindings)))),
+      device_(device) {
+    void* host = nullptr;
+    check(cudaMallocHost(&host, sizeof(BatchGraphBindings)), "Allocate batch decode bindings");
+    auto* bindings = ::new (host) BatchGraphBindings{};
+    host_bindings = std::shared_ptr<BatchGraphBindings>(
+        bindings, [](BatchGraphBindings* binding) { cudaFreeHost(binding); });
 }
 
-ExactGqaWorkspace Request::batch_graph_scores() {
-    if (long_graph_scores) {
-        return *long_graph_scores;
-    }
-    if (pages.page_count <= 0 ||
-        pages.page_count > text_attention_max_tokens / mxfp8_page_size) {
-        throw std::invalid_argument("Invalid batch graph score capacity");
-    }
-    const int capacity = pages.page_count * mxfp8_page_size;
-    const auto count = static_cast<std::size_t>(capacity) * mxfp8_query_heads;
+void BatchGraphScratch::prepare(int lanes) {
+    if (lanes <= prepared_lanes)
+        return;
+    auto added = std::make_unique<Allocations>(device_);
     try {
-        long_graph_scores = {memory.allocate<float>(count), capacity};
-    } catch (const CudaError& error) {
-        if (error.status != cudaErrorMemoryAllocation) {
-            throw;
+        for (int lane = prepared_lanes; lane < lanes; ++lane)
+            work[lane].emplace(*added);
+        if (available_device_bytes() < decoder_shared_reserve) {
+            check(cudaErrorMemoryAllocation, "Reserve device headroom for batch decode");
         }
-        const auto previous = cudaGetLastError();
-        if (previous != cudaErrorMemoryAllocation) {
-            check(previous, "Check CUDA error before eager batch score fallback");
-        }
-        std::fprintf(stderr, "sglang decoder: Allocate batch scores for %d positions: %s, "
-                     "using eager decode for long positions\n", capacity,
-                     cudaGetErrorString(error.status));
-        long_graph_scores = ExactGqaWorkspace{};
+    } catch (...) {
+        for (int lane = prepared_lanes; lane < lanes; ++lane)
+            work[lane].reset();
+        throw;
     }
-    return *long_graph_scores;
+    allocations[prepared_lanes] = std::move(added);
+    prepared_lanes = lanes;
 }
 
 void allocate_gdn(Allocations& memory, GdnBank& states, std::size_t history_elements,
@@ -404,11 +400,6 @@ void Request::grow_kv(int positions, int written, cudaStream_t stream) {
     synchronize_cuda(stream, "Complete MXFP8 cache growth");
     memory.discard_graph();
     memory.free_block(caches.front().key_payload, kv_bytes(previous, cache_kv_heads));
-    if (long_graph_scores && long_graph_scores->scores) {
-        memory.free_block(long_graph_scores->scores,
-                          long_graph_scores->capacity * mxfp8_query_heads * sizeof(float));
-    }
-    long_graph_scores.reset();
     caches = replacement;
     pages.page_count = next;
 }

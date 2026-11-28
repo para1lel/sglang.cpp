@@ -67,6 +67,17 @@ CUresult encode_map(const LaunchTarget& target, CUtensorMap& map, const void* da
                     CUtensorMapDataType type, int element_bytes, int rows, int width,
                     int box_rows);
 
+struct TiledMapShape {
+    CUtensorMapDataType type;
+    int element_bytes;
+    int rows;
+    int width;
+    int box_rows;
+};
+
+CUresult encode_tiled_map(PFN_cuTensorMapEncodeTiled_v12000 encode, CUtensorMap& map,
+                          const void* data, TiledMapShape shape, CUtensorMapL2promotion promotion);
+
 cudaError_t launch_split(const void* kernel, dim3 grid, int shared_bytes, void** args,
                          cudaStream_t stream, unsigned cluster);
 cudaError_t launch_split(const void* kernel, dim3 grid, int shared_bytes, void** args,

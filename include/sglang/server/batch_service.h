@@ -43,6 +43,7 @@ struct BatchProfileStep {
     int prefill_rows = 0;
     int decode_lanes = 0;
     std::uint32_t graph_slots = 0;
+    std::uint32_t verification_graph_slots = 0;
 };
 
 struct BatchProfile {

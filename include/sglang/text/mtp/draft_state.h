@@ -11,9 +11,12 @@ bool use_streaming_projection(bool supported, cudaStream_t stream);
 struct MtpDraftWeights::State {
     State(const std::filesystem::path& directory, int device,
           std::shared_ptr<const Allocations> target_weights, const Bf16* embedding,
-          Bf16Weight lm_head, DraftOperatorCapabilities capabilities);
+          Bf16Weight lm_head, DraftOperatorCapabilities capabilities, WeightSharding shard);
 
     int device;
+    WeightSharding shard;
+    GqaGeometry geometry;
+    int vocab_begin;
     const DraftOperatorCapabilities capabilities;
     bool streaming_projection = false;
     std::shared_ptr<const Allocations> target_weights;
@@ -39,9 +42,9 @@ struct DraftWorkspace {
     static constexpr int score_storage_count = vocab_size * sizeof(Bf16) / sizeof(float);
     static_assert(score_storage_count * sizeof(float) == vocab_size * sizeof(Bf16));
 
-    explicit DraftWorkspace(Allocations& memory);
+    DraftWorkspace(Allocations& memory, WeightSharding shard, int vocab_rows);
 
-    ExactGqaWorkspace attention_scores() const;
+    ExactGqaWorkspace attention_scores(GqaGeometry geometry) const;
 
     Bf16* embedding;
     Bf16* concatenated;
@@ -67,11 +70,15 @@ struct MtpDraftRequest::State {
     State(std::shared_ptr<const MtpDraftWeights> weights, int capacity, RequestBlockCache* cache,
           PrefixStorage storage);
     void validate(int position, int token, const Bf16* hidden) const;
+    static bool bind_tp_rows(MtpDraftInput* const (&inputs)[2], int rank, State** states,
+                             int count);
     void embed(int shifted_token, const Bf16* hidden, cudaStream_t stream,
                const Bf16* feature = nullptr);
     void prepare_attention(cudaStream_t stream);
     void append(int position, bool score, const MropePosition* mrope, int rotary_position,
                 cudaStream_t stream);
+    void append_prefill(int first, int count, const MtpPrefillBuffers& buffers, cudaStream_t stream,
+                        const MediaPrefill* media);
     DraftAttentionRow attention_row(int position);
     void gate_attention(cudaStream_t stream);
     void prepare_mlp(cudaStream_t stream);
@@ -84,6 +91,10 @@ struct MtpDraftRequest::State {
     bool prepare_mapped_score(cudaStream_t stream);
     int score_token();
     static void score_wave(State* const* batch, int count, cudaStream_t stream);
+    static void project_scores(State* const* batch, int count, bool int8, cudaStream_t stream,
+                               int output_offset = 0);
+    static void select_tp_wave(State* const* batch, int count, bool int8, cudaStream_t stream);
+    TextLogitCandidate tp_winner();
     static void select_wave(State* const* batch, int count, cudaStream_t stream);
 
     std::shared_ptr<const MtpDraftWeights> weights;

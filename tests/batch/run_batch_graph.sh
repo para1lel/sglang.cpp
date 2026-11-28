@@ -118,6 +118,7 @@ LD_PRELOAD="$out/activity.so" BATCH_GRAPH_ACTIVITY="$out/operators.cupti.tsv" \
 for route in eager graph; do
     run_lanes "default-$route" "$route"
 done
+run_lanes fault-eager eager '' '' fault
 for fault in begin instantiate launch scratch-oom instantiate-oom hard; do
     route=graph
     observer=failure
@@ -125,7 +126,7 @@ for fault in begin instantiate launch scratch-oom instantiate-oom hard; do
         hard) route=hard ;;
         *-oom) observer=oom ;;
     esac
-    run_lanes "fault-$fault" "$route" "$fault" "$observer"
+    run_lanes "fault-$fault" "$route" "$fault" "$observer" fault
 done
 
 for route in eager graph; do

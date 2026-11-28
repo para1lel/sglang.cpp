@@ -7,6 +7,7 @@
 #include "sglang/decoder_verify.h"
 #include "sglang/runtime/backend/device_arena.h"
 #include "sglang/runtime/backend/tensor_parallel.h"
+#include "sglang/runtime/execution/tp_verify_graph.h"
 #include "sglang/prefill_fp8.h"
 
 #include <algorithm>
@@ -519,8 +520,18 @@ Decoder::Decoder(const std::filesystem::path& checkpoint, int cuda_device, bool 
     if (enable_mtp) {
         model_->mtp_weights = std::make_shared<decoder::MtpDraftWeights>(
             checkpoint, cuda_device, model_->memory, model_->embedding, model_->lm_head,
-            model_->backend.draft);
+            model_->backend.draft, decoder::WeightSharding{0, tensor_parallel});
         model_->tc_vocab = model_->mtp_weights->shared_vocab();
+        if (tp_) {
+            auto& peer = *tp_->peer;
+            peer.mtp_weights = std::make_shared<decoder::MtpDraftWeights>(
+                checkpoint, peer.device, peer.memory, peer.embedding, peer.lm_head,
+                peer.backend.draft, decoder::WeightSharding{1, tensor_parallel});
+            const decoder::DeviceScope root(cuda_device);
+            decoder::check(
+                cudaEventCreateWithFlags(&tp_->draft_input_ready, cudaEventDisableTiming),
+                "Create MTP input handoff event");
+        }
     }
     const auto commit = [](decoder::DeviceArena& arena) {
         if (arena.committed())
@@ -546,7 +557,12 @@ Decoder::Decoder(const std::filesystem::path& checkpoint, int cuda_device, bool 
             entry.nccl_established = true;
             entry.weight_bytes = model.memory->bytes();
             if (model.mtp_weights) {
-                entry.weight_bytes += model.mtp_weights->device_allocation_bytes();
+                const auto& draft = *model.mtp_weights;
+                entry.draft_weight_bytes = draft.device_allocation_bytes();
+                entry.weight_bytes += entry.draft_weight_bytes;
+                entry.draft_vocab_begin = draft.vocab_begin();
+                entry.draft_vocab_rows = draft.vocab_rows();
+                entry.draft_kv_heads = draft.kv_heads();
             }
             entry.lm_head = model.lm_head.values != nullptr;
             entry.mtp = model.mtp_weights != nullptr;
@@ -590,13 +606,18 @@ void Decoder::TpRuntime::load_peer_and_staging(const std::filesystem::path& chec
 }
 
 Decoder::TpRuntime::~TpRuntime() {
+    if (group)
+        decoder::tp_verify_graph::close(verification_capture, *group);
     if (peer_stream) {
         decoder::DeviceScope peer_scope(peer_device);
         synchronize_cuda(peer_stream, "Fence rank-1 stream for tensor-parallel teardown");
     }
-    verification_capture.reset();
     group.reset();
     peer.reset();
+    if (draft_input_ready != nullptr) {
+        const decoder::DeviceScope primary(device);
+        check(cudaEventDestroy(draft_input_ready), "Destroy MTP input handoff event");
+    }
     if (peer_stream != nullptr) {
         decoder::DeviceScope peer_scope(peer_device);
         check(cudaStreamDestroy(peer_stream), "Destroy rank-1 stream");
@@ -714,7 +735,7 @@ void Decoder::Model::advance_serial(Request& request, RequestProgress& progress,
 bool Decoder::Model::serial_graph(const DecoderOptions& options, int prompt_count,
                                   int limit) const {
     const bool split_decode = execution.split_decode(prompt_count, limit);
-    return !options.eager && !options.requires_target_only() && !split_decode;
+    return !options.eager && !options.adjusts_logits(0) && !split_decode;
 }
 
 void Decoder::Model::generate_serial(const std::vector<int>& prompt, const DecoderOptions& options,
@@ -732,7 +753,7 @@ void Decoder::Model::generate_serial(const std::vector<int>& prompt, const Decod
     const int pages = (capacity + mxfp8_page_size - 1) / mxfp8_page_size;
     const auto sampling = options.samples() ? std::optional{request_sampling(options)}
                                             : std::nullopt;
-    const bool adjusted = options.requires_target_only();
+    const bool adjusted = options.adjusts_logits(0);
     const bool reuse_graph = !teacher && serial_graph(options, prompt_count, limit);
     const RequestLease lease(request_in_use, reuse_graph);
     std::unique_ptr<Request> eager_request;
@@ -823,7 +844,7 @@ DecoderResult Decoder::generate(const std::vector<int>& prompt_token_ids,
     if (options.generated_top_logprobs != -1 || options.score_prompt || options.label_token_ids) {
         throw std::invalid_argument("Generated logprobs require the batch decoder");
     }
-    const int proposals = options.requires_target_only() ? 0 : options.mtp_steps;
+    const int proposals = options.adjusts_logits(0) ? 0 : options.mtp_steps;
     if (proposals != 0 && !model_->mtp_weights) {
         throw std::invalid_argument("MTP weights must be enabled when constructing the decoder");
     }

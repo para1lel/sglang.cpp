@@ -13,7 +13,8 @@ mkdir -p "$out"
     -isystem "$CONDA_PREFIX/include" -Iinclude tests/prefix/reader_queue.cpp \
     apps/server/{prefix_controls,flush_cache,http,loads,completions,ollama_discovery}.cpp \
     apps/server/{parse_function_call,native_sessions,responses,native_generate,ollama_generate}.cpp \
-    apps/server/{text_request,text_completion,tokenization_validation,tool_literal,tool_union}.cpp \
+    apps/server/{text_request,text_completion,tokenization,tokenization_validation}.cpp \
+    apps/server/{anthropic_count,tool_literal,tool_union}.cpp \
     apps/server/detail/{batch_state,text_stop}.cpp \
     apps/server/qwen/{qwen_chat_output,qwen_tool_output,qwen_tool_syntax,qwen_chat_template}.cpp \
     src/runtime/server/batch_executor.cpp src/runtime/execution/decoder_options.cpp \
@@ -65,7 +66,7 @@ GPU_UUID="$GPU_UUID" LMCACHE_SOCKET="$LMCACHE_SOCKET" \
 
 Require exit zero and `PASS` in `state.log`, `graph.log`, and `release.log`. The runner bounds each binary, including its STORE worker and receipt waits. `LMCACHE_TEST_TIMEOUT` defaults to `5m`. At the deadline GNU `timeout` sends SIGTERM, then SIGKILL if the process survives another five seconds. A timeout fails the run. [Device runner](run_lmcache_state.sh#L57)<!-- prefix: "CUDA_VISIBLE" -->
 
-The state check compares payloads and scores, counts KV writes with imported GQA, and covers unequal GQA and GDN coverage, a hole in GQA, and K4 continuation. It checks nonterminal views across allocation growth and a failed store. Terminal views retain their source blocks after retirement without copying them. The fixture queues a nonterminal copy before cancelling and replacing its source request, and injects allocation, copy, and event failures. [Nonterminal view](lmcache_state.cpp#L541)<!-- prefix: "void check_d" --> · [Terminal view](lmcache_state.cpp#L566)<!-- prefix: "void check_t" --> · [Delayed copy](lmcache_state.cpp#L616)<!-- prefix: "static void " --> · [Copy failure](lmcache_state.cpp#L669)<!-- prefix: "void check_c" -->
+The state check compares payloads and scores, counts KV writes with imported GQA, and covers unequal GQA and GDN coverage, a hole in GQA, and K4 continuation. It checks nonterminal views across allocation growth and a failed store. Terminal views retain their source blocks after retirement without copying them. The fixture queues a nonterminal copy before cancelling and replacing its source request, and injects allocation, copy, and event failures. [Nonterminal view](lmcache_state.cpp#L546)<!-- prefix: "void check_d" --> · [Terminal view](lmcache_state.cpp#L571)<!-- prefix: "void check_t" --> · [Delayed copy](lmcache_state.cpp#L621)<!-- prefix: "static void " --> · [Copy failure](lmcache_state.cpp#L674)<!-- prefix: "void check_c" -->
 
 The state test checks that the STORE worker returns its GDN slice before acknowledging completion. A second case retains an alias until after acknowledgement and checks that the slice becomes available after the alias releases it.
 

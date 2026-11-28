@@ -136,7 +136,9 @@ void stop_profile(const Socket& connection, BatchService& service, const HttpReq
         report += R"(,"width":)" + std::to_string(step.width);
         report += R"(,"prefill_rows":)" + std::to_string(step.prefill_rows);
         report += R"(,"decode_lanes":)" + std::to_string(step.decode_lanes);
-        report += R"(,"graph_slots":)" + std::to_string(step.graph_slots) + '}';
+        report += R"(,"graph_slots":)" + std::to_string(step.graph_slots);
+        report +=
+            R"(,"verification_graph_slots":)" + std::to_string(step.verification_graph_slots) + '}';
     }
     write_json(connection, "200 OK", report + "]}");
 }

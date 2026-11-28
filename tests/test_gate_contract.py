@@ -10,7 +10,7 @@ import subprocess
 import sys
 from importlib import import_module
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import pytest
 
@@ -18,13 +18,18 @@ if TYPE_CHECKING:
     from types import ModuleType
 
 
-CHECKER = Path(__file__).resolve().parents[1] / ".agents/checks/check_rules.py"
-ROOT = CHECKER.parents[2]
+ROOT = Path(__file__).resolve().parents[1]
+CHECKER = ROOT / ".agents/checks/check_rules.py"
+GATE_POLICY = ".agents/gates.json"
+EXAMPLE_SKILL = "---\nname: example\ndescription: Example.\ndisable-model-invocation: true\n---\n"
+EXPLICIT_SKILL_POLICY = "policy:\n  allow_implicit_invocation: false\n"
 
 
-def clean_environment() -> dict[str, str]:
+def clean_environment(index: Path | None = None) -> dict[str, str]:
     environment = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
     environment.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull)
+    if index is not None:
+        environment["GIT_INDEX_FILE"] = str(index)
     return environment
 
 
@@ -64,44 +69,23 @@ def test_message_body_and_footer(tmp_path: Path, message: str, diagnostic: str |
     source.write_text(message, encoding="utf-8")
     result = checker("commit-message", source)
     if diagnostic is None:
-        assert result.returncode == 0, result.stderr
+        assert_passed(result)
     else:
-        assert result.returncode != 0
-        assert diagnostic in result.stderr
+        assert_rejected(result, diagnostic, stderr_only=True)
 
 
 def test_code_link_detects_drift_at_the_same_line(tmp_path: Path) -> None:
     root = tmp_path / "skills"
-    skill = root / "example"
-    policy = skill / "agents/openai.yaml"
-    policy.parent.mkdir(parents=True)
-    policy.write_text("policy:\n  allow_implicit_invocation: false\n", encoding="utf-8")
-    guide = skill / "SKILL.md"
-    source = skill / "example.py"
-    source.write_text("def first():\n    return 1\n", encoding="utf-8")
+    guide = root / "example/SKILL.md"
+    write_fixture(root, "example/agents/openai.yaml", EXPLICIT_SKILL_POLICY)
+    source = root / "example/example.py"
+    write_fixture(root, source, "def first():\n    return 1\n")
     link = checker("code-link", "example/example.py", "1", "--document", guide, "--root", root)
-    assert link.returncode == 0, link.stderr
-    guide.write_text(
-        "---\nname: example\ndescription: Example.\ndisable-model-invocation: true\n---\n"
-        + link.stdout,
-        encoding="utf-8",
-    )
-    result = checker("package", root)
-    assert result.returncode == 0, result.stderr
-    source.write_text("def other():\n    return 1\n", encoding="utf-8")
-    result = checker("package", root)
-    assert result.returncode != 0
-    assert "example.py#L1" in result.stderr
-    assert "prefix is stale" in result.stderr
-
-
-def git_fixture(root: Path, *arguments: str, index: Path | None = None) -> str:
-    environment = clean_environment()
-    if index is not None:
-        environment["GIT_INDEX_FILE"] = str(index)
-    result = run_fixture(["git", "-C", root, *arguments], environment=environment)
-    assert result.returncode == 0, result.stderr
-    return result.stdout
+    assert_passed(link)
+    write_fixture(root, guide, EXAMPLE_SKILL + link.stdout)
+    assert_passed(checker("package", root))
+    write_fixture(root, source, "def other():\n    return 1\n")
+    assert_rejected(checker("package", root), "example.py#L1", "prefix is stale", stderr_only=True)
 
 
 def write_fixture(root: Path, name: str | Path, contents: str) -> None:
@@ -110,48 +94,125 @@ def write_fixture(root: Path, name: str | Path, contents: str) -> None:
     path.write_text(contents, encoding="utf-8")
 
 
-def stage_files(root: Path, files: dict[str, str], *, index: Path | None = None) -> None:
-    for name, contents in files.items():
-        write_fixture(root, name, contents)
-    git_fixture(root, "add", "--", *files, index=index)
+class GateRepository:
+    def __init__(self, root: Path, index: Path | None = None) -> None:
+        self.root = root
+        self.index = index
+
+    @classmethod
+    def init(cls, root: Path) -> GateRepository:
+        root.mkdir(exist_ok=True)
+        repo = cls(root)
+        repo.git("init", "--quiet", "--template=")
+        return repo
+
+    def alternate(self, *, relative: bool = False) -> GateRepository:
+        index = self.root / ".git/selected-index"
+        shutil.copyfile(self.root / ".git/index", index)
+        return GateRepository(self.root, index.relative_to(self.root) if relative else index)
+
+    def git(self, *arguments: str) -> str:
+        result = run_fixture(
+            ["git", "-C", self.root, *arguments], environment=clean_environment(self.index)
+        )
+        assert_passed(result)
+        return result.stdout
+
+    def write(self, name: str | Path, contents: str) -> None:
+        write_fixture(self.root, name, contents)
+
+    def stage(self, files: dict[str, str]) -> None:
+        for name, contents in files.items():
+            self.write(name, contents)
+        self.git("add", "--", *files)
+
+    def hook(
+        self,
+        *,
+        path: str | Path | None = None,
+        host_root: Path | None = None,
+        command: list[str | Path] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        environment = clean_environment(self.index)
+        if path is not None:
+            environment["PATH"] = str(path)
+            environment.pop("CONDA_PREFIX", None)
+            environment.pop("SGLANG_HOST_ROOT", None)
+        if host_root is not None:
+            environment["SGLANG_HOST_ROOT"] = str(host_root)
+        indexes = {self.root / ".git/index"}
+        if self.index is not None:
+            indexes.add(self.root / self.index)
+        original = {name: name.read_bytes() for name in indexes}
+        worktree = worktree_files(self.root)
+        if command is None:
+            command = ["git", "-C", self.root, "hook", "run", "pre-commit"]
+            cwd = self.root.parent
+        else:
+            cwd = self.root
+        result = run_fixture(command, cwd=cwd, environment=environment)
+        assert {name: name.read_bytes() for name in indexes} == original
+        assert worktree_files(self.root) == worktree
+        return result
+
+    def staged_hook(
+        self, files: dict[str, str], *, unstaged: dict[str, str] | None = None
+    ) -> subprocess.CompletedProcess[str]:
+        self.stage(files)
+        if unstaged is not None:
+            for name, contents in unstaged.items():
+                self.write(name, contents)
+        return self.hook()
+
+    def stage_formatted(self, name: str, source: str) -> None:
+        result = run_fixture(
+            ["clang-format", f"--assume-filename={name}"], cwd=self.root, source=source
+        )
+        assert_passed(result)
+        self.write(name, result.stdout)
+        assert_passed(run_fixture(["clang-format", "--dry-run", "--Werror", name], cwd=self.root))
+        self.git("add", name)
 
 
-def copy_index(root: Path) -> Path:
-    index = root / ".git/selected-index"
-    shutil.copyfile(root / ".git/index", index)
-    return index
+def gate_policy() -> dict[str, Any]:
+    return json.loads((ROOT / GATE_POLICY).read_text(encoding="utf-8"))
 
 
 def seed_repository(
-    root: Path, files: dict[str, str], *, style: bool = False, commit: bool = True
-) -> Path:
-    root.mkdir(exist_ok=True)
-    git_fixture(root, "init", "--quiet", "--template=")
-    git_fixture(root, "config", "core.hooksPath", ".githooks")
+    root: Path,
+    files: dict[str, str] | None = None,
+    *,
+    style: bool = False,
+    commit: bool = True,
+    policy: dict[str, Any] | None = None,
+) -> GateRepository:
+    repo = GateRepository.init(root)
+    repo.git("config", "core.hooksPath", ".githooks")
     names = [".githooks/pre-commit", ".githooks/commit-msg", ".githooks/run"]
     if style:
         names.extend([".clang-format", ".clang-tidy", "ruff.toml"])
     for name in names:
         target = root / name
-        target.parent.mkdir(parents=True, exist_ok=True)
+        target.parent.mkdir(exist_ok=True)
         shutil.copy2(ROOT / name, target)
     for helper in CHECKER.parent.glob("*.py"):
-        write_fixture(root, helper.relative_to(ROOT), helper.read_text(encoding="utf-8"))
-    configuration = json.loads((ROOT / ".agents/gates.json").read_text(encoding="utf-8"))
-    configuration["checks"] = [
-        check
-        for check in configuration["checks"]
-        if style and check["name"] == "Staged source lint and formatting"
-    ]
-    if style:
-        assert len(configuration["checks"]) == 1
-    write_fixture(root, ".agents/gates.json", json.dumps(configuration, indent=2) + "\n")
-    for name, contents in files.items():
-        write_fixture(root, name, contents)
-    git_fixture(root, "add", "--all")
+        repo.write(helper.relative_to(ROOT), helper.read_text(encoding="utf-8"))
+    if policy is None:
+        policy = gate_policy()
+        policy["checks"] = [
+            check
+            for check in policy["checks"]
+            if style and check["name"] == "Staged source lint and formatting"
+        ]
+        if style:
+            assert len(policy["checks"]) == 1
+    repo.write(GATE_POLICY, json.dumps(policy, indent=2) + "\n")
+    if files is not None:
+        for name, contents in files.items():
+            repo.write(name, contents)
+    repo.git("add", "--all")
     if commit:
-        git_fixture(
-            root,
+        repo.git(
             "-c",
             "core.hooksPath=/dev/null",
             "-c",
@@ -162,44 +223,17 @@ def seed_repository(
             "-qm",
             "Seed gate fixture",
         )
-    return root
+    return repo
 
 
-@pytest.fixture
-def header_repository(tmp_path: Path) -> Path:
-    return seed_repository(tmp_path, {"src/legacy.h": "inline int value() { return 7; }\n"})
+def install_hook_tool(host_root: Path, name: str, script: str) -> None:
+    path = host_root / ".pixi/envs/default/bin" / name
+    write_fixture(host_root, path, script)
+    path.chmod(0o755)
 
 
-def selected_hook(
-    root: Path,
-    index: Path | None = None,
-    *,
-    path: str | Path | None = None,
-    host_root: Path | None = None,
-    command: list[str | Path] | None = None,
-) -> subprocess.CompletedProcess[str]:
-    environment = clean_environment()
-    if index is not None:
-        environment["GIT_INDEX_FILE"] = str(index)
-    if path is not None:
-        environment["PATH"] = str(path)
-        environment.pop("CONDA_PREFIX", None)
-        environment.pop("SGLANG_HOST_ROOT", None)
-    if host_root is not None:
-        environment["SGLANG_HOST_ROOT"] = str(host_root)
-    indexes = {root / ".git/index"}
-    if index is not None:
-        indexes.add(root / index)
-    original = {name: name.read_bytes() for name in indexes}
-    worktree = worktree_files(root)
-    if command is None:
-        command = ["git", "-C", root, "hook", "run", "pre-commit"]
-        result = run_fixture(command, cwd=root.parent, environment=environment)
-    else:
-        result = run_fixture(command, cwd=root, environment=environment)
-    assert {name: name.read_bytes() for name in indexes} == original
-    assert worktree_files(root) == worktree
-    return result
+def install_hook_python(host_root: Path) -> None:
+    install_hook_tool(host_root, "python", f'#!/bin/sh\nexec {shlex.quote(sys.executable)} "$@"\n')
 
 
 def worktree_files(root: Path) -> dict[Path, tuple[int, bytes | None]]:
@@ -213,104 +247,95 @@ def worktree_files(root: Path) -> dict[Path, tuple[int, bytes | None]]:
     return paths
 
 
-def assert_passed(result: subprocess.CompletedProcess[str]) -> None:
-    assert result.returncode == 0, result.stdout + result.stderr
+def assert_passed(result: subprocess.CompletedProcess[str]) -> str:
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output
+    return output
 
 
-def assert_rejected(result: subprocess.CompletedProcess[str], *diagnostics: str) -> str:
+def assert_rejected(
+    result: subprocess.CompletedProcess[str], *diagnostics: str, stderr_only: bool = False
+) -> str:
     output = result.stdout + result.stderr
     assert result.returncode != 0, output
+    diagnostic_output = result.stderr if stderr_only else output
     for diagnostic in diagnostics:
-        assert diagnostic in output, output
+        assert diagnostic in diagnostic_output, output
     return output
 
 
 def assert_header_rejected(
     result: subprocess.CompletedProcess[str], path: str, line: int = 1
 ) -> None:
-    assert result.returncode != 0, result.stdout + result.stderr
-    assert f"{path}: Line {line} contains a function definition." in result.stderr
+    assert_rejected(
+        result, f"{path}: Line {line} contains a function definition.", stderr_only=True
+    )
 
 
 @pytest.fixture
-def alternate_index(header_repository: Path) -> Path:
-    index = copy_index(header_repository)
-    stage_files(header_repository, {"README.md": "# Updated fixture\n"}, index=index)
-    return index
+def alternate_index(tmp_path: Path) -> GateRepository:
+    repo = seed_repository(tmp_path, {"src/legacy.h": "inline int value() { return 7; }\n"})
+    selected = repo.alternate()
+    selected.stage({"README.md": "# Updated fixture\n"})
+    return selected
 
 
-def test_header_rule_rejects_retained_internal_definition(
-    header_repository: Path, alternate_index: Path
-) -> None:
-    assert_header_rejected(selected_hook(header_repository, alternate_index), "src/legacy.h")
+def test_header_rule_rejects_retained_internal_definition(alternate_index: GateRepository) -> None:
+    assert_header_rejected(alternate_index.hook(), "src/legacy.h")
 
 
 def test_header_rule_ignores_generated_and_unselected_headers(
-    header_repository: Path, alternate_index: Path
+    alternate_index: GateRepository,
 ) -> None:
-    root = header_repository
-    git_fixture(root, "rm", "--cached", "src/legacy.h", index=alternate_index)
-    write_fixture(root, "build/generated.hpp", "int generated() { return 7; }\n")
-    assert_passed(selected_hook(root, alternate_index))
-    assert (root / "src/legacy.h").is_file()
+    alternate_index.git("rm", "--cached", "src/legacy.h")
+    alternate_index.write("build/generated.hpp", "int generated() { return 7; }\n")
+    assert_passed(alternate_index.hook())
+    assert (alternate_index.root / "src/legacy.h").is_file()
 
 
 @pytest.mark.parametrize("path", ["src/new.cuh", "tests/probe.ipp", "tools/probe.tpp"])
 def test_header_rule_accepts_internal_declarations(
-    header_repository: Path, alternate_index: Path, path: str
+    alternate_index: GateRepository, path: str
 ) -> None:
-    root = header_repository
-    git_fixture(root, "rm", "--cached", "src/legacy.h", index=alternate_index)
-    stage_files(root, {path: "#pragma once\nint declared();\n"}, index=alternate_index)
-    assert_passed(selected_hook(root, alternate_index))
-    assert (root / "src/legacy.h").is_file()
+    alternate_index.git("rm", "--cached", "src/legacy.h")
+    assert_passed(alternate_index.staged_hook({path: "#pragma once\nint declared();\n"}))
+    assert (alternate_index.root / "src/legacy.h").is_file()
 
 
 @pytest.fixture
-def comment_repository(tmp_path: Path) -> tuple[Path, Path]:
-    root = seed_repository(
+def comment_repository(tmp_path: Path) -> GateRepository:
+    return seed_repository(
         tmp_path,
         {"legacy.py": "# inherited\nvalue = 1\n", "removed.cpp": "int value; // inherited\n"},
-    )
-    return root, copy_index(root)
+    ).alternate()
 
 
-def assert_comment_rejected(
-    result: subprocess.CompletedProcess[str], name: str, line: int = 1
-) -> None:
-    assert result.returncode != 0, result.stdout + result.stderr
-    assert f"{name}: Line {line} contains a comment" in result.stderr, result.stderr
+def comment_diagnostic(name: str, line: int = 1) -> str:
+    return f"{name}: Line {line} contains a comment"
 
 
-def test_whole_staged_file_and_worktree_disagreement(comment_repository: tuple[Path, Path]) -> None:
-    root, index = comment_repository
+def test_whole_staged_file_and_worktree_disagreement(comment_repository: GateRepository) -> None:
     name = "legacy.py"
     staged = "# inherited\nvalue = 2\n"
     clean = "value = 2\n"
-    stage_files(root, {name: staged}, index=index)
-    write_fixture(root, name, clean)
-    assert_comment_rejected(selected_hook(root, index), name)
-    git_fixture(root, "add", name, index=index)
-    write_fixture(root, name, staged)
-    assert_passed(selected_hook(root, index))
+    result = comment_repository.staged_hook({name: staged}, unstaged={name: clean})
+    assert_rejected(result, comment_diagnostic(name), stderr_only=True)
+    assert_passed(comment_repository.staged_hook({name: clean}, unstaged={name: staged}))
 
 
 def test_shared_rule_change_ignores_untouched_and_deleted_comments(
-    comment_repository: tuple[Path, Path],
+    comment_repository: GateRepository,
 ) -> None:
-    root, index = comment_repository
-    git_fixture(root, "rm", "--cached", "removed.cpp", index=index)
-    stage_files(root, {"AGENTS.md": "# Shared rules\n"}, index=index)
-    assert_passed(selected_hook(root, index))
+    comment_repository.git("rm", "--cached", "removed.cpp")
+    assert_passed(comment_repository.staged_hook({"AGENTS.md": "# Shared rules\n"}))
 
 
 def test_rename_checks_destination_with_existing_comment(
-    comment_repository: tuple[Path, Path],
+    comment_repository: GateRepository,
 ) -> None:
-    root, index = comment_repository
     target = "renamed.cpp"
-    git_fixture(root, "mv", "removed.cpp", target, index=index)
-    assert_comment_rejected(selected_hook(root, index), target)
+    comment_repository.git("mv", "removed.cpp", target)
+    assert_rejected(comment_repository.hook(), comment_diagnostic(target), stderr_only=True)
 
 
 COMMENT_CASES = [
@@ -334,13 +359,11 @@ COMMENT_CASES = [
     ("name", "clean", "comment"), COMMENT_CASES, ids=[case[0] for case in COMMENT_CASES]
 )
 def test_staged_comment_syntax(
-    comment_repository: tuple[Path, Path], name: str, clean: str, comment: str
+    comment_repository: GateRepository, name: str, clean: str, comment: str
 ) -> None:
-    root, index = comment_repository
-    stage_files(root, {name: clean}, index=index)
-    assert_passed(selected_hook(root, index))
-    stage_files(root, {name: clean + comment}, index=index)
-    assert_comment_rejected(selected_hook(root, index), name, clean.count("\n") + 1)
+    assert_passed(comment_repository.staged_hook({name: clean}))
+    result = comment_repository.staged_hook({name: clean + comment})
+    assert_rejected(result, comment_diagnostic(name, clean.count("\n") + 1), stderr_only=True)
 
 
 @pytest.fixture
@@ -350,9 +373,8 @@ def comment_parser(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
 
 
 def test_other_recognized_languages_use_comment_parsers(
-    comment_repository: tuple[Path, Path], comment_parser: ModuleType
+    comment_repository: GateRepository, comment_parser: ModuleType
 ) -> None:
-    root, index = comment_repository
     sources = {
         "example.go": ("package main\nvar s = `// text`\n", "// comment\n"),
         "example.java": ('class C { String s = "// text"; }\n', "/* comment */\n"),
@@ -364,19 +386,20 @@ def test_other_recognized_languages_use_comment_parsers(
         "example.rs": ('const S: &str = r#"/* text */"#;\n', "/* outer /* inner */ */\n"),
         "example.ps1": ("$s = 'literal # text'\n", "<# first\nsecond #>\n"),
     }
-    stage_files(root, dict.fromkeys(sources, ""), index=index)
-    assert_passed(selected_hook(root, index))
+    assert_passed(comment_repository.staged_hook(dict.fromkeys(sources, "")))
     for name, (source, _) in sources.items():
-        write_fixture(root, name, source)
-        assert comment_parser.comment_errors(root / name, code=True) == []
-    dirty_sources = {name: source + comment for name, (source, comment) in sources.items()}
-    stage_files(root, dirty_sources, index=index)
-    result = selected_hook(root, index)
-    for name, (source, _) in sources.items():
-        line = source.count("\n") + 1
-        assert_comment_rejected(result, name, line)
+        comment_repository.write(name, source)
+        assert comment_parser.comment_errors(comment_repository.root / name, code=True) == []
+    result = comment_repository.staged_hook(
+        {name: source + comment for name, (source, comment) in sources.items()}
+    )
+    lines = {name: source.count("\n") + 1 for name, (source, _) in sources.items()}
+    assert_rejected(
+        result, *(comment_diagnostic(name, line) for name, line in lines.items()), stderr_only=True
+    )
+    for name, line in lines.items():
         for earlier_line in range(1, line):
-            assert f"{name}: Line {earlier_line} contains a comment" not in result.stderr
+            assert comment_diagnostic(name, earlier_line) not in result.stderr
 
 
 def test_cpp_macro_literals_and_line_splicing(tmp_path: Path, comment_parser: ModuleType) -> None:
@@ -426,16 +449,13 @@ def test_cpp_macro_literals_and_line_splicing(tmp_path: Path, comment_parser: Mo
     ],
 )
 def test_staged_headers_reject_function_definitions(
-    comment_repository: tuple[Path, Path], extension: str, line: int, source: str
+    comment_repository: GateRepository, extension: str, line: int, source: str
 ) -> None:
-    root, index = comment_repository
     path = f"tests/fixtures/probe.{extension}"
-    stage_files(root, {path: source}, index=index)
-    assert_header_rejected(selected_hook(root, index), path, line)
+    assert_header_rejected(comment_repository.staged_hook({path: source}), path, line)
 
 
-def test_header_rule_uses_staged_blob(comment_repository: tuple[Path, Path]) -> None:
-    root, index = comment_repository
+def test_header_rule_uses_staged_blob(comment_repository: GateRepository) -> None:
     path = "include/sglang/probe.hpp"
     declaration = (
         "template<class T> T identity(T);\n"
@@ -445,36 +465,31 @@ def test_header_rule_uses_staged_blob(comment_repository: tuple[Path, Path]) -> 
         "inline constexpr int data[] = {1, 2, 3};\n"
     )
     definition = "inline int value() { return 7; }\n"
-    stage_files(root, {path: declaration}, index=index)
-    write_fixture(root, path, definition)
-    assert_passed(selected_hook(root, index))
-
-    git_fixture(root, "add", path, index=index)
-    write_fixture(root, path, declaration)
-    assert_header_rejected(selected_hook(root, index), path)
+    assert_passed(comment_repository.staged_hook({path: declaration}, unstaged={path: definition}))
+    result = comment_repository.staged_hook({path: definition}, unstaged={path: declaration})
+    assert_header_rejected(result, path)
 
 
-def test_cuda_header_rule_uses_staged_qualifier_macro(
-    comment_repository: tuple[Path, Path],
-) -> None:
-    root, index = comment_repository
+def test_cuda_header_rule_uses_staged_qualifier_macro(comment_repository: GateRepository) -> None:
     qualifiers = "src/probe/qualifiers.cuh"
     probe = "src/probe/function.cuh"
     declaration = '#include "qualifiers.cuh"\nQUAL int probe();\n'
     qualifier_source = "#ifdef __CUDACC__\n#define QUAL __device__\n#else\n#define QUAL\n#endif\n"
-    stage_files(root, {qualifiers: qualifier_source, probe: declaration}, index=index)
-    write_fixture(root, qualifiers, "#define QUAL unexpected_token\n")
-    assert_passed(selected_hook(root, index))
+    assert_passed(
+        comment_repository.staged_hook(
+            {qualifiers: qualifier_source, probe: declaration},
+            unstaged={qualifiers: "#define QUAL unexpected_token\n"},
+        )
+    )
 
     definition = '#include "qualifiers.cuh"\nQUAL int probe() { return 0; }\n'
-    stage_files(root, {probe: definition}, index=index)
-    write_fixture(root, probe, declaration)
-    assert_header_rejected(selected_hook(root, index), probe, 2)
+    result = comment_repository.staged_hook({probe: definition}, unstaged={probe: declaration})
+    assert_header_rejected(result, probe, 2)
 
 
 @pytest.fixture
-def style_repository(tmp_path: Path) -> Path:
-    return seed_repository(tmp_path, {}, style=True)
+def style_repository(tmp_path: Path) -> GateRepository:
+    return seed_repository(tmp_path, style=True)
 
 
 ROOT_SOURCES = {"root.cpp": "int main() {\n    return 0;\n}\n", "root.py": "value = 42\n"}
@@ -507,20 +522,12 @@ STYLE_CASES = [
     ("name", "clean", "dirty", "malformed"), STYLE_CASES, ids=[case[0] for case in STYLE_CASES]
 )
 def test_staged_format_and_syntax(
-    style_repository: Path, name: str, clean: str, dirty: str, malformed: str
+    style_repository: GateRepository, name: str, clean: str, dirty: str, malformed: str
 ) -> None:
-    root = style_repository
-    index = copy_index(root)
-    stage_files(root, {name: clean}, index=index)
-    write_fixture(root, name, dirty)
-    assert_passed(selected_hook(root, index))
-
-    git_fixture(root, "add", "--", name, index=index)
-    write_fixture(root, name, clean)
-    assert_format_rejected(selected_hook(root, index), name)
-    stage_files(root, {name: malformed}, index=index)
-    write_fixture(root, name, clean)
-    output = assert_rejected(selected_hook(root, index), name)
+    repo = style_repository.alternate()
+    assert_passed(repo.staged_hook({name: clean}, unstaged={name: dirty}))
+    assert_format_rejected(repo.staged_hook({name: dirty}, unstaged={name: clean}), name)
+    output = assert_rejected(repo.staged_hook({name: malformed}, unstaged={name: clean}), name)
     assert "syntax" in output.lower() or "clang-diagnostic-error" in output, output
 
 
@@ -530,26 +537,25 @@ def assert_format_rejected(result: subprocess.CompletedProcess[str], name: str) 
 
 @pytest.mark.parametrize(("name", "dirty"), [("old.cpp", "int old=42;\n"), ("old.py", "old=42\n")])
 def test_root_rename_checks_destination_format(tmp_path: Path, name: str, dirty: str) -> None:
-    root = seed_repository(tmp_path, {name: dirty}, style=True)
-    stage_files(root, {"new.py": "new = 42\n"})
-    assert_passed(selected_hook(root))
+    repo = seed_repository(tmp_path, {name: dirty}, style=True)
+    assert_passed(repo.staged_hook({"new.py": "new = 42\n"}))
 
     renamed = "renamed" + Path(name).suffix
-    git_fixture(root, "mv", name, renamed)
-    staged_names = git_fixture(root, "diff", "--cached", "--name-status", "-M")
+    repo.git("mv", name, renamed)
+    staged_names = repo.git("diff", "--cached", "--name-status", "-M")
     assert f"R100\t{name}\t{renamed}" in staged_names
-    assert_format_rejected(selected_hook(root), renamed)
+    assert_format_rejected(repo.hook(), renamed)
 
 
 def test_initial_index_checks_root_files(tmp_path: Path) -> None:
-    root = seed_repository(tmp_path, {"root.py": "value=42\n"}, style=True, commit=False)
-    assert_format_rejected(selected_hook(root), "root.py")
+    repo = seed_repository(tmp_path, {"root.py": "value=42\n"}, style=True, commit=False)
+    assert_format_rejected(repo.hook(), "root.py")
 
 
-@pytest.mark.parametrize("changed", ["AGENTS.md", ".agents/gates.json"])
+@pytest.mark.parametrize("changed", ["AGENTS.md", GATE_POLICY])
 def test_shared_policy_scan_skips_unrelated_path_only_check(tmp_path: Path, changed: str) -> None:
-    configuration = json.loads((ROOT / ".agents/gates.json").read_text(encoding="utf-8"))
-    configuration["checks"] = [
+    policy = gate_policy()
+    policy["checks"] = [
         {
             "name": "Full-policy sentinel",
             "kind": "static",
@@ -564,19 +570,17 @@ def test_shared_policy_scan_skips_unrelated_path_only_check(tmp_path: Path, chan
             "command": ["{python}", "-c", "raise SystemExit('path-only check reached')"],
         },
     ]
-    files = {"src/existing.cpp": "int existing;\n"}
-    files[".agents/gates.json"] = json.dumps(configuration, indent=2) + "\n"
-    root = seed_repository(tmp_path, files)
-    text = "# Policy fixture\n" if changed == "AGENTS.md" else (root / changed).read_text() + "\n"
-    stage_files(root, {changed: text})
-    result = selected_hook(root)
-    output = result.stdout + result.stderr
-    assert_passed(result)
+    repo = seed_repository(tmp_path, {"src/existing.cpp": "int existing;\n"}, policy=policy)
+    text = "# Policy fixture\n"
+    if changed == GATE_POLICY:
+        text = (repo.root / changed).read_text(encoding="utf-8") + "\n"
+    output = assert_passed(repo.staged_hook({changed: text}))
     assert "src/existing.cpp" in output, output
     assert "path-only check reached" not in output, output
 
-    stage_files(root, {"src/probe.cpp": "int value = 42;\n"})
-    assert_rejected(selected_hook(root), "path-only check reached")
+    assert_rejected(
+        repo.staged_hook({"src/probe.cpp": "int value = 42;\n"}), "path-only check reached"
+    )
 
 
 @pytest.mark.parametrize(
@@ -596,35 +600,37 @@ def test_format_checks_separate_staged_hunks(
 ) -> None:
     lines = [entry.format(i) for i in range(1, 26)]
     lines[12] = lines[12].replace("= ", "=")
-    root = seed_repository(tmp_path, {name: opening + "".join(lines) + closing}, style=True)
+    repo = seed_repository(tmp_path, {name: opening + "".join(lines) + closing}, style=True)
     lines.insert(0, entry.format(26))
     lines[-1] = entry.format(27)
-    stage_files(root, {name: opening + "".join(lines) + closing})
-    assert_passed(selected_hook(root))
+    assert_passed(repo.staged_hook({name: opening + "".join(lines) + closing}))
 
     lines[-1] = lines[-1].replace("= ", "=")
-    stage_files(root, {name: opening + "".join(lines) + closing})
-    assert_format_rejected(selected_hook(root), name)
+    assert_format_rejected(repo.staged_hook({name: opening + "".join(lines) + closing}), name)
 
 
-def test_tool_configuration_is_read_from_selected_index(style_repository: Path) -> None:
-    root = style_repository
-    index = copy_index(root)
-    stage_files(root, ROOT_SOURCES, index=index)
-    write_fixture(root, ".clang-format", "UnknownStyleOption: true\n")
-    write_fixture(root, ".clang-tidy", "UnknownLintOption: true\n")
-    write_fixture(root, "ruff.toml", "unknown-style-option = true\n")
-    write_fixture(root, ".githooks/run", "exit 77\n")
-    assert_passed(selected_hook(root, index))
+def test_tool_configuration_is_read_from_selected_index(style_repository: GateRepository) -> None:
+    repo = style_repository.alternate()
+    assert_passed(
+        repo.staged_hook(
+            ROOT_SOURCES,
+            unstaged={
+                ".clang-format": "UnknownStyleOption: true\n",
+                ".clang-tidy": "UnknownLintOption: true\n",
+                "ruff.toml": "unknown-style-option = true\n",
+                ".githooks/run": "exit 77\n",
+            },
+        )
+    )
 
 
-def test_real_hook_bootstraps_from_system_only_path(style_repository: Path) -> None:
-    stage_files(style_repository, ROOT_SOURCES)
-    assert_passed(selected_hook(style_repository, path="/usr/bin:/bin"))
+def test_real_hook_bootstraps_from_system_only_path(style_repository: GateRepository) -> None:
+    style_repository.stage(ROOT_SOURCES)
+    assert_passed(style_repository.hook(path="/usr/bin:/bin"))
 
 
 def test_required_tool_missing_from_hook_path(tmp_path: Path) -> None:
-    root = seed_repository(tmp_path / "source", {}, style=True)
+    repo = seed_repository(tmp_path / "source", style=True)
     binaries = tmp_path / "bin"
     host_root = tmp_path / "missing-tools"
     binaries.mkdir()
@@ -632,16 +638,13 @@ def test_required_tool_missing_from_hook_path(tmp_path: Path) -> None:
         executable = shutil.which(command)
         assert executable is not None, command
         (binaries / command).symlink_to(executable)
-    python = host_root / ".pixi/envs/default/bin/python"
-    python.parent.mkdir(parents=True)
-    python.write_text(f'#!/bin/sh\nexec {shlex.quote(sys.executable)} "$@"\n', encoding="utf-8")
-    python.chmod(0o755)
+    install_hook_python(host_root)
 
-    stage_files(root, {"README.md": "# Tool fixture\n"})
-    assert_passed(selected_hook(root, path=binaries, host_root=host_root))
+    repo.stage({"README.md": "# Tool fixture\n"})
+    assert_passed(repo.hook(path=binaries, host_root=host_root))
 
-    stage_files(root, {"root.cpp": ROOT_SOURCES["root.cpp"]})
-    assert_rejected(selected_hook(root, path=binaries, host_root=host_root), "clang-format")
+    repo.stage({"root.cpp": ROOT_SOURCES["root.cpp"]})
+    assert_rejected(repo.hook(path=binaries, host_root=host_root), "clang-format")
 
 
 @pytest.mark.parametrize(
@@ -662,13 +665,12 @@ def test_required_tool_missing_from_hook_path(tmp_path: Path) -> None:
     ],
 )
 def test_staged_python_static_lint(
-    style_repository: Path, name: str, source: str, diagnostic: str
+    style_repository: GateRepository, name: str, source: str, diagnostic: str
 ) -> None:
-    stage_files(style_repository, {name: source})
-    assert_rejected(selected_hook(style_repository), name, diagnostic)
+    assert_rejected(style_repository.staged_hook({name: source}), name, diagnostic)
 
 
-def test_staged_valid_python_fixture(style_repository: Path) -> None:
+def test_staged_valid_python_fixture(style_repository: GateRepository) -> None:
     source = (
         '"""Workload documents with # inside a literal."""\n'
         "\nimport json\nfrom pathlib import Path\n\nimport pytest\n"
@@ -681,8 +683,7 @@ def test_staged_valid_python_fixture(style_repository: Path) -> None:
         "    assert isinstance(identity, Path)\n"
         '    assert json.loads(identity.read_text(encoding="utf-8")) == {"seed": 7}\n'
     )
-    stage_files(style_repository, {"tests/test_workload.py": source})
-    assert_passed(selected_hook(style_repository))
+    assert_passed(style_repository.staged_hook({"tests/test_workload.py": source}))
 
 
 @pytest.mark.parametrize(
@@ -708,19 +709,9 @@ def test_staged_valid_python_fixture(style_repository: Path) -> None:
 def test_staged_deletion_reports_new_diagnostic_on_untouched_line(
     tmp_path: Path, name: str, before: str, removed: str, diagnostic: str
 ) -> None:
-    root = seed_repository(tmp_path, {name: before}, style=True)
-    stage_files(root, {name: before.replace(removed, "")})
-    write_fixture(root, name, before)
-
-    assert_rejected(selected_hook(root), name, diagnostic)
-
-
-def canonical_native_source(root: Path, name: str, source: str) -> None:
-    result = run_fixture(["clang-format", f"--assume-filename={name}"], cwd=root, source=source)
-    assert_passed(result)
-    write_fixture(root, name, result.stdout)
-    assert_passed(run_fixture(["clang-format", "--dry-run", "--Werror", name], cwd=root))
-    git_fixture(root, "add", name)
+    repo = seed_repository(tmp_path, {name: before}, style=True)
+    result = repo.staged_hook({name: before.replace(removed, "")}, unstaged={name: before})
+    assert_rejected(result, name, diagnostic)
 
 
 def test_staged_cpp_analyzer_rejects_formatted_null_dereference(tmp_path: Path) -> None:
@@ -728,7 +719,7 @@ def test_staged_cpp_analyzer_rejects_formatted_null_dereference(tmp_path: Path) 
         "#pragma once\n#include <filesystem>\n"
         "bool checkpoint_exists(const std::filesystem::path&);\n"
     )
-    root = seed_repository(tmp_path, {"checkpoint_probe.h": header}, style=True)
+    repo = seed_repository(tmp_path, {"checkpoint_probe.h": header}, style=True)
     name = "checkpoint_probe.cpp"
     source = (
         '#include "checkpoint_probe.h"\n'
@@ -738,17 +729,17 @@ def test_staged_cpp_analyzer_rejects_formatted_null_dereference(tmp_path: Path) 
         "    return std::filesystem::is_regular_file(path, error) && !error;\n"
         "}\n"
     )
-    canonical_native_source(root, name, source)
-    assert_passed(selected_hook(root))
+    repo.stage_formatted(name, source)
+    assert_passed(repo.hook())
 
     source += "\nint invalid_metadata() { int* value = nullptr; return *value; }\n"
-    canonical_native_source(root, name, source)
-    assert_rejected(selected_hook(root), name, "clang-analyzer-core.NullDereference")
+    repo.stage_formatted(name, source)
+    assert_rejected(repo.hook(), name, "clang-analyzer-core.NullDereference")
 
 
 def test_staged_cuda_analyzes_device_branch_with_cuda_13_4(tmp_path: Path) -> None:
     header = "#pragma once\nvoid launch_lane(int* output);\n"
-    root = seed_repository(tmp_path, {"src/probe_sm100.h": header}, style=True)
+    repo = seed_repository(tmp_path, {"src/probe_sm100.h": header}, style=True)
     name = "src/probe_sm100.cu"
     guarded_ptx = '    asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");\n'
     source = (
@@ -766,53 +757,52 @@ def test_staged_cuda_analyzes_device_branch_with_cuda_13_4(tmp_path: Path) -> No
         "}\n"
         "void launch_lane(int* output) { store_lane<<<1, 1>>>(output); }\n"
     )
-    canonical_native_source(root, name, source)
-    assert_passed(selected_hook(root))
+    repo.stage_formatted(name, source)
+    assert_passed(repo.hook())
 
     defect = "    int* pointer = nullptr;\n    *pointer = static_cast<int>(lane);\n"
-    canonical_native_source(root, name, source.replace(guarded_ptx, guarded_ptx + defect))
-    assert_rejected(selected_hook(root), name, "clang-analyzer-core.NullDereference")
+    repo.stage_formatted(name, source.replace(guarded_ptx, guarded_ptx + defect))
+    assert_rejected(repo.hook(), name, "clang-analyzer-core.NullDereference")
 
 
 @pytest.mark.parametrize("selection", ["default", "relative"])
 def test_staged_bootstrap_and_commit_message(tmp_path: Path, selection: str) -> None:
-    root = seed_repository(tmp_path, {"probe.py": "value = 0\n"})
-    index = copy_index(root).relative_to(root) if selection == "relative" else None
-    stage_files(root, {"probe.py": "value = 1\n"}, index=index)
-    if index is not None:
-        stage_files(root, {"probe.py": "value = (\n"})
+    default = seed_repository(tmp_path, {"probe.py": "value = 0\n"})
+    repo = default.alternate(relative=True) if selection == "relative" else default
+    repo.stage({"probe.py": "value = 1\n"})
+    if selection == "relative":
+        default.stage({"probe.py": "value = (\n"})
     helper = ".agents/checks/gate_config.py"
-    valid = (root / helper).read_text()
+    valid = (repo.root / helper).read_text(encoding="utf-8")
     staged_driver = ".agents/checks/staged_check.py"
     failure_status = 93
     for name in (".githooks/run", ".agents/checks/check_rules.py", helper, staged_driver):
         bad = f"exit {failure_status}\n" if name.endswith("/run") else f"exit({failure_status})\n"
-        write_fixture(root, name, bad)
-    assert_passed(selected_hook(root, index))
-    git_fixture(root, "restore", "--", staged_driver)
-    direct = [sys.executable, "-IB", root / staged_driver, root]
-    assert_passed(selected_hook(root, index, command=direct))
-    message = root / "message"
-    write_fixture(root, "message", "test: verify selected message checker\n")
+        repo.write(name, bad)
+    assert_passed(repo.hook())
+    default.git("restore", "--", staged_driver)
+    direct = [sys.executable, "-IB", repo.root / staged_driver, repo.root]
+    assert_passed(repo.hook(command=direct))
+    message = repo.root / "message"
+    repo.write(message, "test: verify selected message checker\n")
     hook: list[str | Path] = ["git", "hook", "run", "commit-msg", "--", message]
-    if index is not None:
-        git_fixture(root, "add", "--", ".agents/checks/check_rules.py")
-        assert selected_hook(root, command=hook).returncode == failure_status
-    assert_passed(selected_hook(root, index, command=hook))
-    write_fixture(root, "message", "invalid header\n")
-    assert_rejected(selected_hook(root, index, command=hook), "Use a Conventional")
-    stage_files(root, {helper: 'raise ValueError("invalid staged helper")\n'}, index=index)
-    write_fixture(root, helper, valid)
+    if selection == "relative":
+        default.git("add", "--", ".agents/checks/check_rules.py")
+        assert default.hook(command=hook).returncode == failure_status
+    assert_passed(repo.hook(command=hook))
+    repo.write(message, "invalid header\n")
+    assert_rejected(repo.hook(command=hook), "Use a Conventional")
+    repo.stage({helper: 'raise ValueError("invalid staged helper")\n'})
+    repo.write(helper, valid)
     for command in (None, direct):
-        assert_rejected(selected_hook(root, index, command=command), "invalid staged helper")
-    git_fixture(root, "rm", "--cached", "-f", "--", helper, index=index)
-    assert_rejected(selected_hook(root, index), helper)
+        assert_rejected(repo.hook(command=command), "invalid staged helper")
+    repo.git("rm", "--cached", "-f", "--", helper)
+    assert_rejected(repo.hook(), helper)
 
 
 def test_frozen_policy_cannot_be_changed_or_removed(tmp_path: Path) -> None:
-    root = seed_repository(tmp_path, {})
-    name = ".agents/gates.json"
-    original = (root / name).read_text()
+    repo = seed_repository(tmp_path)
+    original = (repo.root / GATE_POLICY).read_text(encoding="utf-8")
     for field in ("baseline", "limits"):
         configuration = json.loads(original)
         if field == "baseline":
@@ -820,70 +810,73 @@ def test_frozen_policy_cannot_be_changed_or_removed(tmp_path: Path) -> None:
         else:
             configuration["baseline"]["maxima"]["directory_entries"] = 31
             configuration[field]["directory_entries"] = 31
-        stage_files(root, {name: json.dumps(configuration) + "\n"})
-        write_fixture(root, name, original)
-        assert_rejected(selected_hook(root), "cannot change the frozen adoption baseline or limits")
-    git_fixture(root, "rm", "--cached", "-f", "--", name)
-    assert_rejected(selected_hook(root), "cannot remove the frozen gate configuration")
+        result = repo.staged_hook(
+            {GATE_POLICY: json.dumps(configuration) + "\n"}, unstaged={GATE_POLICY: original}
+        )
+        assert_rejected(result, "cannot change the frozen adoption baseline or limits")
+    repo.git("rm", "--cached", "-f", "--", GATE_POLICY)
+    assert_rejected(repo.hook(), "cannot remove the frozen gate configuration")
 
 
 def test_replacement_ref_cannot_hide_selected_blob(tmp_path: Path) -> None:
-    root = seed_repository(tmp_path, {})
+    repo = seed_repository(tmp_path)
     name = "probe.py"
-    stage_files(root, {name: "value = (\n"})
-    write_fixture(root, name, "value = 1\n")
-    blob = git_fixture(root, "rev-parse", f":{name}").strip()
-    replacement = git_fixture(root, "hash-object", "-w", name).strip()
-    git_fixture(root, "replace", blob, replacement)
-    assert git_fixture(root, "show", f":{name}") == "value = 1\n"
-    assert_rejected(selected_hook(root), name, "Python syntax is invalid")
+    repo.stage({name: "value = (\n"})
+    repo.write(name, "value = 1\n")
+    blob = repo.git("rev-parse", f":{name}").strip()
+    replacement = repo.git("hash-object", "-w", name).strip()
+    repo.git("replace", blob, replacement)
+    assert repo.git("show", f":{name}") == "value = 1\n"
+    assert_rejected(repo.hook(), name, "Python syntax is invalid")
 
 
 def test_retained_link_follows_selected_source_changes(tmp_path: Path) -> None:
     name = "probe.py"
     guide = '[Value](probe.py#L1)<!-- prefix: "value = 1" -->\n'
-    root = seed_repository(tmp_path, {name: "value = 1\n", "guide.md": guide})
-    stage_files(root, {name: "other = 1\n"})
-    assert_rejected(selected_hook(root), "guide.md", "prefix is stale")
-    git_fixture(root, "rm", "-f", name)
-    assert_rejected(selected_hook(root), "guide.md", "link is missing")
-    git_fixture(root, "restore", "--source=HEAD", "--staged", "--worktree", "--", name)
-    git_fixture(root, "mv", name, "renamed.py")
-    assert_rejected(selected_hook(root), "guide.md", "link is missing")
+    repo = seed_repository(tmp_path, {name: "value = 1\n", "guide.md": guide})
+    assert_rejected(repo.staged_hook({name: "other = 1\n"}), "guide.md", "prefix is stale")
+    repo.git("rm", "-f", name)
+    assert_rejected(repo.hook(), "guide.md", "link is missing")
+    repo.git("restore", "--source=HEAD", "--staged", "--worktree", "--", name)
+    repo.git("mv", name, "renamed.py")
+    assert_rejected(repo.hook(), "guide.md", "link is missing")
 
 
 def test_staged_skill_package_rejects_repository_only_link(tmp_path: Path) -> None:
     package = ".agents/skills/example/"
     name = package + "SKILL.md"
-    skill = "---\nname: example\ndescription: Example.\ndisable-model-invocation: true\n---\n"
-    policy = "policy:\n  allow_implicit_invocation: false\n"
-    root = seed_repository(
-        tmp_path, {name: skill, package + "agents/openai.yaml": policy, "guide.md": "# Guide\n"}
+    repo = seed_repository(
+        tmp_path,
+        {
+            name: EXAMPLE_SKILL,
+            package + "agents/openai.yaml": EXPLICIT_SKILL_POLICY,
+            "guide.md": "# Guide\n",
+        },
     )
-    stage_files(root, {name: skill + "\n[Guide](../../../guide.md)\n"})
-    assert_rejected(selected_hook(root), "link leaves the selected directory")
+    result = repo.staged_hook({name: EXAMPLE_SKILL + "\n[Guide](../../../guide.md)\n"})
+    assert_rejected(result, "link leaves the selected directory")
 
 
 def test_physical_limits_on_the_selected_index(tmp_path: Path) -> None:
-    root = seed_repository(tmp_path, {})
+    repo = seed_repository(tmp_path)
     name = "probe.cpp"
     inside = "int probe() {\n" + "    (void)0;\n" * 97
     ending = "    return 0;\n}\n"
     width = "value = '" + "a" * 90 + "'\n"
     entries = {f"entries/{index}": "initial\n" for index in range(30)}
     exact = {name: inside + ending + "\n" * 900, "width.py": width, "guide.md": "word " * 3000}
-    stage_files(root, {**entries, **exact})
-    assert_passed(selected_hook(root))
+    assert_passed(repo.staged_hook({**entries, **exact}))
     extra = dict(exact)
     extra.update({name: exact[name] + "\n", "width.py": width.replace("a'", "aa'")})
     extra.update({"entries/extra": "one more\n", "guide.md": "word " * 3001})
-    stage_files(root, extra)
-    result = selected_hook(root)
+    result = repo.staged_hook(extra)
     assert_rejected(result, "31 entries", "more than 100 characters", "3001 visible words")
     assert "more than 1000 lines" in result.stderr
-    git_fixture(root, "rm", "-f", "entries/extra")
-    stage_files(root, {**exact, name: inside + "    (void)0;\n" + ending + "\n" * 899})
-    output = assert_rejected(selected_hook(root), "Function probe() at line 1 exceeds")
+    repo.git("rm", "-f", "entries/extra")
+    output = assert_rejected(
+        repo.staged_hook({**exact, name: inside + "    (void)0;\n" + ending + "\n" * 899}),
+        "Function probe() at line 1 exceeds",
+    )
     assert "more than 1000 lines" not in output
 
 
@@ -900,8 +893,7 @@ def test_function_adapter_span(
     tmp_path: Path, suffix: str, definition: str, declaration: str
 ) -> None:
     path = tmp_path / f"probe.{suffix}"
-    config = json.loads((ROOT / ".agents/gates.json").read_text())
-    arguments = config["function_adapters"][f".{suffix}"]
+    arguments = gate_policy()["function_adapters"][f".{suffix}"]
     values = {"{python}": sys.executable, "{file}": str(path)}
     command = [values.get(part, part) for part in arguments]
     for text, expected in ((definition, [(1, 3)]), (declaration, [])):
@@ -915,10 +907,15 @@ def test_function_adapter_span(
 
 def test_configured_child_sees_selected_git_and_fresh_report(tmp_path: Path) -> None:
     name = "probe/input.py"
-    config = json.loads((ROOT / ".agents/gates.json").read_text())
-    check = {"kind": "test", "command": ["{python}", "observe.py", "{files}"]}
-    check.update({"name": "Snapshot observer", "paths": [name], "report": "report.xml"})
-    config["checks"] = [check, check | {"name": "Unrelated observer", "paths": ["other/*"]}]
+    policy = gate_policy()
+    check = {
+        "name": "Snapshot observer",
+        "kind": "test",
+        "paths": [name],
+        "command": ["{python}", "observe.py", "{files}"],
+        "report": "report.xml",
+    }
+    policy["checks"] = [check, check | {"name": "Unrelated observer", "paths": ["other/*"]}]
     script = (
         "import subprocess\nimport sys\nfrom pathlib import Path\n"
         "head = subprocess.check_output(['git', 'rev-parse', 'HEAD']).strip()\n"
@@ -934,19 +931,19 @@ def test_configured_child_sees_selected_git_and_fresh_report(tmp_path: Path) -> 
     )
     report = "<testsuite><testcase/></testsuite>\n"
     files = {name: "value = 0\n", "observe.py": script, "report.xml": report}
-    root = seed_repository(tmp_path, files | {".agents/gates.json": json.dumps(config) + "\n"})
-    expected = git_fixture(root, "rev-parse", "HEAD")
-    stage_files(root, {name: "value = 1\n", "expected-head": expected})
-    write_fixture(root, name, "value = 2\n")
-    result = selected_hook(root)
-    assert_passed(result)
-    output = result.stdout + result.stderr
+    repo = seed_repository(tmp_path, files, policy=policy)
+    expected = repo.git("rev-parse", "HEAD")
+    output = assert_passed(
+        repo.staged_hook(
+            {name: "value = 1\n", "expected-head": expected}, unstaged={name: "value = 2\n"}
+        )
+    )
     assert "Running Snapshot observer" in output
     assert "Running Unrelated observer" not in output
-    stage_files(root, {name: "value = 2\n"})
-    assert_rejected(selected_hook(root), "Running Snapshot observer", "local JUnit report")
-    git_fixture(root, "rm", "-f", name)
-    assert_rejected(selected_hook(root), "Running Snapshot observer", "local JUnit report")
+    result = repo.staged_hook({name: "value = 2\n"})
+    assert_rejected(result, "Running Snapshot observer", "local JUnit report")
+    repo.git("rm", "-f", name)
+    assert_rejected(repo.hook(), "Running Snapshot observer", "local JUnit report")
 
 
 @pytest.mark.parametrize(
@@ -982,19 +979,19 @@ def test_required_junit_report(
 @pytest.mark.parametrize("command", [["missing-proof-tool"], ["{python}", "-c", "exit(23)"]])
 def test_required_static_check_fails_closed(tmp_path: Path, command: list[str]) -> None:
     name = "probe.py"
-    config = json.loads((ROOT / ".agents/gates.json").read_text())
-    check = {"name": "Required static", "kind": "static", "paths": [name], "command": command}
-    config["checks"] = [check]
-    root = seed_repository(tmp_path, {".agents/gates.json": json.dumps(config) + "\n"})
-    stage_files(root, {name: "value = 1\n"})
+    policy = gate_policy()
+    policy["checks"] = [
+        {"name": "Required static", "kind": "static", "paths": [name], "command": command}
+    ]
+    repo = seed_repository(tmp_path, policy=policy)
     diagnostic = command[0] if len(command) == 1 else "23"
-    assert_rejected(selected_hook(root), "Running Required static", diagnostic)
+    assert_rejected(repo.staged_hook({name: "value = 1\n"}), "Running Required static", diagnostic)
 
 
 def test_required_function_adapter_fails_closed(tmp_path: Path) -> None:
-    config = json.loads((ROOT / ".agents/gates.json").read_text())
-    config["checks"] = []
-    config["function_adapters"][".cpp"] = ["missing-proof-parser", "{file}"]
-    root = seed_repository(tmp_path, {".agents/gates.json": json.dumps(config) + "\n"})
-    stage_files(root, {"probe.cpp": "int value;\n" + "\n" * 100})
-    assert_rejected(selected_hook(root), "missing-proof-parser")
+    policy = gate_policy()
+    policy["checks"] = []
+    policy["function_adapters"][".cpp"] = ["missing-proof-parser", "{file}"]
+    repo = seed_repository(tmp_path, policy=policy)
+    result = repo.staged_hook({"probe.cpp": "int value;\n" + "\n" * 100})
+    assert_rejected(result, "missing-proof-parser")

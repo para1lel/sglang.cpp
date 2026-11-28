@@ -1,6 +1,5 @@
 #pragma once
 
-
 #include "sglang/decoder_prefill.h"
 #include "sglang/decoder_batch.h"
 #include "sglang/decoder_media_internal.h"
@@ -54,17 +53,6 @@ struct PrefillDims {
     std::size_t gdn_workspace_bytes(int rows) const;
 };
 
-struct SeedScratch {
-    Bf16* concatenated = nullptr;
-    Bf16* keys = nullptr;
-    Bf16* values = nullptr;
-    Bf16* rope_keys = nullptr;
-};
-
-std::size_t seed_scratch_bytes(int concat_rows, int kv_rows);
-
-SeedScratch make_seed_scratch(Bf16* memory, int concat_rows, int kv_rows);
-
 struct TileBuffers {
     TileBuffers(ScratchLayout& layout, int rows, const PrefillDims& tile_dims = PrefillDims{});
 
@@ -115,8 +103,7 @@ struct Chunk : PrefillProjections {
                         std::initializer_list<PrefillFp8Projection> projections) const;
 
     void seed_draft(MtpDraftRequest& draft, const int* shifted_tokens, int seed_rows,
-                    const Bf16* final_norm, bool wmma, const MediaPrefill* media,
-                    const SeedScratch* seed = nullptr) const;
+                    const Bf16* final_norm, bool wmma, const MediaPrefill* media) const;
 
     void gdn_input(const GdnLayer& layer) const;
 
@@ -154,8 +141,14 @@ void gather_embeddings(const Bf16* embedding, const int* tokens, int rows, Bf16*
 
 void stage_prefill_row(Request& request, const TileBuffers& work, int row, cudaStream_t stream);
 
-void seed_ranked_prefill_draft(const DecoderModel& model, const PrefillGrant& grant,
-                               const Chunk& chunk, ScratchLayout& layout, std::size_t layout_bytes);
+void seed_ranked_prefill_draft(const std::array<const DecoderModel*, 2>& models,
+                               const std::array<const PrefillGrant*, 2>& grants,
+                               const std::array<const Chunk*, 2>& chunks, int offset,
+                               TensorParallel& group);
+void seed_scalar_prefill_draft_tp(const DecoderModel& model, const DecoderModel& peer,
+                                  const PrefillGrant& grant, const PrefillGrant& peer_grant,
+                                  cudaStream_t stream, cudaStream_t peer_stream,
+                                  TensorParallel& group);
 
 struct GdnPrefillCheckpoints {
     GdnPrefillCheckpoints();
@@ -173,12 +166,6 @@ void publish_prefill_checkpoints(const PrefillGrant& grant);
 void capture_prefill_scores(const DecoderModel& model, const PrefillGrant& grant,
                             const TileBuffers* buffers, int offset, cudaStream_t stream);
 
-constexpr int layerwise_row_alignment = 128;
-constexpr int max_layerwise_rows = 1023;
-static_assert(max_layerwise_rows / 256 <= max_gdn_prefill_segments);
-static_assert(text_gqa_kv_width * sizeof(Bf16) >= text_gdn_value_heads * sizeof(float2));
-
-PrefillGroup prefill_group(const PrefillGrant* grants, int count);
 
 Chunk prefill_attention_segment(const Chunk& chunk, const PrefillGrant& grant, int offset);
 

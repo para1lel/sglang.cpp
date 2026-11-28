@@ -1,5 +1,6 @@
 #include "sglang/text_ops.h"
 #include "sglang/decoder_cuda.cuh"
+#include "sglang/decoder_batch.h"
 #include "sglang/decoder_internal.h"
 #include "sglang/decoder_mtp.h"
 #include "sglang/text/decode_proj.h"
@@ -151,21 +152,13 @@ cudaError_t launch_bf16_batch(const __nv_bfloat16* weight, int out_width, int in
                             block_threads, args, 0, stream);
 }
 
-template <bool Batched, bool ApplySwiglu = false>
-__global__ void quantize_fp8_kernel(const __nv_bfloat16* input, int width,
-                                    TextFp8Activation output, const __nv_bfloat16* up) {
+template <bool ApplySwiglu>
+__device__ __forceinline__ void quantize_fp8_group(const __nv_bfloat16* input, int width,
+                                                   TextFp8Activation output,
+                                                   const __nv_bfloat16* up) {
     constexpr int group_warps = text_fp8_group_size / warp_width;
     __shared__ float warp_maxima[group_warps];
     __shared__ float reciprocal_scale;
-    if constexpr (Batched) {
-        const auto offset = static_cast<std::size_t>(blockIdx.y) * width;
-        input += offset;
-        if constexpr (ApplySwiglu) {
-            up += offset;
-        }
-        output.values += offset;
-        output.scales += static_cast<std::size_t>(blockIdx.y) * gridDim.x;
-    }
     const int lane = threadIdx.x % warp_width;
     const int warp = threadIdx.x / warp_width;
     const auto col = static_cast<std::size_t>(blockIdx.x) * text_fp8_group_size + threadIdx.x;
@@ -194,6 +187,29 @@ __global__ void quantize_fp8_kernel(const __nv_bfloat16* input, int width,
         output.values[col] = __nv_cvt_float_to_fp8(value * reciprocal_scale, __NV_SATFINITE,
                                                    __NV_E4M3);
     }
+}
+
+template <bool Batched, bool ApplySwiglu = false>
+__global__ void quantize_fp8_kernel(const __nv_bfloat16* input, int width, TextFp8Activation output,
+                                    const __nv_bfloat16* up) {
+    if constexpr (Batched) {
+        const auto offset = static_cast<std::size_t>(blockIdx.y) * width;
+        input += offset;
+        if constexpr (ApplySwiglu)
+            up += offset;
+        output.values += offset;
+        output.scales += static_cast<std::size_t>(blockIdx.y) * gridDim.x;
+    }
+    quantize_fp8_group<ApplySwiglu>(input, width, output, up);
+}
+
+struct QuantizeFp8Batch {
+    TextFp8QuantizeRow rows[decoder_batch_max_lanes];
+};
+
+__global__ void quantize_fp8_batch_kernel(QuantizeFp8Batch batch, int width) {
+    const auto row = batch.rows[blockIdx.y];
+    quantize_fp8_group<false>(row.input, width, row.output, nullptr);
 }
 
 template <bool ApplySwiglu>
@@ -451,6 +467,24 @@ cudaError_t text_quantize_fp8(const __nv_bfloat16* input, int width, TextFp8Acti
     const __nv_bfloat16* up = nullptr;
     void* args[] = {&input, &width, &output, &up};
     return cudaLaunchKernel(quantize_fp8_kernel<false>, text_fp8_group_count(width),
+                            text_fp8_group_size, args, 0, stream);
+}
+
+cudaError_t text_quantize_fp8(const TextFp8QuantizeRow* rows, int count, int width,
+                              cudaStream_t stream) {
+    if (rows == nullptr || count < 1 || count > decoder_batch_max_lanes || width < 1) {
+        return cudaErrorInvalidValue;
+    }
+    QuantizeFp8Batch batch{};
+    for (int row = 0; row < count; ++row) {
+        if (rows[row].input == nullptr || rows[row].output.values == nullptr ||
+            rows[row].output.scales == nullptr) {
+            return cudaErrorInvalidValue;
+        }
+        batch.rows[row] = rows[row];
+    }
+    void* args[] = {&batch, &width};
+    return cudaLaunchKernel(quantize_fp8_batch_kernel, dim3(text_fp8_group_count(width), count),
                             text_fp8_group_size, args, 0, stream);
 }
 

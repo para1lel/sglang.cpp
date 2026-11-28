@@ -199,8 +199,9 @@ using decoder::DraftAttentionRow;
 using decoder::PagedDecodeLane;
 
 bool valid_draft_attention(const DraftAttentionRow& row, std::int64_t visible) {
+    const GqaGeometry geometry{gqa_query_heads(row.cache.kv_heads), row.cache.kv_heads};
     return row.queries && row.output && cache_covers(row.cache, row.pages, visible) &&
-           gqa_geometry_matches(gqa_full_geometry, row.cache);
+           gqa_geometry_valid(geometry);
 }
 
 bool draft_split_workspace(const DraftAttentionRow& row, std::int64_t visible) {
@@ -231,6 +232,8 @@ std::optional<cudaError_t> try_grouped_draft_attention(const DraftAttentionRow* 
         const auto visible = static_cast<std::int64_t>(row.position) + 1;
         if (row.position < gqa_decode::long_min_position || !valid_draft_attention(row, visible) ||
             !draft_split_workspace(row, visible)) return std::nullopt;
+        if (index != 0 && row.cache.kv_heads != rows[0].cache.kv_heads)
+            return std::nullopt;
         const auto lane = bind_online_draft(row);
         if (!lane) return std::nullopt;
         batch.lanes[index] = *lane;
@@ -318,6 +321,8 @@ cudaError_t decoder::mtp_gqa_attention_batch(const DraftAttentionRow* rows, int 
         if (!valid_draft_attention(row, visible)) {
             return cudaErrorInvalidValue;
         }
+        if (row.cache.kv_heads != rows[0].cache.kv_heads)
+            return cudaErrorInvalidValue;
         const bool long_row = visible > row.workspace.capacity;
         if (draft_split_workspace(row, visible)) {
             if (b200) {
@@ -332,8 +337,9 @@ cudaError_t decoder::mtp_gqa_attention_batch(const DraftAttentionRow* rows, int 
                 continue;
             }
         }
+        const GqaGeometry geometry{gqa_query_heads(row.cache.kv_heads), row.cache.kv_heads};
         const auto status = mtp_gqa_attention(row.cache, row.pages, row.position, row.queries,
-                                              row.output, row.workspace, stream);
+                                              row.output, row.workspace, stream, geometry);
         if (status != cudaSuccess) {
             return status;
         }
@@ -350,59 +356,60 @@ cudaError_t decoder::mtp_gqa_attention_batch(const DraftAttentionRow* rows, int 
 
 namespace {
 
-namespace gqa_verify {
-__device__ decoder::PagedDecodeLane verify_lane(const gqa_decode::EagerTargetBatch& input) {
-    return input.lanes[blockIdx.z];
+struct LiveVerifyBatch {
+    static constexpr int end = text_attention_max_tokens;
+    static constexpr int position_bound = decoder::tp_verify_graph::short_capacity;
+    const decoder::tp_verify_graph::GqaBinding* binding;
+    int indices[decoder::tp_verify_graph::max_rows];
+};
+
+__device__ const decoder::PagedDecodeLane& verify_lane(const gqa_decode::EagerTargetBatch& batch) {
+    return batch.lanes[blockIdx.z];
 }
 
-__device__ decoder::ExactGqaWorkspace verify_scores(const gqa_decode::EagerTargetBatch& input,
-                                                    int lane) {
-    return {static_cast<float*>(input.lanes[lane].buffers.scratch), input.position_bound};
-}
+__device__ const decoder::PagedDecodeLane& verify_lane(const LiveVerifyBatch& batch) {
+    return batch.binding->reads[batch.indices[blockIdx.z]];
 }
 
-__global__ void verify_scores_kernel(const __grid_constant__ gqa_decode::EagerTargetBatch input) {
-    const auto lane = gqa_verify::verify_lane(input);
-    const int head = static_cast<int>(blockIdx.y);
-    if (decoder::target_split_position(lane.position, input.end) || !gqa_decode::readable(lane) ||
-        head >= gqa_query_heads(lane.cache.kv_heads) ||
-        gqa_query_heads(lane.cache.kv_heads) > static_cast<int>(gridDim.y) ||
-        lane.position > input.position_bound) {
-        return;
+template <typename Batch>
+__device__ bool verify_head(const Batch& input, const decoder::PagedDecodeLane& lane, int head,
+                            int heads) {
+    return !decoder::target_split_position(lane.position, input.end) &&
+           gqa_decode::readable(lane) && head < gqa_query_heads(lane.cache.kv_heads) &&
+           gqa_query_heads(lane.cache.kv_heads) <= heads && lane.position < input.position_bound;
+}
+
+template <typename Batch>
+__global__ void verify_scores_kernel(const __grid_constant__ Batch input) {
+    const auto& lane = verify_lane(input);
+    if (verify_head(input, lane, blockIdx.y, gridDim.y)) {
+        exact_scores(lane.cache, lane.pages.device_pages, lane.position, lane.buffers.queries,
+                     {static_cast<float*>(lane.buffers.scratch), input.position_bound});
     }
-    exact_scores(lane.cache, lane.pages.device_pages, lane.position, lane.buffers.queries,
-                 gqa_verify::verify_scores(input, static_cast<int>(blockIdx.z)));
 }
 
-__global__ void verify_replay_kernel(const __grid_constant__ gqa_decode::EagerTargetBatch input) {
-    const auto lane = gqa_verify::verify_lane(input);
-    const int head = static_cast<int>(blockIdx.x);
-    if (decoder::target_split_position(lane.position, input.end) || !gqa_decode::readable(lane) ||
-        head >= gqa_query_heads(lane.cache.kv_heads) ||
-        gqa_query_heads(lane.cache.kv_heads) > static_cast<int>(gridDim.x) ||
-        lane.position > input.position_bound) {
-        return;
+template <typename Batch>
+__global__ void verify_replay_kernel(const __grid_constant__ Batch input) {
+    const auto& lane = verify_lane(input);
+    if (verify_head(input, lane, blockIdx.x, gridDim.x)) {
+        vector_replay_body(lane.cache, lane.pages.device_pages, lane.position,
+                           {static_cast<float*>(lane.buffers.scratch), input.position_bound},
+                           lane.buffers.output, blockIdx.x, blockIdx.y);
     }
-    vector_replay_body(lane.cache, lane.pages.device_pages, lane.position,
-                       gqa_verify::verify_scores(input, static_cast<int>(blockIdx.z)),
-                       lane.buffers.output, head, static_cast<int>(blockIdx.y));
 }
 
-__global__ void live_scores(const decoder::tp_verify_graph::GqaBinding* binding) {
-    const auto& lane = binding->reads[blockIdx.z];
-    constexpr int capacity = decoder::tp_verify_graph::score_capacity;
-    exact_scores(lane.cache, lane.pages.device_pages, lane.position, lane.buffers.queries,
-                 {static_cast<float*>(lane.buffers.scratch), capacity});
+template <typename Batch>
+cudaError_t launch_verify(Batch& batch, int count, int heads, cudaStream_t stream) {
+    const int blocks = std::min(32, (batch.position_bound + score_warps) / score_warps);
+    void* args[] = {&batch};
+    const auto status = cudaLaunchKernel(verify_scores_kernel<Batch>, dim3(blocks, heads, count),
+                                         score_warps * mxfp8_group_size, args, 0, stream);
+    if (status != cudaSuccess)
+        return status;
+    return cudaLaunchKernel(verify_replay_kernel<Batch>,
+                            dim3(heads, mxfp8_head_dim / vector_replay_channels, count),
+                            vector_replay_threads, args, 0, stream);
 }
-
-__global__ void live_replay(const decoder::tp_verify_graph::GqaBinding* binding) {
-    const auto& lane = binding->reads[blockIdx.z];
-    constexpr int capacity = decoder::tp_verify_graph::score_capacity;
-    vector_replay_body(lane.cache, lane.pages.device_pages, lane.position,
-                       {static_cast<float*>(lane.buffers.scratch), capacity},
-                       lane.buffers.output, blockIdx.x, blockIdx.y);
-}
-
 }
 
 bool decoder::short_verify_supported(const PagedDecodeLane* lanes, int count) {
@@ -436,39 +443,23 @@ cudaError_t decoder::short_verify_gqa(const PagedDecodeLane* lanes, int count,
         position_bound = std::max<int>(position_bound, lanes[index].position + 1);
         kv_heads = std::max<int>(kv_heads, lanes[index].cache.kv_heads);
     }
-    const GqaGeometry geometry{gqa_query_heads(kv_heads), kv_heads};
     gqa_decode::EagerTargetBatch batch{};
     for (int index = 0; index < count; ++index) {
         batch.lanes[index] = lanes[index];
     }
     batch.end = text_attention_max_tokens;
     batch.position_bound = position_bound;
-    constexpr int score_threads = score_warps * mxfp8_group_size;
-    void* args[] = {&batch};
-    const int score_blocks = (position_bound + score_warps) / score_warps;
-    const int blocks = 32 < score_blocks ? 32 : score_blocks;
-    auto status = cudaLaunchKernel(verify_scores_kernel,
-        dim3(blocks, geometry.query_heads, count), score_threads, args, 0, stream);
-    if (status == cudaSuccess) {
-        status = cudaLaunchKernel(verify_replay_kernel,
-            dim3(geometry.query_heads, mxfp8_head_dim / vector_replay_channels, count),
-            vector_replay_threads, args, 0, stream);
-    }
-    return status;
+    return launch_verify(batch, count, gqa_query_heads(kv_heads), stream);
 }
 
-cudaError_t decoder::tp_verify_graph::read(const GqaBinding* live, int query_heads,
-                                          cudaStream_t stream) {
-    static_assert(score_capacity % score_warps == 0);
-    constexpr int score_threads = score_warps * mxfp8_group_size;
-    auto status = launch_gqa_kernel(live_scores,
-        dim3(score_capacity / score_warps, query_heads, rows), dim3(score_threads), stream, live);
-    if (status == cudaSuccess) {
-        status = launch_gqa_kernel(live_replay,
-            dim3(query_heads, mxfp8_head_dim / vector_replay_channels, rows),
-            dim3(vector_replay_threads), stream, live);
-    }
-    return status;
+cudaError_t decoder::tp_verify_graph::read(const GqaBinding* live,
+                                           const std::array<int, max_rows>& indices, int rows,
+                                           int query_heads, cudaStream_t stream) {
+    static_assert(static_cast<std::size_t>(short_capacity) * gqa_rank_geometry.query_heads *
+                      sizeof(float) <=
+                  paged_decode_scratch_bytes);
+    LiveVerifyBatch batch{live, {}};
+    std::copy_n(indices.begin(), rows, batch.indices);
+    return launch_verify(batch, rows, query_heads, stream);
 }
-
 }

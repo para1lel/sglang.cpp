@@ -18,6 +18,9 @@ cudaError_t gather_verification_embeddings(const __nv_bfloat16* weight, int voca
                                            const VerificationEmbeddingTokens& tokens,
                                            const VerificationCopyRows& output, int count,
                                            cudaStream_t stream);
+cudaError_t gather_verification_embeddings(const __nv_bfloat16* weight, const int* device_tokens,
+                                           const VerificationCopyRows& output, int count,
+                                           cudaStream_t stream);
 
 cudaError_t scatter_verification_hidden(const __nv_bfloat16* source,
                                         const VerificationCopyRows& output, int count,

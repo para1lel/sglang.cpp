@@ -27,11 +27,13 @@ struct WideMtpCandidates {
     std::uint32_t speculative = 0;
     std::uint32_t eligible = 0;
     int eligible_count = 0;
+    std::uint32_t replay = 0;
 };
 
 struct WideMtpGroups {
     std::array<std::uint8_t, decoder_batch_max_lanes> width{};
     int largest = 0;
+    std::uint32_t replay = 0;
 };
 
 WideMtpGroups wide_mtp_groups(const PrefillRows& decode,

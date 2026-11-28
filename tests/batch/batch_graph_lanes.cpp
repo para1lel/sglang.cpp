@@ -86,8 +86,8 @@ struct Instance {
                 jobs[slot] = 0;
             }
         }
-        require(stats.graph_slots == 0 || stats.graph_slots == decode_slots,
-                "Graph mask differs from the slots that decoded");
+        require((stats.graph_slots & ~decode_slots) == 0,
+                "Graph mask includes a slot that did not decode");
         graph_slots = stats.graph_slots;
         std::cout << std::flush;
         return result;
@@ -142,19 +142,21 @@ void setup(Instance& run) {
     run.repeat(15, 2);
 }
 
-void scenario(const Decoder& decoder, bool graphs, bool hard) {
+void fault(const Decoder& decoder, bool graphs, bool hard) {
+    constexpr unsigned lane = 8U;
     Instance run(decoder, graphs);
-    setup(run);
+    run.admit(3, 127, 12);
+    run.prefill(lane, 3);
     if (hard) {
         try {
-            run.repeat(1, 6);
+            run.repeat(lane, 6);
             throw std::logic_error("Expected a post-launch failure");
         } catch (const std::runtime_error& error) {
             require(std::string_view(error.what()).find("Complete decoder batch step") !=
                     std::string_view::npos, "Unexpected post-launch failure");
         }
         try {
-            run.step(15);
+            run.step(lane);
             throw std::logic_error("Expected an unavailable batch after a post-launch failure");
         } catch (const std::runtime_error& error) {
             require(std::string_view(error.what()) == "Decoder batch is unavailable",
@@ -163,6 +165,12 @@ void scenario(const Decoder& decoder, bool graphs, bool hard) {
         std::cout << "failed-closed\n";
         return;
     }
+    run.drain();
+}
+
+void scenario(const Decoder& decoder, bool graphs) {
+    Instance run(decoder, graphs);
+    setup(run);
     run.repeat(15, 5);
     run.repeat(10, 3);
     run.repeat(5, 2);
@@ -180,7 +188,7 @@ void scenario(const Decoder& decoder, bool graphs, bool hard) {
     require(run.steps > 20, "Insufficient replay steps");
 }
 
-void wide_eager(const Decoder& decoder) {
+void grouped(const Decoder& decoder) {
     constexpr unsigned all_slots = ~0u;
     constexpr int slots = decoder_batch_max_lanes;
     static_assert(slots == 32);
@@ -194,9 +202,13 @@ void wide_eager(const Decoder& decoder) {
     for (int width = 2; width <= slots; ++width) {
         const unsigned low = all_slots >> (slots - width);
         const unsigned high = all_slots << (slots - width);
+        int steps = 0;
         for (const auto bits : {low, high, low}) {
+            ++steps;
             const auto result = run.step(bits);
-            require(run.graph_slots == 0, "Wide B200 decode used a graph");
+            if (width <= decoder_batch_max_graph_lanes && steps > 1) {
+                require(run.graph_slots == bits, "Eligible group lost a bound decode lane");
+            }
             for (int slot = 0; slot < slots; ++slot) {
                 if (bits & (1u << slot)) {
                     require(result[slot].decode && !result[slot].finish_reason,
@@ -248,16 +260,16 @@ void singleton(const Decoder& decoder, std::string_view role) {
     run.step(pair);
     require(run.graph_slots == 0, "First pair decode did not warm eagerly");
     run.step(pair);
-    require(run.graph_slots == 0, "B200 pair unexpectedly used a decode graph");
+    require(run.graph_slots == (graphs ? pair : 0), "Warmed pair did not replay independently");
     require(!run.jobs[far_slot], "Recycled slot did not finish");
     run.cancel(0);
 
     run.admit(far_slot, 5119, 3);
     run.prefill(far_mask, far_slot);
     run.step(far_mask);
-    require(run.graph_slots == singleton_mask, "Last inline score position did not replay");
+    require(run.graph_slots == singleton_mask, "Singleton did not replay at 5120 visible rows");
     run.step(far_mask);
-    require(run.graph_slots == 0, "Singleton beyond inline score capacity used a graph");
+    require(run.graph_slots == singleton_mask, "Long singleton did not retain graph replay");
     run.drain();
     run.check_step(pair, 0);
 }
@@ -363,9 +375,10 @@ void verify_exclusions(const Decoder& decoder, bool graphs) {
         for (int round = 0; round < 2; ++round) {
             const auto result = wider.advance_chunked(mask(2), &stats)[1];
             require(result.token && result.mtp_drafted_tokens == depth &&
-                    result.mtp_verified_rows == depth + 1 &&
-                    stats.graph_slots == 0 && stats.verification_graph_slots == 0,
-                    "Higher-depth verification changed shape or used the K1 graph");
+                        result.mtp_verified_rows == depth + 1 && stats.graph_slots == 0 &&
+                        stats.verification_graph_slots == (graphs && round == 1 ? 2U : 0U),
+                    "Higher-depth verification lost its shape or replay");
+            std::cout << "verify depth-graph " << stats.verification_graph_slots << '\n';
             std::cout << "verify depth " << depth << ' ' << *result.token;
             for (int extra = 0; extra < result.extra_token_count; ++extra) {
                 std::cout << ' ' << result.extra_tokens[extra];
@@ -393,8 +406,9 @@ void verify_graph(const Decoder& decoder, std::string_view role) {
                 "Unexpected K1 verification shape");
         require(stats.graph_slots == k0, "K1 step changed the K0 graph mask");
         require(stats.verification_graph_slots == k1, "Unexpected K1 target graph mask");
-        std::cout << "verify step " << ++steps << ' ' << selected << ' '
-                  << stats.target_rows << ' ' << lanes << ' ' << rows << '\n'
+        ++steps;
+        std::cout << "verify step " << steps << ' ' << selected << ' ' << stats.target_rows << ' '
+                  << lanes << ' ' << rows << '\n'
                   << "verify graphs " << steps << ' ' << k0 << ' ' << k1 << '\n';
         for (const int slot : {first, second}) {
             const auto& lane = result[slot];
@@ -541,9 +555,10 @@ void verify_wide(const Decoder& decoder) {
 
 int main(int argc, char** argv) {
     try {
-        require(argc == 3 || argc == 4, "Expected CHECKPOINT ROLE [wide|singleton|verify]");
+        require(argc == 3 || argc == 4, "Expected CHECKPOINT ROLE [fault|wide|singleton|verify]");
         const std::string_view test = argc == 4 ? argv[3] : "";
-        require(test.empty() || test == "wide" || test == "singleton" || test == "verify",
+        require(test.empty() || test == "fault" || test == "wide" || test == "singleton" ||
+                    test == "verify",
                 "Unexpected graph test scenario");
         const std::string_view role = argv[2];
         const bool wide = test.empty() && role == "verify-wide";
@@ -558,13 +573,15 @@ int main(int argc, char** argv) {
         if (wide) {
             verify_wide(decoder);
         } else if (test == "wide") {
-            wide_eager(decoder);
+            grouped(decoder);
         } else if (test == "singleton") {
             singleton(decoder, role);
         } else if (test == "verify") {
             verify_graph(decoder, role);
+        } else if (test == "fault") {
+            fault(decoder, role != "eager", role == "hard");
         } else {
-            scenario(decoder, role != "eager", role == "hard");
+            scenario(decoder, role != "eager");
         }
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

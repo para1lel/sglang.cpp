@@ -6,7 +6,7 @@ Send `POST /separate_reasoning` with text that already contains model output. Th
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
-| HTTP reader | Match the path, check the media type, and enqueue the request on the CPU FIFO. | [Path match](../../apps/server/prefix_controls.cpp#L608)<!-- prefix: "if (path == " --> · [Media types](../../apps/server/http.cpp#L224)<!-- prefix: "const auto p" --> · [Dispatch](../../apps/server/prefix_controls.cpp#L610)<!-- prefix: "enqueue_auxi" --> |
+| HTTP reader | Match the path, check the media type, and enqueue the request on the CPU FIFO. | [Path match](../../apps/server/prefix_controls.cpp#L610)<!-- prefix: "if (path == " --> · [Media types](../../apps/server/http.cpp#L224)<!-- prefix: "const auto p" --> · [Dispatch](../../apps/server/prefix_controls.cpp#L612)<!-- prefix: "enqueue_auxi" --> |
 | Request and response | Validate the input, select the parser, and serialize the result. | [Request validation](../../apps/server/parse_function_call.cpp#L144)<!-- prefix: "void separat" --> · [Response writer](../../apps/server/parse_function_call.cpp#L68)<!-- prefix: "void write_s" --> |
 | Qwen3 parser | Split the supplied text at literal reasoning and tool markers. | [Text split](../../apps/server/qwen/qwen_chat_output.cpp#L704)<!-- prefix: "std::optiona" --> · [Pinned SGLang Qwen3 detector](https://github.com/sgl-project/sglang/blob/f04d886bf79aa3d6237cbb12a3311838eb9f9bd8/python/sglang/srt/parser/reasoning_parser.py#L447)<!-- prefix: "class Qwen3D" --> |
 
@@ -14,7 +14,7 @@ Send `POST /separate_reasoning` with text that already contains model output. Th
 
 The HTTP reader splits the raw target at the first literal `?`, then percent-decodes the path once. For example, `POST /separate%5Freasoning?x=1` reaches `/separate_reasoning` and ignores the query. A trailing slash follows the [shared redirect rules](../http-server.md#request-targets-and-redirects).
 
-The reader reads the supplied body under the ordinary HTTP limits. The [CPU FIFO](../http-server.md#http-admission-and-shutdown) shares one worker with tokenization and `/parse_function_call`. The worker parses the text without a completion slot, tokenizer call, or model inference. The request selects its parser independently of the [chat output parser](../chat-serving.md#qwen-reasoning-and-tool-calls). [CPU worker](../../apps/server/prefix_controls.cpp#L794)<!-- prefix: "void Connect" -->
+The reader reads the supplied body under the ordinary HTTP limits. The [CPU FIFO](../http-server.md#http-admission-and-shutdown) shares one worker with tokenization, Anthropic token counting, and `/parse_function_call`. The worker parses the text without a completion slot, tokenizer call, or model inference. The request selects its parser independently of the [chat output parser](../chat-serving.md#qwen-reasoning-and-tool-calls). [CPU worker](../../apps/server/prefix_controls.cpp#L796)<!-- prefix: "void Connect" -->
 
 `qwen3`, `dots`, `interns1`, and `nanbeige` return the whole input as ordinary text if it has no literal `<think>`. `qwen3-thinking` and `minimax` start in reasoning even without that marker. Parser names are case-insensitive for ASCII and must match without leading or trailing spaces.
 

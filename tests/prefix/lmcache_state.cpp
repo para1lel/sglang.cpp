@@ -510,28 +510,33 @@ void check_replay_before_export(GraphCheckpointOracle oracle, bool verifier) {
         return;
     }
 
+    constexpr int verification_row_count = 2;
     VerificationGraph graph(oracle.execution);
-    TargetVerification a(owner, 128, prefix, k1_verification_rows, false, stream);
-    TargetVerification b(peer, 128, prefix, k1_verification_rows, false, stream);
+    TargetVerification a(owner, 128, prefix, verification_row_count, false, stream);
+    TargetVerification b(peer, 128, prefix, verification_row_count, false, stream);
     const auto replay = [&](TargetVerification& verification, int position,
-                            const std::array<int, k1_verification_rows>& tokens) {
-        const VerificationSequence sequence{&verification, position, tokens.data(),
-                                             k1_verification_rows};
+                            const std::array<int, verification_row_count>& tokens) {
+        const VerificationSequence sequence{
+            &verification,
+            position,
+            tokens.data(),
+            verification_row_count,
+        };
         return oracle.model.forward_verify(&sequence, 1, stream, &graph, nullptr);
     };
     require(!replay(b, prefix, {1033, 1341}), "K1 warmup unexpectedly replayed");
     b.read();
-    b.commit(k1_verification_rows);
+    b.commit(verification_row_count);
     require(replay(a, prefix, {1147, 1299}), "Owner K1 did not replay");
     const auto* shared_row = a.row(0).work;
     a.read();
     a.commit(1);
     synchronize_cuda(stream, "Commit owner K1 raw operands");
     const auto expected = prefix_fixture::recurrent_digest(owner, *shared_row);
-    require(replay(b, prefix + k1_verification_rows, {1437, 1567}) &&
-            shared_row == b.row(0).work, "Peer K1 did not share graph row");
+    require(replay(b, prefix + verification_row_count, {1437, 1567}) && shared_row == b.row(0).work,
+            "Peer K1 did not share graph row");
     b.read();
-    b.commit(k1_verification_rows);
+    b.commit(verification_row_count);
     oracle.history.push_back(1147);
     oracle.check_export(owner, *a.checkpoint_row(0), *shared_row, expected, prefix + 1, true);
 }

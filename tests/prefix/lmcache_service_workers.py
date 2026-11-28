@@ -104,7 +104,7 @@ def exercise(
                     assert select.select([child.stdout], [], [], 3)[0], "readiness timeout"
                     assert child.stdout.readline() == "restart\n"
                     assert records.resets == 1
-                    assert not records.digests
+                    assert not records.digests, records.digests
                     startup.close()
                     records = startup.enter_context(daemon(endpoint, mode, RANK_DEVICES[::-1]))
                     child.stdin.write("held\n")

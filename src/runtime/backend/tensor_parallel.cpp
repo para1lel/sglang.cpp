@@ -299,6 +299,8 @@ bool TensorParallel::State::submit_vendor(const Submit& submit) {
         return submit();
     } catch (const std::invalid_argument&) {
         throw;
+    } catch (const CudaError&) {
+        throw;
     } catch (const MnnvlArError& error) {
         if (error.peer_enqueued) {
             failed = true;
@@ -457,14 +459,21 @@ TpAllReduceRoute TensorParallel::allreduce_bf16(
         validate_collective_streams(state_->devices, streams, ranks);
     const std::size_t payload = count * sizeof(__nv_bfloat16);
 #if SGLANG_USE_MNNVL_AR
-    const bool two_shot = capture_state.status == cudaStreamCaptureStatusNone &&
+    const bool owned = tp_verify_graph::binding(streams[0]) != nullptr;
+    const bool two_shot = (owned || capture_state.status == cudaStreamCaptureStatusNone) &&
                           supports_mnnvl_twoshot(count);
+    const auto rows = count / mnnvl_ar_hidden_width;
+    if (owned && (rows > tp_verify_graph::max_rows ||
+                  !tp_verify_graph::owns_collective(streams, static_cast<int>(rows)))) {
+        throw CudaError(cudaErrorNotSupported, "Capture TP verification rank pair");
+    }
     if (state_->vendor_allreduce(buffers, streams, count, capture_state, two_shot)) {
-        if (tp_verify_graph::binding(streams[0])) tp_verify_graph::record_regular(streams[0]);
+        if (owned)
+            tp_verify_graph::record_collective(streams[0], two_shot);
         else state_->record_vendor_success(count, payload, two_shot);
         return two_shot ? TpAllReduceRoute::mnnvl_two_shot : TpAllReduceRoute::mnnvl_one_shot;
     }
-    if (tp_verify_graph::binding(streams[0])) {
+    if (owned) {
         throw CudaError(cudaErrorNotSupported, "Capture TP verification allreduce");
     }
     const ArFallback reason = state_->vendor_fallback_reason(count, capture_state, two_shot);
@@ -507,13 +516,14 @@ bool TensorParallel::try_allreduce_rms_quantize(
     const std::size_t count = width * mnnvl_ar_hidden_width;
     const auto capture = validate_collective_streams(state_->devices, streams, 2);
     const bool owned_capture = capture.status == cudaStreamCaptureStatusActive &&
-        capture.same_capture && width == tp_verify_graph::rows &&
-        tp_verify_graph::binding(streams[0]) && tp_verify_graph::binding(streams[1]);
+                               capture.same_capture &&
+                               tp_verify_graph::owns_collective(streams, width);
     if ((capture.status != cudaStreamCaptureStatusNone && !owned_capture) ||
         !state_->vendor_allreduce(buffers, streams, count, capture, false, rows, gains)) {
         return false;
     }
-    if (owned_capture) tp_verify_graph::record_fused(streams[0]);
+    if (owned_capture)
+        tp_verify_graph::record_collective(streams[0]);
     else state_->record_vendor_success(count, count * sizeof(__nv_bfloat16), false);
     return true;
 #else
@@ -530,14 +540,20 @@ bool TensorParallel::try_allreduce_rms_quantize_wide(
     ensure_healthy();
     if (!state_->mnnvl || state_->mnnvl_sticky || !state_->mnnvl->healthy() ||
         !streams[0] || !streams[1]) return false;
-    if (validate_collective_streams(state_->devices, streams, 2).status !=
-        cudaStreamCaptureStatusNone) return false;
+    const auto capture = validate_collective_streams(state_->devices, streams, 2);
+    const bool owned = capture.status == cudaStreamCaptureStatusActive && capture.same_capture &&
+                       tp_verify_graph::owns_collective(streams, Width);
+    if (capture.status != cudaStreamCaptureStatusNone && !owned)
+        return false;
     if (!state_->submit_vendor([&] {
             return state_->mnnvl->try_allreduce_rms_quantize_wide(buffers, streams, rows, gains);
         }))
         return false;
     constexpr std::size_t count = Width * mnnvl_ar_hidden_width;
-    state_->record_vendor_success(count, count * sizeof(__nv_bfloat16), false);
+    if (owned)
+        tp_verify_graph::record_collective(streams[0]);
+    else
+        state_->record_vendor_success(count, count * sizeof(__nv_bfloat16), false);
     return true;
 #else
     return false;
@@ -570,6 +586,40 @@ void TensorParallel::snapshot_transport(TpArCounters& out) const {
         line.bytes_payload_total = entry.payload_bytes;
         out.widths.push_back(std::move(line));
     }
+}
+
+void TensorParallel::allgather_bf16(const __nv_bfloat16* const input[],
+                                    __nv_bfloat16* const output[], const cudaStream_t streams[],
+                                    std::size_t rank_elements) {
+    const std::size_t ranks = state_->devices.size();
+    if (rank_elements == 0) {
+        throw std::invalid_argument("TensorParallel::allgather_bf16 requires a positive count.");
+    }
+    for (std::size_t rank = 0; rank < ranks; ++rank) {
+        if (input[rank] == nullptr || output[rank] == nullptr || streams[rank] == nullptr) {
+            throw std::invalid_argument("TensorParallel::allgather_bf16 requires rank buffers.");
+        }
+    }
+    ensure_healthy();
+    validate_collective_streams(state_->devices, streams, ranks);
+    check_nccl(ncclGroupStart(), "Open NCCL allgather group");
+    try {
+        CallerDevice scope;
+        for (std::size_t rank = 0; rank < ranks; ++rank) {
+            scope.select(state_->devices[rank], "Select a tensor-parallel device");
+            check_nccl(ncclAllGather(input[rank], output[rank], rank_elements, ncclBfloat16,
+                                     state_->comms[rank], streams[rank]),
+                       "Enqueue NCCL BF16 allgather");
+        }
+    } catch (...) {
+        (void)ncclGroupEnd();
+        state_->failed = true;
+        throw;
+    }
+    const auto status = ncclGroupEnd();
+    if (status != ncclSuccess)
+        state_->failed = true;
+    check_nccl(status, "Close NCCL allgather group");
 }
 
 void TensorParallel::broadcast_int32(std::int32_t* const buffers[], const cudaStream_t streams[],
@@ -628,10 +678,16 @@ bool TensorParallel::fused_graph_eligible() const noexcept {
 #endif
 }
 
-void TensorParallel::record_fused_graph_replay() {
+void TensorParallel::record_fused_graph_replay([[maybe_unused]] int rows,
+                                               [[maybe_unused]] int collectives,
+                                               [[maybe_unused]] int two_shot) {
 #if SGLANG_USE_MNNVL_AR
-    constexpr std::size_t count = tp_verify_graph::rows * mnnvl_ar_hidden_width;
-    state_->record_vendor_success(count, count * sizeof(__nv_bfloat16), false, 128);
+    const auto [count, one_shot] = std::pair{rows * mnnvl_ar_hidden_width, collectives - two_shot};
+    const auto payload = count * sizeof(__nv_bfloat16);
+    if (one_shot != 0)
+        state_->record_vendor_success(count, payload, false, one_shot);
+    if (two_shot != 0)
+        state_->record_vendor_success(count, payload, true, two_shot);
 #endif
 }
 

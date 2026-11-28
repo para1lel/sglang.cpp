@@ -13,6 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, closing, contextmanager
 from pathlib import Path
 from threading import Barrier
+from typing import TypedDict
 from uuid import uuid4
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -202,6 +203,77 @@ def check_cancellation(port, log, width, depth, wanted):
     replay = post(port, TEXT, MAIN)
     require(transcript(replay) == wanted, "TCP reset changed the next seeded request")
     return {"interrupted": interrupted, "before_replay_trace": trace.decode(), "replay": replay}
+
+
+class CompletionLogprobs(TypedDict):
+    tokens: list[str]
+    text_offset: list[int]
+    token_logprobs: list[float]
+    top_logprobs: list[dict[str, float]]
+
+
+def check_minimum_logprobs(actual: CompletionLogprobs, expected: CompletionLogprobs) -> None:
+    tolerance = 4e-6
+    require(actual["tokens"] == expected["tokens"], "Scored tokens differ")
+    require(actual["text_offset"] == expected["text_offset"], "Scored token offsets differ")
+    for value, target in zip(actual["token_logprobs"], expected["token_logprobs"], strict=True):
+        require(abs(value - target) <= tolerance, (value, target))
+    for row, target in zip(actual["top_logprobs"], expected["top_logprobs"], strict=True):
+        require(row.keys() == target.keys(), (row, target))
+        require(all(abs(row[token] - target[token]) <= tolerance for token in row), (row, target))
+
+
+def check_minimum(args: argparse.Namespace) -> None:
+    budget = 8
+    control = None
+    for depth in (0, 4):
+        output = args.evidence / f"minimum-k{depth}"
+        flags = ("--prefix-cache-entries", "0", "--tp", str(args.minimum_tp))
+        with server(args, output, 1, depth, flags) as (port, log):
+            base = MAIN | {
+                "max_tokens": budget,
+                "temperature": 1,
+                "top_k": 20,
+                "top_p": 0.95,
+                "min_p": 0,
+                "ignore_eos": True,
+            }
+            sampled = transcript(post(port, TEXT, base))["tokens"]
+            greedy = transcript(post(port, TEXT, base | {"temperature": 0}))["tokens"]
+            requests = {
+                "minimum-equals-maximum": base
+                | {"min_tokens": budget, "stop_token_ids": sampled[:1]},
+                "minimum-crossing": base | {"min_tokens": 3, "stop_token_ids": sampled[:1]},
+                "minimum-greedy": base
+                | {"min_tokens": 3, "temperature": 0, "stop_token_ids": greedy[:1]},
+            }
+            wire, observed = {}, {}
+            for name, request in requests.items():
+                offset = log.stat().st_size
+                wire[name] = post(port, TEXT, request)
+                row = observed[name] = transcript(wire[name])
+                require(row["finish"] == "length" and len(row["tokens"]) == budget, row)
+                (stopped,) = request["stop_token_ids"]
+                require(stopped not in row["tokens"][: request["min_tokens"]], row)
+                trace = log.read_bytes()[offset:]
+                drafts = COUNTERS.findall(trace)
+                drafted = any(int(row[0]) > 0 and int(row[2]) > 0 for row in drafts)
+                require(
+                    drafted == bool(depth and not args.minimum_baseline),
+                    f"Unexpected minimum-output verification activity for {name}: {drafts}",
+                )
+            scored = requests["minimum-greedy"] | {"logprobs": 3}
+            wire["minimum-greedy-logprobs"] = post(port, TEXT, scored, stream=False)
+            (choice,) = wire["minimum-greedy-logprobs"]["choices"]
+            require(choice["token_ids"] == observed["minimum-greedy"]["tokens"], choice)
+            logprobs = choice["logprobs"]
+            require(len(logprobs["token_logprobs"]) == budget, choice)
+        write_json(output / "minimum.json", {"requests": requests, "wire": wire})
+        if control is None:
+            control = observed, logprobs
+        else:
+            check_against_control(observed, control[0], f"minimum K{depth}")
+            check_minimum_logprobs(logprobs, control[1])
 
 
 def run_cases(port, log, width, depth):
@@ -423,17 +495,23 @@ def check_eager_cache(args):
                 "Cold or warm sampled request did not use MTP")
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--server", type=Path, required=True)
     parser.add_argument("--checkpoint", type=Path, default=CHECKPOINT)
     parser.add_argument("--evidence", type=Path, required=True)
     parser.add_argument("--eager-cache-only", action="store_true")
+    parser.add_argument("--minimum-only", action="store_true")
+    parser.add_argument("--minimum-tp", type=int, choices=(1, 2), default=1)
+    parser.add_argument("--minimum-baseline", action="store_true")
     parser.add_argument("--lmcache-socket", type=Path)
     args = parser.parse_args()
     if args.eager_cache_only and not args.lmcache_socket:
         parser.error("--lmcache-socket is required for --eager-cache-only")
     args.evidence.mkdir(parents=True)
+    if args.minimum_only:
+        check_minimum(args)
+        return
     check_startup(args)
     if args.eager_cache_only:
         check_eager_cache(args)

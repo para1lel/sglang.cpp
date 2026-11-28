@@ -163,10 +163,22 @@ def compare_scores(actual, expected, steps):
     assert not mismatched, (actual, f"{mismatched}/{len(labels)} BF16 rows differ", first)
 
 
-def verify_singleton_binding(device, runtime, masks):
-    widths = [mask.bit_count() for _, mask in zip(device, masks, strict=True)]
-    assert widths and set(widths) == {1} and len(set(device)) == 1, (device, masks)
-    assert all(count(runtime, api) == 1 for api in LIFECYCLE), runtime
+def verify_binding(
+    device: list[int],
+    runtime: list[str],
+    masks: list[int],
+    required: set[int],
+    *,
+    one_id_per_width: bool = False,
+) -> None:
+    ids = {}
+    for graph_id, mask in zip(device, masks, strict=True):
+        ids.setdefault(mask.bit_count(), set()).add(graph_id)
+    assert required <= ids.keys(), (device, masks, required)
+    assert sum(map(len, ids.values())) == len(set(device)), (device, masks, required)
+    if one_id_per_width:
+        assert all(len(values) == 1 for values in ids.values()), ids
+    assert all(count(runtime, api) == len(set(device)) for api in LIFECYCLE), (ids, runtime)
 
 
 def verify_lanes(evidence, policy):
@@ -178,7 +190,7 @@ def verify_lanes(evidence, policy):
     assert tokens and observed
     assert [row for row in steps if row[0] == "step"][-1][-2] == "0"
     device, runtime = trace(graph.with_suffix(".cupti.tsv"))
-    verify_singleton_binding(device, runtime, masks)
+    verify_binding(device, runtime, masks, {1, 2, 3, 4}, one_id_per_width=True)
     verify_scores(graph.with_suffix(".scores"), observed)
     compare_scores(graph.with_suffix(".scores"), eager.with_suffix(".scores"), steps)
     assert baseline == steps and tokens == observed
@@ -213,7 +225,8 @@ def verify_singleton(evidence):
     assert not masks and trace(eager.with_suffix(".cupti.tsv")) == ([], [])
     scores = eager.with_suffix(".scores").read_bytes()
     far_mask = 1 << (BATCH_MAX_SLOTS - 1)
-    expected = {"graph": [3, 4, 5, 7, 8, 9, 13], "launch": [3]}
+    mixed_mask_step = 11
+    expected = {"graph": [3, 4, 5, 7, 8, 9, 11, 13, 14], "launch": [3, 11]}
     for role, replay_steps in expected.items():
         stem = evidence / f"singleton-{role}"
         steps, masks, observed = lane_trace(
@@ -222,14 +235,14 @@ def verify_singleton(evidence):
             expected_replay_steps=replay_steps,
         )
         assert steps == baseline and observed == tokens and tokens
-        assert masks == [far_mask] * len(replay_steps), (stem, masks)
+        assert masks == [far_mask | int(step == mixed_mask_step) for step in replay_steps], (
+            stem,
+            masks,
+        )
         verify_scores(stem.with_suffix(".scores"), tokens)
         assert stem.with_suffix(".scores").read_bytes() == scores
         device, runtime = trace(stem.with_suffix(".cupti.tsv"))
-        singleton_ids = {graph_id for graph_id, mask in zip(device, masks, strict=True)
-                         if mask == far_mask}
-        assert len(singleton_ids) == 1
-        assert all(count(runtime, api) == 1 for api in LIFECYCLE)
+        verify_binding(device, runtime, masks, {1, 2}, one_id_per_width=True)
         output = stem.with_suffix(".log").read_text()
         assert output.count("inject: launch") == (role == "launch")
         assert ("at width 1:" in output) == (role == "launch"), output
@@ -244,28 +257,53 @@ def verify_k1(evidence):
                  if line.startswith("verify graphs ")]
         device, _ = trace(stem.with_suffix(".cupti.tsv"))
         log = stem.with_suffix(".log").read_text()
-        return [line for line in lines if not line.startswith("verify graphs ")], masks, device, log
+        depth_masks = [
+            int(line.split()[-1]) for line in lines if line.startswith("verify depth-graph ")
+        ]
+        return (
+            [
+                line
+                for line in lines
+                if not line.startswith(("verify graphs ", "verify depth-graph "))
+            ],
+            masks,
+            device,
+            log,
+            depth_masks,
+        )
 
-    eager, masks, device, _ = records("eager")
+    eager, masks, device, _, depth_masks = records("eager")
+    depth_replays = 3
     assert masks and not any(k0 or k1 for k0, k1 in masks) and not device
+    assert depth_masks == [0] * 6
     closed = {"launch": 1, "submitted": 2, "hard": 1, "hard-drain": 1,
               "cleanup": 0, "exec-cleanup": 1}
     recovered = {"upload": 2}
     fallbacks = ("prepare", "begin", "instantiate")
     for role in ("graph", *fallbacks, *closed, *recovered):
-        steps, masks, device, log = records(role)
+        steps, masks, device, log, depth_masks = records(role)
         if role in closed or role in recovered:
             terminal = "verify failed-closed" if role in closed else "verify recovered"
             assert steps[-1] == terminal
             assert steps[:-1] == eager[:len(steps) - 1]
             assert len(device) == (closed | recovered)[role] and len(set(device)) <= 1
             assert "using eager K1 target verification" not in log
+            assert not depth_masks
         else:
             assert steps == eager
+            assert depth_masks == [0, 2] * depth_replays
             submitted = [(k0, k1) for k0, k1 in masks if k0 or k1]
-            identities = {depth: {graph_id for (k0, k1), graph_id
-                                  in zip(submitted, device, strict=True)
-                                  if (k0, k1)[depth]} for depth in (0, 1)}
+            main_device, depth_device = device[: len(submitted)], device[len(submitted) :]
+            assert len(depth_device) == len(set(depth_device)) == depth_replays
+            assert set(depth_device).isdisjoint(main_device)
+            identities = {
+                depth: {
+                    graph_id
+                    for (k0, k1), graph_id in zip(submitted, main_device, strict=True)
+                    if (k0, k1)[depth]
+                }
+                for depth in (0, 1)
+            }
             assert len(identities[0]) == 1 and identities[0].isdisjoint(identities[1])
             assert len(identities[1]) == (role == "graph")
             assert all(not (k0 and k1) for k0, k1 in submitted)
@@ -296,7 +334,7 @@ def verify_http(evidence, policy):
     device, runtime = trace(graph / "cupti.tsv")
     log = (graph / "server.log").read_text()
     masks = [int(mask) for mask in re.findall(r"^batch graph_slots=(\d+)$", log, re.M)]
-    verify_singleton_binding(device, runtime, masks)
+    verify_binding(device, runtime, masks, {1, 2})
 
 
 def churn_responses(data):
@@ -420,7 +458,7 @@ def main():
             print(f"PASS {label}")
 
     def default_faults(evidence):
-        eager = evidence / "default-eager"
+        eager = evidence / "fault-eager"
         baseline, _, tokens = lane_trace(eager.with_suffix(".lanes"))
         verify_faults(evidence, baseline, tokens, eager.with_suffix(".scores"))
 

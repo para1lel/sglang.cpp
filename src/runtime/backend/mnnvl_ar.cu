@@ -1,5 +1,6 @@
 #include "sglang/runtime/backend/mnnvl_ar.h"
 #include "sglang/runtime/backend/device_arena.h"
+#include "sglang/runtime/backend/cuda_resources.h"
 #include "sglang/runtime/backend/mnnvl_rms_quantize.h"
 #include "sglang/text/quantization/rms_quantize.cuh"
 #include "sglang/runtime/execution/tp_verify_graph.h"
@@ -327,8 +328,10 @@ __device__ bool poll_wide_rank0(const uint4* address, PackedBf16& remote, std::u
                                 std::uint64_t epoch) {
     unsigned misses = 0;
     while (!poll_pack(address, remote)) {
-        if ((++misses & 255) == 0 &&
-            PairAtomic(*rejected).load(cuda::memory_order_acquire) == epoch) return false;
+        if (rejected != nullptr && (++misses & 255) == 0 &&
+            PairAtomic(*rejected).load(cuda::memory_order_acquire) == epoch) {
+            return false;
+        }
     }
     return true;
 }
@@ -782,6 +785,7 @@ std::unique_ptr<MnnvlAllReduce> MnnvlAllReduce::create(std::vector<int> devices)
 cudaStreamCaptureStatus MnnvlAllReduce::preflight(State& state, __nv_bfloat16* const buffers[],
                                                   const cudaStream_t streams[], bool two_shot) {
     cudaStreamCaptureStatus capture_status[kRanks];
+    unsigned long long capture_id[kRanks]{};
     for (int r = 0; r < kRanks; ++r) {
         int stream_device = -1;
         if (cudaStreamGetDevice(streams[r], &stream_device) != cudaSuccess ||
@@ -790,7 +794,8 @@ cudaStreamCaptureStatus MnnvlAllReduce::preflight(State& state, __nv_bfloat16* c
                 "MnnvlAllReduce::allreduce_bf16 requires each stream to belong to its "
                 "rank's device.");
         }
-        const cudaError_t capture_error = cudaStreamIsCapturing(streams[r], &capture_status[r]);
+        const auto capture_error =
+            cudaStreamGetCaptureInfo(streams[r], &capture_status[r], &capture_id[r]);
         if (capture_error != cudaSuccess) {
             state.failed = true;
             throw MnnvlArError(
@@ -817,14 +822,13 @@ cudaStreamCaptureStatus MnnvlAllReduce::preflight(State& state, __nv_bfloat16* c
                 "MnnvlAllReduce::allreduce_bf16 requires 16-byte aligned buffers.");
         }
     }
-    if (capture_status[0] != capture_status[1]) {
-        throw std::invalid_argument(
-            "MnnvlAllReduce::allreduce_bf16 requires both ranks to share one capture "
-            "state; a graph-recorded kernel cannot Lamport-synchronize with an "
-            "eager peer.");
+    const bool captured = capture_status[0] == cudaStreamCaptureStatusActive;
+    if (capture_status[0] != capture_status[1] ||
+        (captured && (capture_id[0] == 0 || capture_id[0] != capture_id[1]))) {
+        throw std::invalid_argument("MNNVL allreduce requires one capture across both ranks.");
     }
-    if (two_shot && capture_status[0] != cudaStreamCaptureStatusNone) {
-        throw std::invalid_argument("The two-shot MNNVL allreduce requires eager streams.");
+    if (captured && two_shot && !tp_verify_graph::owns_collective(streams, kTwoshotRows)) {
+        throw std::invalid_argument("Captured two-shot MNNVL requires an owned rank pair.");
     }
     return capture_status[0];
 }
@@ -854,7 +858,8 @@ void MnnvlAllReduce::allreduce_bf16(__nv_bfloat16* const buffers[], const cudaSt
         throw std::invalid_argument("Unsupported two-shot MNNVL allreduce count or device.");
     }
     ensure_healthy();
-    preflight(*state_, buffers, streams, two_shot);
+    const bool captured =
+        preflight(*state_, buffers, streams, two_shot) != cudaStreamCaptureStatusNone;
 
     const int tokens = static_cast<int>(count / kTokenDim);
     CallerDevice device_scope;
@@ -868,6 +873,8 @@ void MnnvlAllReduce::allreduce_bf16(__nv_bfloat16* const buffers[], const cudaSt
             ? launch_twoshot(args, r, streams[r])
             : launch_oneshot(args, r, tokens, state_->multiprocessors[r], streams[r]);
         if (status != cudaSuccess) {
+            if (captured)
+                throw CudaError(status, "Record the MNNVL BF16 allreduce");
             state_->failed = true;
             throw MnnvlArError(std::string("Enqueue the MNNVL BF16 allreduce: ") +
                                    cudaGetErrorString(status),
@@ -929,16 +936,17 @@ bool MnnvlAllReduce::try_reduce_norm(Bf16* const buffers[], const cudaStream_t s
         }
     }
     ensure_healthy();
-    if (preflight(*state_, buffers, streams, false) != cudaStreamCaptureStatusNone) {
-        if constexpr (!narrow) return false;
-        if (width != tp_verify_graph::rows || !tp_verify_graph::binding(streams[0]) ||
-            !tp_verify_graph::binding(streams[1])) return false;
-    }
+    const bool captured =
+        preflight(*state_, buffers, streams, false) != cudaStreamCaptureStatusNone;
+    if (captured && !tp_verify_graph::owns_collective(streams, width))
+        return false;
     std::uint64_t epoch = 0;
     if constexpr (!narrow) {
-        if (state_->wide_epoch == UINT64_MAX)
-            return false;
-        epoch = ++state_->wide_epoch;
+        if (!captured) {
+            if (state_->wide_epoch == UINT64_MAX)
+                return false;
+            epoch = ++state_->wide_epoch;
+        }
     }
 
     ReduceNorm<Rows> launch[kRanks];
@@ -948,7 +956,7 @@ bool MnnvlAllReduce::try_reduce_norm(Bf16* const buffers[], const cudaStream_t s
                              reinterpret_cast<void*>(state_->mc_va), state_->flags[rank],
                              rows[rank]};
         if constexpr (!narrow) {
-            launch[rank].rejected = state_->wide_device_word;
+            launch[rank].rejected = captured ? nullptr : state_->wide_device_word;
             launch[rank].epoch = epoch;
         }
     }
@@ -962,6 +970,8 @@ bool MnnvlAllReduce::try_reduce_norm(Bf16* const buffers[], const cudaStream_t s
                                       streams[rank]);
         }
         if (status != cudaSuccess) {
+            if (captured)
+                throw CudaError(status, "Record MNNVL reduction and RMS quantization");
             state_->failed = true;
             if constexpr (!narrow) {
                 if (rank > 0) {
@@ -978,10 +988,6 @@ bool MnnvlAllReduce::try_reduce_norm(Bf16* const buffers[], const cudaStream_t s
     }
     return true;
 }
-
-}   
-
-namespace sglang::decoder {
 
 bool MnnvlRmsQuantizeRows::supports(int count) {
     return count == size || (count >= 3 && count <= 5);

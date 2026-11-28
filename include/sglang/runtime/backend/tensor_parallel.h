@@ -31,6 +31,8 @@ public:
 
     TpAllReduceRoute allreduce_bf16(__nv_bfloat16* const buffers[], const cudaStream_t streams[],
                                    std::size_t count);
+    void allgather_bf16(const __nv_bfloat16* const input[], __nv_bfloat16* const output[],
+                        const cudaStream_t streams[], std::size_t rank_elements);
     bool supports_mnnvl_oneshot(std::size_t count) const noexcept;
     bool supports_mnnvl_twoshot(std::size_t count) const noexcept;
     bool try_allreduce_rms_quantize(
@@ -49,7 +51,7 @@ public:
 
     bool graph_eligible() const noexcept;
     bool fused_graph_eligible() const noexcept;
-    void record_fused_graph_replay();
+    void record_fused_graph_replay(int rows, int collectives, int two_shot);
     void fail_fused_graph_replay() noexcept;
 
 private:

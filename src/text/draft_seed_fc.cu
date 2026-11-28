@@ -11,9 +11,8 @@ namespace sglang {
 namespace decoder {
 
 std::optional<cudaError_t> try_seed_fc_sm100(const __nv_bfloat16* weight,
-                                            const __nv_bfloat16* input, int height,
-                                            __nv_bfloat16* output, cudaStream_t stream);
-
+                                             const __nv_bfloat16* input, int height, int width,
+                                             __nv_bfloat16* output, cudaStream_t stream);
 }
 
 namespace {
@@ -66,8 +65,10 @@ __device__ void seed_stage_operands(SeedOperands& operands, const __nv_bfloat16*
     asm volatile("cp.async.commit_group;" ::: "memory");
 }
 
-__global__ __launch_bounds__(seed_threads) void bf16_seed_fc_kernel(
-    const __nv_bfloat16* weight, const __nv_bfloat16* input, int rows, __nv_bfloat16* output) {
+__global__ __launch_bounds__(seed_threads) void bf16_seed_fc_kernel(const __nv_bfloat16* weight,
+                                                                    const __nv_bfloat16* input,
+                                                                    int rows, __nv_bfloat16* output,
+                                                                    int width) {
     union alignas(32) SeedTile {
         SeedOperands operands[2];
         float result[seed_tile_rows][seed_tile_columns];
@@ -113,20 +114,19 @@ __global__ __launch_bounds__(seed_threads) void bf16_seed_fc_kernel(
         const int row = element / seed_tile_columns;
         const int column = element % seed_tile_columns;
         if (first_row + row < rows) {
-            output[(first_row + row) * decoder::hidden_size + first_column + column] =
+            output[((first_row + row) * width) + first_column + column] =
                 __float2bfloat16_rn(tile.result[row][column]);
         }
     }
 }
-
 }
 
 cudaError_t text_bf16_seed_fc(const __nv_bfloat16* weight, const __nv_bfloat16* input,
                              int out_width, int in_width, int rows, __nv_bfloat16* output,
                              cudaStream_t stream) {
-    if (!weight || !input || !output || out_width != decoder::hidden_size ||
-        in_width != seed_inner || rows < decoder::wmma_seed_min_rows ||
-        rows > decoder::wmma_seed_max_rows ||
+    if (weight == nullptr || input == nullptr || output == nullptr || out_width <= 0 ||
+        out_width % seed_tile_columns != 0 || in_width != seed_inner ||
+        rows < decoder::wmma_seed_min_rows || rows > decoder::wmma_seed_max_rows ||
         reinterpret_cast<std::uintptr_t>(weight) % sizeof(uint4) != 0 ||
         reinterpret_cast<std::uintptr_t>(input) % sizeof(uint4) != 0) {
         return text_bf16_gemv_rows(weight, input, out_width, in_width, rows, output, stream);
@@ -134,13 +134,14 @@ cudaError_t text_bf16_seed_fc(const __nv_bfloat16* weight, const __nv_bfloat16* 
     static_assert(decoder::hidden_size % seed_tile_columns == 0 &&
                   seed_inner % seed_tile_k == 0);
     if (reinterpret_cast<std::uintptr_t>(output) % alignof(unsigned) == 0) {
-        if (const auto status = decoder::try_seed_fc_sm100(weight, input, rows, output, stream)) {
+        if (const auto status =
+                decoder::try_seed_fc_sm100(weight, input, rows, out_width, output, stream)) {
             return *status;
         }
     }
     const auto tiles = (rows + seed_tile_rows - 1) / seed_tile_rows;
     bf16_seed_fc_kernel<<<dim3(out_width / seed_tile_columns, tiles), seed_threads, 0, stream>>>(
-        weight, input, rows, output);
+        weight, input, rows, output, out_width);
     return cudaGetLastError();
 }
 

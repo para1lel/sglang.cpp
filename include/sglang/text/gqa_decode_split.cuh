@@ -38,6 +38,8 @@ SGLANG_GQA_HOST_DEVICE bool tensor_aligned(const decoder::PagedDecodeLane& lane)
 bool supports_eager_wide_split(int position);
 bool valid_buffers(const decoder::PagedDecodeBuffers& buffers);
 
+enum class SplitVariant { multi_stage, single_stage, reuse };
+
 struct TargetLane {
     decoder::PagedDecodeLane eager;
     decoder::BoundPagedDecodeLane bound;
@@ -45,8 +47,10 @@ struct TargetLane {
 };
 
 struct TargetBatch {
-    decoder::BoundPagedDecodeLane lanes[text_gdn_max_verify_rows];
+    decoder::BoundPagedDecodeLane lanes[decoder::target_split_eager_max_rows];
     int end;
+    bool single_stage = false;
+    int kv_heads = mxfp8_kv_heads;
 };
 
 struct EagerTargetBatch {
@@ -61,6 +65,10 @@ cudaError_t launch(const EagerTargetBatch& batch, int count, cudaStream_t stream
 cudaError_t launch_multistage(const EagerTargetBatch& batch, int count, cudaStream_t stream);
 std::optional<cudaError_t> try_launch_reuse(const EagerTargetBatch& batch, int count,
                                            cudaStream_t stream);
+SplitVariant split_variant(const decoder::PagedDecodeLane* lanes, int count, int end,
+                           bool allow_reuse = true);
+std::optional<cudaError_t> try_launch_reuse(const TargetBatch& batch, int kv_heads,
+                                            cudaStream_t stream);
 
 #ifdef __CUDACC__
 __device__ decoder::PagedDecodeLane resolve(TargetLane lane);

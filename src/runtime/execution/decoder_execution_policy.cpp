@@ -1,5 +1,6 @@
 #include "sglang/runtime/execution/decoder_execution_policy.h"
 
+#include "sglang/decoder_batch.h"
 #include "sglang/decoder_cuda.cuh"
 #include "sglang/runtime/backend/cuda_backend_policy.h"
 
@@ -13,13 +14,12 @@ DecoderExecutionPolicy DecoderExecutionPolicy::for_backend(const CudaBackendPoli
         backend.tensor_core_prefill,
         limits.tensor_prefill_rows,
         limits.fallback_prefill_rows,
-        limits.ordered_graph_lanes,
         backend.target_split_end,
     };
 }
 
 bool DecoderExecutionPolicy::regular_decode_graph(int count) const {
-    return count != 0 && (!ordered_attention || count == ordered_graph_lanes);
+    return count > 0 && count <= decoder_batch_max_lanes;
 }
 
 int DecoderExecutionPolicy::prefill_limit() const {

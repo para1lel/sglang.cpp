@@ -18,8 +18,12 @@ from time import monotonic, sleep
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from collections.abc import Generator
-    from types import FrameType
+    from collections.abc import Generator, Iterable
+    from types import FrameType, ModuleType
+
+    from lmcache_route_helpers import Witness
+
+Event = dict[str, object]
 
 ROOT = Path(__file__).resolve().parents[3]
 sys.path[:0] = [str(ROOT / "tests"), str(ROOT / "tests" / "prefix"), str(ROOT / "tests" / "text")]
@@ -30,6 +34,10 @@ PREFIX = [760, 6511, 314, 9338, 369, 220, 17, 478, 220, 17, 283, 13, 198]
 TP2 = 2
 PAGE_CAPACITY = 16
 CHECKPOINT_CAPACITY = 4
+SAMPLED_TOKENS = 8
+DRAFT_HOLE_ROWS = 251
+DRAFT_HOLE_SALT = "rank-draft-hole"
+SeededResult = tuple[list[int], str]
 
 
 def free_port() -> str:
@@ -86,58 +94,197 @@ def daemon(
                     proc.wait()
 
 
-def erase_rank1(daemon_socket: Path, entries: list[dict[str, object]], devices: list[str]) -> None:
-    rank_keys = {
-        entry["device"]: key for entry in entries for key in entry["keys"] if key[0] == lmcache.GQA
+def erase_rank1(
+    witness: Witness, entries: list[Event], devices: list[str], family: int
+) -> list[str]:
+    keys = {device: set() for device in devices}
+    for entry in entries:
+        keys[entry["device"]].update(key for key in entry["keys"] if key[0] == family)
+    first, second = (sorted(keys[device]) for device in devices)
+    assert first, keys
+    assert second, keys
+    assert set(first).isdisjoint(second), keys
+    witness.lookup(first + second, [1] * (len(first) + len(second)))
+    witness.erase(second)
+    witness.lookup(first + second, [1] * len(first) + [0] * len(second))
+    return [key[1].hex() for key in second]
+
+
+def read_receipts(
+    pool: ModuleType,
+    entries: Iterable[Event],
+    devices: list[str],
+) -> dict[str, list[int]]:
+    receipts = {device: [0] * 4 for device in devices}
+    for entry in entries:
+        for index, size in enumerate(pool.rank_receipt(entry, TP2)):
+            receipts[entry["device"]][index] += size
+    return receipts
+
+
+def sampled(prompt: list[int], count: int) -> dict[str, object]:
+    return http.native_text(prompt, count)["sampling_params"] | {
+        "temperature": 0.8,
+        "top_k": 12,
+        "sampling_seed": 7103,
     }
-    assert set(rank_keys) == set(devices), rank_keys
-    first, second = (rank_keys[device] for device in devices)
-    assert first != second
-    assert lmcache.control(daemon_socket, "sglang", lmcache.ERASE, lmcache.key_body(second))[0] == 0
-    payload = (2).to_bytes(4, "big") + lmcache.key_body(first) + lmcache.key_body(second)
-    assert lmcache.control(daemon_socket, "sglang", lmcache.LOOKUP, payload) == (0, b"\x01\x00")
+
+
+def backup_prompt(
+    witness: Witness,
+    pool: ModuleType,
+    label: str,
+    prompt: list[int],
+    devices: list[str],
+) -> list[Event]:
+    backed = pool.helpers.backup_under_pressure(witness, label, pool.rows(1023))
+    rows = len(prompt)
+    extents = {lmcache.GQA: rows, lmcache.DRAFT: rows - 1, lmcache.GDN: rows}
+    records = [
+        entry
+        for entry in backed
+        if any(
+            record.get("endpoint", record.get("end")) == extents[record["family"]]
+            for record in entry["records"]
+        )
+    ]
+    families = pool.record_families(records)
+    assert set(families) == {(device, family) for device in devices for family in extents}
+    for entry in records:
+        pool.rank_receipt(entry, TP2, exact=False)
+    keys = {key for entry in records for key in entry["keys"]}
+    witness.lookup(sorted(keys), [1] * len(keys))
+    return records
+
+
+def prepare_draft_hole(
+    witness: Witness,
+    pool: ModuleType,
+    devices: list[str],
+) -> tuple[SeededResult, list[str]]:
+    prompt = pool.rows(DRAFT_HOLE_ROWS)
+    oracle = pool.generate(
+        witness,
+        "cold-draft-hole-oracle",
+        prompt,
+        0,
+        SAMPLED_TOKENS,
+        cache_salt="draft-hole-oracle",
+        sampling_params=sampled(prompt, SAMPLED_TOKENS),
+    )
+    pool.generate(witness, "prime-draft-hole", prompt, 0, cache_salt=DRAFT_HOLE_SALT)
+    records = backup_prompt(witness, pool, "draft-hole", prompt, devices)
+    return oracle, erase_rank1(witness, records, devices, lmcache.DRAFT)
+
+
+def restore_draft_hole(
+    args: argparse.Namespace,
+    daemon_socket: Path,
+    relay: lmcache.Relay,
+    options: tuple[str, ...],
+    prepared: tuple[SeededResult, list[str]],
+) -> dict[str, object]:
+    pool = import_module("pool_routes")
+    devices = pool.get_devices(TP2)
+    prompt = pool.rows(DRAFT_HOLE_ROWS)
+    oracle, erased = prepared
+    with http.server_process(args, "restart-with-draft-rank-hole", *options) as (port, _, process):
+        witness = pool.helpers.Witness(port, args.evidence, daemon_socket, relay)
+        start = len(relay.since())
+        fallback, work = witness.changes(
+            "missing-draft-rank-cold",
+            prompt,
+            0,
+            {
+                "gqa_restored_tokens": len(prompt),
+                "gdn_restored_tokens": 0,
+                "draft_restored_rows": 0,
+                "io_errors": 0,
+            },
+            count=SAMPLED_TOKENS,
+            cache_salt=DRAFT_HOLE_SALT,
+            sampling_params=sampled(prompt, SAMPLED_TOKENS),
+        )
+        assert fallback[:2] == oracle, (fallback, oracle)
+        surviving = pool.transfer(relay.since(start), lmcache.RANK_GET)
+        actual = read_receipts(pool, surviving, devices)
+        expected = {device: [16896 * len(prompt), 0, 0, 0] for device in devices}
+        assert actual == expected, actual
+        pool.settle(witness, "after-draft-rank-hole")
+        pool.terminate(process)
+    return {"erased": erased, "rank_read_receipts": actual, "work": work}
 
 
 def restart_restore(
-    args: argparse.Namespace, daemon_socket: Path, relay_path: Path, relay: lmcache.Relay
+    args: argparse.Namespace,
+    daemon_socket: Path,
+    relay_path: Path,
+    relay: lmcache.Relay,
+    oracle: SeededResult,
 ) -> dict[str, object]:
     pool = import_module("pool_routes")
     options = pool.server_options(TP2, relay_path, PAGE_CAPACITY, CHECKPOINT_CAPACITY)
+    options += ("--eager",)
     prompt = pool.rows(pool.SUBJECT_ROWS)
     devices = pool.get_devices(TP2)
-    report = {}
+    budget = SAMPLED_TOKENS
+    gqa, gdn, draft = 16896 * len(prompt), 76992512, 1056 * (len(prompt) - 1)
+    report = {"seeded_output": oracle[0]}
     with http.server_process(args, "restore-after-restart", *options) as (port, _, process):
         witness = pool.helpers.Witness(port, args.evidence, daemon_socket, relay)
         start = len(relay.since())
-        hit = pool.generate(
-            witness, "both-ranks-cpu-restart", prompt, len(prompt), cache_salt="subject"
+        hit, work = witness.changes(
+            "both-ranks-cpu-restart",
+            prompt,
+            len(prompt),
+            {
+                "gqa_restored_tokens": len(prompt),
+                "gdn_restored_tokens": len(prompt),
+                "draft_restored_rows": len(prompt) - 1,
+                "io_errors": 0,
+            },
+            count=budget,
+            cache_salt="subject",
+            sampling_params=sampled(prompt, budget),
         )
+        assert hit[:2] == oracle, (hit, oracle)
         restored = pool.transfer(relay.since(start), lmcache.RANK_GET)
-        per_device = {device: [] for device in devices}
-        for event in restored:
-            per_device[event["device"]].append(pool.rank_receipt(event, TP2))
-        actual = {
-            device: [sum(values) for values in zip(*receipts, strict=True)]
-            for device, receipts in per_device.items()
-        }
-        expected = [16896 * len(prompt), 76992512, 0, 0]
-        draft = 2112 * (len(prompt) - 1)
-        assert actual == {devices[0]: [*expected[:2], draft, 0], devices[1]: expected}, actual
-        pool.settle(witness, "before-restart-exit")
+        actual = read_receipts(pool, restored, devices)
+        assert actual == {device: [gqa, gdn, draft, 0] for device in devices}, actual
+        report["complete"] = {"rank_read_receipts": actual, "work": work}
+        erased_target = erase_rank1(witness, restored, devices, lmcache.GQA)
         pool.terminate(process)
-    erase_rank1(daemon_socket, restored, devices)
-    with http.server_process(args, "restart-with-rank-hole", *options) as (port, _, process):
+    with http.server_process(args, "restart-with-target-rank-hole", *options) as (port, _, process):
         witness = pool.helpers.Witness(port, args.evidence, daemon_socket, relay)
         start = len(relay.since())
-        fallback = pool.generate(witness, "missing-rank-cold", prompt, 0, cache_salt="subject")
-        assert fallback == hit, (hit, fallback)
+        fallback, work = witness.changes(
+            "missing-target-rank-cold",
+            prompt,
+            0,
+            {
+                "gqa_restored_tokens": 0,
+                "gdn_restored_tokens": 0,
+                "draft_restored_rows": len(prompt) - 1,
+                "io_errors": 0,
+            },
+            count=budget,
+            cache_salt="subject",
+            sampling_params=sampled(prompt, budget),
+        )
+        assert fallback[:2] == oracle, (fallback, oracle)
         surviving = pool.transfer(relay.since(start), lmcache.RANK_GET)
-        assert set(pool.record_families(surviving)) == {(devices[0], lmcache.DRAFT)}, surviving
-        assert all(pool.rank_receipt(event, TP2)[2] > 0 for event in surviving)
-        report["terminal"] = pool.generated_terminal(witness, pool.rows(257), TP2)
-        pool.settle(witness, "after-rank-hole-terminal")
+        actual = read_receipts(pool, surviving, devices)
+        assert actual == {device: [0, 0, draft, 0] for device in devices}, actual
+        report["target_hole"] = {
+            "erased": erased_target,
+            "rank_read_receipts": actual,
+            "work": work,
+        }
+        prepared = prepare_draft_hole(witness, pool, devices)
+        pool.settle(witness, "after-target-rank-hole")
         pool.terminate(process)
-    return report | {"rank_read_receipts": actual, "fallback_output": fallback[0]}
+    report["draft_hole"] = restore_draft_hole(args, daemon_socket, relay, options, prepared)
+    return report
 
 
 def exercise(args: argparse.Namespace, work: Path, daemon_socket: Path, daemon_pid: int) -> None:
@@ -145,6 +292,7 @@ def exercise(args: argparse.Namespace, work: Path, daemon_socket: Path, daemon_p
     relay_path = work / "relay.sock"
     devices = pool.get_devices(TP2)
     options = pool.server_options(TP2, relay_path, PAGE_CAPACITY, CHECKPOINT_CAPACITY)
+    options += ("--eager",)
     with lmcache.Relay(relay_path, daemon_socket) as relay:
         try:
             with http.server_process(args, "ranked-cache", *options) as (port, _, process):
@@ -153,21 +301,51 @@ def exercise(args: argparse.Namespace, work: Path, daemon_socket: Path, daemon_p
                 (args.evidence / "server-info.json").write_bytes(raw)
                 info = json.loads(raw)
                 assert status == HTTPStatus.OK, raw
+                assert info["batch_cuda_graphs"] is False, info
                 assert info["tp_size"] == info["tensor_parallel"] == TP2, info
                 assert info["lmcache_available"], info
-                if args.store_only:
-                    prompt = pool.rows(pool.SUBJECT_ROWS)
-                    cold, before = pool.cold_and_hot(witness, str, prompt)
-                    held, old = pool.hold_backup(witness, prompt, cold, before, devices)
-                    report = {"held": held, "held_keys": old["keys"]}
+                prompt = pool.rows(pool.SUBJECT_ROWS)
+                if args.store_only or args.restart_only:
+                    pool.generate(
+                        witness,
+                        "prime-rank-checkpoint",
+                        prompt,
+                        0,
+                        cache_salt="subject",
+                        sampling_params=sampled(prompt, 1),
+                    )
+                    records = backup_prompt(witness, pool, "rank-checkpoint", prompt, devices)
+                    endpoints = pool.helpers.transfer_records(
+                        records,
+                        lmcache.RANK_PUT,
+                        lmcache.GDN,
+                    )
+                    checkpoints = [
+                        (device, key)
+                        for device, key, record in endpoints
+                        if record["endpoint"] == len(prompt)
+                    ]
+                    assert {device for device, _ in checkpoints} == set(devices), checkpoints
+                    report = {
+                        "stored_checkpoints": checkpoints,
+                        "rank_families": sorted(pool.record_families(records)),
+                    }
                 else:
                     report = pool.pressure(witness, str, TP2)
+                if not args.store_only:
+                    oracle = pool.generate(
+                        witness,
+                        "cold-restart-seeded-oracle",
+                        prompt,
+                        0,
+                        SAMPLED_TOKENS,
+                        cache_salt="seeded-restart-oracle",
+                        sampling_params=sampled(prompt, SAMPLED_TOKENS),
+                    )
                 report["settled"] = pool.settle(witness, "ranked-drained")
                 pool.terminate(process)
             if not args.store_only:
-                restarted = restart_restore(args, daemon_socket, relay_path, relay)
-                assert restarted["fallback_output"] == report["cold"], restarted
-                report["restart"] = restarted
+                report["restart"] = restart_restore(args, daemon_socket, relay_path, relay, oracle)
             (args.evidence / "rank-receipts.json").write_text(
                 json.dumps(report, default=bytes.hex, indent=2) + "\n", encoding="utf-8"
             )
@@ -189,7 +367,9 @@ def interrupted(signum: int, _frame: FrameType | None) -> None:
 def main() -> None:
     signal.signal(signal.SIGTERM, interrupted)
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--store-only", action="store_true")
+    scope = parser.add_mutually_exclusive_group()
+    scope.add_argument("--store-only", action="store_true")
+    scope.add_argument("--restart-only", action="store_true")
     for key in ("server", "checkpoint", "evidence"):
         parser.add_argument(key, type=Path)
     args = parser.parse_args()

@@ -5,8 +5,8 @@
 | Part | Responsibility | Source |
 | --- | --- | --- |
 | Native generation | Assign one request ID per generated item and track its owner. | [ID input](../apps/server/native_generate.cpp#L474)<!-- prefix: "std::vector\u003c" --> · [Registration](../apps/server/native_generate.cpp#L529)<!-- prefix: "NativeGenera" --> |
-| HTTP control | Dispatch `POST /abort_request` on the reader and release fully aborted queue entries. | [Control route](../apps/server/prefix_controls.cpp#L442)<!-- prefix: "if (abort_ &" --> · [Queue cleanup](../apps/server/prefix_controls.cpp#L812)<!-- prefix: "void Connect" --> |
-| Decoder service | Skip waiting items, retire running items, and apply abort delivery according to the job's overlap history. | [ID state](../include/sglang/server/batch_service.h#L53)<!-- prefix: "class BatchR" --> · [Retirement](../apps/server/batch_service.cpp#L224)<!-- prefix: "if (cancelle" --> · [Waiting items](../apps/server/batch_service.cpp#L517)<!-- prefix: "bool BatchSe" --> · [Abort delivery](../apps/server/detail/batch_state.cpp#L166)<!-- prefix: "bool Job::ha" --> |
+| HTTP control | Dispatch `POST /abort_request` on the reader and release fully aborted queue entries. | [Control route](../apps/server/prefix_controls.cpp#L444)<!-- prefix: "if (abort_ &" --> · [Queue cleanup](../apps/server/prefix_controls.cpp#L814)<!-- prefix: "void Connect" --> |
+| Decoder service | Skip waiting items, retire running items, and apply abort delivery according to the job's overlap history. | [ID state](../include/sglang/server/batch_service.h#L54)<!-- prefix: "class BatchR" --> · [Retirement](../apps/server/batch_service.cpp#L224)<!-- prefix: "if (cancelle" --> · [Waiting items](../apps/server/batch_service.cpp#L517)<!-- prefix: "bool BatchSe" --> · [Abort delivery](../apps/server/detail/batch_state.cpp#L166)<!-- prefix: "bool Job::ha" --> |
 | Native response | Report each item's terminal abort on its original generation connection. | [Finish metadata](../apps/server/native_generate.cpp#L132)<!-- prefix: "if (terminal" --> · [Pre-admission response](../apps/server/native_generate.cpp#L330)<!-- prefix: "void complet" --> |
 
 ## Runtime path
@@ -61,7 +61,7 @@ The control route uses the [shared HTTP reader](http-server.md#http-admission-an
 
 With `--max-active A`, the completion queue holds up to `A` waiters and the reader retains up to `A + 1` incomplete requests. An idle incomplete request becomes eligible for replacement after 250 milliseconds. The read deadline is five seconds from acceptance.
 
-One additional CPU worker removes a fully aborted pending request from the completion queue. It validates its prompts and writes the terminal response without claiming a generation slot. Invalid prompts or options still return the usual generation error. A partially aborted pending batch stays in FIFO order so its remaining items can use a normal slot. [Queue admission](../apps/server/prefix_controls.cpp#L565)<!-- prefix: "void Connect" --> · [Abort worker](../apps/server/prefix_controls.cpp#L827)<!-- prefix: "auto work = " -->
+One additional CPU worker removes a fully aborted pending request from the completion queue. It validates its prompts and writes the terminal response without claiming a generation slot. Invalid prompts or options still return the usual generation error. A partially aborted pending batch stays in FIFO order so its remaining items can use a normal slot. [Queue admission](../apps/server/prefix_controls.cpp#L567)<!-- prefix: "void Connect" --> · [Abort worker](../apps/server/prefix_controls.cpp#L829)<!-- prefix: "auto work = " -->
 
 ## Constraints and failure behavior
 

@@ -12,6 +12,30 @@ namespace sglang {
 using namespace decoder;
 using namespace decoder::batch_detail;
 
+namespace {
+
+int cacheable_draft_rows(const Lane& lane, int endpoint) {
+    if (!lane.draft)
+        return 0;
+    const int local = std::min(endpoint - 1, lane.draft->valid_prefix());
+    if (!lane.peer_request)
+        return local;
+    return lane.peer_draft ? std::min(local, lane.peer_draft->valid_prefix()) : 0;
+}
+
+void commit_resident_draft(Lane& lane, int rows) {
+    if (lane.draft)
+        lane.draft->commit_restored_prefix(rows);
+    if (lane.peer_draft)
+        lane.peer_draft->commit_restored_prefix(rows);
+}
+
+bool attention_only(const PrefixDeviceTransfer& transfer) {
+    return transfer.attention_only_restore && *transfer.attention_only_restore;
+}
+
+}
+
 void DecoderBatch::release_retired_allocations() try {
     auto& storage = *state_->storage;
     std::exception_ptr local_failure;
@@ -92,7 +116,12 @@ DecoderBatchPrefixUpdate DecoderBatch::poll_prefix(int slot) {
         if (lane->resident_prefix) {
             state_->finish_resident_restore(*lane, transferred);
         } else if (transferred) {
-            if (prefix.command.attention_only_restore && *prefix.command.attention_only_restore) {
+            if (attention_only(prefix.command) ||
+                (lane->peer_prefix && attention_only(lane->peer_prefix->command))) {
+                if (prefix.command.attention_only_restore)
+                    *prefix.command.attention_only_restore = true;
+                if (lane->peer_prefix && lane->peer_prefix->command.attention_only_restore)
+                    *lane->peer_prefix->command.attention_only_restore = true;
                 lane->request->reset(state_->execution.stream());
                 lane->prefill_lookup.reset();
             }
@@ -215,11 +244,22 @@ bool DecoderBatch::State::prepare_lane_checkpoints(const Lane& lane, int slot,
         return true;
     if (lane.resident_prefix) {
         for (const auto* endpoint = first; endpoint != last; ++endpoint) {
+            auto existing = prefix_pool->find_checkpoint(lane.options.prefix_cache_keys, *endpoint);
+            if (existing.front()) {
+                auto& points = batch.local[slot];
+                points[points.size() - ++batch.retained[slot]] = {
+                    *endpoint,
+                    std::move(existing.front()),
+                };
+                continue;
+            }
             bool transfer_pending = false;
             auto snapshots = prefix_pool->reserve_checkpoint(&transfer_pending);
             if (!snapshots.front()) {
-                const bool capture_pending = std::any_of(batch.counts.begin(), batch.counts.end(),
-                                                         [](int count) { return count != 0; });
+                const auto pending = [](int count) { return count != 0; };
+                const bool capture_pending =
+                    std::any_of(batch.counts.begin(), batch.counts.end(), pending) ||
+                    std::any_of(batch.retained.begin(), batch.retained.end(), pending);
                 if (transfer_pending || capture_pending) {
                     rows = *endpoint - begin - 1;
                     batch.blocked_resident |= transfer_pending;
@@ -297,7 +337,7 @@ void DecoderBatch::State::store_checkpoint(Lane& lane, int end, const Workspace*
     const int generated = std::max(lane.prompt_size, lane.checkpoint);
     const int count = std::max(0, end - generated);
     const auto* draft = lane.draft.get();
-    if (local != nullptr && draft != nullptr && draft->valid_prefix() < end - 1)
+    if ((local != nullptr || tp_driver) && cacheable_draft_rows(lane, end) != end - 1)
         draft = nullptr;
     const auto* layouts = tp_driver ? decoder::tp2_prefix_layouts() : nullptr;
     if (terminal && end > lane.prompt_size)
@@ -309,17 +349,23 @@ void DecoderBatch::State::store_checkpoint(Lane& lane, int end, const Workspace*
     view.retention_endpoint_count = lane.prefill_capture_count;
     view.retention_requires_draft = lane.prefill_capture_count != 0 && lane.draft != nullptr;
     if (!acknowledged_stores) acknowledged_stores = std::make_shared<std::atomic_uint64_t>(0);
-    lane.options.store_prefix(std::move(view), count > 0 ? lane.prompt.data() + generated : nullptr,
-                              count, std::move(reservation), acknowledged_stores);
+    PrefixDeviceTransfer peer_view;
     if (tp_driver && lane.peer_request) {
         const DeviceScope device(tp->peer_device);
         if (terminal && end > lane.prompt_size)
             lane.peer_request->materialize_gdn(tp->peer_stream);
-        auto peer_view = export_prefix_view(*lane.peer_request, 0, 0, end, tp->peer_stream, nullptr,
-                                            lane.peer_checkpoint_row, terminal, &layouts[1],
-                                            peer != nullptr ? peer->snapshot : nullptr);
+        peer_view = export_prefix_view(*lane.peer_request, 0, 0, end, tp->peer_stream,
+                                       draft != nullptr ? lane.peer_draft.get() : nullptr,
+                                       lane.peer_checkpoint_row, terminal, &layouts[1],
+                                       peer != nullptr ? peer->snapshot : nullptr);
         peer_view.retention_endpoints = lane.prefill_captures;
         peer_view.retention_endpoint_count = lane.prefill_capture_count;
+        peer_view.retention_requires_draft = view.retention_requires_draft;
+    }
+    lane.options.store_prefix(std::move(view), count > 0 ? lane.prompt.data() + generated : nullptr,
+                              count, std::move(reservation), acknowledged_stores);
+    if (tp_driver && lane.peer_request) {
+        const DeviceScope device(tp->peer_device);
         lane.options.store_prefix(std::move(peer_view),
                                   count > 0 ? lane.prompt.data() + generated : nullptr, count,
                                   peer_reservation, acknowledged_stores);
@@ -353,13 +399,12 @@ void DecoderBatch::State::apply_resident_read(Lane& lane, const ResidentPrefixRe
     lane.request->cached_gqa_tokens = hit.gqa_tokens;
     lane.resident_target_end = hit.gqa_tokens / prefix_gqa_chunk_tokens * prefix_gqa_chunk_tokens;
     lane.resident_draft_end = hit.draft_rows / prefix_gqa_chunk_tokens * prefix_gqa_chunk_tokens;
-    if (lane.draft)
-        lane.draft->commit_restored_prefix(hit.draft_rows);
+    commit_resident_draft(lane, hit.draft_rows);
     restore_resident_checkpoint(lane, hit.gdn);
-    prefix_pool->commit_lookup(hit);
     prefix_stats.gqa_matched_tokens += hit.gqa_tokens;
     prefix_stats.gdn_matched_tokens += hit.matched_gdn;
     finish_restore(lane, hit.gdn_tokens);
+    prefix_pool->commit_lookup(hit, lane.options.prefix_cache_keys, hit.gdn_tokens);
 }
 
 void DecoderBatch::State::restore_resident_checkpoint(Lane& lane,
@@ -458,27 +503,31 @@ void DecoderBatch::State::repair_resident_restore(Lane& lane, const PrefixDevice
         }
     }
     if (!draft_transferred && layout.draft.end > 0 && lane.draft) {
-        copy_restored_tail(*prefix_pool->draft(), 0, hit.draft, lane.draft->resident_prefix_pages(),
-                           layout.draft, hit.draft_rows, stream);
+        const auto& slab = *prefix_pool->draft();
+        copy_restored_tail(slab, 0, hit.draft, lane.draft->resident_prefix_pages(), layout.draft,
+                           hit.draft_rows, stream);
+        if (lane.peer_draft) {
+            const DeviceScope device(tp->peer_device);
+            copy_restored_tail(slab, 1, hit.draft, lane.peer_draft->resident_prefix_pages(),
+                               layout.draft, hit.draft_rows, tp->peer_stream);
+        }
     }
 }
 
 void DecoderBatch::State::finish_resident_restore(Lane& lane, bool transferred) {
     const auto& hit = lane.restore_fallback;
-    prefix_pool->commit_lookup(hit);
     prefix_stats.gqa_matched_tokens += std::max(hit.gqa_tokens, lane.prefill_lookup->matched_gqa);
     prefix_stats.gdn_matched_tokens += std::max(hit.matched_gdn, lane.prefill_lookup->matched_gdn);
     const auto& command = lane.prefix->command;
-    const bool complete =
-        transferred && (!command.attention_only_restore || !*command.attention_only_restore);
+    const bool complete = transferred && !attention_only(command) &&
+                          (!lane.peer_prefix || !attention_only(lane.peer_prefix->command));
     repair_resident_restore(lane, command.layout, transferred, complete);
     const bool restored_gqa = transferred && command.layout.gqa.end > 0;
     const bool restored_draft = complete && command.layout.draft.end > 0;
     const int gqa = restored_gqa ? command.layout.gqa.end : hit.gqa_tokens;
     const int draft = restored_draft ? command.layout.draft.end : hit.draft_rows;
     lane.request->cached_gqa_tokens = gqa;
-    if (lane.draft)
-        lane.draft->commit_restored_prefix(draft);
+    commit_resident_draft(lane, draft);
     lane.resident_target_end = hit.gqa_tokens / prefix_gqa_chunk_tokens * prefix_gqa_chunk_tokens;
     lane.resident_draft_end = hit.draft_rows / prefix_gqa_chunk_tokens * prefix_gqa_chunk_tokens;
     int end = hit.gdn_tokens;
@@ -497,6 +546,7 @@ void DecoderBatch::State::finish_resident_restore(Lane& lane, bool transferred) 
     }
     restore_resident_checkpoint(lane, snapshots);
     finish_restore(lane, end);
+    prefix_pool->commit_lookup(hit, lane.options.prefix_cache_keys, restored_gdn ? 0 : end);
     if (restored_gdn) {
         prefix_pool->publish_checkpoint(lane.options.prefix_cache_keys,
                                         lane.options.prefix_cache_backing, end, snapshots, true);
@@ -566,19 +616,32 @@ void DecoderBatch::State::publish_resident_prefill(const PrefillRows& rows,
             continue;
         auto& lane = *slot_lane;
         const int end = lane.progress.position + rows[slot];
-        for (int index = 0; index < entries.counts[slot]; ++index) {
-            auto& local = entries.local[slot][index];
-            const int draft = lane.draft ? std::min(local.end - 1, lane.draft->valid_prefix()) : 0;
-            publish_resident_pages(lane, local.end, draft, true);
+        auto& points = entries.local[slot];
+        const auto publish_pages = [&](PrefillCheckpoint& point) {
+            publish_resident_pages(lane, point.end, cacheable_draft_rows(lane, point.end), true);
+            ++prefix_stats.prefill_checkpoints_resident;
+        };
+        const auto captured_count = entries.counts[slot];
+        auto reused = points.rbegin();
+        const auto reused_end = reused + entries.retained[slot];
+        for (int index = 0; index <= captured_count; ++index) {
+            while (reused != reused_end &&
+                   (index == captured_count || reused->end < points[index].end)) {
+                publish_pages(*reused);
+                (reused++)->snapshot.reset();
+            }
+            if (index == captured_count)
+                break;
+            auto& local = points[index];
+            publish_pages(local);
             prefix_pool->publish_checkpoint(lane.options.prefix_cache_keys,
                                             lane.options.prefix_cache_backing, local.end,
                                             {local.snapshot, entries.peer[slot][index].snapshot});
             local.snapshot.reset();
             entries.peer[slot][index].snapshot.reset();
-            ++prefix_stats.prefill_checkpoints_resident;
             ++prefix_stats.prefill_checkpoints_published;
         }
-        const int draft = lane.draft ? std::min(end - 1, lane.draft->valid_prefix()) : 0;
+        const int draft = cacheable_draft_rows(lane, end);
         publish_resident_pages(lane, end, draft, end == lane.prompt_size);
     }
     prefix_pool->notify_released();
@@ -594,8 +657,10 @@ void DecoderBatch::State::publish_resident_terminal(Lane& lane, const Workspace*
         while (key->tokens() < end)
             key->append(lane.prompt.at(key->tokens()));
     }
-    const int draft = lane.draft ? std::min(end - 1, lane.draft->valid_prefix()) : 0;
+    const int draft = cacheable_draft_rows(lane, end);
     publish_resident_pages(lane, end, draft, true);
+    if (prefix_pool->find_checkpoint(keys, end).front())
+        return;
     auto snapshots = prefix_pool->reserve_checkpoint();
     if (!snapshots.front())
         return;

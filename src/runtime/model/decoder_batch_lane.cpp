@@ -41,7 +41,8 @@ ForwardLane Lane::input() const {
 
 void Lane::record_decode_input(cudaStream_t stream) {
     prompt.push_back(progress.last_token);
-    if (!draft || draft->valid_prefix() >= progress.position) return;
+    if (!draft || peer_draft || draft->valid_prefix() >= progress.position)
+        return;
     MtpRound tail{};
     tail.draft = draft.get();
     tail.media = media ? &media_prefill : nullptr;

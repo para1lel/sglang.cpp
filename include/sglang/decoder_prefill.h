@@ -85,7 +85,6 @@ public:
   PrefillWorkspace& operator=(const PrefillWorkspace&) = delete;
 
   std::size_t bytes() const;
-  std::size_t layout_bytes() const;
   void close();
 
   cudaStream_t stream() const;
@@ -103,7 +102,6 @@ private:
     int capacity_;
     void* data_ = nullptr;
     std::size_t bytes_ = 0;
-    std::size_t layout_bytes_ = 0;
     PairedPrefillScratch staging_{};
     cudaError_t release_status_ = cudaSuccess;
     std::shared_ptr<DeviceArena> arena_;
@@ -133,8 +131,12 @@ private:
 
 std::size_t prefill_workspace_bytes(int rows);
 
-bool full_tile_prefill_grants(const PrefillGrant* grants, int count);
-PrefillGrant prefill_tile(PrefillGrant grant, int offset);
+struct PrefillTileSpan {
+    int offset = 0;
+    int rows = batch_prefill_tile_rows;
+};
+
+PrefillGrant prefill_tile(PrefillGrant grant, PrefillTileSpan span);
 
 bool try_prefill_projection_groups(const DecoderModel& model, const PrefillGrant* grants,
                                    int count, cudaStream_t stream, DecoderBatchStepStats& stats);

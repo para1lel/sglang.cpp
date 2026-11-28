@@ -28,6 +28,7 @@ struct Lane {
     std::unique_ptr<MtpDraftRequest> draft = nullptr;
     std::unique_ptr<TargetVerification> verification = nullptr;
     std::unique_ptr<Request> peer_request = nullptr;
+    std::unique_ptr<MtpDraftRequest> peer_draft = nullptr;
     std::unique_ptr<TargetVerification> peer_verification = nullptr;
     std::unique_ptr<PendingBatchPrefix> peer_prefix = nullptr;
     std::optional<SamplingParameters> sampling = std::nullopt;

@@ -38,6 +38,10 @@ struct TpRuntimeInfo {
         std::size_t weight_bytes = 0;
         bool lm_head = false;
         bool mtp = false;
+        std::size_t draft_weight_bytes = 0;
+        int draft_vocab_begin = 0;
+        int draft_vocab_rows = 0;
+        int draft_kv_heads = 0;
     };
     int world_size = 0;
     Rank ranks[2]{};

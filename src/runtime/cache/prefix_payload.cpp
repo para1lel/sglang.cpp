@@ -43,7 +43,6 @@ namespace decoder {
 namespace {
 
 constexpr int model_rows = QwenTextModel::max_position_embeddings;
-constexpr auto kv_row_bytes = 2 * mxfp8_kv_heads * (mxfp8_head_dim + mxfp8_groups);
 
 std::string media_digest(const DecoderMedia& media) {
     if (!media.cache_identity || !media.cache_identity->matches(media)) return {};
@@ -62,7 +61,7 @@ std::string media_digest(const DecoderMedia& media) {
 
 std::string prefix_cache_domain(const PrefixCacheLayout& layout) {
     if (layout.world_size == 1) return "sglang/qwen3_5/split-prefix-mxfp8-v2/";
-    std::string domain = "sglang/qwen3_5/split-prefix-mxfp8-v3/tp";
+    std::string domain = "sglang/qwen3_5/split-prefix-mxfp8-v4/tp";
     domain += std::to_string(layout.world_size);
     domain += "-r";
     domain += std::to_string(layout.rank);
@@ -72,7 +71,9 @@ std::string prefix_cache_domain(const PrefixCacheLayout& layout) {
     domain += std::to_string(layout.gdn_key_heads);
     domain += 'x';
     domain += std::to_string(layout.gdn_value_heads);
-    domain += layout.draft_lane ? "/draft/" : "/target/";
+    domain += "/draft";
+    domain += std::to_string(layout.draft_lane ? layout.kv_heads : 0);
+    domain += '/';
     return domain;
 }
 
@@ -83,16 +84,15 @@ std::size_t prefix_payload_bytes(PrefixPayloadKind kind, int begin, int end) {
 std::size_t prefix_payload_bytes(PrefixPayloadKind kind, int begin, int end,
                                  const PrefixCacheLayout& layout) {
     if (begin < 0 || end <= begin || end > model_rows) return 0;
-    const bool kv_chunk = begin % prefix_gqa_chunk_tokens == 0 &&
-        end - begin <= prefix_gqa_chunk_tokens;
+    const bool kv_chunk =
+        begin % prefix_gqa_chunk_tokens == 0 && end - begin <= prefix_gqa_chunk_tokens;
+    const auto row =
+        2 * static_cast<std::size_t>(layout.kv_heads) * (mxfp8_head_dim + mxfp8_groups);
     switch (kind) {
-    case PrefixPayloadKind::gqa: {
-        const auto row = 2 * static_cast<std::size_t>(layout.kv_heads) *
-            (mxfp8_head_dim + mxfp8_groups);
-        return kv_chunk
-            ? std::size_t(end - begin) * row * qwen_text_model.full_attention_layers()
-            : 0;
-    }
+    case PrefixPayloadKind::gqa:
+        return kv_chunk ? static_cast<std::size_t>(end - begin) * row *
+                              qwen_text_model.full_attention_layers()
+                        : 0;
     case PrefixPayloadKind::gdn: {
         if (begin) return 0;
         std::size_t total = 0;
@@ -100,7 +100,7 @@ std::size_t prefix_payload_bytes(PrefixPayloadKind kind, int begin, int end,
         return total;
     }
     case PrefixPayloadKind::draft:
-        return kv_chunk ? std::size_t(end - begin) * kv_row_bytes : 0;
+        return kv_chunk && layout.draft_lane ? static_cast<std::size_t>(end - begin) * row : 0;
     }
     return 0;
 }
@@ -163,6 +163,11 @@ bool PrefixCacheKeys::matches_rank(int world_size, int rank) const {
     return world_size_ == world_size && rank_ == rank;
 }
 
+bool PrefixCacheKeys::same_prefix(const PrefixCacheKeys& other, int end) const {
+    return end >= 0 && end <= cacheable_tokens() && end <= other.cacheable_tokens() &&
+           digest(end) == other.digest(end);
+}
+
 std::string PrefixCacheKeys::key(int end) const {
     if (end < 0 || end > cacheable_tokens()) return {};
     return tokenizer::format_sha256(digest(end));
@@ -191,14 +196,10 @@ void PrefixCacheKeys::append_row(int token, MropePosition position, std::string_
     keys_.push_back(tokenizer::sha256_digest({input.data(), fixed + media.size()}));
 }
 
-}
-}
-
-namespace sglang::decoder {
-
 int PrefixCacheKeys::tokens() const { return tokens_; }
 
 int PrefixCacheKeys::cacheable_tokens() const {
     return prefix_size_ + static_cast<int>(keys_.size()) - 1;
+}
 }
 }

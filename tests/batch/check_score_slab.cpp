@@ -1,6 +1,7 @@
 #include "sglang/decoder_internal.h"
 #include "sglang/runtime/backend/device_arena.h"
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <iostream>
@@ -134,82 +135,69 @@ cudaError_t cudaStreamDestroy(cudaStream_t) { return cudaSuccess; }
 }
 
 static void capacity_bounds(sglang::decoder::DeviceArena& arena) {
-    using sglang::decoder::Request;
+    using namespace sglang::decoder;
     Request request(0);
     const auto base = request.memory.bytes();
     const auto available = arena.available_bytes();
-    require(request.work.gqa_scores(262144).capacity == 5120 &&
-                request.work.gqa_scores(5119).capacity == 5119 &&
-                arena.available_bytes() == available,
-            "Inline workspace changed");
-    struct Case {
-        int pages;
-        int positions;
-        std::size_t bytes;
-    };
-    for (const auto test : {Case{41, 5248, 503808}, {64, 8192, 786432},
-                            {72, 9216, 884736}, {73, 9344, 897024},
-                            {2048, 262144, 25165824}}) {
-        Request lane(0);
-        lane.pages.page_count = test.pages;
-        const auto before = arena.available_bytes();
-        const auto scores = lane.batch_graph_scores();
-        require(scores.scores && scores.capacity == test.positions &&
-                    arena.available_bytes() == before - test.bytes &&
-                    lane.memory.bytes() == base + test.bytes,
-                "Wrong page-rounded score capacity");
-        require(lane.batch_graph_scores().scores == scores.scores &&
-                    arena.available_bytes() == before - test.bytes,
-                "Rebinding allocated another score slab");
-        lane.memory.close();
-        require(arena.available_bytes() == available, "Released slab remains leased");
+    const auto* scratch = reinterpret_cast<float*>(request.work.logits);
+    for (const int length : {1, 5119, 5120, 5248, 8192, 32768, 262144}) {
+        const auto scores = request.work.gqa_scores(length);
+        require(scores.scores == scratch && scores.capacity == std::min(length, 5120),
+                "Exact attention lost its bounded logits backing");
     }
+    require(request.memory.bytes() == base && arena.available_bytes() == available,
+            "Binding exact scores changed request storage");
 }
 
 static void binding_rejection(sglang::decoder::DeviceArena& arena, int failed_lane) {
     using namespace sglang::decoder;
     constexpr int width = 4;
-    constexpr std::size_t slab_bytes = 503808;
     Allocations execution(0);
     execution.open_stream();
     std::array<Request, width> lanes{Request(0), Request(0), Request(0), Request(0)};
+    std::array<Workspace*, width> bindings{};
+    for (int slot = 0; slot < width; ++slot)
+        bindings[slot] = &lanes[slot].work;
     const auto base = lanes.front().memory.bytes();
-    for (auto& lane : lanes) {
-        lane.pages.page_count = 41;
-    }
+    const auto available = arena.available_bytes();
+    auto* const reserved = arena.allocate(available);
+    const auto launches = runtime.launches;
+    const auto captures = runtime.captures;
+    int visited = 0;
     auto bind = [&] {
-        for (auto& lane : lanes) {
-            if (lane.batch_graph_scores().capacity <= 5120) {
+        visited = 0;
+        for (const auto* workspace : bindings) {
+            ++visited;
+            if (!workspace)
                 return false;
-            }
+            require(workspace->gqa_scores(5120).scores ==
+                        reinterpret_cast<float*>(workspace->logits),
+                    "Wrong short score backing");
         }
         return true;
     };
-    auto* const reserved = arena.allocate(arena.available_bytes() - (failed_lane * slab_bytes));
-    const auto launches = runtime.launches;
-    const auto captures = runtime.captures;
     const auto nop = [] {};
-    const auto ready = [] { return true; };
-    require(!execution.replay_batch_graph(width, nop, nop, bind), "OOM submitted a graph");
-    require(!execution.replay_batch_graph(width, nop, nop, bind), "Remembered OOM submitted");
+    bindings[failed_lane] = nullptr;
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        require(!execution.replay_batch_graph(width, nop, nop, bind) && visited == failed_lane + 1,
+                "Missing graph binding advanced beyond the rejected lane");
+    }
     require(runtime.launches == launches && arena.available_bytes() == 0 &&
                 cudaGetLastError() == cudaSuccess,
-            "OOM relaunched, retried or left an error");
-    for (int slot = 0; slot < width; ++slot) {
-        const auto bytes = slot < failed_lane ? base + slab_bytes : base;
-        require(lanes[slot].memory.bytes() == bytes, "Unexpected partial binding ownership");
+            "Rejected binding submitted, allocated storage, or left a CUDA error");
+    for (const auto& lane : lanes) {
+        require(lane.memory.bytes() == base, "Rejected binding changed request ownership");
     }
     arena.release(reserved);
-    require(lanes[failed_lane].batch_graph_scores().capacity == 0,
-            "Remembered OOM retried after storage became available");
     lanes[failed_lane].memory.close();
-    require(execution.replay_batch_graph(width, nop, nop, ready), "Short binding lost executable");
     Request replacement(0);
-    replacement.pages.page_count = 73;
-    require(replacement.batch_graph_scores().capacity == 9344 &&
-            replacement.memory.bytes() == base + 897024, "Replacement could not grow");
+    bindings[failed_lane] = &replacement.work;
+    require(replacement.memory.bytes() == base && arena.available_bytes() == available,
+            "Replacing the rejected request changed its storage budget");
+    require(execution.replay_batch_graph(width, nop, nop, bind) && visited == width,
+            "Replacing the rejected lane did not replay");
     require(runtime.captures == captures + 1 && runtime.launches == launches + 1,
-            "Rejected binding discarded or disabled its executable");
+            "Rejected binding discarded its reusable graph");
     std::cout << "Score allocation rejected at packed lane " << failed_lane << '\n';
 }
 

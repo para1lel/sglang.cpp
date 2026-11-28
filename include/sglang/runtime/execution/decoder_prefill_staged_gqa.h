@@ -13,7 +13,7 @@ using PrefillPartners = std::array<int, staged_prefill_batch_size>;
 std::optional<PrefillPartners> mixed_prefill_partners(const PrefillGrant* grants, int count);
 
 void prefill_mixed_gqa(const Chunk& chunk, const GqaLayer& layer, int bank,
-                       const PrefillGrant* grants, const PrefillPartners& partners);
+                       const PrefillGrant* grants, int count, const PrefillPartners& partners);
 
 bool can_batch_staged_gqa(const PrefillGrant* grants, int count);
 

@@ -1,6 +1,5 @@
 #include "sglang/text/gqa/decode_kernels.cuh"
 #include "sglang/text/gqa_verify_batch.h"
-#include "sglang/runtime/execution/tp_verify_graph.h"
 #include <algorithm>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
@@ -207,14 +206,15 @@ __global__ void gqa_verify_append_kernel(
     append_head(row.cache, row.pages.device_pages, row.position, 0, row.keys, row.values);
 }
 
-__global__ void live_append(
-    const __grid_constant__ decoder::GqaVerifyRows<decoder::GqaVerifyAppendRow> batch,
-    const decoder::tp_verify_graph::GqaBinding* live) {
+__global__ void
+live_append(const __grid_constant__
+                decoder::GqaVerifyRows<decoder::GqaVerifyAppendRow, decoder::max_wide_mtp_rows>
+                    batch,
+            const decoder::PagedDecodeLane* reads) {
     const auto& row = batch.rows[blockIdx.x];
-    const auto& read = live->reads[blockIdx.x];
+    const auto& read = reads[blockIdx.x];
     append_head(read.cache, read.pages.device_pages, read.position, 0, row.keys, row.values);
 }
-
 }
 
 template <int Capacity>
@@ -237,10 +237,11 @@ cudaError_t decoder::gqa_verify_append(const GqaVerifyRows<GqaVerifyAppendRow, C
                             mxfp8_head_dim, arguments, 0, stream);
 }
 
-cudaError_t decoder::tp_verify_graph::append(const GqaVerifyRows<GqaVerifyAppendRow>& batch,
-                                            const GqaBinding* live, int kv_heads,
-                                            cudaStream_t stream) {
-    live_append<<<dim3(rows, kv_heads), mxfp8_head_dim, 0, stream>>>(batch, live);
+cudaError_t
+decoder::gqa_verify_append_bound(const GqaVerifyRows<GqaVerifyAppendRow, max_wide_mtp_rows>& batch,
+                                 const PagedDecodeLane* reads, int rows, int kv_heads,
+                                 cudaStream_t stream) {
+    live_append<<<dim3(rows, kv_heads), mxfp8_head_dim, 0, stream>>>(batch, reads);
     return cudaPeekAtLastError();
 }
 

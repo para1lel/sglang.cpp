@@ -182,7 +182,7 @@ struct Allocations::State {
     cudaStream_t stream = nullptr;
     cudaGraph_t capture = nullptr;
     cudaGraphExec_t graph = nullptr;
-    std::array<BatchGraph, decoder_batch_max_graph_lanes + text_gdn_max_verify_rows> batch_graphs{};
+    std::array<BatchGraph, batch_graph_slots + verification_graph_slots> batch_graphs{};
     bool verification_graph_incomplete = false;
     bool uncertain_stream = false;
     bool uncertain_graph = false;
@@ -534,9 +534,31 @@ void Allocations::capture_graph(const std::function<void()>& enqueue) {
 
 bool Allocations::replay_batch_graph(int width, const std::function<void()>& prepare,
                                      const std::function<void()>& capture_nodes,
-                                     const std::function<bool()>& bind, bool target_verify) {
-    const int index = (target_verify ? decoder_batch_max_graph_lanes : 0) + width - 1;
-    return replay_graph_slot(index, width, prepare, capture_nodes, bind, target_verify);
+                                     const std::function<bool()>& bind, int slot) {
+    return replay_graph_slot(slot < 0 ? width - 1 : slot, width, prepare, capture_nodes, bind,
+                             false);
+}
+
+void Allocations::reset_batch_graph(int slot) {
+    reset_graph_slot(slot);
+}
+
+bool Allocations::replay_verification_graph(int slot, int rows,
+                                            const std::function<void()>& prepare,
+                                            const std::function<void()>& capture_nodes,
+                                            const std::function<bool()>& bind) {
+    return replay_graph_slot(batch_graph_slots + slot, rows, prepare, capture_nodes, bind, true);
+}
+
+void Allocations::reset_verification_graph(int slot) {
+    reset_graph_slot(batch_graph_slots + slot);
+}
+
+void Allocations::reset_graph_slot(int index) {
+    auto& batch = state_->batch_graphs.at(index);
+    state_->destroy_executable(batch.executable).raise();
+    state_->destroy_capture(batch.capture).raise();
+    batch.disabled = false;
 }
 
 bool Allocations::replay_graph_slot(int index, int width, const std::function<void()>& prepare,
@@ -579,6 +601,8 @@ bool Allocations::replay_graph_slot(int index, int width, const std::function<vo
             }
             throw;
         }
+        if (target_verify && !bind())
+            return false;
         if (target_verify) {
             state_->verification_graph_incomplete = true;
         }
@@ -619,8 +643,10 @@ bool Allocations::replay_graph_slot(int index, int width, const std::function<vo
         if (target_verify) {
             state_->verification_graph_incomplete = false;
         }
+    } else if (target_verify && !bind()) {
+        return false;
     }
-    if (!bind()) {
+    if (!target_verify && !bind()) {
         return false;
     }
     check(cudaGetLastError(), "Check CUDA error before batch graph launch");

@@ -106,7 +106,7 @@ DecoderResult Decoder::generate_multimodal_impl(const std::vector<int>& template
     if (options.prefix_cache_salt.size() > decoder_prefix_max_salt_bytes) {
         throw std::invalid_argument("Prefix cache salt is too long");
     }
-    const int proposals = !teacher && !options.requires_target_only() ? options.mtp_steps : 0;
+    const int proposals = teacher == nullptr && !options.adjusts_logits(0) ? options.mtp_steps : 0;
     if (!teacher && (options.generated_top_logprobs != -1 || options.score_prompt ||
                      options.label_token_ids)) {
         throw std::invalid_argument("Generated logprobs require the batch decoder");

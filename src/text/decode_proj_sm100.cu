@@ -58,19 +58,30 @@ __device__ __inline_hint__ void fence_before_sync() {
     asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
 }
 
+__device__ __inline_hint__ void allocate_tmem(unsigned* address, int columns) {
+    const auto shared = shared_address(address);
+    asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" ::"r"(shared),
+                 "r"(columns)
+                 : "memory");
+    asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;" ::: "memory");
+}
+
+__device__ __inline_hint__ void free_tmem(const unsigned* address, int columns) {
+    asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;" ::"r"(*address),
+                 "r"(columns)
+                 : "memory");
+}
+
 template <int Columns, int Accumulators, int Slots>
 __device__ __inline_hint__ void allocate_tmem(DecodePipeline<Slots>& pipe) {
-    asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;"
-                 :: "r"(shared_address(&pipe.tmem)),
-                    "r"(tmem_columns<Columns, Accumulators ? Accumulators : Slots>) : "memory");
-    asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;" ::: "memory");
+    constexpr int count = Accumulators ? Accumulators : Slots;
+    allocate_tmem(&pipe.tmem, tmem_columns<Columns, count>);
 }
 
 template <int Columns, int Accumulators, int Slots>
 __device__ __inline_hint__ void free_tmem(const DecodePipeline<Slots>& pipe) {
-    asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;"
-                 :: "r"(pipe.tmem),
-                    "r"(tmem_columns<Columns, Accumulators ? Accumulators : Slots>) : "memory");
+    constexpr int count = Accumulators ? Accumulators : Slots;
+    free_tmem(&pipe.tmem, tmem_columns<Columns, count>);
 }
 
 template <bool PerStage, int Slots>
@@ -363,32 +374,8 @@ template __device__ void init_pipeline<true, 3>(DecodePipeline<3>&);
 template __device__ void init_pipeline<true, 4>(DecodePipeline<4>&);
 template __device__ void init_pipeline<true, 8>(DecodePipeline<8>&);
 
-template __device__ void allocate_tmem<8, 0, 8>(DecodePipeline<8>&);
-template __device__ void allocate_tmem<16, 0, 8>(DecodePipeline<8>&);
-template __device__ void allocate_tmem<32, 0, 8>(DecodePipeline<8>&);
-template __device__ void allocate_tmem<64, 0, 8>(DecodePipeline<8>&);
-template __device__ void allocate_tmem<16, 0, 4>(DecodePipeline<4>&);
-template __device__ void allocate_tmem<32, 0, 4>(DecodePipeline<4>&);
-template __device__ void allocate_tmem<48, 0, 4>(DecodePipeline<4>&);
-template __device__ void allocate_tmem<64, 0, 4>(DecodePipeline<4>&);
-template __device__ void allocate_tmem<80, 0, 4>(DecodePipeline<4>&);
-template __device__ void allocate_tmem<160, 0, 3>(DecodePipeline<3>&);
 template __device__ void allocate_tmem<16, 1, 4>(DecodePipeline<4>&);
-template __device__ void allocate_tmem<32, 1, 3>(DecodePipeline<3>&);
-
-template __device__ void free_tmem<8, 0, 8>(const DecodePipeline<8>&);
-template __device__ void free_tmem<16, 0, 8>(const DecodePipeline<8>&);
-template __device__ void free_tmem<32, 0, 8>(const DecodePipeline<8>&);
-template __device__ void free_tmem<64, 0, 8>(const DecodePipeline<8>&);
-template __device__ void free_tmem<16, 0, 4>(const DecodePipeline<4>&);
-template __device__ void free_tmem<32, 0, 4>(const DecodePipeline<4>&);
-template __device__ void free_tmem<48, 0, 4>(const DecodePipeline<4>&);
-template __device__ void free_tmem<64, 0, 4>(const DecodePipeline<4>&);
-template __device__ void free_tmem<80, 0, 4>(const DecodePipeline<4>&);
-template __device__ void free_tmem<160, 0, 3>(const DecodePipeline<3>&);
 template __device__ void free_tmem<16, 1, 4>(const DecodePipeline<4>&);
-template __device__ void free_tmem<32, 1, 3>(const DecodePipeline<3>&);
-
 template __device__ void produce<128, 8, true, 8>(DecodePipeline<8>&, unsigned,
     const CUtensorMap*, const CUtensorMap*, int, int, int, int);
 template __device__ void produce<128, 16, true, 8>(DecodePipeline<8>&, unsigned,

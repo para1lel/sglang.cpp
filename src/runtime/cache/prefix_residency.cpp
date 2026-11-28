@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
+#include <limits>
 #include <list>
 #include <map>
 #include <mutex>
@@ -32,9 +33,10 @@ int pages_for(int rows) {
     return (rows + mxfp8_page_size - 1) / mxfp8_page_size;
 }
 
-std::size_t layout_state_bytes(const PrefixCacheLayout& layout) {
+std::size_t checkpoint_stride(const PrefixCacheLayout& layout) {
     const auto parts = prefix_gdn_state_bytes(layout);
-    return std::accumulate(parts.begin(), parts.end(), std::size_t{0});
+    const auto bytes = std::accumulate(parts.begin(), parts.end(), std::size_t{0});
+    return (bytes + 255) / 256 * 256;
 }
 
 struct CheckpointSlab {
@@ -65,7 +67,7 @@ CheckpointSlab::CheckpointSlab(const std::vector<int>& devices, int count)
             const DeviceScope selected(devices[rank]);
             auto& slot = ranks[rank];
             slot.layout = world == 1 ? tp1_prefix_cache_layout : tp2_prefix_cache_layout(rank);
-            slot.stride = (layout_state_bytes(slot.layout) + 255) / 256 * 256;
+            slot.stride = checkpoint_stride(slot.layout);
             slot.arena = DeviceArena::current(devices[rank]);
             slot.base = static_cast<std::byte*>(slot.arena->allocate_cache(slot.stride * count));
         }
@@ -148,7 +150,7 @@ PoolLimits pool_limits(const std::vector<int>& devices, bool enabled, bool draft
         const auto layout = devices.size() == 1 ? tp1_prefix_cache_layout
                                                 : tp2_prefix_cache_layout(static_cast<int>(rank));
         bytes[rank] = DeviceArena::current(devices[rank])->cache_available_bytes();
-        checkpoint[rank] = (layout_state_bytes(layout) + 255) / 256 * 256;
+        checkpoint[rank] = checkpoint_stride(layout);
         const auto budget = opts.max_checkpoints != 0 ? bytes[rank] / 2 : bytes[rank] / 12;
         checkpoints =
             static_cast<int>(std::min<std::size_t>(checkpoints, budget / checkpoint[rank]));
@@ -158,19 +160,40 @@ PoolLimits pool_limits(const std::vector<int>& devices, bool enabled, bool draft
     const auto target_bytes = std::size_t{2} * full_attention_layers *
                               (mxfp8_payload_bytes_per_page + mxfp8_scale_bytes_per_page) /
                               devices.size();
-    constexpr auto draft_bytes = 2 * (mxfp8_payload_bytes_per_page + mxfp8_scale_bytes_per_page);
+    const auto draft_bytes =
+        2 * (mxfp8_payload_bytes_per_page + mxfp8_scale_bytes_per_page) / devices.size();
     const auto page_cost = target_bytes + (draft ? draft_bytes : 0);
     const auto token_pages = decoder_batch_prefix_max_tokens / mxfp8_page_size;
     int pages = opts.max_pages > 0 ? opts.max_pages : token_pages * opts.lanes;
     for (std::size_t rank = 0; rank < devices.size(); ++rank) {
         const auto available = bytes[rank] - (checkpoint[rank] * checkpoints);
-        pages = static_cast<int>(
-            std::min<std::size_t>(pages, available / (rank == 0 ? page_cost : target_bytes)));
+        pages = static_cast<int>(std::min<std::size_t>(pages, available / page_cost));
     }
     if (pages < 1 || (enabled && checkpoints < 1)) {
         throw DecoderCapacityError("Device cache arena cannot hold resident prefix pools", false);
     }
+    if (enabled && opts.max_checkpoints == 0) {
+        const auto page_bytes = pages * page_cost;
+        auto fit = static_cast<std::size_t>(std::numeric_limits<int>::max());
+        for (std::size_t rank = 0; rank < devices.size(); ++rank) {
+            const auto remaining = (bytes[rank] - page_bytes) / checkpoint[rank];
+            fit = std::min(fit, remaining);
+        }
+        checkpoints = std::max(checkpoints, static_cast<int>(fit) - opts.lanes);
+    }
     return {pages, draft ? pages : 0, checkpoints};
+}
+
+int ranked_key_tokens(const PrefixRankKeys& keys, int world) {
+    if (keys.size() != static_cast<std::size_t>(world))
+        return -1;
+    int tokens = std::numeric_limits<int>::max();
+    for (int rank = 0; rank < world; ++rank) {
+        if (!keys[rank] || !keys[rank]->matches_rank(world, rank))
+            return -1;
+        tokens = std::min(tokens, keys[rank]->cacheable_tokens());
+    }
+    return tokens;
 }
 
 struct Entry {
@@ -188,14 +211,26 @@ struct Entry {
 using EntryHandle = std::shared_ptr<Entry>;
 using EntryQueue = std::list<EntryHandle>;
 
+enum class Reclaim { reclaimed, backup_pending, exhausted };
+
+bool matches_peers(const Entry& entry, const PrefixRankKeys& keys, int end) {
+    for (std::size_t rank = 1; rank < keys.size(); ++rank) {
+        if (!keys[rank]->same_prefix(*entry.keys[rank], end))
+            return false;
+    }
+    return true;
+}
+
 struct Family {
     EntryQueue lru;
     std::unordered_map<std::string, EntryQueue::iterator> index;
     std::map<int, int, std::greater<>> endpoints;
     std::unordered_map<int, int> page_references;
     bool unpinned(const Entry& entry) const;
-    EntryHandle get(const std::string& key);
-    void insert(EntryHandle entry);
+    const Entry* get(const PrefixRankKeys& keys, int end, bool touch = false);
+    const Entry* deepest(const PrefixRankKeys& keys, int maximum);
+    EntryHandle backup_candidate(bool checkpoint) const;
+    void insert(EntryHandle entry, int key_end);
     void erase(EntryQueue::iterator position);
 };
 
@@ -208,20 +243,49 @@ bool Family::unpinned(const Entry& entry) const {
                        [](const auto& snapshot) { return !snapshot || snapshot.use_count() == 1; });
 }
 
-EntryHandle Family::get(const std::string& key) {
-    if (const auto found = index.find(key); found != index.end()) {
+const Entry* Family::get(const PrefixRankKeys& keys, int end, bool touch) {
+    const auto found = index.find(keys.front()->key(end));
+    if (found == index.end() || !matches_peers(**found->second, keys, end))
+        return nullptr;
+    if (touch)
         lru.splice(lru.end(), lru, found->second);
-        return *found->second;
-    }
-    return {};
+    return found->second->get();
 }
 
-void Family::insert(EntryHandle entry) {
+const Entry* Family::deepest(const PrefixRankKeys& keys, int maximum) {
+    for (auto at = endpoints.lower_bound(maximum); at != endpoints.end(); ++at) {
+        if (const auto* entry = get(keys, at->first); entry != nullptr)
+            return entry;
+    }
+    return nullptr;
+}
+
+EntryHandle Family::backup_candidate(bool checkpoint) const {
+    EntryHandle candidate;
+    for (const auto& entry : lru) {
+        const bool eligible = entry->io && !entry->attempted;
+        if ((!checkpoint && !eligible) || !unpinned(*entry))
+            continue;
+        if (checkpoint && (entry->backed || entry->attempted))
+            return {};
+        if (eligible && !candidate) {
+            if (!checkpoint)
+                return entry;
+            candidate = entry;
+        }
+    }
+    return candidate;
+}
+
+void Family::insert(EntryHandle entry, int key_end) {
     if (const auto duplicate = index.find(entry->key); duplicate != index.end()) {
         auto& previous = **duplicate->second;
+        if (!matches_peers(previous, entry->keys, key_end))
+            return;
         previous.backed |= entry->backed;
         previous.attempted |= entry->backed;
-        lru.splice(lru.end(), lru, duplicate->second);
+        if (!entry->pages.empty())
+            lru.splice(lru.end(), lru, duplicate->second);
         return;
     }
     const auto inserted = lru.insert(lru.end(), std::move(entry));
@@ -265,13 +329,13 @@ void Family::erase(EntryQueue::iterator position) {
     lru.erase(position);
 }
 
-bool load_chunk(Family& family, const PrefixCacheKeys& keys, PrefixPages& output,
+bool load_chunk(Family& family, const PrefixRankKeys& keys, PrefixPages& output,
                 ResidentPrefixPageRange range, bool draft, int& coverage) {
     for (auto at = family.endpoints.lower_bound(range.end);
          at != family.endpoints.end() && at->first > range.begin; ++at) {
         const int end = at->first;
-        const auto entry = family.get(keys.key(end + static_cast<int>(draft)));
-        if (!entry || entry->begin != range.begin)
+        const auto* entry = family.get(keys, end + static_cast<int>(draft), true);
+        if (entry == nullptr || entry->begin != range.begin)
             continue;
         output.insert(output.end(), entry->pages.begin(), entry->pages.end());
         coverage = end;
@@ -280,7 +344,7 @@ bool load_chunk(Family& family, const PrefixCacheKeys& keys, PrefixPages& output
     return false;
 }
 
-void lookup_pages(Family& family, const PrefixCacheKeys& keys, PrefixPages& output, int maximum,
+void lookup_pages(Family& family, const PrefixRankKeys& keys, PrefixPages& output, int maximum,
                   bool draft, int& coverage) {
     for (int begin = 0; begin < maximum; begin += prefix_gqa_chunk_tokens) {
         const int end = std::min(maximum, begin + prefix_gqa_chunk_tokens);
@@ -288,7 +352,6 @@ void lookup_pages(Family& family, const PrefixCacheKeys& keys, PrefixPages& outp
             break;
     }
 }
-
 }
 
 struct PrefixResidency::State {
@@ -305,7 +368,7 @@ struct PrefixResidency::State {
     bool backup_pending() const;
     bool should_back_up(std::size_t family) const;
     LmCacheStatus backup(std::size_t family, const Entry& entry) const;
-    bool reclaim(std::size_t family, bool defer_backup);
+    Reclaim reclaim(std::size_t family);
     bool evict(Family& family, bool backed);
     int free_slots(std::size_t family) const;
 
@@ -332,9 +395,10 @@ PrefixResidency::State::State(const std::vector<int>& selected, bool enabled, bo
       limits(pool_limits(selected, enabled, has_draft, {lanes, max_pages, max_checkpoints})),
       target(std::make_shared<PrefixSlab>(selected, limits.target, full_attention_layers,
                                           mxfp8_kv_heads / static_cast<int>(selected.size()))),
-      draft(has_draft ? std::make_shared<PrefixSlab>(std::vector<int>{selected.front()},
-                                                     limits.draft, 1, mxfp8_kv_heads)
-                      : nullptr),
+      draft(has_draft
+                ? std::make_shared<PrefixSlab>(selected, limits.draft, 1,
+                                               mxfp8_kv_heads / static_cast<int>(selected.size()))
+                : nullptr),
       checkpoints(enabled ? std::make_shared<CheckpointSlab>(selected, limits.checkpoints)
                           : nullptr) {
     if (enabled)
@@ -371,14 +435,14 @@ bool PrefixResidency::State::should_back_up(std::size_t family) const {
 std::pair<std::size_t, EntryHandle> PrefixResidency::State::backup_candidate() const {
     if (resetting)
         return {};
-    for (std::size_t family = 0; family < families; ++family) {
+    const std::array order = pressure[state_family]
+                                 ? std::array{state_family, target_family, draft_family}
+                                 : std::array{target_family, state_family, draft_family};
+    for (const auto family : order) {
         if (!should_back_up(family))
             continue;
-        const auto& entries = resident[family];
-        for (const auto& entry : entries.lru) {
-            if (entry->io && !entry->attempted && entries.unpinned(*entry))
-                return {family, entry};
-        }
+        if (auto entry = resident[family].backup_candidate(family == state_family))
+            return {family, std::move(entry)};
     }
     return {};
 }
@@ -391,10 +455,6 @@ LmCacheStatus PrefixResidency::State::backup(std::size_t family, const Entry& en
     ranked_views.reserve(devices.size());
     for (std::size_t rank = 0; rank < devices.size(); ++rank) {
         ranked_keys.push_back(entry.keys.at(rank).get());
-        if (family == draft_family && rank != 0) {
-            ranked_views.push_back(nullptr);
-            continue;
-        }
         const DeviceScope selected(devices[rank]);
         const std::array<PrefixSlab*, families> slabs{target.get(), nullptr, draft.get()};
         const auto* slab = slabs[family];
@@ -441,7 +501,9 @@ void PrefixResidency::State::run() {
 
 bool PrefixResidency::State::evict(Family& family, bool backed) {
     for (auto entry = family.lru.begin(); entry != family.lru.end(); ++entry) {
-        if (*entry == transferring || (*entry)->backed != backed || !family.unpinned(**entry)) {
+        const auto& victim = **entry;
+        if (*entry == transferring || victim.backed != backed ||
+            (!backed && victim.io && !victim.attempted) || !family.unpinned(victim)) {
             continue;
         }
         family.erase(entry);
@@ -454,25 +516,23 @@ bool PrefixResidency::State::evict(Family& family, bool backed) {
     return false;
 }
 
-bool PrefixResidency::State::reclaim(std::size_t family, bool defer_backup) {
+Reclaim PrefixResidency::State::reclaim(std::size_t family) {
     auto& entries = resident[family];
     if (evict(entries, true))
-        return true;
+        return Reclaim::reclaimed;
     pressure[family] = true;
-    const auto backup_ready = [&](const auto& entry) {
-        return entry->io && !entry->attempted && entries.unpinned(*entry);
-    };
-    const auto candidate = std::find_if(entries.lru.begin(), entries.lru.end(), backup_ready);
-    if (!transferring && candidate != entries.lru.end()) {
-        transferring = *candidate;
-        transferring_family = family;
-        transferring->attempted = true;
-    }
     changed.notify_all();
-    if (defer_backup && (candidate != entries.lru.end() || transferring_family == family)) {
-        return false;
+    if (transferring_family == family)
+        return Reclaim::backup_pending;
+    if (auto candidate = entries.backup_candidate(family == state_family)) {
+        if (!transferring) {
+            transferring = std::move(candidate);
+            transferring_family = family;
+            transferring->attempted = true;
+        }
+        return Reclaim::backup_pending;
     }
-    return evict(entries, false);
+    return evict(entries, false) ? Reclaim::reclaimed : Reclaim::exhausted;
 }
 
 PrefixResidency::PrefixResidency(const std::vector<int>& devices, bool enabled, bool draft,
@@ -493,16 +553,15 @@ const std::shared_ptr<PrefixSlab>& PrefixResidency::draft() const {
 ResidentPrefixRead PrefixResidency::lookup(const PrefixRankKeys& keys, int max_restore,
                                            bool draft_wanted) {
     ResidentPrefixRead result;
-    if (keys.empty() || keys.size() != state_->devices.size())
+    const int maximum = ranked_key_tokens(keys, static_cast<int>(state_->devices.size()));
+    if (maximum <= 0)
         return result;
-    const auto& key = *keys.front();
-    const int maximum = key.cacheable_tokens();
     const int max_checkpoint = std::min(maximum, max_restore);
     const std::scoped_lock lock(state_->mutex);
     auto& resident = state_->resident;
-    lookup_pages(resident[target_family], key, result.gqa, maximum, false, result.gqa_tokens);
+    lookup_pages(resident[target_family], keys, result.gqa, maximum, false, result.gqa_tokens);
     if (draft_wanted && maximum > 1) {
-        lookup_pages(resident[draft_family], key, result.draft, maximum - 1, true,
+        lookup_pages(resident[draft_family], keys, result.draft, maximum - 1, true,
                      result.draft_rows);
     }
     result.gqa_private_from = result.gqa_tokens;
@@ -511,19 +570,14 @@ ResidentPrefixRead PrefixResidency::lookup(const PrefixRankKeys& keys, int max_r
     if (draft_wanted)
         usable = std::min(usable, result.draft_rows + 1);
     auto& checkpoints = resident[state_family];
-    for (auto at = checkpoints.endpoints.lower_bound(max_checkpoint);
-         at != checkpoints.endpoints.end(); ++at) {
-        const int end = at->first;
-        const auto hit = checkpoints.get(key.key(end));
-        if (!hit)
-            continue;
-        if (result.matched_gdn == 0)
-            result.matched_gdn = end;
-        if (end > usable)
-            continue;
-        result.gdn = hit->snapshots;
-        result.gdn_tokens = end;
-        break;
+    const auto* matched = checkpoints.deepest(keys, max_checkpoint);
+    if (matched != nullptr) {
+        result.matched_gdn = matched->end;
+        const auto* hit = matched->end <= usable ? matched : checkpoints.deepest(keys, usable);
+        if (hit != nullptr) {
+            result.gdn = hit->snapshots;
+            result.gdn_tokens = hit->end;
+        }
     }
     return result;
 }
@@ -531,19 +585,34 @@ ResidentPrefixRead PrefixResidency::lookup(const PrefixRankKeys& keys, int max_r
 PrefixSnapshots PrefixResidency::lookup_checkpoint(const PrefixRankKeys& keys, int maximum,
                                                    int& end) {
     end = 0;
+    maximum = std::min(maximum, ranked_key_tokens(keys, static_cast<int>(state_->devices.size())));
+    if (maximum <= 0)
+        return {};
     const std::scoped_lock lock(state_->mutex);
-    auto& family = state_->resident[state_family];
-    for (auto at = family.endpoints.lower_bound(maximum); at != family.endpoints.end(); ++at) {
-        if (const auto entry = family.get(keys.front()->key(at->first))) {
-            end = at->first;
-            return entry->snapshots;
-        }
+    const auto* entry = state_->resident[state_family].deepest(keys, maximum);
+    if (entry != nullptr) {
+        end = entry->end;
+        return entry->snapshots;
     }
     return {};
 }
 
-void PrefixResidency::commit_lookup(const ResidentPrefixRead& result) {
+PrefixSnapshots PrefixResidency::find_checkpoint(const PrefixRankKeys& keys, int end) {
+    if (end <= 0 || end > ranked_key_tokens(keys, static_cast<int>(state_->devices.size())))
+        return {};
     const std::scoped_lock lock(state_->mutex);
+    if (const auto* entry = state_->resident[state_family].get(keys, end); entry != nullptr)
+        return entry->snapshots;
+    return {};
+}
+
+void PrefixResidency::commit_lookup(const ResidentPrefixRead& result, const PrefixRankKeys& keys,
+                                    int resident_gdn) {
+    const std::scoped_lock lock(state_->mutex);
+    if (resident_gdn > 0 &&
+        resident_gdn <= ranked_key_tokens(keys, static_cast<int>(state_->devices.size()))) {
+        state_->resident[state_family].get(keys, resident_gdn, true);
+    }
     auto& stats = state_->counters;
     stats.gqa_resident_hits += result.gqa_tokens > 0 ? 1 : 0;
     stats.gqa_resident_tokens += result.gqa_tokens;
@@ -570,7 +639,7 @@ PrefixPages PrefixResidency::reserve_pages(const ResidentPrefixRead& read, int c
         auto page = slab->acquire();
         if (page) {
             result.push_back(std::move(page));
-        } else if (!state_->reclaim(family, true)) {
+        } else if (state_->reclaim(family) != Reclaim::reclaimed) {
             throw DecoderCapacityError("Resident KV pages are busy", true);
         }
     }
@@ -595,10 +664,10 @@ PrefixSnapshots PrefixResidency::reserve_checkpoint(bool* transfer_pending) {
             state_->pressure[state_family] = false;
             return snapshots;
         }
-        if (!state_->reclaim(state_family, false)) {
-            if (transfer_pending != nullptr) {
-                *transfer_pending = state_->transferring_family == state_family;
-            }
+        const auto reclaimed = state_->reclaim(state_family);
+        if (reclaimed != Reclaim::reclaimed) {
+            if (transfer_pending != nullptr)
+                *transfer_pending = reclaimed == Reclaim::backup_pending;
             return {};
         }
     }
@@ -606,19 +675,20 @@ PrefixSnapshots PrefixResidency::reserve_checkpoint(bool* transfer_pending) {
 
 void PrefixResidency::wait_for_checkpoint() {
     std::unique_lock lock(state_->mutex);
-    state_->changed.wait_for(lock, std::chrono::milliseconds(1), [&] {
-        return state_->stopping || state_->transferring_family != state_family;
-    });
+    state_->changed.wait_for(lock, std::chrono::milliseconds(1),
+                             [&] { return state_->stopping || !state_->transferring; });
 }
 
 void PrefixResidency::publish_pages(const PrefixRankKeys& keys,
                                     const std::shared_ptr<const LmCacheGroup>& io,
                                     ResidentPrefixPageRange range, bool draft_wanted, bool backed) {
-    if (keys.size() != state_->devices.size())
+    const int key_end = range.end + static_cast<int>(draft_wanted);
+    if (range.pages == nullptr || range.end <= range.begin ||
+        key_end > ranked_key_tokens(keys, static_cast<int>(state_->devices.size())))
         return;
     const auto family = draft_wanted ? draft_family : target_family;
-    auto key = keys.front()->key(range.end + static_cast<int>(draft_wanted));
-    if (key.empty() || range.pages == nullptr || range.end <= range.begin)
+    auto key = keys.front()->key(key_end);
+    if (key.empty())
         return;
     auto entry = std::make_shared<Entry>();
     entry->key = std::move(key);
@@ -632,7 +702,7 @@ void PrefixResidency::publish_pages(const PrefixRankKeys& keys,
     entry->attempted = backed;
     {
         const std::scoped_lock lock(state_->mutex);
-        state_->resident[family].insert(std::move(entry));
+        state_->resident[family].insert(std::move(entry), key_end);
     }
     state_->changed.notify_one();
 }
@@ -640,11 +710,12 @@ void PrefixResidency::publish_pages(const PrefixRankKeys& keys,
 void PrefixResidency::publish_checkpoint(const PrefixRankKeys& keys,
                                          const std::shared_ptr<const LmCacheGroup>& io, int end,
                                          const PrefixSnapshots& snapshots, bool backed) {
-    if (keys.size() != state_->devices.size() || !snapshots.front())
+    const auto world = state_->devices.size();
+    if (end <= 0 || end > ranked_key_tokens(keys, static_cast<int>(world)) ||
+        std::any_of(snapshots.begin(), snapshots.begin() + world,
+                    [](const auto& snapshot) { return !snapshot; }))
         return;
     std::string key = keys.front()->key(end);
-    if (key.empty())
-        return;
     auto entry = std::make_shared<Entry>();
     entry->key = std::move(key);
     entry->keys = keys;
@@ -655,7 +726,7 @@ void PrefixResidency::publish_checkpoint(const PrefixRankKeys& keys,
     entry->attempted = backed;
     {
         const std::scoped_lock lock(state_->mutex);
-        state_->resident[state_family].insert(std::move(entry));
+        state_->resident[state_family].insert(std::move(entry), end);
     }
     state_->changed.notify_one();
 }
@@ -683,7 +754,8 @@ void PrefixResidency::stats(DecoderPrefixCacheStats& result) const {
             result.device_bytes += result.entries * rank.stride;
         }
     }
-    result.draft_device_bytes = draft() ? result.draft_pages * draft()->bytes_per_page() : 0;
+    result.draft_device_bytes =
+        draft() ? result.draft_pages * draft()->bytes_per_page() * draft()->devices() : 0;
     result.pending_backups = static_cast<int>(state_->backup_pending());
     result.gqa_resident_hits = stats.gqa_resident_hits;
     result.gqa_resident_tokens = stats.gqa_resident_tokens;

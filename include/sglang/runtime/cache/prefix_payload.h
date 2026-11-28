@@ -93,6 +93,7 @@ public:
     std::string key(int end) const;
     void append(int token);
     bool matches_rank(int world_size, int rank) const;
+    bool same_prefix(const PrefixCacheKeys& other, int end) const;
 
   private:
     const tokenizer::Sha256Digest& digest(int end) const;

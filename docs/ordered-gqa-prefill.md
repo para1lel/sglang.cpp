@@ -2,7 +2,7 @@
 
 ## Responsibilities and sources of truth
 
-Model prefill appends uncovered KV and selects the attention path. The native dispatcher picks Flash, staged or direct ordered tiles, or protected single-row attention. Ordered attention owns causal FP32 scoring and token-ordered accumulation. [Caller](../src/runtime/execution/decoder_prefill_tiles.cpp#L363)<!-- prefix: "void Chunk::" --> · [Policy](../src/decoder_prefill.cpp#L636)<!-- prefix: "const bool t" --> · [Dispatch](../src/text/gqa/ordered_prefill.cu#L354)<!-- prefix: "cudaError_t " --> · [Score](../src/text/gqa/ordered_prefill.cu#L34)<!-- prefix: "__device__ v" --> · [Tile loop](../src/text/gqa/ordered_prefill.cu#L188)<!-- prefix: "for (int fir" -->
+Model prefill appends uncovered KV and selects the attention path. The native dispatcher picks Flash, staged or direct ordered tiles, or protected single-row attention. Ordered attention owns causal FP32 scoring and token-ordered accumulation. [Caller](../src/runtime/execution/decoder_prefill_tiles.cpp#L346)<!-- prefix: "void Chunk::" --> · [Policy](../src/decoder_prefill.cpp#L659)<!-- prefix: "void Decoder" --> · [Dispatch](../src/text/gqa/ordered_prefill.cu#L354)<!-- prefix: "cudaError_t " --> · [Score](../src/text/gqa/ordered_prefill.cu#L34)<!-- prefix: "__device__ v" --> · [Tile loop](../src/text/gqa/ordered_prefill.cu#L188)<!-- prefix: "for (int fir" -->
 
 ## Runtime path
 
@@ -12,7 +12,7 @@ Staged ordered attention double-buffers packed K/V and scales in 32-key blocks, 
 
 ### Grouped partial grants
 
-The [partial-grant projection path](native-prefill-workspace.md#partial-grant-projection-groups) appends new KV before selecting a reader. Each lane keeps its own page table, causal mask and unwritten KV/query-tail guards. Staged and raw grouped readers require a common KV head count across lanes. [Grouping](../src/runtime/execution/decoder_prefill_staged_gqa.cpp#L85)<!-- prefix: "for (; first" --> · [Staged guard](../src/text/gqa/tmem_staged.cu#L478)<!-- prefix: "if (rows \u003c m" --> · [KV head guard](../src/text/gqa/tmem_staged.cu#L474)<!-- prefix: "if (sequence" --> · [Buffer validation](../src/text/gqa/prefill_common.cu#L375)<!-- prefix: "bool valid_p" -->
+The [partial-grant projection path](native-prefill-workspace.md#partial-grant-projection-groups) appends new KV before selecting a reader. Each lane keeps its own page table, causal mask and unwritten KV/query-tail guards. Staged and raw grouped readers require a common KV head count across lanes. [Grouping](../src/runtime/execution/decoder_prefill_staged_gqa.cpp#L49)<!-- prefix: "for (; first" --> · [Staged guard](../src/text/gqa/tmem_staged.cu#L476)<!-- prefix: "if (rows \u003c m" --> · [KV head guard](../src/text/gqa/tmem_staged.cu#L472)<!-- prefix: "if (sequence" --> · [Buffer validation](../src/text/gqa/prefill_common.cu#L375)<!-- prefix: "bool valid_p" -->
 
 | Reader | Eligibility and sequence |
 | --- | --- |
@@ -20,15 +20,15 @@ The [partial-grant projection path](native-prefill-workspace.md#partial-grant-pr
 | Raw grouped | After staging declines, 148-SM SM100 may use raw ordered TMEM for a group divisible by four with equal 256- or 512-row grants and starts ≥8,192. |
 | Per-lane | If neither group reader submits, each lane, including leftovers, reads retained and appended KV. |
 
-Queued predecode precedes fallback on the same stream. Pending/unexpected errors propagate. Gate per lane or defer for [fused postgate and quantization](fp8-prefill-projections.md#attention-output-quantization). [Staged launch](../src/runtime/execution/decoder_prefill_staged_gqa.cpp#L98)<!-- prefix: "auto submitt" --> · [Lane fallback](../src/runtime/execution/decoder_prefill_staged_gqa.cpp#L108)<!-- prefix: "if (!submitt" --> · [KV tail](../src/text/gqa/tmem_staged_kernels.cu#L81)<!-- prefix: "if (logical " -->
+Queued predecode precedes fallback on the same stream. Pending/unexpected errors propagate. Gate per lane or defer for [fused postgate and quantization](fp8-prefill-projections.md#attention-output-quantization). [Staged launch](../src/runtime/execution/decoder_prefill_staged_gqa.cpp#L62)<!-- prefix: "auto submitt" --> · [Lane fallback](../src/runtime/execution/decoder_prefill_staged_gqa.cpp#L72)<!-- prefix: "if (!submitt" --> · [KV tail](../src/text/gqa/tmem_staged_kernels.cu#L81)<!-- prefix: "if (logical " -->
 
 ### Long serial TP2 tiles
 
-The ordinary long serial TP2 route stages 992–1,024 rows at 32,769–131,072 visible tokens, including new rows. Each rank has 12 Q heads and two KV heads of dimension 256. The page reader stages BF16 K/V, masks causal tails, and writes only live rows. See [warm cached GQA](flash-prefill.md#warm-cached-gqa-through-the-full-context) for the dedicated route. [Shape guard](../src/text/gqa/geometry.cpp#L48)<!-- prefix: "bool wants_l" --> · [Serial reader](../src/text/gqa/tmem_staged.cu#L606)<!-- prefix: "std::optiona" -->
+The ordinary long serial TP2 route stages 992–1,024 rows at 32,769–131,072 visible tokens, including new rows. Each rank has 12 Q heads and two KV heads of dimension 256. The page reader stages BF16 K/V, masks causal tails, and writes only live rows. See [warm cached GQA](flash-prefill.md#warm-cached-gqa-through-the-full-context) for the dedicated route. [Shape guard](../src/text/gqa/geometry.cpp#L48)<!-- prefix: "bool wants_l" --> · [Serial reader](../src/text/gqa/tmem_staged.cu#L604)<!-- prefix: "std::optiona" -->
 
-A mixed 4,096-row group can use this reader after grouped readers decline. Contiguous causal groups use their [causal reader](flash-prefill.md#same-request-causal-gqa). Clean setup decline uses ordinary per-lane GQA. CUDA errors propagate. [Lane fallback](../src/runtime/execution/decoder_prefill_staged_gqa.cpp#L108)<!-- prefix: "if (!submitt" --> · [Reader dispatch](../src/runtime/execution/decoder_prefill_tiles.cpp#L348)<!-- prefix: "staged = lon" -->
+A mixed 4,096-row group can use this reader after grouped readers decline. Contiguous causal groups use their [causal reader](flash-prefill.md#same-request-causal-gqa). Clean setup decline uses ordinary per-lane GQA. CUDA errors propagate. [Lane fallback](../src/runtime/execution/decoder_prefill_staged_gqa.cpp#L72)<!-- prefix: "if (!submitt" --> · [Reader dispatch](../src/runtime/execution/decoder_prefill_tiles.cpp#L328)<!-- prefix: "if (long_sta" -->
 
-For the ordinary serial route, optional [dedicated scratch](native-prefill-workspace.md#dedicated-long-context-staging) follows the largest eligible span per step. It uses up to 268,443,648 B per rank for page-rounded K/V and metadata. On clean OOM the failing rank retries the base arena and both ranks use ordinary attention. [Span planning](../src/runtime/execution/decoder_prefill_plan.cpp#L28)<!-- prefix: "int long_ser" --> · [Both-rank gate](../src/runtime/execution/decoder_prefill_tiles.cpp#L324)<!-- prefix: "PrefillGqaSt" -->
+For the ordinary serial route, optional [dedicated scratch](native-prefill-workspace.md#dedicated-long-context-staging) follows the largest eligible span per step. It uses up to 268,443,648 B per rank for page-rounded K/V and metadata. On clean OOM the failing rank retries the base arena and both ranks use ordinary attention. [Span planning](../src/runtime/execution/decoder_prefill_plan.cpp#L202)<!-- prefix: "int long_ser" --> · [Both-rank gate](../src/runtime/execution/decoder_prefill_tiles.cpp#L304)<!-- prefix: "PrefillGqaSt" -->
 
 ## Constraints and failure behavior
 
@@ -44,7 +44,7 @@ Zero rows succeed. For other inputs, negative positions, negative rows, and posi
 
 ## Verification
 
-Run the [GQA checker](development.md#gqa-verification) on a reserved B200. The [public multirow overflow control](../tests/mxfp8_gqa_prefill_check.cu#L820)<!-- prefix: "void check_o" --> covers 65 rows at 65, 32,768, 32,769, 131,072, and 131,073 visible tokens. It compares aligned graph replay against an FP64 known answer and requires bitwise parity with unaligned K. The [evidence gate](../tests/batch/check_graph_evidence.py#L308)<!-- prefix: "def verify_o" --> requires the matching CUPTI graph sequence and CTA counts of 33, 17, 2, 2, and 2.
+Run the [GQA checker](development.md#gqa-verification) on a reserved B200. The [public multirow overflow control](../tests/mxfp8_gqa_prefill_check.cu#L820)<!-- prefix: "void check_o" --> covers 65 rows at 65, 32,768, 32,769, 131,072, and 131,073 visible tokens. It compares aligned graph replay against an FP64 known answer and requires bitwise parity with unaligned K. The [evidence gate](../tests/batch/check_graph_evidence.py#L346)<!-- prefix: "def verify_o" --> requires the matching CUPTI graph sequence and CTA counts of 33, 17, 2, 2, and 2.
 
 Replay identical checkpoint Q and KV with remapped pages and guarded outputs. Compare complete BF16 outputs and the corresponding rows from a shortened causal grant. Run memcheck, initcheck, and synccheck on eager replays with unwritten tail slots.
 

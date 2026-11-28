@@ -85,9 +85,16 @@ public:
     void discard_graph();
     void free_block(void* pointer, std::size_t bytes);
     std::shared_ptr<const void> retain_block(const void* pointer) const;
+    static constexpr int batch_graph_slots = 16;
     bool replay_batch_graph(int width, const std::function<void()>& prepare,
-                            const std::function<void()>& capture,
-                            const std::function<bool()>& bind, bool target_verify = false);
+                            const std::function<void()>& capture, const std::function<bool()>& bind,
+                            int slot = -1);
+    void reset_batch_graph(int slot);
+    static constexpr int verification_graph_slots = 16;
+    bool replay_verification_graph(int slot, int rows, const std::function<void()>& prepare,
+                                   const std::function<void()>& capture,
+                                   const std::function<bool()>& bind);
+    void reset_verification_graph(int slot);
     bool verification_graph_failed() const;
     void reclaim_deferred();
     void open_stream(std::shared_ptr<const void> owners = nullptr);
@@ -103,6 +110,7 @@ private:
     bool replay_graph_slot(int index, int width, const std::function<void()>& prepare,
                            const std::function<void()>& capture,
                            const std::function<bool()>& bind, bool target_verify);
+    void reset_graph_slot(int index);
 
     std::unique_ptr<State> state_;
 };

@@ -39,6 +39,10 @@ void print_tp_receipt(const sglang::Decoder& decoder) {
                   << " weights=" << entry.weight_bytes
                   << " lm_head=" << (entry.lm_head ? 1 : 0)
                   << " mtp=" << (entry.mtp ? 1 : 0) << '\n';
+        std::cerr << "tp2 draft rank=" << rank << " bytes=" << entry.draft_weight_bytes
+                  << " vocab_begin=" << entry.draft_vocab_begin
+                  << " vocab_rows=" << entry.draft_vocab_rows
+                  << " kv_heads=" << entry.draft_kv_heads << '\n';
     }
     std::cerr << "tp2 world=" << info->world_size << " ranks="
               << info->world_size << '\n';

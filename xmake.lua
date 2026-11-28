@@ -145,24 +145,24 @@ target("sglang_cuda")
     add_rpathdirs(path.join(toolkit, "lib"), {interface = true})
     add_syslinks("cudart", {public = true})
     add_deps("sglang_prefill_fp8_sm100", "sglang_cuda_support")
-    add_files("src/text_decode_fp8.cu")
     add_files("src/runtime/execution/tp_verify_graph.cu")
     add_files("src/text/draft_seed_fc.cu")
     add_files("src/text/bf16_head_projection.cu")
     add_files("src/text/target_fp8.cu")
     add_files("src/runtime/execution/verification_row_copy.cu")
-    add_files("src/text_decode_bandwidth.cu")
     add_files("src/text/gdn_chunk.cu", "src/text/gdn_replay_ssm.cu")
-    add_files("src/decoder_sampling.cu", "src/decoder_constraint.cu",
-              "src/text/decoder_logprobs.cu")
+    add_files("src/decoder_sampling.cu", "src/decoder_adjusted_sampling.cu",
+              "src/decoder_constraint.cu", "src/text/decoder_logprobs.cu")
     add_cuda_device_lto("100", {
         "src/mxfp8_gqa.cu",
         "src/mxfp8_gqa_prefill.cu",
         "src/text_attention_gdn.cu",
         "src/text_attention_gqa.cu",
         "src/text_normalization.cu",
+        "src/text_decode_bandwidth.cu",
         "src/text_ops.cu",
         "src/text/fp8_projection.cu",
+        "src/text/fp8_projection_rows.cu",
         "src/text/gdn_prefill.cu",
         "src/text/rms_quantize.cu",
         "src/text/text_cuda_primitives.cu",
@@ -182,12 +182,13 @@ target("sglang_prefill_fp8_sm100")
     add_cuflags("--dependency-target-name=", {force = true})
     add_includedirs("include", path.join(toolkit, "include"))
     add_deps("sglang_cuda_support")
-    add_files("src/prefill_fp8_sm100.cu", "src/text/gqa/geometry.cpp")
+    add_files("src/text/gqa/geometry.cpp")
     add_files("src/text/draft_seed_fc_sm100.cu")
     add_files("src/text/decode_proj_host.cu")
     add_packages("sglang-cutlass-headers")
     add_files("src/text/prefill_down_sm100.cu", {cuflags = "--expt-relaxed-constexpr"})
     add_cuda_device_lto("100a", table.join(gqa_device_sources, {
+        "src/prefill_fp8_sm100.cu",
         "src/text/decode_proj_sm100.cu",
         "src/text/decode_proj_fp8.cu",
         "src/text/decode_proj_bf16.cu",
@@ -566,7 +567,6 @@ target("sglang_decoder")
     add_files("src/decoder_tp.cpp")
     add_files("src/runtime/execution/decoder_forward_tp.cpp")
     add_files("src/runtime/execution/tp_verify_graph.cpp")
-    add_files("src/runtime/execution/peer_draft_repair.cpp")
     add_files("src/runtime/execution/decoder_batch_prefix.cpp")
 target_end()
 

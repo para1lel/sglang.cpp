@@ -169,31 +169,32 @@ Retain the run manifest, commands, environment, fixture hashes, raw samples, and
 
 ## Matched K4 evidence
 
-### Single-request split release
+### Wide verification release
 
-Native `3808bf3034cd91dbf1733857ab1cc87566b3ad8a` used server SHA-256 `5ba8aaab4da749269905f6756ec08e5387f763f3adcc0e9f12b70dc2561b39e7`. Each width paired both engines on the same B200s and CPU sets.
+Native `81b477126d5bbcf1166fbc5fb27353c5e651de23` used server SHA-256 `d2c01558e9b60a04f3292b8da73204b73cd61922973baa15aee8f5c71d14b0e1`. Each width paired both engines on the same B200s and CPU sets.
 
-TP1 used GPU 0 on NUMA 0 with server CPUs 24–33 and client CPUs 34–35. TP2 used GPUs 4→5 on NUMA 1 with server CPUs 60–69 and client CPUs 70–71.
+TP1 used GPU 0 on NUMA 0, with server CPUs 24–33 and client CPUs 34–35. TP2 used GPUs 4→5 on NUMA 1, with server CPUs 60–69 and client CPUs 70–71.
 
 Both engines used MTP4, a 32,768-token step cap, and eight active slots per GPU. Native used 0.88 memory utilization, automatic GPU pools, and LMCache. Pinned vLLM used local prefix caching with KV offload disabled.
 
-All six TP1 cells passed the 1.10× gate. TP2 W4 exceeded the limit by 142.663 ms. The TP2 campaign stopped there, leaving W1–W3, W5, and W6 unmeasured.
+Five of six measured cells passed the 1.10× makespan gate. TP1 W1–W5 passed, and the next release superseded TP1 W6 before launch. TP2 W4 exceeded the limit by 24.069 ms, so TP2 W1–W3, W5 and W6 remained unmeasured.
 
 | Width | Row | Completed per arm | Native (ns) | vLLM (ns) | Ratio | Gate |
 | --- | --- | ---: | ---: | ---: | ---: | --- |
-| TP1 | W1 | 1 | 572,332,552 | 716,725,293 | 0.798538× | Pass |
-| TP1 | W2 | 1 | 1,400,666,477 | 1,946,555,558 | 0.719562× | Pass |
-| TP1 | W3 | 4 | 4,311,918,381 | 4,369,887,462 | 0.986734× | Pass |
-| TP1 | W4 | 8 | 27,120,961,738 | 27,930,806,918 | 0.971005× | Pass |
-| TP1 | W5 | 4 | 38,842,740,739 | 36,702,894,134 | 1.058302× | Pass |
-| TP1 | W6 | 20 | 71,489,950,373 | 73,295,181,425 | 0.975370× | Pass |
-| TP2 | W4 | 16 | 29,024,582,054 | 26,256,289,900 | 1.105433× | Miss |
+| TP1 | W1 | 1 | 574,596,795 | 657,854,124 | 0.873441× | Pass |
+| TP1 | W2 | 1 | 1,383,710,704 | 1,945,530,399 | 0.711225× | Pass |
+| TP1 | W3 | 4 | 4,278,837,817 | 4,355,186,050 | 0.982470× | Pass |
+| TP1 | W4 | 8 | 26,887,706,164 | 27,917,806,074 | 0.963102× | Pass |
+| TP1 | W5 | 4 | 38,895,223,037 | 36,822,021,878 | 1.056303× | Pass |
+| TP2 | W4 | 16 | 28,037,442,347 | 25,466,703,294 | 1.100945× | Miss |
 
-Each measured TP1 W6 arm completed 20 turns with 2,129,920 input and 20,480 output tokens. Native reported 1,945,581 cached input tokens, versus 1,925,248 for vLLM.
+Two TP1 W4 startup attempts on GPU 1 ended before either arm measured. All reported TP1 cells used GPU 0.
 
-A foreign GPU compute owner invalidated an earlier TP1 W1 attempt. The table uses the sealed replacement.
+The campaign at `artifacts/pool-w6/campaign/official-81b477126d5b-d2c01558e9b6/` retains raw streams, comparisons, and final cell status in `closure/results.json`. See `artifacts/pool-w6/verification/audit-formal-digest-81b477126d5b.json` for the independent audit. [Earlier AgentX results](agentx-256k.md) predate these changes.
 
-The campaign at `artifacts/pool-w6/campaign/official-3808bf3034cd-5ba8aaab4da7/` retains the raw streams, comparisons, and exclusions. Its `closure/results.json` records the final cell status. See `artifacts/pool-w6/verification/audit-formal-digest-3808bf3034cd.json` for the independent aggregate audit. [Earlier AgentX results](agentx-256k.md) predate these changes.
+### Single-request split release
+
+Native `3808bf3034cd` passed all six TP1 cells. TP2 W4 missed at 1.105433× by 142.663 ms, leaving five TP2 cells unmeasured. [Full archived results and receipts](https://github.com/para1lel/sglang.cpp/blob/31cbe16db2ba51bce13989f4d5a38ad8e2ad6174/docs/performance.md#single-request-split-release)
 
 ### Warm GQA release
 

@@ -344,134 +344,6 @@ target("sglang-server")
     add_files("apps/server/qwen/*.cpp")
     add_media_codecs()
 
-option("text-tokenizer-check")
-    set_default(false)
-option_end()
-
-if has_config("text-tokenizer-check") then
-    target("text-tokenizer-check")
-        set_kind("binary")
-        set_toolchains("host-pixi")
-        set_targetdir("$(builddir)/bin")
-        add_deps("sglang_tokenizer")
-        add_files("tests/text/tokenizer_test.cpp")
-    target_end()
-end
-
-option("mxfp8-gqa-check")
-    set_default(false)
-option_end()
-
-if has_config("mxfp8-gqa-check") then
-    target("mxfp8-gqa-check")
-        set_kind("binary")
-        set_toolchains("host-pixi")
-        set_targetdir("$(builddir)/bin")
-        set_values("cuda.rdc", false)
-        set_values("cuda.build.devlink", false)
-        add_cugencodes("sm_100")
-        add_cuflags("--dependency-target-name=", {force = true})
-        add_deps("sglang_cuda")
-        add_syslinks("cudart")
-        add_files("tests/mxfp8_gqa_check.cu", "tests/mxfp8_gqa_prefill_check.cu")
-        add_files("tests/mxfp8_gqa_flash_check.cu", "tests/mxfp8_gqa_short_prefill_check.cu")
-    target_end()
-
-end
-
-option("sampling-check")
-    set_default(false)
-option_end()
-
-if has_config("sampling-check") then
-    target("sampling-check")
-        set_kind("binary")
-        set_toolchains("host-pixi")
-        set_targetdir("$(builddir)/bin")
-        add_deps("sglang_decoder")
-        add_rpathdirs(path.join(prefix, "lib"), path.join(toolkit, "lib"))
-        add_files("tests/text/sampling_check.cpp")
-    target_end()
-end
-
-option("gdn-check")
-    set_default(false)
-option_end()
-
-if has_config("gdn-check") then
-    target("gdn-check")
-        set_kind("binary")
-        set_toolchains("host-pixi")
-        set_targetdir("$(builddir)/bin")
-        set_values("cuda.rdc", false)
-        set_values("cuda.build.devlink", false)
-        add_cugencodes("sm_100")
-        add_cuflags("--dependency-target-name=", {force = true})
-        add_deps("sglang_cuda")
-        add_defines("SGLANG_TEST_GDN_TILED", "SGLANG_TEST_GDN_CHUNK")
-        add_ldflags("-Wl,--wrap=cudaLaunchKernel", {force = true})
-        add_files("tests/decoder/gdn_check.cu")
-    target_end()
-
-    target("gdn-routes")
-        set_kind("binary")
-        set_toolchains("host-pixi")
-        set_targetdir("$(builddir)/bin")
-        add_deps("sglang_decoder", "sglang_tokenizer")
-        add_rpathdirs(path.join(prefix, "lib"), path.join(toolkit, "lib"))
-        add_ldflags("-Wl,--wrap=cudaLaunchKernel", {force = true})
-        add_files("tests/decoder/gdn_routes.cpp", "tests/prefix/prefix_fixture.cpp")
-    target_end()
-end
-
-option("batch-graph-lanes")
-    set_default(false)
-option_end()
-
-if has_config("batch-graph-lanes") then
-    target("batch-graph-lanes")
-        set_kind("binary")
-        set_toolchains("host-pixi")
-        set_targetdir("$(builddir)/bin")
-        add_deps("sglang_decoder")
-        add_rpathdirs(path.join(prefix, "lib"), path.join(toolkit, "lib"))
-        add_files("tests/batch/batch_graph_lanes.cpp")
-    target_end()
-end
-
-option("decoder-batch-plan-check")
-    set_default(false)
-option_end()
-
-if has_config("decoder-batch-plan-check") then
-    target("decoder-batch-plan-check")
-        set_kind("binary")
-        set_toolchains("host-pixi")
-        set_targetdir("$(builddir)/bin")
-        add_includedirs("include")
-        add_files("tests/decoder/decoder_batch_plan_check.cpp",
-                  "src/runtime/execution/batch_admission_order.cpp",
-                  "src/text/decoder_batch_plan.cpp")
-    target_end()
-end
-
-option("constraint-check")
-    set_default(false)
-option_end()
-
-if has_config("constraint-check") then
-    target("constraint-check")
-        set_kind("binary")
-        set_toolchains("host-pixi")
-        set_targetdir("$(builddir)/bin")
-        add_deps("sglang_decoder", "sglang_tokenizer")
-        add_rpathdirs(path.join(prefix, "lib"), path.join(toolkit, "lib"))
-        add_files("tests/text/constraint_check.cpp")
-        add_ldflags("-Wl,--wrap=_ZN6sglang7decoder25gather_constrained_logits" ..
-                    "EPK13__nv_bfloat16PKiPS1_iP11CUstream_st", {force = true})
-    target_end()
-end
-
 target("sglang_media_preprocess")
     set_kind("static")
     set_default(false)
@@ -481,76 +353,6 @@ target("sglang_media_preprocess")
     add_cxxflags("-ffp-contract=off")
     add_files("src/media_preprocess.cpp", "src/media_resize.cpp")
 
-option("media-preprocess-check")
-    set_default(false)
-option_end()
-
-if has_config("media-preprocess-check") then
-    target("media-preprocess-check")
-        set_kind("binary")
-        set_default(false)
-        set_toolchains("host-pixi")
-        set_targetdir("$(builddir)/bin")
-        add_deps("sglang_media_preprocess")
-        add_files("tests/media/preprocess_check.cpp")
-    target_end()
-end
-
-option("long-decode-check")
-    set_default(false)
-option_end()
-
-if has_config("long-decode-check") then
-    target("gqa-split-fp64-check")
-        set_kind("binary")
-        set_toolchains("host-pixi")
-        set_targetdir("$(builddir)/bin")
-        add_deps("sglang_cuda")
-        add_files("tests/decoder/gqa_split_fp64_check.cpp")
-    target_end()
-
-    target("long-decode-check")
-        set_kind("binary")
-        set_toolchains("host-pixi")
-        set_targetdir("$(builddir)/bin")
-        set_values("cuda.rdc", false)
-        set_values("cuda.build.devlink", false)
-        add_cugencodes("sm_100")
-        add_cuflags("--dependency-target-name=", {force = true})
-        add_deps("sglang_cuda")
-        add_ldflags("-Wl,--wrap=cudaLaunchKernel", {force = true})
-        add_files("tests/decoder/long_decode_check.cu")
-    target_end()
-
-    target("long-decode-routes")
-        set_kind("binary")
-        set_toolchains("host-pixi")
-        set_targetdir("$(builddir)/bin")
-        add_deps("sglang_decoder", "sglang_tokenizer")
-        add_rpathdirs(path.join(prefix, "lib"), path.join(toolkit, "lib"))
-        add_ldflags("-Wl,--wrap=cudaLaunchKernel", {force = true})
-        add_ldflags("-Wl,--wrap=_ZN6sglang7decoder15RequestProgress6selectERNS0_7RequestERNS0_" ..
-                    "9WorkspaceERKNS_14DecoderOptionsERKNS0_19ConstraintWorkspaceEPKNS0_" ..
-                    "18SamplingParametersEPvP11CUstream_stPKNS0_23AdjustedLogitsWorkspaceE",
-                    {force = true})
-        add_files("tests/decoder/long_decode_routes.cpp", "tests/prefix/prefix_fixture.cpp")
-    target_end()
-end
-
-option("generated-logprobs-check")
-    set_default(false)
-option_end()
-
-if has_config("generated-logprobs-check") then
-    target("generated-logprobs-check")
-        set_kind("binary")
-        set_toolchains("host-pixi")
-        set_targetdir("$(builddir)/bin")
-        add_deps("sglang_decoder")
-        add_rpathdirs(path.join(prefix, "lib"), path.join(toolkit, "lib"))
-        add_files("tests/text/generated_logprobs_check.cpp")
-    target_end()
-end
 local nccl_wheel = (os.dirs(path.join(prefix, "lib/python*/site-packages/nvidia/nccl")) or {})[1]
 if not nccl_wheel then
     raise("pixi env is missing the nvidia/nccl wheel " ..
@@ -570,35 +372,133 @@ target("sglang_decoder")
     add_files("src/runtime/execution/decoder_batch_prefix.cpp")
 target_end()
 
-option("tp2-collective-check")
-    set_default(false)
-option_end()
+local cuda_launch_wrap = "-Wl,--wrap=cudaLaunchKernel"
+local prefix_fixture = "tests/prefix/prefix_fixture.cpp"
+local checks = {
+    {
+        name = "text-tokenizer-check", deps = {"sglang_tokenizer"},
+        sources = {"tests/text/tokenizer_test.cpp"},
+    },
+    {
+        name = "mxfp8-gqa-check", deps = {"sglang_cuda"}, cuda = true, syslinks = {"cudart"},
+        sources = {"tests/mxfp8_gqa_check.cu", "tests/mxfp8_gqa_prefill_check.cu",
+                   "tests/mxfp8_gqa_flash_check.cu", "tests/mxfp8_gqa_short_prefill_check.cu"},
+    },
+    {
+        name = "sampling-check", deps = {"sglang_decoder"}, decoder_rpaths = true,
+        sources = {"tests/text/sampling_check.cpp"},
+    },
+    {
+        name = "gdn-check", deps = {"sglang_cuda"}, cuda = true,
+        defines = {"SGLANG_TEST_GDN_TILED", "SGLANG_TEST_GDN_CHUNK"},
+        ldflags = {cuda_launch_wrap}, sources = {"tests/decoder/gdn_check.cu"},
+    },
+    {
+        name = "gdn-routes", option = "gdn-check", decoder_rpaths = true,
+        deps = {"sglang_decoder", "sglang_tokenizer"}, ldflags = {cuda_launch_wrap},
+        sources = {"tests/decoder/gdn_routes.cpp", prefix_fixture},
+    },
+    {
+        name = "batch-graph-lanes", deps = {"sglang_decoder"}, decoder_rpaths = true,
+        sources = {"tests/batch/batch_graph_lanes.cpp"},
+    },
+    {
+        name = "decoder-batch-plan-check", includes = {"include"},
+        sources = {"tests/decoder/decoder_batch_plan_check.cpp",
+                   "src/runtime/execution/batch_admission_order.cpp",
+                   "src/text/decoder_batch_plan.cpp"},
+    },
+    {
+        name = "constraint-check", deps = {"sglang_decoder", "sglang_tokenizer"},
+        decoder_rpaths = true, sources = {"tests/text/constraint_check.cpp"},
+        ldflags = {"-Wl,--wrap=_ZN6sglang7decoder25gather_constrained_logits" ..
+                   "EPK13__nv_bfloat16PKiPS1_iP11CUstream_st"},
+    },
+    {
+        name = "media-preprocess-check", deps = {"sglang_media_preprocess"}, default = false,
+        sources = {"tests/media/preprocess_check.cpp"},
+    },
+    {
+        name = "gqa-split-fp64-check", option = "long-decode-check", deps = {"sglang_cuda"},
+        sources = {"tests/decoder/gqa_split_fp64_check.cpp"},
+    },
+    {
+        name = "long-decode-check", deps = {"sglang_cuda"}, cuda = true,
+        ldflags = {cuda_launch_wrap}, sources = {"tests/decoder/long_decode_check.cu"},
+    },
+    {
+        name = "long-decode-routes", option = "long-decode-check", decoder_rpaths = true,
+        deps = {"sglang_decoder", "sglang_tokenizer"},
+        ldflags = {cuda_launch_wrap,
+                   "-Wl,--wrap=_ZN6sglang7decoder15RequestProgress6selectERNS0_7RequestERNS0_" ..
+                   "9WorkspaceERKNS_14DecoderOptionsERKNS0_19ConstraintWorkspaceEPKNS0_" ..
+                   "18SamplingParametersEPvP11CUstream_stPKNS0_23AdjustedLogitsWorkspaceE"},
+        sources = {"tests/decoder/long_decode_routes.cpp", prefix_fixture},
+    },
+    {
+        name = "generated-logprobs-check", deps = {"sglang_decoder"}, decoder_rpaths = true,
+        sources = {"tests/text/generated_logprobs_check.cpp"},
+    },
+    {
+        name = "tp2-collective-check", deps = {"sglang_decoder"}, decoder_rpaths = true,
+        sysincludes = {path.join(nccl_wheel, "include")}, optional_source = true,
+        ldflags = {"-Wl,--wrap=cuMulticastGetGranularity"},
+        sources = {"tests/decoder/tp2/collective_check.cpp"},
+    },
+    {
+        name = "tp2-verification-row-copy-check", deps = {"sglang_cuda"},
+        sources = {"tests/decoder/tp2/verification_row_copy_check.cpp"},
+    },
+}
 
-if has_config("tp2-collective-check") and os.isfile("tests/decoder/tp2/collective_check.cpp") then
-    target("tp2-collective-check")
-        set_kind("binary")
-        set_toolchains("host-pixi")
-        set_targetdir("$(builddir)/bin")
-        add_sysincludedirs(path.join(nccl_wheel, "include"))
-        add_deps("sglang_decoder")
-        add_rpathdirs(path.join(prefix, "lib"), path.join(toolkit, "lib"))
-        add_ldflags("-Wl,--wrap=cuMulticastGetGranularity", {force = true})
-        add_files("tests/decoder/tp2/collective_check.cpp")
-    target_end()
-end
+local check_options = {}
+for _, check in ipairs(checks) do
+    local config = check.option or check.name
+    if not check_options[config] then
+        option(config)
+            set_default(false)
+        option_end()
+        check_options[config] = true
+    end
 
-option("tp2-verification-row-copy-check")
-    set_default(false)
-option_end()
-
-if has_config("tp2-verification-row-copy-check") then
-    target("tp2-verification-row-copy-check")
-        set_kind("binary")
-        set_toolchains("host-pixi")
-        set_targetdir("$(builddir)/bin")
-        add_deps("sglang_cuda")
-        add_files("tests/decoder/tp2/verification_row_copy_check.cpp")
-    target_end()
+    if has_config(config) and (not check.optional_source or os.isfile(check.sources[1])) then
+        target(check.name)
+            set_kind("binary")
+            set_toolchains("host-pixi")
+            set_targetdir("$(builddir)/bin")
+            if check.default == false then
+                set_default(false)
+            end
+            if check.cuda then
+                set_values("cuda.rdc", false)
+                set_values("cuda.build.devlink", false)
+                add_cugencodes("sm_100")
+                add_cuflags("--dependency-target-name=", {force = true})
+            end
+            if check.includes then
+                add_includedirs(check.includes)
+            end
+            if check.sysincludes then
+                add_sysincludedirs(check.sysincludes)
+            end
+            if check.deps then
+                add_deps(check.deps)
+            end
+            if check.decoder_rpaths then
+                add_rpathdirs(path.join(prefix, "lib"), path.join(toolkit, "lib"))
+            end
+            if check.defines then
+                add_defines(check.defines)
+            end
+            if check.syslinks then
+                add_syslinks(check.syslinks)
+            end
+            if check.ldflags then
+                add_ldflags(check.ldflags, {force = true})
+            end
+            add_files(check.sources)
+        target_end()
+    end
 end
 
 target("sglang_mnnvl_ar")
